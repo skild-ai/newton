@@ -24599,23 +24599,38 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                                         return u_n + G_nn * d_n + G_nt1 * (tangent1 - old_lambda_t1) + G_nt2 * (tangent2 - old_lambda_t2)
                                             - target_vel_n;
                                     };
-                                    float trial_t1, trial_t2;
+                                    float probed_n = -1.0f, probed_t1 = 0.0f, probed_t2 = 0.0f;
+                                    const auto residual = [&](float lambda_n) {
+                                        const float f = probe(lambda_n, probed_t1, probed_t2);
+                                        probed_n = lambda_n;
+                                        return f;
+                                    };
+                                    // Within a tolerance of what a 1e-6 relative error in the load would leave.
+                                    const auto converged = [&](float lambda_n, float f) { return fabsf(f) <= 1.0e-6f * G_nn * lambda_n; };
                                     float lo = 0.0f, f_lo = u_n_at_zero - target_vel_n;
-                                    // Friction can raise the root above the frictionless one, so the bracket grows until it holds the root.
-                                    float hi = fmaxf(old_lambda_n * 2.0f, -f_lo / G_nn);
-                                    float f_hi = probe(hi, trial_t1, trial_t2);
+                                    // The current load is close to the root in later sweeps. Friction can raise the root above the
+                                    // frictionless one, so the bracket grows until it holds the root.
+                                    float hi = fmaxf(old_lambda_n, -f_lo / G_nn);
+                                    float f_hi = residual(hi);
+                                    if (converged(hi, f_hi)) f_hi = 0.0f;
                                     for (int _grow = 0; _grow < 40 && f_hi < 0.0f; _grow++) {
                                         lo = hi;
                                         f_lo = f_hi;
                                         hi *= 2.0f;
-                                        f_hi = probe(hi, trial_t1, trial_t2);
+                                        f_hi = residual(hi);
                                     }
                                     // Illinois regula falsi: exact where the residual is linear in the load, superlinear elsewhere.
                                     int last_side = 0;
                                     for (int _it = 0; _it < 24 && f_hi > 0.0f && hi - lo > 1.0e-6f * hi; _it++) {
                                         float x = (lo * f_hi - hi * f_lo) / (f_hi - f_lo);
                                         if (!(x > lo && x < hi)) x = 0.5f * (lo + hi);
-                                        const float f_x = probe(x, trial_t1, trial_t2);
+                                        const float f_x = residual(x);
+                                        if (converged(x, f_x)) {
+                                            lo = x;
+                                            hi = x;
+                                            f_hi = 0.0f;
+                                            break;
+                                        }
                                         if (f_x < 0.0f) {
                                             lo = x;
                                             f_lo = f_x;
@@ -24630,7 +24645,12 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                                     }
                                     // Interpolate the root in the final bracket.
                                     new_lambda_n = f_hi >= 0.0f ? lo - f_lo * (hi - lo) / (f_hi - f_lo) : hi;
-                                    probe(new_lambda_n, new_lambda_t1, new_lambda_t2);
+                                    if (new_lambda_n == probed_n) {
+                                        new_lambda_t1 = probed_t1;
+                                        new_lambda_t2 = probed_t2;
+                                    } else {
+                                        probe(new_lambda_n, new_lambda_t1, new_lambda_t2);
+                                    }
                                 }
                             }
 
@@ -24801,23 +24821,38 @@ _MF_BISECTION_FRICTION_SOURCE = """
                                         return u_n + G_nn * d_n + G_nt1 * (tangent1 - old_lambda_t1) + G_nt2 * (tangent2 - old_lambda_t2)
                                             - target_vel_n;
                                     };
-                                    float trial_t1, trial_t2;
+                                    float probed_n = -1.0f, probed_t1 = 0.0f, probed_t2 = 0.0f;
+                                    const auto residual = [&](float lambda_n) {
+                                        const float f = probe(lambda_n, probed_t1, probed_t2);
+                                        probed_n = lambda_n;
+                                        return f;
+                                    };
+                                    // Within a tolerance of what a 1e-6 relative error in the load would leave.
+                                    const auto converged = [&](float lambda_n, float f) { return fabsf(f) <= 1.0e-6f * G_nn * lambda_n; };
                                     float lo = 0.0f, f_lo = u_n_at_zero - target_vel_n;
-                                    // Friction can raise the root above the frictionless one, so the bracket grows until it holds the root.
-                                    float hi = fmaxf(old_lambda_n * 2.0f, -f_lo / G_nn);
-                                    float f_hi = probe(hi, trial_t1, trial_t2);
+                                    // The current load is close to the root in later sweeps. Friction can raise the root above the
+                                    // frictionless one, so the bracket grows until it holds the root.
+                                    float hi = fmaxf(old_lambda_n, -f_lo / G_nn);
+                                    float f_hi = residual(hi);
+                                    if (converged(hi, f_hi)) f_hi = 0.0f;
                                     for (int _grow = 0; _grow < 40 && f_hi < 0.0f; _grow++) {
                                         lo = hi;
                                         f_lo = f_hi;
                                         hi *= 2.0f;
-                                        f_hi = probe(hi, trial_t1, trial_t2);
+                                        f_hi = residual(hi);
                                     }
                                     // Illinois regula falsi: exact where the residual is linear in the load, superlinear elsewhere.
                                     int last_side = 0;
                                     for (int _it = 0; _it < 24 && f_hi > 0.0f && hi - lo > 1.0e-6f * hi; _it++) {
                                         float x = (lo * f_hi - hi * f_lo) / (f_hi - f_lo);
                                         if (!(x > lo && x < hi)) x = 0.5f * (lo + hi);
-                                        const float f_x = probe(x, trial_t1, trial_t2);
+                                        const float f_x = residual(x);
+                                        if (converged(x, f_x)) {
+                                            lo = x;
+                                            hi = x;
+                                            f_hi = 0.0f;
+                                            break;
+                                        }
                                         if (f_x < 0.0f) {
                                             lo = x;
                                             f_lo = f_x;
@@ -24832,7 +24867,12 @@ _MF_BISECTION_FRICTION_SOURCE = """
                                     }
                                     // Interpolate the root in the final bracket.
                                     new_lambda_n = f_hi >= 0.0f ? lo - f_lo * (hi - lo) / (f_hi - f_lo) : hi;
-                                    probe(new_lambda_n, new_lambda_t1, new_lambda_t2);
+                                    if (new_lambda_n == probed_n) {
+                                        new_lambda_t1 = probed_t1;
+                                        new_lambda_t2 = probed_t2;
+                                    } else {
+                                        probe(new_lambda_n, new_lambda_t1, new_lambda_t2);
+                                    }
                                 }
                             }
                             d_n_total = new_lambda_n - old_lambda_n;
