@@ -371,7 +371,12 @@ repository examples spend tuning effort, not a shared solver API.
        change, contact with a moving body or a tangentially moving mesh
        surface, reset or model notification wakes them; it saves work on
        scenes where many objects rest, and costs a few extra launches per
-       step when nothing sleeps. ``articulated_contact_response``
+       step when nothing sleeps. An island sleeps only after every body stays
+       below both speed thresholds for ``sleep_quiet_time``; when resting
+       stacks stay awake, as they can in many-world scenes with the default
+       contact order, a deterministic contact order
+       (``CollisionPipeline(deterministic=True)``) or a larger
+       ``sleep_angular_threshold`` lets them sleep. ``articulated_contact_response``
        selects how contacts of articulated bodies are solved: ``"immediate"`` rows of
        the generalized coordinates, or the ``"propagation"`` response,
        which solves them as body-space rows and propagates their impulses through each

@@ -2511,7 +2511,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 shapes (other notifications and changes to static or kinematic owners wake
                 every island). Driven articulations (nonzero drive gains) and articulations with
                 passive springs (nonzero :attr:`~newton.Model.joint_stiffness` on a PRISMATIC,
-                REVOLUTE or D6 tree joint) stay awake.
+                REVOLUTE or D6 tree joint) stay awake. The thresholds apply to every body's speeds
+                at the end of each step. The default contact order follows GPU scheduling, so each
+                step solves a world's contacts in a different order and resting stacks keep a small
+                jitter; its angular speed can reach the default ``sleep_angular_threshold``, and in
+                scenes with many worlds most such islands then stay awake. A deterministic contact
+                order (``CollisionPipeline(deterministic=True)``, see :ref:`Deterministic Contacts`)
+                roughly halves the jitter; a larger ``sleep_angular_threshold`` also lets them sleep.
                 Sleeping is configured at construction; rebuild captured graphs to change it. Construction raises :class:`ValueError` with ``contact_warmstart``
                 or ``velocity_iterations``, or for a model without articulations, and
                 :class:`NotImplementedError` with ``articulated_contact_response="propagation"`` and
