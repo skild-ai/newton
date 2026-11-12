@@ -1574,12 +1574,11 @@ class SolverSteel(SolverBase, CouplingInterface):
     - The rigid-body bias forces, including the velocity-product (Coriolis and centrifugal)
       terms, are evaluated at the start of the step, as in :class:`~newton.solvers.SolverFeatherstone`
       and the ``"euler"`` and ``"implicitfast"`` integrators of :class:`~newton.solvers.SolverMuJoCo`.
-      The energy this adds grows with ``dt`` and the joint speeds, which are largest across DOFs of
-      small effective inertia, so a free-swinging chain of light links can gain energy and diverge
-      at ordinary ``dt``. More ``iterations`` do not change it. A smaller ``dt``, heavier links, or
-      joint armature on those DOFs that dominates the links' inertia about their joints keep such
-      chains stable; armature bounds the joint-space response ``H^-1`` that scales the error, and a
-      smaller armature only delays the divergence.
+      In rapidly moving articulated chains, such as a free-swinging chain of light links whose tip
+      whips at high joint speed, this can add energy and diverge at ordinary ``dt``. More
+      ``iterations`` do not change it; a smaller ``dt`` reduces the error. Joint armature changes the
+      effective inertia and can improve stability, but it changes the physical model; validate it over
+      the intended trajectory and duration.
 
     On CUDA, branched articulations use sparse mass factors when
     every articulated (non-free-body) response group shares one joint topology with at most

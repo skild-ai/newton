@@ -101,10 +101,11 @@ Effort limits, target rates, armature, and friction
    :class:`~newton.solvers.SolverFeatherstone`,
    :class:`~newton.solvers.SolverSteel` and the ``"euler"`` and
    ``"implicitfast"`` integrators of :class:`~newton.solvers.SolverMuJoCo`,
-   can gain energy and diverge on chains of very light links that swing
-   freely. A smaller ``dt``, heavier links, or armature on those joints
-   that dominates the links' inertia about their axes restore stability; a
-   smaller armature only delays the divergence.
+   can gain energy numerically in rapidly moving articulated chains, such as
+   freely swinging chains of light links. A smaller ``dt`` reduces this error.
+   Armature can improve stability there too, with the caveat above; validate
+   it over the intended trajectory and duration. More solver iterations do not
+   address this unconstrained integration error.
 
 Collision frequency
    When the solver consumes contacts from :class:`~newton.CollisionPipeline`,
