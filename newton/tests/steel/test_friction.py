@@ -970,7 +970,7 @@ _ZERO_LOAD_BLOCKS = {
 _COLORED_BLOCK_SOLVE = """
     const float* b = block.data;
     float n, t1, t2;
-    contact_block_solve(b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], 0.0f, b[9], 0.0f, 0.0f, 0.0f, n, t1, t2);
+    contact_block_solve(b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], 0.0f, b[9], b[10], b[11], b[12], n, t1, t2);
     out.data[0] = n;
     out.data[1] = t1;
     out.data[2] = t2;
@@ -1022,19 +1022,21 @@ _COLORED_BLOCK_KERNELS = {
 
 
 def _colored_block(device, block, friction_mode="coulomb_newton"):
-    """Solve one block with the colored sweep's ``contact_block_solve`` from zero impulses."""
+    """Solve one block with the colored sweep's ``contact_block_solve``; omitted old impulses are zero."""
     out = wp.zeros(3, dtype=float, device=device)
+    padded = np.zeros(13, dtype=np.float32)
+    padded[: len(block)] = block
     wp.launch(
         _COLORED_BLOCK_KERNELS[friction_mode],
         dim=1,
-        inputs=[wp.array(block, dtype=float, device=device), out],
+        inputs=[wp.array(padded, dtype=float, device=device), out],
         device=device,
     )
     return out.numpy()
 
 
 def _mf_block(device, block, friction_mode="coulomb_newton"):
-    """Solve one free-body contact block with the matrix-free kernel's coupled update from zero impulses.
+    """Solve one free-body contact block with the matrix-free kernel's coupled update; omitted old impulses are zero.
 
     Unit Jacobians ``J = e_i`` with responses ``M^-1 J^T = G e_i`` give the rows the Delassus block ``G``, and the
     body's velocity is ``u``. The contact row has no diagonal, so only the coupled update moves it.
@@ -1050,7 +1052,9 @@ def _mf_block(device, block, friction_mode="coulomb_newton"):
     meta[0, :3, 1] = np.array([0.0, 1.0, 1.0], dtype=np.float32).view(np.int32)
     row_types = [PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION]
     meta[0, :3, 3] = np.array(row_types, dtype=np.int64) | (np.array([-1, 0, 0], dtype=np.int64) << 16)
-    impulses = wp.zeros((1, 4), dtype=float, device=device)
+    old = np.zeros(4, dtype=np.float32)
+    old[: len(block) - 10] = block[10:13]
+    impulses = wp.array([old], dtype=float, device=device)
     velocity = np.zeros(6, dtype=np.float32)
     velocity[:3] = u
     kernel = _get_pgs_solve_mf_gs_kernel(
@@ -1166,6 +1170,28 @@ def test_bisection_solves_the_tangent_pair_on_the_disk(test, device):
                     np.testing.assert_allclose(result, expected, rtol=1.0e-4, atol=1.0e-5)
 
 
+# An ill-conditioned block whose coupled sticking solution lies well inside the cone, reached from nonzero impulses.
+# Values: u_n, u_t1, u_t2, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2, G_t2t2, mu, old impulses (normal, tangent 1, tangent 2).
+_ILL_CONDITIONED_STICKING_BLOCK = (
+    *(25.8318977356, -25.1314468384, 32.4639778137),
+    *(28.9735565186, -27.5162124634, 35.8052368164, 26.2391510010, -34.0760879517, 44.3519554138),
+    1.08889448643,
+    *(0.362457841635, -0.0915545076132, 0.380765765905),
+)
+
+
+def test_bisection_leaves_an_ill_conditioned_sticking_contact_at_rest(test, device):
+    """Reach the sticking solution of an ill-conditioned block: the contact's velocity ends at zero."""
+    block = np.array(_ILL_CONDITIONED_STICKING_BLOCK, dtype=np.float32)
+    g_nn, g_nt1, g_nt2, g_11, g_12, g_22 = block[3:9].astype(np.float64)
+    delassus = np.array([[g_nn, g_nt1, g_nt2], [g_nt1, g_11, g_12], [g_nt2, g_12, g_22]])
+    for route, solve in (("colored", _colored_block), ("serial", _mf_block)):
+        with test.subTest(route=route):
+            result = solve(device, block, "bisection").astype(np.float64)
+            velocity = block[:3].astype(np.float64) + delassus @ (result - block[10:13].astype(np.float64))
+            test.assertLess(float(np.abs(velocity).max()), 1.0e-3)
+
+
 class TestSteelFrictionMode(unittest.TestCase):
     pass
 
@@ -1182,6 +1208,7 @@ for _fn in (
     test_coulomb_newton_normal_impulse_stays_nonnegative,
     test_coupled_modes_hold_near_the_cone_boundary,
     test_bisection_solves_the_tangent_pair_on_the_disk,
+    test_bisection_leaves_an_ill_conditioned_sticking_contact_at_rest,
 ):
     add_function_test(TestSteelFrictionMode, _fn.__name__, _fn, devices=cuda_devices)
 

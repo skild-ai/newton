@@ -24558,22 +24558,36 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                                 new_lambda_t1 = 0.0f;
                                 new_lambda_t2 = 0.0f;
                             } else {
-                                // A contact whose coupled sticking solution lies inside the cone needs no search.
+                                // A contact whose coupled sticking solution lies inside the cone needs no search. The cofactor solve is
+                                // refined once and accepted only if it leaves the contact at rest; ill-conditioned blocks fall back.
                                 const float minor_nn = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
                                 const float minor_n1 = G_nt2 * G_t1t2 - G_nt1 * G_t2t2;
                                 const float minor_n2 = G_nt1 * G_t1t2 - G_nt2 * G_t1t1;
                                 const float det_block = G_nn * minor_nn + G_nt1 * minor_n1 + G_nt2 * minor_n2;
                                 bool sticks = false;
                                 if (minor_nn > 0.0f && det_block > 1.0e-6f * G_nn * minor_nn) {
-                                    const float r_n = u_n - target_vel_n;
                                     const float inv_det = 1.0f / det_block;
                                     const float minor_11 = G_nn * G_t2t2 - G_nt2 * G_nt2;
                                     const float minor_12 = G_nt1 * G_nt2 - G_nn * G_t1t2;
                                     const float minor_22 = G_nn * G_t1t1 - G_nt1 * G_nt1;
-                                    const float stick_n = old_lambda_n - (minor_nn * r_n + minor_n1 * u_t1 + minor_n2 * u_t2) * inv_det;
-                                    const float stick_t1 = old_lambda_t1 - (minor_n1 * r_n + minor_11 * u_t1 + minor_12 * u_t2) * inv_det;
-                                    const float stick_t2 = old_lambda_t2 - (minor_n2 * r_n + minor_12 * u_t1 + minor_22 * u_t2) * inv_det;
-                                    if (stick_n >= 0.0f && sqrtf(stick_t1 * stick_t1 + stick_t2 * stick_t2) <= mu * stick_n) {
+                                    const float r_n = u_n - target_vel_n;
+                                    float d_n = 0.0f, d_t1 = 0.0f, d_t2 = 0.0f;
+                                    float e_n = r_n, e_t1 = u_t1, e_t2 = u_t2;
+                                    for (int _refine = 0; _refine < 2; _refine++) {
+                                        d_n -= (minor_nn * e_n + minor_n1 * e_t1 + minor_n2 * e_t2) * inv_det;
+                                        d_t1 -= (minor_n1 * e_n + minor_11 * e_t1 + minor_12 * e_t2) * inv_det;
+                                        d_t2 -= (minor_n2 * e_n + minor_12 * e_t1 + minor_22 * e_t2) * inv_det;
+                                        e_n = r_n + G_nn * d_n + G_nt1 * d_t1 + G_nt2 * d_t2;
+                                        e_t1 = u_t1 + G_nt1 * d_n + G_t1t1 * d_t1 + G_t1t2 * d_t2;
+                                        e_t2 = u_t2 + G_nt2 * d_n + G_t1t2 * d_t1 + G_t2t2 * d_t2;
+                                    }
+                                    const float scale = fabsf(r_n) + fabsf(u_t1) + fabsf(u_t2)
+                                        + G_nn * fabsf(d_n) + G_t1t1 * fabsf(d_t1) + G_t2t2 * fabsf(d_t2);
+                                    const float stick_n = old_lambda_n + d_n;
+                                    const float stick_t1 = old_lambda_t1 + d_t1;
+                                    const float stick_t2 = old_lambda_t2 + d_t2;
+                                    if (fabsf(e_n) + fabsf(e_t1) + fabsf(e_t2) <= 1.0e-5f * scale && stick_n >= 0.0f
+                                        && sqrtf(stick_t1 * stick_t1 + stick_t2 * stick_t2) <= mu * stick_n) {
                                         new_lambda_n = stick_n;
                                         new_lambda_t1 = stick_t1;
                                         new_lambda_t2 = stick_t2;
@@ -24764,22 +24778,36 @@ _MF_BISECTION_FRICTION_SOURCE = """
                                 new_lambda_t1 = 0.0f;
                                 new_lambda_t2 = 0.0f;
                             } else {
-                                // A contact whose coupled sticking solution lies inside the cone needs no search.
+                                // A contact whose coupled sticking solution lies inside the cone needs no search. The cofactor solve is
+                                // refined once and accepted only if it leaves the contact at rest; ill-conditioned blocks fall back.
                                 const float minor_nn = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
                                 const float minor_n1 = G_nt2 * G_t1t2 - G_nt1 * G_t2t2;
                                 const float minor_n2 = G_nt1 * G_t1t2 - G_nt2 * G_t1t1;
                                 const float det_block = G_nn * minor_nn + G_nt1 * minor_n1 + G_nt2 * minor_n2;
                                 bool sticks = false;
                                 if (minor_nn > 0.0f && det_block > 1.0e-6f * G_nn * minor_nn) {
-                                    const float r_n = u_n - target_vel_n;
                                     const float inv_det = 1.0f / det_block;
                                     const float minor_11 = G_nn * G_t2t2 - G_nt2 * G_nt2;
                                     const float minor_12 = G_nt1 * G_nt2 - G_nn * G_t1t2;
                                     const float minor_22 = G_nn * G_t1t1 - G_nt1 * G_nt1;
-                                    const float stick_n = old_lambda_n - (minor_nn * r_n + minor_n1 * u_t1 + minor_n2 * u_t2) * inv_det;
-                                    const float stick_t1 = old_lambda_t1 - (minor_n1 * r_n + minor_11 * u_t1 + minor_12 * u_t2) * inv_det;
-                                    const float stick_t2 = old_lambda_t2 - (minor_n2 * r_n + minor_12 * u_t1 + minor_22 * u_t2) * inv_det;
-                                    if (stick_n >= 0.0f && sqrtf(stick_t1 * stick_t1 + stick_t2 * stick_t2) <= mu * stick_n) {
+                                    const float r_n = u_n - target_vel_n;
+                                    float d_n = 0.0f, d_t1 = 0.0f, d_t2 = 0.0f;
+                                    float e_n = r_n, e_t1 = u_t1, e_t2 = u_t2;
+                                    for (int _refine = 0; _refine < 2; _refine++) {
+                                        d_n -= (minor_nn * e_n + minor_n1 * e_t1 + minor_n2 * e_t2) * inv_det;
+                                        d_t1 -= (minor_n1 * e_n + minor_11 * e_t1 + minor_12 * e_t2) * inv_det;
+                                        d_t2 -= (minor_n2 * e_n + minor_12 * e_t1 + minor_22 * e_t2) * inv_det;
+                                        e_n = r_n + G_nn * d_n + G_nt1 * d_t1 + G_nt2 * d_t2;
+                                        e_t1 = u_t1 + G_nt1 * d_n + G_t1t1 * d_t1 + G_t1t2 * d_t2;
+                                        e_t2 = u_t2 + G_nt2 * d_n + G_t1t2 * d_t1 + G_t2t2 * d_t2;
+                                    }
+                                    const float scale = fabsf(r_n) + fabsf(u_t1) + fabsf(u_t2)
+                                        + G_nn * fabsf(d_n) + G_t1t1 * fabsf(d_t1) + G_t2t2 * fabsf(d_t2);
+                                    const float stick_n = old_lambda_n + d_n;
+                                    const float stick_t1 = old_lambda_t1 + d_t1;
+                                    const float stick_t2 = old_lambda_t2 + d_t2;
+                                    if (fabsf(e_n) + fabsf(e_t1) + fabsf(e_t2) <= 1.0e-5f * scale && stick_n >= 0.0f
+                                        && sqrtf(stick_t1 * stick_t1 + stick_t2 * stick_t2) <= mu * stick_n) {
                                         new_lambda_n = stick_n;
                                         new_lambda_t1 = stick_t1;
                                         new_lambda_t2 = stick_t2;
