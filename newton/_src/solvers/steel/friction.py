@@ -276,56 +276,44 @@ _COUPLED_CONTACT_BISECTION = """
             new_lambda_t2 = 0.0f;
             return;
         }
-        float lo = 0.0f;
-        float hi = fmaxf(old_lambda_n * 2.0f, (target_vel_n - u_n) / G_nn + old_lambda_n);
-        hi = fmaxf(hi, 1.0f);
-        float f_lo = u_n_at_zero - target_vel_n, f_hi = -1.0f;
+        // Each probe solves the tangent pair on the friction disk of its load, like fixed_normal, and returns
+        // the normal velocity residual of that load and pair.
+        float pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy;
+        friction_pair_setup(
+            G_t1t1, G_t1t2, G_t2t2, pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy);
+        const auto probe = [&](float lambda_n, float& tangent1, float& tangent2) {
+            const float d_n = lambda_n - old_lambda_n;
+            const float radius = fmaxf(mu * lambda_n, 0.0f);
+            const float2 pair = friction_pair_solve(
+                pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy, u_t1 + G_nt1 * d_n,
+                u_t2 + G_nt2 * d_n, old_lambda_t1, old_lambda_t2, radius, 1.0f);
+            const float mag = sqrtf(pair.x * pair.x + pair.y * pair.y);
+            const float sc = mag > radius ? radius / mag : 1.0f;
+            tangent1 = pair.x * sc;
+            tangent2 = pair.y * sc;
+            return u_n + G_nn * d_n + G_nt1 * (tangent1 - old_lambda_t1) + G_nt2 * (tangent2 - old_lambda_t2)
+                - target_vel_n;
+        };
+        float trial_t1, trial_t2;
+        float lo = 0.0f, f_lo = u_n_at_zero - target_vel_n;
+        // Friction can raise the root above the frictionless one, so the bracket grows until it holds the root.
+        float hi = fmaxf(old_lambda_n * 2.0f, -f_lo / G_nn);
+        float f_hi = probe(hi, trial_t1, trial_t2);
+        for (int _grow = 0; _grow < 40 && f_hi < 0.0f; _grow++) {
+            lo = hi;
+            f_lo = f_hi;
+            hi *= 2.0f;
+            f_hi = probe(hi, trial_t1, trial_t2);
+        }
         for (int _bi = 0; _bi < 20; _bi++) {
             float mid = 0.5f * (lo + hi);
-            float d_n = mid - old_lambda_n;
-            float ut1_eff = u_t1 + G_nt1 * d_n;
-            float ut2_eff = u_t2 + G_nt2 * d_n;
-            float det = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
-            float d_t1 = 0.0f, d_t2 = 0.0f;
-            if (fabsf(det) > 1.0e-20f) {
-                d_t1 = (-ut1_eff * G_t2t2 + ut2_eff * G_t1t2) / det;
-                d_t2 = ( ut1_eff * G_t1t2 - ut2_eff * G_t1t1) / det;
-            }
-            float trial_t1 = old_lambda_t1 + d_t1;
-            float trial_t2 = old_lambda_t2 + d_t2;
-            float flimit = mu * mid;
-            float tmag = sqrtf(trial_t1 * trial_t1 + trial_t2 * trial_t2);
-            if (tmag > flimit && tmag > 1.0e-20f) {
-                float sc = flimit / tmag;
-                trial_t1 *= sc;
-                trial_t2 *= sc;
-            }
-            float d_t1_actual = trial_t1 - old_lambda_t1;
-            float d_t2_actual = trial_t2 - old_lambda_t2;
-            float u_n_trial = u_n + G_nn * d_n + G_nt1 * d_t1_actual + G_nt2 * d_t2_actual;
-            if (u_n_trial < target_vel_n) { lo = mid; f_lo = u_n_trial - target_vel_n; }
-            else { hi = mid; f_hi = u_n_trial - target_vel_n; }
+            float f_mid = probe(mid, trial_t1, trial_t2);
+            if (f_mid < 0.0f) { lo = mid; f_lo = f_mid; }
+            else { hi = mid; f_hi = f_mid; }
         }
-        // Interpolate the root in the final bracket, whose width scales with the initial one.
-        new_lambda_n = f_hi >= 0.0f ? lo - f_lo * (hi - lo) / (f_hi - f_lo) : 0.5f * (lo + hi);
-        float d_n_final = new_lambda_n - old_lambda_n;
-        float ut1_f = u_t1 + G_nt1 * d_n_final;
-        float ut2_f = u_t2 + G_nt2 * d_n_final;
-        float det_f = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
-        float d_t1_f = 0.0f, d_t2_f = 0.0f;
-        if (fabsf(det_f) > 1.0e-20f) {
-            d_t1_f = (-ut1_f * G_t2t2 + ut2_f * G_t1t2) / det_f;
-            d_t2_f = ( ut1_f * G_t1t2 - ut2_f * G_t1t1) / det_f;
-        }
-        new_lambda_t1 = old_lambda_t1 + d_t1_f;
-        new_lambda_t2 = old_lambda_t2 + d_t2_f;
-        float flimit_f = mu * new_lambda_n;
-        float tmag_f = sqrtf(new_lambda_t1 * new_lambda_t1 + new_lambda_t2 * new_lambda_t2);
-        if (tmag_f > flimit_f && tmag_f > 1.0e-20f) {
-            float sc_f = flimit_f / tmag_f;
-            new_lambda_t1 *= sc_f;
-            new_lambda_t2 *= sc_f;
-        }
+        // Interpolate the root in the final bracket.
+        new_lambda_n = f_hi >= 0.0f ? lo - f_lo * (hi - lo) / (f_hi - f_lo) : hi;
+        probe(new_lambda_n, new_lambda_t1, new_lambda_t2);
     };
 """
 
