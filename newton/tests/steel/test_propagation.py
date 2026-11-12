@@ -3368,7 +3368,10 @@ def test_contact_then_internal_gives_internal_rows_the_last_word(test, device):
 
 
 def test_contact_then_internal_sinks_a_load_on_a_joint_limit(test, device):
-    """Sink a box on a link at its limit by the documented depth at any iteration count; interleaved holds it."""
+    """Sink a box on a link at its limit under contact_then_internal at any iteration count; interleaved holds it.
+
+    For this one-axis hard stop the steady sink is ``(1 + M / m) * g * dt**2 / baumgarte``.
+    """
     box_mass, link_mass, dt, baumgarte = 4.0, 1.0, 1.0 / 240.0, 0.2
     builder = newton.ModelBuilder()
     shape_cfg = newton.ModelBuilder.ShapeConfig(density=0.0)
