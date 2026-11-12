@@ -1486,7 +1486,8 @@ class SolverSteel(SolverBase, CouplingInterface):
       update and clamps its impulse, which bounds the complete reaction.
       :attr:`~newton.Model.joint_armature` is applied. Passive :attr:`~newton.Model.joint_damping`
       of PRISMATIC, REVOLUTE, BALL and D6 DOFs is integrated implicitly in both drive modes by
-      folding ``dt * damping`` into the mass matrix, so large damping on light links stays stable.
+      folding ``dt * damping`` into the mass matrix, which removes the explicit damping step-size
+      limit; explicit springs and velocity-product forces still limit the time step.
     - Passive joint springs: :attr:`~newton.Model.joint_stiffness` and
       :attr:`~newton.Model.joint_rest_q` on PRISMATIC, REVOLUTE and D6 DOFs, applied
       explicitly as ``stiffness * (rest_q - q)`` like :class:`~newton.solvers.SolverFeatherstone`,
