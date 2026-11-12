@@ -276,44 +276,80 @@ _COUPLED_CONTACT_BISECTION = """
             new_lambda_t2 = 0.0f;
             return;
         }
-        // Each probe solves the tangent pair on the friction disk of its load, like fixed_normal, and returns
-        // the normal velocity residual of that load and pair.
-        float pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy;
-        friction_pair_setup(
-            G_t1t1, G_t1t2, G_t2t2, pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy);
-        const auto probe = [&](float lambda_n, float& tangent1, float& tangent2) {
-            const float d_n = lambda_n - old_lambda_n;
-            const float radius = fmaxf(mu * lambda_n, 0.0f);
-            const float2 pair = friction_pair_solve(
-                pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy, u_t1 + G_nt1 * d_n,
-                u_t2 + G_nt2 * d_n, old_lambda_t1, old_lambda_t2, radius, 1.0f);
-            const float mag = sqrtf(pair.x * pair.x + pair.y * pair.y);
-            const float sc = mag > radius ? radius / mag : 1.0f;
-            tangent1 = pair.x * sc;
-            tangent2 = pair.y * sc;
-            return u_n + G_nn * d_n + G_nt1 * (tangent1 - old_lambda_t1) + G_nt2 * (tangent2 - old_lambda_t2)
-                - target_vel_n;
-        };
-        float trial_t1, trial_t2;
-        float lo = 0.0f, f_lo = u_n_at_zero - target_vel_n;
-        // Friction can raise the root above the frictionless one, so the bracket grows until it holds the root.
-        float hi = fmaxf(old_lambda_n * 2.0f, -f_lo / G_nn);
-        float f_hi = probe(hi, trial_t1, trial_t2);
-        for (int _grow = 0; _grow < 40 && f_hi < 0.0f; _grow++) {
-            lo = hi;
-            f_lo = f_hi;
-            hi *= 2.0f;
-            f_hi = probe(hi, trial_t1, trial_t2);
+        // A contact whose coupled sticking solution lies inside the cone needs no search.
+        const float minor_nn = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
+        const float minor_n1 = G_nt2 * G_t1t2 - G_nt1 * G_t2t2;
+        const float minor_n2 = G_nt1 * G_t1t2 - G_nt2 * G_t1t1;
+        const float det_block = G_nn * minor_nn + G_nt1 * minor_n1 + G_nt2 * minor_n2;
+        bool sticks = false;
+        if (minor_nn > 0.0f && det_block > 1.0e-6f * G_nn * minor_nn) {
+            const float r_n = u_n - target_vel_n;
+            const float inv_det = 1.0f / det_block;
+            const float minor_11 = G_nn * G_t2t2 - G_nt2 * G_nt2;
+            const float minor_12 = G_nt1 * G_nt2 - G_nn * G_t1t2;
+            const float minor_22 = G_nn * G_t1t1 - G_nt1 * G_nt1;
+            const float stick_n = old_lambda_n - (minor_nn * r_n + minor_n1 * u_t1 + minor_n2 * u_t2) * inv_det;
+            const float stick_t1 = old_lambda_t1 - (minor_n1 * r_n + minor_11 * u_t1 + minor_12 * u_t2) * inv_det;
+            const float stick_t2 = old_lambda_t2 - (minor_n2 * r_n + minor_12 * u_t1 + minor_22 * u_t2) * inv_det;
+            if (stick_n >= 0.0f && sqrtf(stick_t1 * stick_t1 + stick_t2 * stick_t2) <= mu * stick_n) {
+                new_lambda_n = stick_n;
+                new_lambda_t1 = stick_t1;
+                new_lambda_t2 = stick_t2;
+                sticks = true;
+            }
         }
-        for (int _bi = 0; _bi < 20; _bi++) {
-            float mid = 0.5f * (lo + hi);
-            float f_mid = probe(mid, trial_t1, trial_t2);
-            if (f_mid < 0.0f) { lo = mid; f_lo = f_mid; }
-            else { hi = mid; f_hi = f_mid; }
+        if (!sticks) {
+            // Each probe solves the tangent pair on the friction disk of its load, like fixed_normal, and returns
+            // the normal velocity residual of that load and pair.
+            float pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy;
+            friction_pair_setup(
+                G_t1t1, G_t1t2, G_t2t2, pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy);
+            const auto probe = [&](float lambda_n, float& tangent1, float& tangent2) {
+                const float d_n = lambda_n - old_lambda_n;
+                const float radius = fmaxf(mu * lambda_n, 0.0f);
+                const float2 pair = friction_pair_solve(
+                    pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy, u_t1 + G_nt1 * d_n,
+                    u_t2 + G_nt2 * d_n, old_lambda_t1, old_lambda_t2, radius, 1.0f);
+                const float mag = sqrtf(pair.x * pair.x + pair.y * pair.y);
+                const float sc = mag > radius ? radius / mag : 1.0f;
+                tangent1 = pair.x * sc;
+                tangent2 = pair.y * sc;
+                return u_n + G_nn * d_n + G_nt1 * (tangent1 - old_lambda_t1) + G_nt2 * (tangent2 - old_lambda_t2)
+                    - target_vel_n;
+            };
+            float trial_t1, trial_t2;
+            float lo = 0.0f, f_lo = u_n_at_zero - target_vel_n;
+            // Friction can raise the root above the frictionless one, so the bracket grows until it holds the root.
+            float hi = fmaxf(old_lambda_n * 2.0f, -f_lo / G_nn);
+            float f_hi = probe(hi, trial_t1, trial_t2);
+            for (int _grow = 0; _grow < 40 && f_hi < 0.0f; _grow++) {
+                lo = hi;
+                f_lo = f_hi;
+                hi *= 2.0f;
+                f_hi = probe(hi, trial_t1, trial_t2);
+            }
+            // Illinois regula falsi: exact where the residual is linear in the load, superlinear elsewhere.
+            int last_side = 0;
+            for (int _it = 0; _it < 24 && f_hi > 0.0f && hi - lo > 1.0e-6f * hi; _it++) {
+                float x = (lo * f_hi - hi * f_lo) / (f_hi - f_lo);
+                if (!(x > lo && x < hi)) x = 0.5f * (lo + hi);
+                const float f_x = probe(x, trial_t1, trial_t2);
+                if (f_x < 0.0f) {
+                    lo = x;
+                    f_lo = f_x;
+                    if (last_side < 0) f_hi *= 0.5f;
+                    last_side = -1;
+                } else {
+                    hi = x;
+                    f_hi = f_x;
+                    if (last_side > 0) f_lo *= 0.5f;
+                    last_side = 1;
+                }
+            }
+            // Interpolate the root in the final bracket.
+            new_lambda_n = f_hi >= 0.0f ? lo - f_lo * (hi - lo) / (f_hi - f_lo) : hi;
+            probe(new_lambda_n, new_lambda_t1, new_lambda_t2);
         }
-        // Interpolate the root in the final bracket.
-        new_lambda_n = f_hi >= 0.0f ? lo - f_lo * (hi - lo) / (f_hi - f_lo) : hi;
-        probe(new_lambda_n, new_lambda_t1, new_lambda_t2);
     };
 """
 
