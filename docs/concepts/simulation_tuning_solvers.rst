@@ -96,7 +96,15 @@ Effort limits, target rates, armature, and friction
    armature, and friction rather than inferring support from the model arrays.
    Armature adds joint-space inertia and can lower the effective natural
    frequency of a drive, but it changes the physical model and should be
-   justified by actuator or gearbox data when possible.
+   justified by actuator or gearbox data when possible. Solvers that evaluate
+   Coriolis and centrifugal forces explicitly, such as
+   :class:`~newton.solvers.SolverFeatherstone`,
+   :class:`~newton.solvers.SolverSteel` and the ``"euler"`` and
+   ``"implicitfast"`` integrators of :class:`~newton.solvers.SolverMuJoCo`,
+   can gain energy and diverge on chains of very light links that swing
+   freely. A smaller ``dt``, heavier links, or armature on those joints
+   that dominates the links' inertia about their axes restore stability; a
+   smaller armature only delays the divergence.
 
 Collision frequency
    When the solver consumes contacts from :class:`~newton.CollisionPipeline`,
