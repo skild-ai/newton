@@ -1727,26 +1727,92 @@ add_function_test(
 )
 
 
-class TestFreeRigidAngularFrictionImport(unittest.TestCase):
-    """MJCF ``condim`` stays with MuJoCo: registering the Steel attributes never enables angular rows."""
+def _import_mjcf(mjcf: str, device="cpu"):
+    """Import ``mjcf`` into a builder registered for both SolverSteel and SolverMuJoCo and finalize it."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    SolverSteel.register_custom_attributes(builder)
+    newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
+    builder.add_mjcf(mjcf)
+    return builder.finalize(device=device)
 
-    def test_mjcf_condim_does_not_enable_angular_rows(self):
-        """Leave the registered ``steel:condim`` at 3 for an MJCF condim of 6, direct or inherited."""
-        for inherited in (False, True):
-            with self.subTest(inherited=inherited):
-                default = '<default><geom condim="6"/></default>' if inherited else ""
-                geom = "" if inherited else ' condim="6"'
-                mjcf = (
-                    f"<mujoco>{default}<worldbody>"
-                    '<geom type="plane" size="1 1 0.1"/>'
-                    f'<body pos="0 0 0.1"><freejoint/><geom type="sphere" size="0.03"{geom}/></body>'
-                    "</worldbody></mujoco>"
-                )
-                builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+
+def _mjcf_ball(condim: int, inherited: bool = False, joint: str = "<freejoint/>") -> str:
+    """Return an MJCF ball on a plane whose geoms take ``condim`` directly or from the default class."""
+    default = f'<default><geom condim="{condim}"/></default>' if inherited else ""
+    geom = "" if inherited else f' condim="{condim}"'
+    return (
+        f"<mujoco>{default}<worldbody>"
+        f'<geom type="plane" size="1 1 0.1" friction="1 0.01 0.01"{geom}/>'
+        f'<body pos="0 0 {_RADIUS}">{joint}'
+        f'<geom type="sphere" size="{_RADIUS}" density="800" friction="1 0.01 0.01"{geom}/></body>'
+        "</worldbody></mujoco>"
+    )
+
+
+class TestFreeRigidAngularFrictionImport(unittest.TestCase):
+    """MJCF ``condim`` fills both ``steel:condim`` and ``mujoco:condim``."""
+
+    def test_mjcf_condim_fills_steel_and_mujoco_condim(self):
+        """Import condim 6, direct or inherited, into both attributes; condim 1 and 3 import as Steel's 3."""
+        for condim, steel in ((6, 6), (4, 4), (3, 3), (1, 3)):
+            for inherited in (False, True):
+                with self.subTest(condim=condim, inherited=inherited):
+                    model = _import_mjcf(_mjcf_ball(condim, inherited))
+                    np.testing.assert_array_equal(model.steel.condim.numpy(), steel)
+                    np.testing.assert_array_equal(model.mujoco.condim.numpy(), condim)
+
+    def test_articulated_condim_adds_no_angular_rows(self):
+        """Leave the angular rows off for a condim 6 link that no free-body contact reads, which CPU accepts."""
+        model = _import_mjcf(
+            "<mujoco><worldbody>"
+            '<geom type="plane" size="1 1 0.1"/>'
+            f'<body pos="0 0 0.1"><joint type="hinge" axis="0 1 0"/><geom type="sphere" size="{_RADIUS}"/></body>'
+            f'<body pos="0.2 0 0.1"><freejoint/><geom type="sphere" size="{_RADIUS}"/></body>'
+            "</worldbody></mujoco>"
+        )
+        # The hinged link's condim 6, written directly so this check does not depend on the importer.
+        hinged = model.joint_child.numpy()[model.joint_type.numpy() == newton.JointType.REVOLUTE][0]
+        model.steel.condim.assign(np.where(model.shape_body.numpy() == hinged, 6, 3).astype(np.int32))
+        self.assertFalse(SolverSteel(model)._free_rigid_angular_rows)
+
+    def test_prescribed_free_body_condim_adds_no_angular_rows(self):
+        """Leave the rows off for a condim 6 kinematic free body that the solver prescribes, and on for a dynamic one."""
+        for kinematic in (True, False):
+            with self.subTest(kinematic=kinematic):
+                builder = newton.ModelBuilder()
                 SolverSteel.register_custom_attributes(builder)
-                builder.add_mjcf(mjcf)
+                body = builder.add_body(is_kinematic=kinematic)
+                builder.add_shape_box(body, hx=0.2, hy=0.2, hz=0.1, custom_attributes={"steel:condim": 6})
+                link = builder.add_link()
+                builder.add_shape_sphere(link, radius=0.1)
+                builder.add_articulation([builder.add_joint_revolute(-1, link)])
                 model = builder.finalize(device="cpu")
-                np.testing.assert_array_equal(model.steel.condim.numpy(), 3)
+                if kinematic:
+                    self.assertFalse(SolverSteel(model)._free_rigid_angular_rows)
+                else:
+                    # The rows are CUDA-only, so enabling them on CPU raises.
+                    with self.assertRaisesRegex(NotImplementedError, "steel:condim"):
+                        SolverSteel(model)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Steel free-body angular rows require CUDA")
+    def test_imported_condim_6_stops_a_rolling_ball(self):
+        """Stop a ball rolling at 0.3 m/s with the imported rolling coefficient; keep it rolling at condim 3."""
+        speeds = {}
+        for condim in (3, 6):
+            model = _import_mjcf(_mjcf_ball(condim), device="cuda:0")
+            solver = SolverSteel(model, iterations=16)
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            state_0, state_1, control = model.state(), model.state(), model.control()
+            state_0.joint_qd.assign(np.array([0.0, -0.3, 0.0, 10.0, 0.0, 0.0], dtype=np.float32))
+            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+            for _ in range(int(0.25 / _DT)):
+                pipeline.collide(state_0, contacts)
+                solver.step(state_0, state_1, control, contacts, _DT)
+                state_0, state_1 = state_1, state_0
+            speeds[condim] = float(np.linalg.norm(state_0.body_qd.numpy()[0, :3]))
+        self.assertGreater(speeds[3], 0.25)
+        self.assertLess(speeds[6], 1.0e-3)
 
     def test_usd_reads_the_authored_steel_condim(self):
         """Read ``newton:steel:condim`` from a USD shape and leave unauthored shapes at 3."""

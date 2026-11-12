@@ -1815,9 +1815,12 @@ class SolverSteel(SolverBase, CouplingInterface):
           [m] to a spin row bounded by that coefficient times the normal load; at 6 also
           :attr:`~newton.Model.shape_material_mu_rolling` [m] to a rolling pair. A contact takes the
           larger coefficient of its two shapes, regardless of the other shape's condim. Only contacts
-          between free bodies, and free bodies on static or kinematic geometry, read it. USD reads it
-          only from an explicitly authored ``newton:steel:condim``; the MJCF importer leaves it to
-          :class:`~newton.solvers.SolverMuJoCo`'s ``mujoco:condim``. Under friction patches, contacts
+          between free bodies, and free bodies on static or kinematic geometry, read it, so a condim
+          above 3 on other shapes adds no rows. USD reads it only from an explicitly authored
+          ``newton:steel:condim``. The MJCF importer reads the geom's ``condim``, which also fills
+          :class:`~newton.solvers.SolverMuJoCo`'s ``mujoco:condim``; MJCF condim 1 (frictionless in MuJoCo)
+          imports as 3, since this attribute only adds angular rows and sliding friction follows ``mu``.
+          Under friction patches, contacts
           share a patch only if their angular coefficients match. A contact with angular rows takes up
           to 6 free-body rows instead of 3; raise ``free_body_constraint_max`` if
           :attr:`constraint_overflow` reports dropped rows. The solver reads ``steel:condim`` at
@@ -1964,8 +1967,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 assignment=Model.AttributeAssignment.MODEL,
                 dtype=wp.int32,
                 default=3,
-                # The default MJCF/URDF name, condim, belongs to SolverMuJoCo's mujoco:condim.
-                mjcf_attribute_name="steel:condim",
+                mjcf_attribute_name="condim",
+                mjcf_value_transformer=_mjcf_condim,
                 urdf_attribute_name="steel:condim",
             )
         )
@@ -2866,11 +2869,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._restitution_combine = restitution_combine
         self._friction_combine_id = _MATERIAL_COMBINE_MODES[friction_combine]
         self._restitution_combine_id = _MATERIAL_COMBINE_MODES[restitution_combine]
-        configure_free_rigid_angular_friction(self, model, free_rigid_torsional_friction, free_rigid_rolling_friction)
-        if not model.device.is_cuda:
-            # CPU fallback: portable twins of the native row kernels cover the core matrix-free solve;
-            # features with only native CUDA rows are rejected.
-            reject_cpu_unsupported_features(self, enable_sleeping=bool(enable_sleeping))
         inherited = deterministic is None
         if inherited:
             deterministic = wp.config.deterministic
@@ -3035,6 +3033,12 @@ class SolverSteel(SolverBase, CouplingInterface):
         # Kinematic bodies and moving mesh surfaces both enter contact rows as target velocities.
         self._has_contact_target_velocity = self._has_prescribed_response or self._has_surface_velocity
         self._compute_articulation_metadata(model)
+        # The angular rows follow the free-body route, which the articulation metadata decides.
+        configure_free_rigid_angular_friction(self, model, free_rigid_torsional_friction, free_rigid_rolling_friction)
+        if not model.device.is_cuda:
+            # CPU fallback: portable twins of the native row kernels cover the core matrix-free solve;
+            # features with only native CUDA rows are rejected.
+            reject_cpu_unsupported_features(self, enable_sleeping=bool(enable_sleeping))
         self._init_joint_friction(model)
         if self._enable_joint_friction:
             self._validate_joint_friction()
@@ -25095,3 +25099,9 @@ _MF_COULOMB_NEWTON_FRICTION_SOURCE = """
                     new_impulse = new_lambda_t1;
                 }
 """
+
+
+def _mjcf_condim(value: str, context: dict | None) -> int | None:
+    """Convert an MJCF geom ``condim`` to ``steel:condim``; condim 1 keeps the default 3."""
+    condim = int(value)
+    return None if condim == 1 else condim
