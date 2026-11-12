@@ -3367,6 +3367,52 @@ def test_contact_then_internal_gives_internal_rows_the_last_word(test, device):
     test.assertGreater(changes["interleaved"], 1.0e-3)
 
 
+def test_contact_then_internal_sinks_a_load_on_a_joint_limit(test, device):
+    """Sink a box on a link at its limit by the documented depth at any iteration count; interleaved holds it."""
+    box_mass, link_mass, dt, baumgarte = 4.0, 1.0, 1.0 / 240.0, 0.2
+    builder = newton.ModelBuilder()
+    shape_cfg = newton.ModelBuilder.ShapeConfig(density=0.0)
+    link = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), mass=link_mass)
+    builder.add_shape_box(link, hx=0.2, hy=0.2, hz=0.05, cfg=shape_cfg)
+    joint = builder.add_joint_prismatic(
+        -1,
+        link,
+        axis=newton.Axis.Z,
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+        limit_lower=0.0,
+        limit_upper=0.5,
+    )
+    builder.add_articulation([joint])
+    box = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.6), wp.quat_identity()),
+        mass=box_mass,
+        inertia=wp.mat33(np.eye(3) * 1.0e-2),
+    )
+    builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=shape_cfg)
+    model = builder.finalize(device=device)
+    expected_sink = (1.0 + box_mass / link_mass) * 9.81 * dt**2 / baumgarte
+
+    for schedule, iterations in (("contact_then_internal", 4), ("contact_then_internal", 16), ("interleaved", 4)):
+        with test.subTest(schedule=schedule, iterations=iterations):
+            solver = SolverSteel(
+                model, enable_joint_limits=True, iterations=iterations, row_schedule=schedule, baumgarte=baumgarte
+            )
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            state_0, state_1, control = model.state(), model.state(), model.control()
+            for _ in range(240):
+                pipeline.collide(state_0, contacts)
+                solver.step(state_0, state_1, control, contacts, dt)
+                state_0, state_1 = state_1, state_0
+            body_q = state_0.body_q.numpy()
+            sink = 0.1 - (body_q[box, 2] - body_q[link, 2])
+            if schedule == "contact_then_internal":
+                test.assertAlmostEqual(float(state_0.joint_q.numpy()[0]), 0.0, delta=1.0e-6)
+                test.assertAlmostEqual(sink, expected_sink, delta=0.05 * expected_sink)
+            else:
+                test.assertLess(abs(sink), 0.05 * expected_sink)
+
+
 def test_propagation_schedules(test, device):
     """Run the propagation response with every schedule; phased is its interleaved order."""
     results = {}
@@ -4194,6 +4240,12 @@ for _fn in (
     test_captured_schedules_match_eager,
 ):
     add_function_test(TestSteelSchedule, _fn.__name__, _fn, devices=cuda_devices)
+add_function_test(
+    TestSteelSchedule,
+    "test_contact_then_internal_sinks_a_load_on_a_joint_limit",
+    test_contact_then_internal_sinks_a_load_on_a_joint_limit,
+    devices=get_test_devices(),
+)
 
 
 if __name__ == "__main__":
