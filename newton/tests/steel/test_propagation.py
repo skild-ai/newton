@@ -3368,7 +3368,7 @@ def test_contact_then_internal_gives_internal_rows_the_last_word(test, device):
 
 
 def test_contact_then_internal_sinks_a_load_on_a_joint_limit(test, device):
-    """Sink a box on a link at its limit under contact_then_internal at any iteration count; interleaved holds it.
+    """Characterize a load on a hard stop at 4 and 16 iterations under contact_then_internal; interleaved holds it.
 
     For this one-axis hard stop the steady sink is ``(1 + M / m) * g * dt**2 / baumgarte``.
     """
