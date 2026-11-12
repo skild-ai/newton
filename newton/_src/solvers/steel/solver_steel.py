@@ -2511,14 +2511,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 shapes (other notifications and changes to static or kinematic owners wake
                 every island). Driven articulations (nonzero drive gains) and articulations with
                 passive springs (nonzero :attr:`~newton.Model.joint_stiffness` on a PRISMATIC,
-                REVOLUTE or D6 tree joint) stay awake. The thresholds apply to every body's speeds
-                at the end of each step. The default contact order follows GPU scheduling, so each
-                step solves a world's contacts in a different order and resting stacks keep a small
-                jitter. Its angular speed can reach the default ``sleep_angular_threshold``, so
-                whether such islands fall asleep varies from run to run and with the world count.
-                A deterministic contact order (``CollisionPipeline(deterministic=True)``, see
-                :ref:`Deterministic Contacts`) roughly halves the jitter; a larger
-                ``sleep_angular_threshold`` also lets them sleep.
+                REVOLUTE or D6 tree joint) stay awake. Sleeping checks body speeds at the end of
+                each step. With the default collision pipeline the contact order depends on GPU
+                scheduling, and the residual motion this leaves in a resting stack can keep it from
+                meeting ``sleep_quiet_time``. A deterministic contact order
+                (``CollisionPipeline(deterministic=True)``, see :ref:`Deterministic Contacts`) may
+                reduce that motion; when angular motion is the limiting condition, a larger
+                ``sleep_angular_threshold`` lets islands sleep with more residual motion.
                 Sleeping is configured at construction; rebuild captured graphs to change it. Construction raises :class:`ValueError` with ``contact_warmstart``
                 or ``velocity_iterations``, or for a model without articulations, and
                 :class:`NotImplementedError` with ``articulated_contact_response="propagation"`` and
