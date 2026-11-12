@@ -1,8 +1,9 @@
 # Pelican bicycle
 
-Original CAD mechanism created and supplied by liinbor, contributed under
-Apache-2.0. Converted to a self-contained binary USD for this example; no
-external asset download, STL loading, or MJCF conversion is needed at runtime.
+Original CAD mechanism created by liinbor (LuckyIYI) of the Skild AI team.
+Copyright 2026 Skild AI; contributed under Apache-2.0. Converted to a
+self-contained binary USD for this example; no external asset download, STL
+loading, or MJCF conversion is needed at runtime.
 The original CAD/MJCF source is retained under the permanent
 [`steel-pelican-cad-source-v1` tag](https://github.com/skild-ai/newton/tree/steel-pelican-cad-source-v1/newton/examples/assets/steel_tabletop/pelican_bicycle),
 independently of this feature branch or a squash merge. It is provenance only;
