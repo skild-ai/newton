@@ -1157,7 +1157,7 @@ add_function_test(
     TestSteelRowAllocation,
     "test_deterministic_overflow_keeps_the_same_contacts",
     test_deterministic_overflow_keeps_the_same_contacts,
-    devices=get_test_devices(),
+    devices=get_cuda_test_devices(),
 )
 
 
