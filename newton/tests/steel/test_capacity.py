@@ -1102,7 +1102,7 @@ def test_deterministic_overflow_repeats_with_little_pair_churn(test, device):
     """Repeat an overflowing colored propagation solve in the deterministic order, keeping most self-contact pairs.
 
     The folding chain's self-contacts need more dense rows than ``articulation_constraint_max``. The churn bound
-    holds for this scene: the default order changes about a third of the kept shape pairs per step.
+    holds for this scene.
     """
     finals = []
     for _ in range(2):
