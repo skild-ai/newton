@@ -2074,7 +2074,13 @@ SPRING_DOFS = ((40.0, 0.2, -0.1), (25.0, -0.4, 0.3), (60.0, 0.05, 0.25), (30.0, 
 SPRING_COORDS = slice(7, 11)
 
 
-def _spring_scene(device, *, stiffness: tuple[float, ...] | None = None, rest_q: tuple[float, ...] | None = None):
+def _spring_scene(
+    device,
+    *,
+    stiffness: tuple[float, ...] | None = None,
+    rest_q: tuple[float, ...] | None = None,
+    damping: float = 0.0,
+):
     """A free body, a prismatic joint, and a welded root branching into a revolute and a two-axis D6 joint.
 
     Gravity is off and every center of mass lies on its joint axes, so each spring DOF is an independent
@@ -2097,7 +2103,7 @@ def _spring_scene(device, *, stiffness: tuple[float, ...] | None = None, rest_q:
 
     def axis(index, direction):
         return newton.ModelBuilder.JointDofConfig(
-            axis=direction, stiffness=stiffness[index], rest_q=rest_q[index], armature=SPRING_ARMATURE
+            axis=direction, stiffness=stiffness[index], rest_q=rest_q[index], armature=SPRING_ARMATURE, damping=damping
         )
 
     slider = builder.add_joint_prismatic(
@@ -2107,6 +2113,7 @@ def _spring_scene(device, *, stiffness: tuple[float, ...] | None = None, rest_q:
         stiffness=stiffness[0],
         rest_q=rest_q[0],
         armature=SPRING_ARMATURE,
+        damping=damping,
         parent_xform=parent_xform(0.0),
     )
     builder.add_articulation([slider])
@@ -2120,6 +2127,7 @@ def _spring_scene(device, *, stiffness: tuple[float, ...] | None = None, rest_q:
             stiffness=stiffness[1],
             rest_q=rest_q[1],
             armature=SPRING_ARMATURE,
+            damping=damping,
         ),
         builder.add_joint_d6(
             root,
@@ -2138,14 +2146,14 @@ def _spring_scene(device, *, stiffness: tuple[float, ...] | None = None, rest_q:
 
 
 def _spring_reference(steps: int, *, damping: float = 0.0):
-    """Explicit spring force with Steel's symplectic Euler update, one independent oscillator per DOF."""
+    """Explicit spring force and implicit damping with Steel's symplectic Euler update, one oscillator per DOF."""
     k = np.array([entry[0] for entry in SPRING_DOFS])
     rest = np.array([entry[1] for entry in SPRING_DOFS])
     q = np.array([entry[2] for entry in SPRING_DOFS])
     qd = np.zeros_like(q)
     history = []
     for _ in range(steps):
-        qd = qd + DT * (k * (rest - q) - damping * qd) / (SPRING_MASS + SPRING_ARMATURE)
+        qd = qd + DT * (k * (rest - q) - damping * qd) / (SPRING_MASS + SPRING_ARMATURE + DT * damping)
         q = q + DT * qd
         history.append(q.copy())
     return np.asarray(history)
@@ -2189,6 +2197,87 @@ def test_springs_match_explicit_reference(test, device, solve_mode="serial", **s
     test.assertTrue(np.all(np.max(history[:, SPRING_COORDS] - rest, axis=0) > 0.05))
     # The free body carries no spring and stays put.
     np.testing.assert_array_equal(history[:, :7], np.broadcast_to(model.joint_q.numpy()[:7], (SPRING_STEPS, 7)))
+
+
+def test_joint_damping_is_implicit(test, device, solve_mode="serial", **solver_kwargs):
+    """Damp springs beyond the explicit bound ``dt * damping / m < 2`` as the implicit reference does."""
+    # dt * damping / (mass + armature) is about 3.8, where an explicit damping force grows every step.
+    damping = 1000.0
+    model = _spring_scene(device, damping=damping)
+    solver = _construct(test, model, solve_mode=solve_mode, **solver_kwargs)
+    history = _spring_trajectory(model, solver, SPRING_STEPS)
+    reference = _spring_reference(SPRING_STEPS, damping=damping)
+    np.testing.assert_allclose(history[:, SPRING_COORDS], reference, rtol=0.0, atol=1.0e-5)
+
+
+def test_ball_joint_damping_is_implicit(test, device, solve_mode="serial", **solver_kwargs):
+    """Decay a damped BALL joint's spin by ``1 / (1 + dt * damping / inertia)`` per step."""
+    inertia, damping = 0.01, 9.6
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * inertia))
+    builder.add_articulation([builder.add_joint_ball(-1, body, damping=damping)])
+    model = builder.finalize(device=device)
+    solver = _construct(test, model, solve_mode=solve_mode, **solver_kwargs)
+    state_0, state_1 = model.state(), model.state()
+    qd0 = np.array([2.0, -1.0, 0.5], dtype=np.float32)
+    state_0.joint_qd.assign(qd0)
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    control = model.control()
+    for _ in range(3):
+        solver.step(state_0, state_1, control, None, DT)
+        state_0, state_1 = state_1, state_0
+    np.testing.assert_allclose(state_0.joint_qd.numpy(), qd0 / (1.0 + DT * damping / inertia) ** 3, rtol=1.0e-5)
+
+
+def test_light_damped_chain_loses_energy(test, device, solve_mode="serial", **solver_kwargs):
+    """Damp a swinging chain of light capsules whose lightest mode is far past the explicit damping bound."""
+    builder = newton.ModelBuilder()
+    parent, joints = -1, []
+    for i in range(6):
+        link = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.95 - 0.1 * i), wp.quat_identity()))
+        builder.add_shape_capsule(
+            link, radius=0.02, half_height=0.03, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0)
+        )
+        joints.append(
+            builder.add_joint_revolute(
+                parent,
+                link,
+                axis=newton.Axis.Y,
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.0 if parent < 0 else -0.05), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()),
+                damping=0.05,
+            )
+        )
+        builder.joint_q[-1] = 1.2 if i == 0 else 0.0
+        parent = link
+    builder.add_articulation(joints)
+    model = builder.finalize(device=device)
+    solver = _construct(test, model, solve_mode=solve_mode, **solver_kwargs)
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    control = model.control()
+    mass = model.body_mass.numpy()
+    inertia = model.body_inertia.numpy()
+
+    def energy(state):
+        body_q, body_qd = state.body_q.numpy(), state.body_qd.numpy()
+        total = 0.0
+        for body in range(model.body_count):
+            rotation = np.array(wp.quat_to_matrix(wp.quat(*body_q[body, 3:]))).reshape(3, 3)
+            v, w = body_qd[body, :3], body_qd[body, 3:]
+            total += 0.5 * mass[body] * v @ v + 0.5 * w @ rotation @ inertia[body] @ rotation.T @ w
+            total += mass[body] * 9.81 * body_q[body, 2]
+        return total
+
+    energies = [energy(state_0)]
+    # The explicit damping force diverged within 14 steps.
+    for _ in range(60):
+        solver.step(state_0, state_1, control, None, DT)
+        state_0, state_1 = state_1, state_0
+        energies.append(energy(state_0))
+    test.assertTrue(np.all(np.isfinite(state_0.joint_qd.numpy())))
+    test.assertLess(float(np.max(np.diff(energies))), 1.0e-4)
+    test.assertLess(energies[-1], energies[0])
 
 
 def test_zero_stiffness_ignores_rest_coordinates(test, device, solve_mode="serial", **solver_kwargs):
@@ -2424,6 +2513,16 @@ for _suffix, _kwargs in SPRING_ROUTES.items():
         test_springs_match_explicit_reference,
         devices=get_cuda_test_devices(),
         **_kwargs,
+    )
+for _name, _func in (
+    ("test_joint_damping_is_implicit", test_joint_damping_is_implicit),
+    ("test_ball_joint_damping_is_implicit", test_ball_joint_damping_is_implicit),
+    ("test_light_damped_chain_loses_energy", test_light_damped_chain_loses_energy),
+):
+    add_function_test(TestSteelSprings, _name, _func, devices=get_test_devices())
+    add_function_test(TestSteelSprings, f"{_name}_drive_rows", _func, devices=get_test_devices(), drive_mode="rows")
+    add_function_test(
+        TestSteelSprings, f"{_name}_parallel_tree", _func, devices=get_cuda_test_devices(), parallel_tree=True
     )
 for _name, _func in (
     ("test_zero_stiffness_ignores_rest_coordinates", test_zero_stiffness_ignores_rest_coordinates),
