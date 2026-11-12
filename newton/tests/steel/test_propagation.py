@@ -3372,7 +3372,11 @@ def test_contact_then_internal_sinks_a_load_on_a_joint_limit(test, device):
     box_mass, link_mass, dt, baumgarte = 4.0, 1.0, 1.0 / 240.0, 0.2
     builder = newton.ModelBuilder()
     shape_cfg = newton.ModelBuilder.ShapeConfig(density=0.0)
-    link = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), mass=link_mass)
+    link = builder.add_link(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+        mass=link_mass,
+        inertia=wp.mat33(np.eye(3) * 1.0e-2),
+    )
     builder.add_shape_box(link, hx=0.2, hy=0.2, hz=0.05, cfg=shape_cfg)
     joint = builder.add_joint_prismatic(
         -1,
