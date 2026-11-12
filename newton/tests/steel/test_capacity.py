@@ -1098,8 +1098,12 @@ def _folding_chain(device, links=12):
     return builder.finalize(device=device)
 
 
-def test_deterministic_overflow_keeps_the_same_contacts(test, device):
-    """Keep the same self-contacts on the dense rows of an overflowing colored propagation solve."""
+def test_deterministic_overflow_repeats_with_little_pair_churn(test, device):
+    """Repeat an overflowing colored propagation solve in the deterministic order, keeping most self-contact pairs.
+
+    The folding chain's self-contacts need more dense rows than ``articulation_constraint_max``. The churn bound
+    holds for this scene: the default order changes about a third of the kept shape pairs per step.
+    """
     finals = []
     for _ in range(2):
         model = _folding_chain(device)
@@ -1119,7 +1123,7 @@ def test_deterministic_overflow_keeps_the_same_contacts(test, device):
             pipeline.collide(state_0, contacts)
             solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
             state_0, state_1 = state_1, state_0
-            if not solver.constraint_overflow.numpy()[0]:
+            if int(solver._row_dropped_dense.numpy()[0]) == 0:
                 continue
             count = int(contacts.rigid_contact_count.numpy()[0])
             on_rows = (solver._contact_path.numpy()[:count] == 0) & (solver._contact_slot.numpy()[:count] >= 0)
@@ -1130,10 +1134,11 @@ def test_deterministic_overflow_keeps_the_same_contacts(test, device):
                     strict=True,
                 )
             )
+            test.assertGreater(len(pairs), 0)
             if kept is not None:
-                changed.append(len(pairs ^ kept) / max(len(pairs | kept), 1))
+                changed.append(len(pairs ^ kept) / len(pairs | kept))
             kept = pairs
-        test.assertGreater(len(changed), 0)
+        test.assertGreater(len(changed), 20)
         test.assertLess(float(np.mean(changed)), 0.05)
         body_q = state_0.body_q.numpy()
         test.assertTrue(np.isfinite(body_q).all())
@@ -1155,8 +1160,8 @@ add_function_test(
 )
 add_function_test(
     TestSteelRowAllocation,
-    "test_deterministic_overflow_keeps_the_same_contacts",
-    test_deterministic_overflow_keeps_the_same_contacts,
+    "test_deterministic_overflow_repeats_with_little_pair_churn",
+    test_deterministic_overflow_repeats_with_little_pair_churn,
     devices=get_cuda_test_devices(),
 )
 
