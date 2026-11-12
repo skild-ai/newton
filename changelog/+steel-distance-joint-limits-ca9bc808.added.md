@@ -1,0 +1,1 @@
+Enforce the `min_distance` and `max_distance` of DISTANCE joints that root their articulation in `SolverSteel` when `enable_joint_limits=True`, as unilateral joint-limit rows on the distance between the joint's anchors; other DISTANCE joints in an articulation tree raise `NotImplementedError` when joint limits are enabled.

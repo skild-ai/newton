@@ -8488,6 +8488,98 @@ def build_joint_limit_rows(
 
 
 @wp.kernel
+def build_distance_limit_rows(
+    articulation_dof_start: wp.array[int],
+    art_to_world: wp.array[int],
+    group_to_art: wp.array[int],
+    articulation_active: wp.array[int],
+    distance_start: wp.array[int],
+    distance_joint: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_c: wp.array[wp.transform],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    body_com: wp.array[wp.vec3],
+    joint_q: wp.array[float],
+    activation_gap: wp.array[float],
+    joint_qd: wp.array[float],
+    activation_speed_scale: float,
+    dt: float,
+    max_constraints: int,
+    # outputs
+    world_slot_counter: wp.array[int],
+    J_group: wp.array3d[float],
+    world_row_type: wp.array2d[int],
+    world_row_parent: wp.array2d[int],
+    world_row_mu: wp.array2d[float],
+    world_phi: wp.array2d[float],
+    world_target_velocity: wp.array2d[float],
+    row_slot_mode: int,
+    element_row_cursor: wp.array[int],
+):
+    """Allocate and fill the anchor-distance limit rows of the root DISTANCE joint of one articulation per thread.
+
+    A bound is active when it is non-negative and below ``MAXVAL``, the builder's convention. The distance is
+    ``|p|``, the child anchor's position in the parent anchor frame (the joint's linear coordinates). With the
+    joint velocity ``(v, w)`` of the child COM in that frame, its rate is ``n . v + (r x n) . w`` for ``n = p / |p|``
+    and ``r = p - p_com``, so each row spans only the joint's own six DOFs.
+    """
+    group_idx = wp.tid()
+    art = group_to_art[group_idx]
+    if articulation_active[art] == 0:
+        return
+    world = art_to_world[art]
+    dof_start = articulation_dof_start[art]
+    for k in range(distance_start[art], distance_start[art + 1]):
+        joint = distance_joint[k]
+        dof = joint_qd_start[joint]
+        lower = joint_limit_lower[dof]
+        upper = joint_limit_upper[dof]
+        has_lower = lower >= 0.0 and lower < MAXVAL
+        has_upper = upper >= 0.0 and upper < MAXVAL
+        if not has_lower and not has_upper:
+            continue
+        q = joint_q_start[joint]
+        p = wp.vec3(joint_q[q], joint_q[q + 1], joint_q[q + 2])
+        X_j = wp.transform(p, wp.quat(joint_q[q + 3], joint_q[q + 4], joint_q[q + 5], joint_q[q + 6]))
+        com = wp.transform_point(X_j * wp.transform_inverse(joint_X_c[joint]), body_com[joint_child[joint]])
+        distance = wp.length(p)
+        # Coincident anchors take the parent anchor frame's x axis.
+        n = wp.vec3(1.0, 0.0, 0.0)
+        if distance > 1.0e-9:
+            n = p / distance
+        n_w = wp.cross(p - com, n)
+        local = dof - dof_start
+        rate = float(0.0)
+        for i in range(3):
+            rate += n[i] * joint_qd[dof + i] + n_w[i] * joint_qd[dof + 3 + i]
+        gap = joint_limit_effective_gap(activation_gap[dof], activation_speed_scale, dt, rate)
+        for side in range(2):
+            phi = distance - lower
+            active = has_lower and distance <= lower + gap
+            sign = 1.0
+            if side == 1:
+                phi = upper - distance
+                active = has_upper and distance >= upper - gap
+                sign = -1.0
+            if not active:
+                continue
+            slot = reserve_world_rows(row_slot_mode, world_slot_counter, world, 1, element_row_cursor, art)
+            if row_slot_mode == ROW_SLOTS_COUNT or slot >= max_constraints:
+                continue
+            for i in range(3):
+                J_group[group_idx, slot, local + i] = sign * n[i]
+                J_group[group_idx, slot, local + 3 + i] = sign * n_w[i]
+            world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+            world_row_parent[world, slot] = -1
+            world_row_mu[world, slot] = 0.0
+            world_phi[world, slot] = phi
+            world_target_velocity[world, slot] = 0.0
+
+
+@wp.kernel
 def scale_array_inplace(values: wp.array[float], scale: float):
     """Multiply every entry of ``values`` by ``scale``."""
     i = wp.tid()
