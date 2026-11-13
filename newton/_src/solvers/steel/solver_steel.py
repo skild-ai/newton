@@ -59,6 +59,7 @@ from .cpu_fallback import pgs_solve_mf_gs_cpu, pgs_solve_propagation_contact_cpu
 from .friction import FRICTION_PAIR_CUDA, coupled_contact_cuda
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .kernels import (
+    CONNECT_MAX_ROWS,
     CONTACT_GENERATION_NONE,
     CONTACT_ROW_FAMILIES,
     MATERIAL_COMBINE_AVERAGE,
@@ -4934,11 +4935,12 @@ class SolverSteel(SolverBase, CouplingInterface):
             for size in self._connect_sizes:
                 wp.launch(
                     populate_connect_J_for_size,
-                    dim=self._n_arts_by_size[size],
+                    dim=self._connect_count * CONNECT_MAX_ROWS,
                     inputs=[
                         self._articulation_dof_start,
                         self._art_to_world,
                         self._group_to_art[size],
+                        self._art_group_idx,
                         size,
                         self._connect_slot,
                         self._connect_art,

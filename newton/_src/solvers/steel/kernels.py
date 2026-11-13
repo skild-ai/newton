@@ -3860,11 +3860,16 @@ def _walk_has_free_dof(
     return False
 
 
+CONNECT_MAX_ROWS = 6
+"""Rows of the largest closure (FIXED); the connect kernel runs this many threads per closure."""
+
+
 @wp.kernel
 def populate_connect_J_for_size(
     articulation_dof_start: wp.array[int],
     art_to_world: wp.array[int],
     group_to_art: wp.array[int],
+    art_group_idx: wp.array[int],
     n_dofs: int,
     connect_slot: wp.array[int],
     connect_art: wp.array[int],
@@ -3897,8 +3902,9 @@ def populate_connect_J_for_size(
 ):
     """Fill the Jacobian and metadata of the connect rows of one size group.
 
-    One thread per articulation of the group scans the closure table and writes three
-    rows per owned closure: for world axis ``e``, ``phi = e . (p_A - p_B)`` and
+    One thread per closure row (``CONNECT_MAX_ROWS`` threads per closure) writes the rows of
+    the closures owned by an articulation of this group; ``art_group_idx`` maps an
+    articulation to its index within its size group. A closure has three point rows: for world axis ``e``, ``phi = e . (p_A - p_B)`` and
     ``J = e . (J_point(parent, p_M) - J_point(child, p_M))``, built with the ancestor
     walk of the contact rows. ``p_M`` is the midpoint of the two anchors, so each impulse
     pair acts at one world point and adds no couple while the closure is open. Once the
@@ -3927,149 +3933,154 @@ def populate_connect_J_for_size(
     ``phi`` and target). ``connect_row_inv_norm`` keeps each row's factor (zero when
     inert) so a solved impulse maps back to a force.
     """
-    group_idx = wp.tid()
-    art = group_to_art[group_idx]
+    tid = wp.tid()
+    k = tid // CONNECT_MAX_ROWS
+    r = tid - k * CONNECT_MAX_ROWS
+    if r >= connect_rows[k]:
+        return
+    art = connect_art[k]
+    group_idx = art_group_idx[art]
+    if group_idx < 0 or group_idx >= group_to_art.shape[0]:
+        return
+    if group_to_art[group_idx] != art:
+        return
+    base_slot = connect_slot[k]
+    if base_slot < 0:
+        return
     world = art_to_world[art]
     dof_start = articulation_dof_start[art]
 
-    n_connect = connect_art.shape[0]
-    for k in range(n_connect):
-        if connect_art[k] != art:
-            continue
-        base_slot = connect_slot[k]
-        if base_slot < 0:
-            continue
-
-        body_p = connect_body_p[k]
-        body_c = connect_body_c[k]
-        prescribed = connect_parent_prescribed[k] != 0
-        joint = connect_joint[k]
-        anchor_p = wp.transform_get_translation(joint_X_p[joint])
-        p_a = anchor_p
-        v_a = wp.vec3(0.0, 0.0, 0.0)
-        if body_p >= 0:
-            p_a = wp.transform_point(body_q[body_p], anchor_p)
-            if prescribed:
-                # The anchor velocity of a prescribed parent comes from its body twist.
-                twist = body_qd[body_p]
-                x_com = wp.transform_point(body_q[body_p], body_com[body_p])
-                v_a = wp.spatial_top(twist) + wp.cross(wp.spatial_bottom(twist), p_a - x_com)
-        p_b = wp.transform_point(body_q[body_c], wp.transform_get_translation(joint_X_c[joint]))
-        origin = articulation_origin[art]
-        rel_a = p_a - origin
-        rel_b = p_b - origin
-        delta = p_a - p_b
-        at_midpoint = (
-            not prescribed
-            and _walk_has_free_dof(body_p, body_to_joint, joint_ancestor, joint_qd_start, kinematic_dof_mask)
-            and _walk_has_free_dof(body_c, body_to_joint, joint_ancestor, joint_qd_start, kinematic_dof_mask)
-        )
+    body_p = connect_body_p[k]
+    body_c = connect_body_c[k]
+    prescribed = connect_parent_prescribed[k] != 0
+    joint = connect_joint[k]
+    anchor_p = wp.transform_get_translation(joint_X_p[joint])
+    p_a = anchor_p
+    v_a = wp.vec3(0.0, 0.0, 0.0)
+    if body_p >= 0:
+        p_a = wp.transform_point(body_q[body_p], anchor_p)
+        if prescribed:
+            # The anchor velocity of a prescribed parent comes from its body twist.
+            twist = body_qd[body_p]
+            x_com = wp.transform_point(body_q[body_p], body_com[body_p])
+            v_a = wp.spatial_top(twist) + wp.cross(wp.spatial_bottom(twist), p_a - x_com)
+    p_b = wp.transform_point(body_q[body_c], wp.transform_get_translation(joint_X_c[joint]))
+    origin = articulation_origin[art]
+    rel_a = p_a - origin
+    rel_b = p_b - origin
+    delta = p_a - p_b
+    at_midpoint = (
+        not prescribed
+        and _walk_has_free_dof(body_p, body_to_joint, joint_ancestor, joint_qd_start, kinematic_dof_mask)
+        and _walk_has_free_dof(body_c, body_to_joint, joint_ancestor, joint_qd_start, kinematic_dof_mask)
+    )
+    if r == 0:
         connect_at_midpoint[k] = int(at_midpoint)
-        if at_midpoint:
-            # Both walks take their lever arm from the anchors' midpoint, so the impulse pair
-            # is not a couple across an open closure.
-            rel_a = (p_a - 0.5 * delta) - origin
-            rel_b = rel_a
+    if at_midpoint:
+        # Both walks take their lever arm from the anchors' midpoint, so the impulse pair
+        # is not a couple across an open closure.
+        rel_a = (p_a - 0.5 * delta) - origin
+        rel_b = rel_a
 
-        for axis in range(3):
-            slot = base_slot + axis
-            e = wp.vec3(0.0, 0.0, 0.0)
-            e[axis] = 1.0
-            target = float(0.0)
+    if r < 3:
+        axis = r
+        slot = base_slot + axis
+        e = wp.vec3(0.0, 0.0, 0.0)
+        e[axis] = 1.0
+        target = float(0.0)
 
-            # Both walks accumulate into the row, which the caller zeroed this step.
-            if prescribed:
-                target = -wp.dot(e, v_a)
-            else:
-                curr = body_to_joint[body_p]
-                while curr != -1:
-                    for d in range(joint_qd_start[curr], joint_qd_start[curr + 1]):
-                        S = joint_S_s[d]
-                        lin = wp.vec3(S[0], S[1], S[2])
-                        ang = wp.vec3(S[3], S[4], S[5])
-                        J_group[group_idx, slot, d - dof_start] += wp.dot(e, lin + wp.cross(ang, rel_a))
-                    curr = joint_ancestor[curr]
-            curr = body_to_joint[body_c]
+        # Both walks accumulate into the row, which the caller zeroed this step.
+        if prescribed:
+            target = -wp.dot(e, v_a)
+        else:
+            curr = body_to_joint[body_p]
             while curr != -1:
                 for d in range(joint_qd_start[curr], joint_qd_start[curr + 1]):
                     S = joint_S_s[d]
                     lin = wp.vec3(S[0], S[1], S[2])
                     ang = wp.vec3(S[3], S[4], S[5])
-                    J_group[group_idx, slot, d - dof_start] -= wp.dot(e, lin + wp.cross(ang, rel_b))
+                    J_group[group_idx, slot, d - dof_start] += wp.dot(e, lin + wp.cross(ang, rel_a))
                 curr = joint_ancestor[curr]
+        curr = body_to_joint[body_c]
+        while curr != -1:
+            for d in range(joint_qd_start[curr], joint_qd_start[curr + 1]):
+                S = joint_S_s[d]
+                lin = wp.vec3(S[0], S[1], S[2])
+                ang = wp.vec3(S[3], S[4], S[5])
+                J_group[group_idx, slot, d - dof_start] -= wp.dot(e, lin + wp.cross(ang, rel_b))
+            curr = joint_ancestor[curr]
 
-            connect_row_inv_norm[k, axis] = _finish_connect_row(
-                group_idx,
-                slot,
-                n_dofs,
-                world,
-                delta[axis],
-                target,
-                J_group,
-                world_row_type,
-                world_row_parent,
-                world_row_mu,
-                world_phi,
-                world_target_velocity,
-            )
-
-        rows = connect_rows[k]
-        if rows < 5:
-            continue
-        dirs, phis = _connect_rotation_rows(
-            rows, body_p, body_c, joint, joint_axis, joint_qd_start, joint_X_p, joint_X_c, body_q
+        connect_row_inv_norm[k, axis] = _finish_connect_row(
+            group_idx,
+            slot,
+            n_dofs,
+            world,
+            delta[axis],
+            target,
+            J_group,
+            world_row_type,
+            world_row_parent,
+            world_row_mu,
+            world_phi,
+            world_target_velocity,
         )
-        omega_a = wp.vec3(0.0, 0.0, 0.0)
-        if prescribed and body_p >= 0:
-            omega_a = wp.spatial_bottom(body_qd[body_p])
-        # Rotation rows: two hinge-alignment rows for REVOLUTE, three weld rows for FIXED.
-        for i in range(rows - 3):
-            slot = base_slot + 3 + i
-            e = dirs[i]
-            target = float(0.0)
-            if prescribed:
-                target = -wp.dot(e, omega_a)
-            else:
-                _accumulate_angular_jacobian_row(
-                    body_p,
-                    1.0,
-                    e,
-                    body_to_joint,
-                    joint_ancestor,
-                    joint_qd_start,
-                    joint_S_s,
-                    dof_start,
-                    group_idx,
-                    slot,
-                    J_group,
-                )
-            _accumulate_angular_jacobian_row(
-                body_c,
-                -1.0,
-                e,
-                body_to_joint,
-                joint_ancestor,
-                joint_qd_start,
-                joint_S_s,
-                dof_start,
-                group_idx,
-                slot,
-                J_group,
-            )
-            connect_row_inv_norm[k, 3 + i] = _finish_connect_row(
-                group_idx,
-                slot,
-                n_dofs,
-                world,
-                phis[i],
-                target,
-                J_group,
-                world_row_type,
-                world_row_parent,
-                world_row_mu,
-                world_phi,
-                world_target_velocity,
-            )
+        return
+
+    rows = connect_rows[k]
+    dirs, phis = _connect_rotation_rows(
+        rows, body_p, body_c, joint, joint_axis, joint_qd_start, joint_X_p, joint_X_c, body_q
+    )
+    omega_a = wp.vec3(0.0, 0.0, 0.0)
+    if prescribed and body_p >= 0:
+        omega_a = wp.spatial_bottom(body_qd[body_p])
+    # Rotation rows: two hinge-alignment rows for REVOLUTE, three weld rows for FIXED.
+    i = r - 3
+    slot = base_slot + 3 + i
+    e = dirs[i]
+    target = float(0.0)
+    if prescribed:
+        target = -wp.dot(e, omega_a)
+    else:
+        _accumulate_angular_jacobian_row(
+            body_p,
+            1.0,
+            e,
+            body_to_joint,
+            joint_ancestor,
+            joint_qd_start,
+            joint_S_s,
+            dof_start,
+            group_idx,
+            slot,
+            J_group,
+        )
+    _accumulate_angular_jacobian_row(
+        body_c,
+        -1.0,
+        e,
+        body_to_joint,
+        joint_ancestor,
+        joint_qd_start,
+        joint_S_s,
+        dof_start,
+        group_idx,
+        slot,
+        J_group,
+    )
+    connect_row_inv_norm[k, 3 + i] = _finish_connect_row(
+        group_idx,
+        slot,
+        n_dofs,
+        world,
+        phis[i],
+        target,
+        J_group,
+        world_row_type,
+        world_row_parent,
+        world_row_mu,
+        world_phi,
+        world_target_velocity,
+    )
 
 
 # =============================================================================

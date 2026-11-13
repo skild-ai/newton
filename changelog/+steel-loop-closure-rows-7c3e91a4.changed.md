@@ -1,0 +1,1 @@
+Speed up ``SolverSteel`` on articulations with many loop closures by building the closure rows with one GPU thread per row instead of one per articulation; the rows are unchanged (91 closures: 5.7 ms to 0.11 ms per step). No migration is required.

@@ -12,6 +12,7 @@ import warp as wp
 import newton
 from newton import NewtonWarning
 from newton._src.solvers.steel.kernels import (
+    CONNECT_MAX_ROWS,
     accumulate_connect_wrenches_from_impulses,
     populate_connect_J_for_size,
 )
@@ -560,11 +561,12 @@ def test_closure_force_uses_the_row_builder_norm(test, device):
             at_midpoint = wp.zeros(1, dtype=wp.int32, device=device)
             wp.launch(
                 populate_connect_J_for_size,
-                dim=1,
+                dim=CONNECT_MAX_ROWS,
                 inputs=[
                     zero,  # articulation_dof_start
                     zero,  # art_to_world
                     zero,  # group_to_art
+                    zero,  # art_group_idx
                     2,
                     zero,  # connect_slot
                     zero,  # connect_art
@@ -652,11 +654,12 @@ def test_open_closure_force_acts_where_the_rows_do(test, device):
             at_midpoint = wp.zeros(1, dtype=wp.int32, device=device)
             wp.launch(
                 populate_connect_J_for_size,
-                dim=1,
+                dim=CONNECT_MAX_ROWS,
                 inputs=[
                     zero,  # articulation_dof_start
                     zero,  # art_to_world
                     zero,  # group_to_art
+                    zero,  # art_group_idx
                     n_dofs,
                     zero,  # connect_slot
                     zero,  # connect_art
