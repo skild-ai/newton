@@ -24494,6 +24494,8 @@ def _synchronize_streams(streams: list) -> None:
 
 
 # Contact updates of the non-default friction modes, spliced into the matrix-free kernel.
+# _MF_BISECTION_FRICTION_SOURCE and contact_block_solve in friction.py repeat this arithmetic; change all three
+# together.
 _DENSE_BISECTION_FRICTION_SOURCE = """
                 int parent_idx = (s_meta_dense[i] >> __DENSE_META_ROW_TYPE_BITS__) - 1;
                 int i_t1 = parent_idx + 1;
@@ -24622,11 +24624,17 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                                     bool bracketed = false, last_probe = false;
                                     int last_side = 0;
                                     float x = fmaxf(old_lambda_n, -f_lo / G_nn);
+                                    // A singular block whose coupled solution sticks at every load has no root; stop once it sticks.
+                                    const bool jammed = minor_nn > 0.0f && det_block <= 1.0e-6f * G_nn * minor_nn
+                                        && minor_n1 * minor_n1 + minor_n2 * minor_n2 <= mu * mu * minor_nn * minor_nn;
                                     for (int _it = 0; _it < 64; _it++) {
                                         const float f_x = probe(x, new_lambda_t1, new_lambda_t2);
                                         new_lambda_n = x;
                                         // Within what a 1e-5 relative error in the load would leave.
                                         if (last_probe || fabsf(f_x) <= 1.0e-5f * G_nn * x) break;
+                                        if (jammed && f_x < 0.0f
+                                            && new_lambda_t1 * new_lambda_t1 + new_lambda_t2 * new_lambda_t2 < 0.999f * mu * mu * x * x)
+                                            break;
                                         if (f_x < 0.0f) {
                                             lo = x;
                                             f_lo = f_x;
@@ -24679,7 +24687,8 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                     new_impulse = new_lambda_t1;
                 }
 """
-# contact_block_solve in friction.py repeats this arithmetic for the colored sweep; change both together.
+# _DENSE_BISECTION_FRICTION_SOURCE and contact_block_solve in friction.py repeat this arithmetic; change all three
+# together.
 _MF_BISECTION_FRICTION_SOURCE = """
                 int i_t1 = mf_par + 1;
                 int i_t2 = mf_par + 2;
@@ -24842,11 +24851,17 @@ _MF_BISECTION_FRICTION_SOURCE = """
                                     bool bracketed = false, last_probe = false;
                                     int last_side = 0;
                                     float x = fmaxf(old_lambda_n, -f_lo / G_nn);
+                                    // A singular block whose coupled solution sticks at every load has no root; stop once it sticks.
+                                    const bool jammed = minor_nn > 0.0f && det_block <= 1.0e-6f * G_nn * minor_nn
+                                        && minor_n1 * minor_n1 + minor_n2 * minor_n2 <= mu * mu * minor_nn * minor_nn;
                                     for (int _it = 0; _it < 64; _it++) {
                                         const float f_x = probe(x, new_lambda_t1, new_lambda_t2);
                                         new_lambda_n = x;
                                         // Within what a 1e-5 relative error in the load would leave.
                                         if (last_probe || fabsf(f_x) <= 1.0e-5f * G_nn * x) break;
+                                        if (jammed && f_x < 0.0f
+                                            && new_lambda_t1 * new_lambda_t1 + new_lambda_t2 * new_lambda_t2 < 0.999f * mu * mu * x * x)
+                                            break;
                                         if (f_x < 0.0f) {
                                             lo = x;
                                             f_lo = f_x;

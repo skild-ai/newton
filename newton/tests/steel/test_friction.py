@@ -1192,6 +1192,25 @@ def test_bisection_leaves_an_ill_conditioned_sticking_contact_at_rest(test, devi
             test.assertLess(float(np.abs(velocity).max()), 1.0e-3)
 
 
+# Blocks whose tangent impulse cancels the normal one and sticks at every load, so no load zeroes u_n.
+# Values: u_n, u_t1, u_t2, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2, G_t2t2, mu.
+_JAMMED_BLOCKS = {
+    "singular": (-0.5, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.2),
+    "near_singular": (-0.5, 0.0, 0.0, 1.0000005, 1.0, 0.0, 1.0, 0.0, 1.0, 1.2),
+}
+
+
+def test_bisection_keeps_a_jammed_contact_near_the_frictionless_load(test, device):
+    """Stop the bisection search near the frictionless load on a block that has no root."""
+    for mode in ("bisection", "bisection_desaxce"):
+        for name, block in _JAMMED_BLOCKS.items():
+            for route, solve in (("colored", _colored_block), ("serial", _mf_block)):
+                with test.subTest(mode=mode, block=name, route=route):
+                    normal, *tangent = solve(device, np.array(block, dtype=np.float32), mode)
+                    test.assertLessEqual(normal, 1.0)
+                    test.assertLessEqual(float(np.linalg.norm(tangent)), block[9] * normal * (1.0 + 1.0e-6))
+
+
 class TestSteelFrictionMode(unittest.TestCase):
     pass
 
@@ -1209,6 +1228,7 @@ for _fn in (
     test_coupled_modes_hold_near_the_cone_boundary,
     test_bisection_solves_the_tangent_pair_on_the_disk,
     test_bisection_leaves_an_ill_conditioned_sticking_contact_at_rest,
+    test_bisection_keeps_a_jammed_contact_near_the_frictionless_load,
 ):
     add_function_test(TestSteelFrictionMode, _fn.__name__, _fn, devices=cuda_devices)
 
