@@ -17,6 +17,7 @@ from newton._src.solvers.steel.friction_patches import _GEOMETRY_FIELDS
 from newton._src.solvers.steel.kernels import accumulate_group_diag_worlds, compute_composite_inertia
 from newton._src.solvers.steel.solver_steel import _get_composite_inertia_warp_kernel, _get_hinv_jt_kernel
 from newton.solvers import SolverSteel
+from newton.tests.steel._fixtures import _build_four_bar, _loop_anchor_gap
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 
@@ -1396,6 +1397,172 @@ add_function_test(
     test_tiled_response_diagonal_matches_dense_reference,
     devices=get_cuda_test_devices(),
 )
+
+
+def _build_mixed_floating_tree(device, num_worlds=2):
+    """Build a floating base with revolute, ball, prismatic and fixed joints, armature and position drives."""
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    base = b.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.4), wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.3)))
+    b.add_shape_box(base, hx=0.2, hy=0.1, hz=0.05)
+    joints = [b.add_joint_free(child=base)]
+    upper = b.add_link()
+    b.add_shape_box(upper, hx=0.12, hy=0.03, hz=0.03)
+    joints.append(
+        b.add_joint_revolute(
+            parent=base,
+            child=upper,
+            axis=wp.vec3(0.0, 1.0, 0.0),
+            parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(-0.12, 0.0, 0.0), wp.quat_identity()),
+        )
+    )
+    lower = b.add_link()
+    b.add_shape_sphere(lower, radius=0.05)
+    joints.append(
+        b.add_joint_ball(
+            parent=upper,
+            child=lower,
+            parent_xform=wp.transform(wp.vec3(0.12, 0.0, 0.0), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(-0.05, 0.0, 0.0), wp.quat_identity()),
+        )
+    )
+    slider = b.add_link()
+    b.add_shape_box(slider, hx=0.04, hy=0.04, hz=0.04)
+    joints.append(
+        b.add_joint_prismatic(
+            parent=base,
+            child=slider,
+            axis=wp.vec3(0.0, 0.0, 1.0),
+            parent_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
+        )
+    )
+    weight = b.add_link()
+    b.add_shape_box(weight, hx=0.03, hy=0.08, hz=0.02)
+    joints.append(
+        b.add_joint_fixed(
+            parent=slider, child=weight, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.06), wp.quat_identity())
+        )
+    )
+    b.add_articulation(joints)
+    for dof in range(b.joint_dof_count):
+        b.joint_armature[dof] = 0.01
+    for dof, coord in ((6, 7), (10, 12)):  # the revolute and prismatic DOFs
+        b.joint_target_ke[dof] = 40.0
+        b.joint_target_kd[dof] = 2.0
+        b.joint_target_mode[dof] = int(newton.JointTargetMode.POSITION)
+        b.joint_target_q[coord] = 0.4
+    world = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    world.replicate(b, num_worlds, spacing=(2.0, 0.0, 0.0))
+    world.add_ground_plane()
+    return world.finalize(device=device)
+
+
+def _run_mass_solve(model, mass_solve, steps, dt, **options):
+    """Step ``model`` from rest with the given mass solve and return the solver and final state."""
+    with kernel_overrides({"mass_solve": mass_solve}):
+        solver = SolverSteel(model, **options)
+    state_in, state_out = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    contacts = pipeline.contacts()
+    control = model.control()
+    for _ in range(steps):
+        state_in.clear_forces()
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, control, contacts, dt)
+        state_in, state_out = state_out, state_in
+    return solver, state_in
+
+
+def test_articulated_body_solve_matches_cholesky_on_a_mixed_tree(test, device):
+    """Match the Cholesky solve on a floating tree with every joint type, armature, drives and contacts."""
+    model = _build_mixed_floating_tree(device)
+    reference, expected = _run_mass_solve(model, "cholesky", 60, 1.0 / 240.0)
+    solver, result = _run_mass_solve(model, "articulated_body", 60, 1.0 / 240.0)
+    test.assertEqual(reference._articulated_body_sizes, frozenset())
+    test.assertTrue(solver._articulated_body_sizes)
+    np.testing.assert_allclose(result.joint_q.numpy(), expected.joint_q.numpy(), rtol=0.0, atol=2.0e-4)
+    np.testing.assert_allclose(result.joint_qd.numpy(), expected.joint_qd.numpy(), rtol=0.0, atol=2.0e-3)
+
+
+def test_articulated_body_solve_matches_cholesky_on_a_four_bar(test, device):
+    """Match the Cholesky solve on a driven four-bar loop whose tip link reaches its limits."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.replicate(_build_four_bar(tip_limits=(-0.2, 0.2)), 2)
+    builder.joint_target_q[0] = 0.6
+    model = builder.finalize(device=device)
+    _, expected = _run_mass_solve(model, "cholesky", 120, 1.0 / 240.0)
+    solver, result = _run_mass_solve(model, "articulated_body", 120, 1.0 / 240.0)
+    test.assertTrue(solver._articulated_body_sizes)
+    np.testing.assert_allclose(result.joint_q.numpy(), expected.joint_q.numpy(), rtol=0.0, atol=2.0e-4)
+    test.assertLess(_loop_anchor_gap(model, result), 1.0e-3)
+
+
+def _build_branched_ball_tree(device, num_worlds=2):
+    """Build a floating base with a ball chain, a revolute side chain off its first link and a second ball chain."""
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
+    base = b.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()))
+    b.add_shape_box(base, hx=0.15, hy=0.1, hz=0.05)
+    joints = [b.add_joint_free(child=base)]
+
+    def attach(parent, offset, kind, half):
+        child = b.add_link()
+        b.add_shape_box(child, hx=half, hy=0.03, hz=0.03)
+        xform_p = wp.transform(wp.vec3(*offset), wp.quat_identity())
+        xform_c = wp.transform(wp.vec3(-half, 0.0, 0.0), wp.quat_identity())
+        if kind == "ball":
+            joints.append(b.add_joint_ball(parent=parent, child=child, parent_xform=xform_p, child_xform=xform_c))
+        else:
+            joints.append(
+                b.add_joint_revolute(
+                    parent=parent, child=child, axis=wp.vec3(0.0, 0.0, 1.0), parent_xform=xform_p, child_xform=xform_c
+                )
+            )
+        return child
+
+    # Joint order: chain A (ball, ball, ball), a revolute side chain off A's first link, then chain C
+    # off the base, so the branch points are the base and a link inside chain A.
+    a1 = attach(base, (0.15, 0.0, 0.0), "ball", 0.08)
+    a2 = attach(a1, (0.08, 0.0, 0.0), "ball", 0.07)
+    attach(a2, (0.07, 0.0, 0.0), "ball", 0.06)
+    s1 = attach(a1, (0.0, 0.05, 0.0), "revolute", 0.05)
+    attach(s1, (0.05, 0.0, 0.0), "revolute", 0.04)
+    c1 = attach(base, (-0.15, 0.0, 0.0), "ball", 0.08)
+    attach(c1, (0.08, 0.0, 0.0), "ball", 0.07)
+    b.add_articulation(joints)
+    for dof in range(b.joint_dof_count):
+        b.joint_armature[dof] = 0.005
+    # Keep the links out of contact so the comparison stays free of contact rows.
+    for shape in range(b.shape_count):
+        b.shape_collision_group[shape] = 2 + shape
+    world = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
+    world.replicate(b, num_worlds, spacing=(2.0, 0.0, 0.0))
+    return world.finalize(device=device)
+
+
+def test_articulated_body_solve_matches_cholesky_on_a_branched_ball_tree(test, device):
+    """Match the Cholesky solve where a branch point sits inside a chain and sibling chains follow it."""
+    model = _build_branched_ball_tree(device)
+    rng = np.random.default_rng(3)
+    model.joint_qd.assign(rng.uniform(-2.0, 2.0, model.joint_dof_count).astype(np.float32))
+    _, expected = _run_mass_solve(model, "cholesky", 120, 1.0 / 240.0)
+    solver, result = _run_mass_solve(model, "articulated_body", 120, 1.0 / 240.0)
+    test.assertTrue(solver._articulated_body_sizes)
+    # Without contacts the two solves differ by float32 roundoff only (about 3e-7 rad after 120 steps).
+    np.testing.assert_allclose(result.joint_q.numpy(), expected.joint_q.numpy(), rtol=0.0, atol=1.0e-5)
+    np.testing.assert_allclose(result.joint_qd.numpy(), expected.joint_qd.numpy(), rtol=0.0, atol=1.0e-4)
+
+
+class TestSteelArticulatedBodySolve(unittest.TestCase):
+    pass
+
+
+for _func in (
+    test_articulated_body_solve_matches_cholesky_on_a_mixed_tree,
+    test_articulated_body_solve_matches_cholesky_on_a_four_bar,
+    test_articulated_body_solve_matches_cholesky_on_a_branched_ball_tree,
+):
+    add_function_test(TestSteelArticulatedBodySolve, _func.__name__, _func, devices=get_test_devices())
 
 
 if __name__ == "__main__":
