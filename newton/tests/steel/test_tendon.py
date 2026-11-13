@@ -524,6 +524,25 @@ def test_tendon_position_dampratio_is_critically_damped(test, device):
             test.assertTrue(np.isfinite(run.state_0.joint_qd.numpy()).all())
 
 
+def test_tendon_dampratio_leaves_the_model_unchanged(test, device):
+    """Resolving dampratio writes the solver's copy of biasprm, so a later kp change re-resolves the same ratio."""
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>{_frame(_slider("m", "0 0 1", axis="1 0 0"))}</worldbody>
+    <tendon><fixed name="t"><joint joint="m" coef="1"/></fixed></tendon>
+    <actuator><position tendon="t" kp="30" dampratio="1"/></actuator></mujoco>"""
+    run = _Run(mjcf, device)
+    mujoco = run.model.mujoco
+    test.assertEqual(float(mujoco.actuator_biasprm.numpy()[0, 2]), 1.0)
+    # the slider's reflected inertia is 1 kg
+    test.assertAlmostEqual(float(run.solver._tendon.biasprm.numpy()[0, 2]), -2.0 * math.sqrt(30.0), places=4)
+    gain, bias = mujoco.actuator_gainprm.numpy(), mujoco.actuator_biasprm.numpy()
+    gain[0, 0], bias[0, 1] = 120.0, -120.0
+    mujoco.actuator_gainprm.assign(gain)
+    mujoco.actuator_biasprm.assign(bias)
+    run.solver.notify_model_changed(newton.ModelFlags.ACTUATOR_PROPERTIES)
+    test.assertEqual(float(mujoco.actuator_biasprm.numpy()[0, 2]), 1.0)
+    test.assertAlmostEqual(float(run.solver._tendon.biasprm.numpy()[0, 2]), -2.0 * math.sqrt(120.0), places=4)
+
+
 def test_tendon_fixed_length_includes_the_joint_reference(test, device):
     """A fixed tendon's length is sum(c * qpos) with qpos = joint_q + ref, as MuJoCo's ten_length."""
     ref, k, dt = 0.2, 100.0, 1.0e-3
@@ -767,6 +786,7 @@ for _name in (
     "test_tendon_armature_history_restarts_on_reset",
     "test_tendon_margin_and_routed_tendons_warn",
     "test_tendon_position_dampratio_is_critically_damped",
+    "test_tendon_dampratio_leaves_the_model_unchanged",
     "test_tendon_fixed_length_includes_the_joint_reference",
     "test_tendon_actuator_force_range_caps_the_summed_force",
     "test_tendon_property_changes_reach_the_solver",

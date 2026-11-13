@@ -1804,7 +1804,7 @@ class TendonPlan:
         if not self.count or not self.actuator_count:
             return
         m = model.mujoco
-        bias = m.actuator_biasprm.numpy()
+        bias = m.actuator_biasprm.numpy().copy()
         gain = m.actuator_gainprm.numpy()
         biastype = m.actuator_biastype.numpy()
         gear = m.actuator_gear.numpy()
