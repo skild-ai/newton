@@ -1601,11 +1601,9 @@ class SolverSteel(SolverBase, CouplingInterface):
     in a device kernel (for example an RL termination term) or call
     :meth:`check_constraint_capacity` outside graph capture.
 
-    An overflowing row family keeps the contacts whose reservations fit first. ``deterministic=RUN_TO_RUN`` with a
-    ``CollisionPipeline(deterministic=True)`` reserves them in contact order, so the selection repeats for the same
-    inputs; otherwise it follows the order in which threads reserve. As the kept contacts change, a contact that
-    penetrated while dropped is pushed out by the position correction when it regains its rows, which can add energy
-    and make the state diverge. Size the capacities to avoid overflow; the deterministic order helps reproduce it.
+    Treat overflow as a sizing error and raise the capacity until no world is flagged. Which contacts keep their
+    rows is described under ``deterministic``. As that set changes, a contact that penetrated while it had no rows
+    is pushed out by the position correction when it regains them, which can add energy and make the state diverge.
 
     Global articulations are solved together with world 0. A kinematic global free body
     (for example a moving platform) contacts the bodies of every world.

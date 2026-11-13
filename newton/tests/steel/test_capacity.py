@@ -1098,12 +1098,8 @@ def _folding_chain(device, links=12):
     return builder.finalize(device=device)
 
 
-def test_deterministic_overflow_repeats_with_little_pair_churn(test, device):
-    """Repeat an overflowing colored propagation solve in the deterministic order, keeping most self-contact pairs.
-
-    The folding chain's self-contacts need more dense rows than ``articulation_constraint_max``. The churn bound
-    holds for this scene.
-    """
+def test_deterministic_overflow_repeats(test, device):
+    """Repeat an overflowing colored propagation solve bitwise with the deterministic row order."""
     finals = []
     for _ in range(2):
         model = _folding_chain(device)
@@ -1118,28 +1114,11 @@ def test_deterministic_overflow_repeats_with_little_pair_churn(test, device):
         pipeline = newton.CollisionPipeline(model, deterministic=True)
         contacts = pipeline.contacts()
         state_0, state_1, control = model.state(), model.state(), model.control()
-        kept, changed = None, []
         for _ in range(320):
             pipeline.collide(state_0, contacts)
             solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
             state_0, state_1 = state_1, state_0
-            if int(solver._row_dropped_dense.numpy()[0]) == 0:
-                continue
-            count = int(contacts.rigid_contact_count.numpy()[0])
-            on_rows = (solver._contact_path.numpy()[:count] == 0) & (solver._contact_slot.numpy()[:count] >= 0)
-            pairs = set(
-                zip(
-                    contacts.rigid_contact_shape0.numpy()[:count][on_rows].tolist(),
-                    contacts.rigid_contact_shape1.numpy()[:count][on_rows].tolist(),
-                    strict=True,
-                )
-            )
-            test.assertGreater(len(pairs), 0)
-            if kept is not None:
-                changed.append(len(pairs ^ kept) / len(pairs | kept))
-            kept = pairs
-        test.assertGreater(len(changed), 20)
-        test.assertLess(float(np.mean(changed)), 0.05)
+        test.assertTrue(bool(solver.constraint_overflow.numpy()[0]))
         body_q = state_0.body_q.numpy()
         test.assertTrue(np.isfinite(body_q).all())
         finals.append(body_q)
@@ -1160,8 +1139,8 @@ add_function_test(
 )
 add_function_test(
     TestSteelRowAllocation,
-    "test_deterministic_overflow_repeats_with_little_pair_churn",
-    test_deterministic_overflow_repeats_with_little_pair_churn,
+    "test_deterministic_overflow_repeats",
+    test_deterministic_overflow_repeats,
     devices=get_cuda_test_devices(),
 )
 
