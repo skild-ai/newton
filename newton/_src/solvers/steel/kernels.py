@@ -2714,15 +2714,20 @@ def factor_articulated_body(
             U0 = IA * S0
             U1 = IA * S1
             U2 = IA * S2
+            # Build D symmetric: rounding leaves I^A slightly asymmetric, and an asymmetric D^-1 feeds
+            # an antisymmetric part back into the parent's I^A that grows at every multi-DOF joint.
+            d01 = 0.5 * (wp.dot(S0, U1) + wp.dot(S1, U0))
+            d02 = 0.5 * (wp.dot(S0, U2) + wp.dot(S2, U0))
+            d12 = 0.5 * (wp.dot(S1, U2) + wp.dot(S2, U1))
             D = wp.mat33(
                 wp.dot(S0, U0) + diag_group[idx, d0],
-                wp.dot(S0, U1),
-                wp.dot(S0, U2),
-                wp.dot(S1, U0),
+                d01,
+                d02,
+                d01,
                 wp.dot(S1, U1) + diag_group[idx, d0 + 1],
-                wp.dot(S1, U2),
-                wp.dot(S2, U0),
-                wp.dot(S2, U1),
+                d12,
+                d02,
+                d12,
                 wp.dot(S2, U2) + diag_group[idx, d0 + 2],
             )
             Di = wp.inverse(D)
@@ -2749,7 +2754,11 @@ def factor_articulated_body(
             Dg = wp.spatial_matrix()
             for a in range(k):
                 for b in range(k):
-                    Dg[a, b] = wp.dot(S_group[idx, d0 + a], U_group[idx, d0 + b])
+                    # Symmetric by construction, as in the 3-DOF branch.
+                    Dg[a, b] = 0.5 * (
+                        wp.dot(S_group[idx, d0 + a], U_group[idx, d0 + b])
+                        + wp.dot(S_group[idx, d0 + b], U_group[idx, d0 + a])
+                    )
                 Dg[a, a] = Dg[a, a] + diag_group[idx, d0 + a]
             Dinv = _invert_spd_block(Dg, k)
             for a in range(k):

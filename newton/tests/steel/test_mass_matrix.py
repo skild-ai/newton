@@ -1553,6 +1553,44 @@ def test_articulated_body_solve_matches_cholesky_on_a_branched_ball_tree(test, d
     np.testing.assert_allclose(result.joint_qd.numpy(), expected.joint_qd.numpy(), rtol=0.0, atol=1.0e-4)
 
 
+def test_articulated_body_solve_is_stable_on_a_long_ball_chain(test, device):
+    """Match the default solve on a 20-link ball chain, where an asymmetric 3x3 joint block once grew without bound."""
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    joints, parent = [], -1
+    for i in range(20):
+        link = b.add_link()
+        b.add_shape_capsule(link, radius=0.01, half_height=0.02)
+        joints.append(
+            b.add_joint_ball(
+                parent=parent,
+                child=link,
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 2.0 if i == 0 else -0.05), wp.quat_identity()),
+            )
+        )
+        parent = link
+    b.add_articulation(joints)
+    for shape in range(b.shape_count):
+        b.shape_collision_group[shape] = 2 + shape
+    model = b.finalize(device=device)
+    rng = np.random.default_rng(5)
+    q = model.joint_q.numpy()
+    for i in range(20):
+        axis = rng.normal(size=3)
+        axis /= np.linalg.norm(axis)
+        q[4 * i : 4 * i + 4] = wp.quat_from_axis_angle(wp.vec3(*axis), float(rng.uniform(0.2, 1.0)))
+    model.joint_q.assign(q)
+    model.joint_qd.assign(rng.uniform(-1.0, 1.0, model.joint_dof_count).astype(np.float32))
+    qd0 = model.joint_qd.numpy().copy()
+    _, expected = _run_mass_solve(model, "cholesky", 1, 1.0 / 240.0)
+    solver, result = _run_mass_solve(model, "articulated_body", 1, 1.0 / 240.0)
+    test.assertTrue(solver._articulated_body_sizes)
+    # Compare the velocity change of one step, which is what the mass solve produces. On this chain (no armature,
+    # light links) float32 Cholesky and articulated-body results differ by about 1% on CPU and CUDA alike; the
+    # unsymmetrized joint block was off by more than 100%.
+    dqd_ref = expected.joint_qd.numpy() - qd0
+    np.testing.assert_allclose(result.joint_qd.numpy() - qd0, dqd_ref, rtol=0.0, atol=5.0e-2 * np.abs(dqd_ref).max())
+
+
 class TestSteelArticulatedBodySolve(unittest.TestCase):
     pass
 
@@ -1561,6 +1599,7 @@ for _func in (
     test_articulated_body_solve_matches_cholesky_on_a_mixed_tree,
     test_articulated_body_solve_matches_cholesky_on_a_four_bar,
     test_articulated_body_solve_matches_cholesky_on_a_branched_ball_tree,
+    test_articulated_body_solve_is_stable_on_a_long_ball_chain,
 ):
     add_function_test(TestSteelArticulatedBodySolve, _func.__name__, _func, devices=get_test_devices())
 
