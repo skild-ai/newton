@@ -2500,6 +2500,15 @@ SPRING_ROUTES = {
 }
 
 
+# Each route factors the damped mass matrix on a different path.
+DAMPING_ROUTES = {
+    "_parallel_tree": {"parallel_tree": True},
+    "_parallel_streams": {"use_parallel_streams": True},
+    "_propagation": {"articulated_contact_response": "propagation"},
+    "_double_buffer": {"double_buffer": True},
+}
+
+
 add_function_test(
     TestSteelSprings,
     "test_springs_match_explicit_reference",
@@ -2521,9 +2530,8 @@ for _name, _func in (
 ):
     add_function_test(TestSteelSprings, _name, _func, devices=get_test_devices())
     add_function_test(TestSteelSprings, f"{_name}_drive_rows", _func, devices=get_test_devices(), drive_mode="rows")
-    add_function_test(
-        TestSteelSprings, f"{_name}_parallel_tree", _func, devices=get_cuda_test_devices(), parallel_tree=True
-    )
+    for _suffix, _kwargs in DAMPING_ROUTES.items():
+        add_function_test(TestSteelSprings, f"{_name}{_suffix}", _func, devices=get_cuda_test_devices(), **_kwargs)
 for _name, _func in (
     ("test_zero_stiffness_ignores_rest_coordinates", test_zero_stiffness_ignores_rest_coordinates),
     ("test_damped_spring_settles_at_rest_coordinate", test_damped_spring_settles_at_rest_coordinate),
