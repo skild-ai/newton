@@ -1571,14 +1571,9 @@ class SolverSteel(SolverBase, CouplingInterface):
       when its ``target_kind`` / ``target`` link names a loop joint or mimic constraint
       between the row's own bodies or joints. Particles are not simulated.
     - Gradients are not supported.
-    - The rigid-body bias forces, including the velocity-product (Coriolis and centrifugal)
-      terms, are evaluated at the start of the step, as in :class:`~newton.solvers.SolverFeatherstone`
-      and the ``"euler"`` and ``"implicitfast"`` integrators of :class:`~newton.solvers.SolverMuJoCo`.
-      In rapidly moving articulated chains, such as a free-swinging chain of light links whose tip
-      whips at high joint speed, this can add energy and diverge at ordinary ``dt``. More
-      ``iterations`` do not change it; a smaller ``dt`` reduces the error. Joint armature changes the
-      effective inertia and can improve stability, but it changes the physical model; validate it over
-      the intended trajectory and duration.
+    - Bias (Coriolis and centrifugal) forces are explicit, so articulated chains with high joint
+      speeds can gain energy; a smaller ``dt`` reduces it and more ``iterations`` do not. See
+      :ref:`Tuning Solver Reference`.
 
     On CUDA, branched articulations use sparse mass factors when
     every articulated (non-free-body) response group shares one joint topology with at most
