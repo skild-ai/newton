@@ -256,8 +256,10 @@ _MFGS_TILE_SHARED_STORAGE_BYTES = 128
 _MFGS_VELOCITY_LIMIT_UNIT_CAPACITY = 256
 # Threads per block of the tiled Cholesky, triangular-solve and H^-1 J^T kernels.
 _TILE_THREADS = 64
-# Block size of the serial one-thread-per-articulation kernels.
-_SERIAL_KERNEL_BLOCK_DIM = 256
+# Block-size range of the serial kernels, whose threads each walk one articulation (or one row of it).
+_SERIAL_KERNEL_MIN_BLOCK_DIM = 8
+_SERIAL_KERNEL_MAX_BLOCK_DIM = 64
+_SERIAL_KERNEL_BLOCK_DIMS = (8, 16, 32, 64, 128, 256, 512, 1024)
 # PhysX's default rigid-body angular damping [1/s].
 _DEFAULT_ANGULAR_DAMPING = 0.05
 # Namespace of the PhysX-schema custom attributes registered by register_custom_attributes().
@@ -345,6 +347,20 @@ _SUPPORTED_JOINT_TYPES = (
     int(JointType.DISTANCE),
     int(JointType.D6),
 )
+
+
+def _serial_launch_block_dim(thread_count: int, sm_count: int) -> int:
+    """Return the block size of a launch whose threads each run a serial articulation walk.
+
+    Such a launch is latency-bound: a thread's cost is its walk, not its share of a warp, so the
+    threads are spread over every SM before blocks grow. Start at the minimum and double while each
+    SM still gets two blocks of the doubled size, up to the maximum. One block size for all thread
+    counts leaves most SMs idle: 1024 articulations in blocks of 256 occupy 4 SMs.
+    """
+    block_dim = _SERIAL_KERNEL_MIN_BLOCK_DIM
+    while block_dim < _SERIAL_KERNEL_MAX_BLOCK_DIM and thread_count >= 2 * (2 * block_dim) * max(sm_count, 1):
+        block_dim *= 2
+    return block_dim
 
 
 def _finite_non_negative(name: str, value) -> float:
@@ -3030,11 +3046,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._tile_threads = int(self._kernel_overrides.get("tile_threads", _TILE_THREADS))
         if self._tile_threads not in (32, 64, 128, 256):
             raise ValueError("tile_threads must be one of (32, 64, 128, 256)")
-        self._serial_kernel_block_dim = int(
-            self._kernel_overrides.get("serial_kernel_block_dim", _SERIAL_KERNEL_BLOCK_DIM)
-        )
-        if self._serial_kernel_block_dim <= 0 or self._serial_kernel_block_dim % 32:
-            raise ValueError("serial_kernel_block_dim must be a positive multiple of 32")
+        self._serial_kernel_block_dim = self._kernel_overrides.get("serial_kernel_block_dim", "auto")
+        if self._serial_kernel_block_dim != "auto" and self._serial_kernel_block_dim not in _SERIAL_KERNEL_BLOCK_DIMS:
+            raise ValueError(f"serial_kernel_block_dim must be 'auto' or one of {_SERIAL_KERNEL_BLOCK_DIMS}")
+        self._sm_count = int(getattr(model.device, "sm_count", 0) or 0)
         if not model.device.is_cuda:
             # The tiled and native kernels are CUDA-only; CPU runs the scalar Warp kernels.
             self._cholesky_kernel = "loop"
@@ -4906,6 +4921,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._target_velocity,
                     ],
                     device=model.device,
+                    block_dim=self._serial_block_dim(self._n_arts_by_size[size]),
                 )
         if self._connect_count:
 
@@ -4973,6 +4989,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._connect_at_midpoint,
                     ],
                     device=model.device,
+                    block_dim=self._serial_block_dim(self._connect_count * CONNECT_MAX_ROWS),
                 )
 
     def _stage4_bilateral_preelim(self) -> None:
@@ -5011,6 +5028,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._preelim_LS,
                 ],
                 device=self.model.device,
+                block_dim=self._serial_block_dim(n_arts),
             )
             wp.launch(
                 preelim_correct_Y_for_size,
@@ -5053,6 +5071,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ],
                 outputs=[self._v_out],
                 device=self.model.device,
+                block_dim=self._serial_block_dim(self._n_arts_by_size[size]),
             )
 
     def _setup_passive_joint_forces(self, model) -> None:
@@ -8198,7 +8217,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 body_ft_s,
             ],
             outputs=[body_parent_f],
-            block_dim=self._serial_kernel_block_dim,
+            block_dim=self._serial_block_dim(model.articulation_count),
             device=model.device,
         )
         wp.launch(
@@ -9070,7 +9089,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 state_aug._body_a_s,
                 self._fk_id_scratch,
             ],
-            block_dim=16,
+            block_dim=self._serial_block_dim(model.articulation_count),
             device=model.device,
         )
         if model.body_count:
@@ -9180,7 +9199,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._dynamics_art_active,
                     ],
                     outputs=[self._aug_row_counts, self._aug_row_dof_index, self._aug_row_K, state_aug._joint_tau],
-                    block_dim=self._serial_kernel_block_dim,
+                    block_dim=self._serial_block_dim(model.articulation_count),
                     device=model.device,
                 )
         elif self._articulation_max_dofs > 0:
@@ -9210,7 +9229,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._aug_row_K,
                     state_aug._joint_tau,
                 ],
-                block_dim=self._serial_kernel_block_dim,
+                block_dim=self._serial_block_dim(model.articulation_count),
                 device=model.device,
             )
         else:
@@ -9219,7 +9238,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 dim=model.articulation_count,
                 inputs=[*common_inputs, *tau_inputs, self._dynamics_art_active],
                 outputs=[state_aug._body_ft_s, state_aug._joint_tau],
-                block_dim=self._serial_kernel_block_dim,
+                block_dim=self._serial_block_dim(model.articulation_count),
                 device=model.device,
             )
 
@@ -9271,6 +9290,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 block_dim=32,
                 device=self.model.device,
             )
+
+    def _serial_block_dim(self, thread_count: int) -> int:
+        """Return the block size of a launch of ``thread_count`` serial articulation walks."""
+        if self._serial_kernel_block_dim != "auto":
+            return self._serial_kernel_block_dim
+        return _serial_launch_block_dim(thread_count, self._sm_count)
 
     def _stage1_crba(self, state_aug: State, dt: float):
         """Build the joint-space mass matrix of articulations due for a refresh and add drive terms."""
@@ -9342,7 +9367,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ],
                 outputs=[self._body_I_c],
                 device=model.device,
-                block_dim=128,
+                block_dim=self._serial_block_dim(model.articulation_count),
             )
         for size in self._size_groups:
             n_arts = self._n_arts_by_size[size]
@@ -9635,6 +9660,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             inputs=[self._group_to_art[size], self._mass_update_mask, size, self._L_by_size[size]],
             outputs=[self._Linv_by_size[size]],
             device=model.device,
+            block_dim=self._serial_block_dim(n_arts),
         )
 
     def _stage2_cholesky_tiled(self, size: int):
@@ -9692,6 +9718,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             ],
             outputs=[self._L_by_size[size]],
             device=self.model.device,
+            block_dim=self._serial_block_dim(self._n_arts_by_size[size]),
         )
 
     def _stage3_trisolve_tiled(self, size: int, state_aug: State):
@@ -9709,6 +9736,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             ],
             outputs=[self._tau_by_size[size]],
             device=model.device,
+            block_dim=self._serial_block_dim(n_arts),
         )
         wp.launch_tiled(
             self._triangular_solve_kernels_by_size[size],
@@ -9735,6 +9763,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             ],
             outputs=[state_aug._joint_qdd],
             device=model.device,
+            block_dim=self._serial_block_dim(n_arts),
         )
 
     def _stage3_solve_diagonal(self, size: int, state_aug: State) -> None:
@@ -9768,6 +9797,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             ],
             outputs=[state_aug._joint_qdd],
             device=self.model.device,
+            block_dim=self._serial_block_dim(self._n_arts_by_size[size]),
         )
 
     def _stage3_joint_friction_load(self, state_in: State, state_aug: State) -> None:
@@ -9801,7 +9831,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._joint_friction_load_ft_s,
             ],
             outputs=[self._joint_friction_total],
-            block_dim=self._serial_kernel_block_dim,
+            block_dim=self._serial_block_dim(model.articulation_count),
             device=model.device,
         )
 
@@ -10258,6 +10288,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._drive_vel_limit,
                     ],
                     device=model.device,
+                    block_dim=self._serial_block_dim(self._n_arts_by_size[size]),
                 )
 
         self._stage4_build_bilateral_rows(state_in, state_aug)
@@ -10367,6 +10398,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._row_cursor,
                         ],
                         device=model.device,
+                        block_dim=self._serial_block_dim(n_arts),
                     )
                     continue
                 wp.launch_tiled(
@@ -10545,6 +10577,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._target_velocity,
                     ],
                     device=model.device,
+                    block_dim=self._serial_block_dim(self._n_arts_by_size[size]),
                 )
 
         if self._sparse_diagonal_contact_solve:
@@ -11421,7 +11454,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._body_a_s,
                     self._fk_id_valid,
                 ],
-                block_dim=16,
+                block_dim=self._serial_block_dim(model.articulation_count),
                 device=model.device,
             )
             if model.body_count:
@@ -12427,6 +12460,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     inputs=[arts, self._propagation_tree_activity, *factor_inputs, model.joint_dof_dim, *factor_terms],
                     outputs=factor_outputs,
                     device=model.device,
+                    block_dim=self._serial_block_dim(n_arts),
                 )
                 wp.launch(
                     compute_propagation_tree_body_response_for_size,
@@ -12458,6 +12492,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._propagation_body_response_split,
                     ],
                     device=model.device,
+                    block_dim=self._serial_block_dim(n_arts),
                 )
         if self._has_free_rigid_bodies:
             wp.launch(
@@ -12610,6 +12645,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     ],
                     outputs=[self._propagation_body_qd],
                     device=model.device,
+                    block_dim=self._serial_block_dim(n_arts),
                 )
         if self._has_free_rigid_bodies:
             wp.launch(
@@ -12712,6 +12748,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._v_out,
                     ],
                     device=model.device,
+                    block_dim=self._serial_block_dim(n_arts),
                 )
         if self._has_free_rigid_bodies:
             wp.launch(
