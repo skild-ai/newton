@@ -364,7 +364,6 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |yes| :sup:`9`
      - |no|
      - |no|
-     - |no|
      - |yes|
      - |no|
      - |yes|
