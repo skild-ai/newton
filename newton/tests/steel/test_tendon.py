@@ -558,6 +558,151 @@ def test_tendon_actuator_force_range_caps_the_summed_force(test, device):
             test.assertAlmostEqual(run.qd("m"), 1.5 * steps * dt, delta=1.0e-5)
 
 
+def test_tendon_property_changes_reach_the_solver(test, device):
+    """notify_model_changed(TENDON_PROPERTIES) re-derives the spring terms; edits that add tendon rows raise.
+
+    The second tendon starts with zero stiffness. Giving it a stiffness, or moving its springlength, must change
+    the next step's acceleration to -k (L - L_s) / m along L = q.
+    """
+    dt = 1.0e-3
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>
+      {_frame(_slider("a", "0 -0.2 1", axis="1 0 0") + _slider("b", "0 0.2 1", axis="1 0 0"))}
+    </worldbody><tendon><fixed stiffness="10" springlength="0"><joint joint="a" coef="1"/></fixed>
+      <fixed springlength="0"><joint joint="b" coef="1"/></fixed></tendon></mujoco>"""
+    flags = newton.ModelFlags.TENDON_PROPERTIES
+    for mode in _MODES:
+        with test.subTest(solve_mode=mode):
+            run = _Run(mjcf, device, solve_mode=mode, q={"b": 0.1}, iterations=8)
+            stiffness = run.model.mujoco.tendon_stiffness.numpy()
+            stiffness[1] = 50.0
+            run.model.mujoco.tendon_stiffness.assign(stiffness)
+            run.solver.notify_model_changed(flags)
+            run.step(dt, 1)
+            # implicit damping mode: the spring is explicit, the slider started at rest
+            test.assertAlmostEqual(run.qd("b"), -50.0 * 0.1 * dt, delta=1.0e-6)
+            band = run.model.mujoco.tendon_springlength.numpy()
+            band[1] = (0.3, 0.3)
+            run.model.mujoco.tendon_springlength.assign(band)
+            run.solver.notify_model_changed(flags)
+            qd, q = run.qd("b"), run.q("b")
+            run.step(dt, 1)
+            test.assertAlmostEqual(run.qd("b") - qd, -50.0 * (q - 0.3) * dt, delta=1.0e-6)
+            limited = run.model.mujoco.tendon_limited.numpy()
+            limited[1] = 1
+            run.model.mujoco.tendon_limited.assign(limited)
+            with test.assertRaises(NotImplementedError):
+                run.solver.notify_model_changed(flags)
+
+
+def _fresh_copy(run, mode, **solver_kwargs):
+    """A solver constructed from ``run``'s current model, stepping a copy of its current state."""
+    if mode == "colored":
+        solver_kwargs.setdefault("articulated_contact_response", "propagation")
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="SolverSteel: solve_mode='colored' runs", category=newton.exceptions.NewtonWarning
+        )
+        solver = SolverSteel(run.model, solve_mode=mode, **solver_kwargs)
+    state_0, state_1 = run.model.state(), run.model.state()
+    for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+        wp.copy(getattr(state_0, name), getattr(run.state_0, name))
+    return solver, state_0, state_1
+
+
+def _step_alongside(run, fresh, state_0, state_1, dt, steps):
+    """Step ``run`` and a fresh solver from the same state; return the fresh solver's final state."""
+    run.step(dt, steps)
+    for _ in range(steps):
+        fresh.step(state_0, state_1, run.control, None, dt)
+        state_0, state_1 = state_1, state_0
+    return state_0
+
+
+def test_tendon_stiffness_switched_on_by_notify(test, device):
+    """A spring given at runtime to a tendon on an articulation without tendon mass terms rings as the closed form.
+
+    ``L = qa + 2 qb`` on a two-slider chain (``H = [[2, 1], [1, 1]]``) whose articulation size has no tendon mass
+    terms at construction (only a separate one-slider articulation has a damped tendon), so the notification moves
+    that size onto the tendon mass path (and off the fused CRBA-Cholesky kernel with parallel streams). From the
+    switch state ``(q_s, v_s)`` the motion is ``q_s + v_s t + H^-1 J^T (L - L_s - dL_s t) / (J H^-1 J^T)`` with
+    ``L = L_s cos wt + dL_s / w sin wt`` and ``w^2 = k J H^-1 J^T``, and it matches a solver constructed with the
+    spring. Switched off, the tendon keeps its zero mass terms and the motion is free; switched on again, nothing
+    has to change.
+    """
+    k, dt, steps = 50.0, 1.0e-3, 600
+    J, H = np.array([1.0, 2.0]), np.array([[2.0, 1.0], [1.0, 1.0]])
+    chain = _slider("a", "0 0 1", axis="1 0 0")[: -len("</body>")] + _slider("b", "0 0 0.2", axis="1 0 0") + "</body>"
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>{chain}{_slider("anchor", "0 1 1", axis="1 0 0")}</worldbody><tendon>
+      <fixed damping="1"><joint joint="anchor" coef="1"/></fixed>
+      <fixed springlength="0"><joint joint="a" coef="1"/><joint joint="b" coef="2"/></fixed></tendon></mujoco>"""
+    flags = newton.ModelFlags.TENDON_PROPERTIES
+    for mode, streams in [(m, s) for m in _MODES for s in (False, True)]:
+        with test.subTest(solve_mode=mode, use_parallel_streams=streams):
+            options = {"iterations": 8, "use_parallel_streams": streams}
+            run = _Run(mjcf, device, solve_mode=mode, q={"a": 0.1, "b": -0.05}, qd={"a": 0.3, "b": 0.1}, **options)
+            run.step(dt, 100)
+            q_s, v_s = np.array([run.q("a"), run.q("b")]), np.array([run.qd("a"), run.qd("b")])
+            np.testing.assert_allclose(v_s, (0.3, 0.1), atol=1.0e-6)  # free motion before the switch
+            run.model.mujoco.tendon_stiffness.assign(np.array([0.0, k], dtype=np.float32))
+            run.solver.notify_model_changed(flags)
+            fresh = _step_alongside(run, *_fresh_copy(run, mode, **options), dt, steps)
+            np.testing.assert_array_equal(run.state_0.joint_q.numpy(), fresh.joint_q.numpy())
+            np.testing.assert_array_equal(run.state_0.joint_qd.numpy(), fresh.joint_qd.numpy())
+            Hinv_J = np.linalg.solve(H, J)
+            m_eff = float(J @ Hinv_J)
+            w, t = math.sqrt(k * m_eff), steps * dt
+            L_s, dL_s = float(J @ q_s), float(J @ v_s)
+            L = L_s * math.cos(w * t) + dL_s / w * math.sin(w * t)
+            q = q_s + v_s * t + Hinv_J * (L - L_s - dL_s * t) / m_eff
+            # symplectic Euler's O((w dt)^2) phase error over 0.6 s
+            np.testing.assert_allclose([run.q("a"), run.q("b")], q, atol=2.0e-4)
+            run.model.mujoco.tendon_stiffness.assign(np.zeros(2, dtype=np.float32))
+            run.solver.notify_model_changed(flags)
+            v_off = np.array([run.qd("a"), run.qd("b")])
+            run.step(dt, 50)
+            np.testing.assert_allclose([run.qd("a"), run.qd("b")], v_off, atol=1.0e-6)
+            run.model.mujoco.tendon_stiffness.assign(np.array([0.0, k], dtype=np.float32))
+            run.solver.notify_model_changed(flags)
+
+
+def test_tendon_friction_loss_switched_by_notify(test, device):
+    """A friction-loss row keeps its slot at zero friction loss, so switching it off and on needs no new solver.
+
+    On a 30 degree incline, with friction loss switched off, both sliders accelerate at g sin(theta). Switched
+    back on, the one whose friction loss is below m g sin(theta) keeps accelerating at g sin(theta) - f / m; the
+    other decelerates at that rate until it stops and then stays stopped, as a solver constructed with the
+    friction loss does. Friction loss on a tendon that had no friction row adds a row and raises.
+    """
+    theta, dt, off, on = math.radians(30.0), 1.0e-3, 200, 500
+    axis = f"{math.cos(theta)} 0 {-math.sin(theta)}"
+    bodies = _slider("slip", "0 -0.4 1", axis=axis) + _slider("stop", "0 0 1", axis=axis) + _slider("free", "0 0.4 1")
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>{_frame(bodies)}</worldbody><tendon>
+      <fixed frictionloss="3"><joint joint="slip" coef="1"/></fixed>
+      <fixed frictionloss="8"><joint joint="stop" coef="1"/></fixed>
+      <fixed><joint joint="free" coef="1"/></fixed></tendon></mujoco>"""
+    gs, f = G * math.sin(theta), np.array([3.0, 8.0, 0.0], dtype=np.float32)
+    flags = newton.ModelFlags.TENDON_PROPERTIES
+    for mode in _MODES:
+        with test.subTest(solve_mode=mode):
+            run = _Run(mjcf, device, solve_mode=mode, iterations=16)
+            run.model.mujoco.tendon_frictionloss.assign(np.zeros(3, dtype=np.float32))
+            run.solver.notify_model_changed(flags)
+            run.step(dt, off)
+            v_s = gs * off * dt
+            test.assertAlmostEqual(run.qd("slip"), v_s, delta=1.0e-4)
+            test.assertAlmostEqual(run.qd("stop"), v_s, delta=1.0e-4)
+            run.model.mujoco.tendon_frictionloss.assign(f)
+            run.solver.notify_model_changed(flags)
+            fresh = _step_alongside(run, *_fresh_copy(run, mode, iterations=16), dt, on)
+            np.testing.assert_array_equal(run.state_0.joint_qd.numpy(), fresh.joint_qd.numpy())
+            np.testing.assert_array_equal(run.state_0.joint_q.numpy(), fresh.joint_q.numpy())
+            test.assertAlmostEqual(run.qd("slip"), v_s + (gs - f[0]) * on * dt, delta=1.0e-4)
+            test.assertAlmostEqual(run.qd("stop"), 0.0, delta=1.0e-5)  # stopped at t = 0.32 s, then held
+            run.model.mujoco.tendon_frictionloss.assign(np.array([3.0, 8.0, 1.0], dtype=np.float32))
+            with test.assertRaises(NotImplementedError):
+                run.solver.notify_model_changed(flags)
+
+
 def test_tendon_inside_sphere_wrap_matches_mujoco(test, device):
     """A span wrapping a sphere whose side site is inside it matches MuJoCo's length and varies continuously.
 
@@ -624,6 +769,9 @@ for _name in (
     "test_tendon_position_dampratio_is_critically_damped",
     "test_tendon_fixed_length_includes_the_joint_reference",
     "test_tendon_actuator_force_range_caps_the_summed_force",
+    "test_tendon_property_changes_reach_the_solver",
+    "test_tendon_stiffness_switched_on_by_notify",
+    "test_tendon_friction_loss_switched_by_notify",
     "test_tendon_inside_sphere_wrap_matches_mujoco",
     "test_tendon_armature_history_survives_coupled_iteration_restarts",
 ):

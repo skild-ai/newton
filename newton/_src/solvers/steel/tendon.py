@@ -1287,6 +1287,17 @@ def gather_tendon_forces(
         tendon_force[k, 2] = world_impulses[world, slot] * inv_dt
 
 
+def _ranges(adr: np.ndarray, num: np.ndarray, items: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The entries ``adr[i] .. adr[i] + num[i] - 1`` of each of ``items``, as (owner item, entry) pairs."""
+    if items.size == 0:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty
+    count = num[items].astype(np.int64)
+    owner = np.repeat(items.astype(np.int64), count)
+    first = np.repeat(adr[items].astype(np.int64) - (np.cumsum(count) - count), count)
+    return owner, first + np.arange(owner.size, dtype=np.int64)
+
+
 class TendonPlan:
     """Static per-tendon tables for the tendon row family (host validation, device lookup arrays)."""
 
@@ -1312,6 +1323,7 @@ class TendonPlan:
         body_to_articulation: np.ndarray | None,
         art_to_world: np.ndarray | None,
         response_dof_count: np.ndarray,
+        keep: TendonPlan | None = None,
     ) -> TendonPlan:
         """Validate the model's ``mujoco:tendon_*`` and tendon ``mujoco:actuator_*`` attributes and build tables.
 
@@ -1319,6 +1331,10 @@ class TendonPlan:
         fixed tendon, warn and are ignored, with their actuators. Range limits and friction loss become
         rows; armature, the spring-damper and actuators become mass-matrix terms (``mass_sizes``). Every
         valid tendon's length is reported, including tendons without rows or mass terms.
+
+        ``keep`` is the plan this one replaces: its friction-loss rows and mass terms stay in the new plan even
+        when their values are now zero (a friction row boxed to 0 and zero mass terms are no-ops), so switching
+        a term off and on again changes no solver structure.
         """
         plan = cls()
         mujoco = getattr(model, "mujoco", None)
@@ -1356,65 +1372,64 @@ class TendonPlan:
         kinematic = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
 
         art = np.full(n, -1, dtype=np.int32)
-        valid = np.zeros(n, dtype=bool)
-        flags = np.zeros(n, dtype=np.int32)
-        has_mass = np.zeros(n, dtype=bool)
-        for k in range(n):
+        fixed_type = ttype == int(TENDON_TYPE_FIXED)
+        # Each tendon's moving articulations: one per fixed-tendon joint, one per non-pulley wrap on a dynamic body.
+        owner_f, entry_f = _ranges(joint_adr, joint_num, np.flatnonzero(fixed_type))
+        joints = tjoint[entry_f]
+        one_dof = (np.diff(joint_qd_start)[joints] == 1) & (np.diff(joint_q_start)[joints] == 1)
+        multi_dof = np.zeros(n, dtype=bool)
+        multi_dof[owner_f[~one_dof]] = True
+        owner_s, entry_s = _ranges(wrap_adr, wrap_num, np.flatnonzero(~fixed_type))
+        pulley = wrap_type[entry_s] == 2
+        bad_divisor = np.zeros(n, dtype=bool)
+        bad_divisor[owner_s[pulley & (wrap_prm[entry_s] <= 0.0)]] = True
+        body = np.where(pulley, -1, shape_body[np.where(pulley, 0, wrap_shape[entry_s])])
+        moving = (body >= 0) & ~kinematic[np.maximum(body, 0)]
+        owner = np.concatenate((owner_f, owner_s[moving]))
+        art_of = np.concatenate((joint_articulation[joints], body_to_articulation[body[moving]])).astype(np.int64)
+        touches = np.bincount(owner, minlength=n)
+        lowest = np.full(n, np.iinfo(np.int64).max, dtype=np.int64)
+        highest = np.full(n, np.iinfo(np.int64).min, dtype=np.int64)
+        np.minimum.at(lowest, owner, art_of)
+        np.maximum.at(highest, owner, art_of)
+        one_art = (touches > 0) & (lowest == highest) & (lowest >= 0)
+        for k in np.flatnonzero(multi_dof | bad_divisor | ~one_art):
             name = labels[k] if k < len(labels) and labels[k] else f"tendon_{k}"
-            arts = set()
-            if int(ttype[k]) == 0:
-                joints = tjoint[int(joint_adr[k]) : int(joint_adr[k]) + int(joint_num[k])]
-                bad = [
-                    int(j)
-                    for j in joints
-                    if joint_qd_start[j + 1] - joint_qd_start[j] != 1 or joint_q_start[j + 1] - joint_q_start[j] != 1
-                ]
-                if bad:
-                    warnings.warn(
-                        f"SolverSteel: fixed tendon '{name}' references multi-DoF joints {bad}; ignored.",
-                        NewtonWarning,
-                        stacklevel=3,
-                    )
-                    continue
-                arts = {int(joint_articulation[j]) for j in joints}
-            else:
-                start = int(wrap_adr[k])
-                elements = range(start, start + int(wrap_num[k]))
-                if any(int(wrap_type[e]) == 2 and float(wrap_prm[e]) <= 0.0 for e in elements):
-                    warnings.warn(
-                        f"SolverSteel: tendon '{name}' has a non-positive pulley divisor; ignored.",
-                        NewtonWarning,
-                        stacklevel=3,
-                    )
-                    continue
-                for e in elements:
-                    if int(wrap_type[e]) == 2:
-                        continue
-                    body = int(shape_body[int(wrap_shape[e])])
-                    if body >= 0 and not kinematic[body]:
-                        arts.add(int(body_to_articulation[body]))
-            if len(arts) != 1 or -1 in arts:
+            if multi_dof[k]:
+                bad = [int(j) for j, ok in zip(joints[owner_f == k], one_dof[owner_f == k], strict=True) if not ok]
                 warnings.warn(
-                    f"SolverSteel: tendon '{name}' must move DOFs of exactly one articulation "
-                    f"(touches {sorted(arts)}); cross-articulation and DOF-free tendons are ignored.",
+                    f"SolverSteel: fixed tendon '{name}' references multi-DoF joints {bad}; ignored.",
                     NewtonWarning,
                     stacklevel=3,
                 )
-                continue
-            a = arts.pop()
-            if response_dof_count[a] <= 0:
-                continue
-            valid[k] = True
-            lim = int(limited[k])
-            if lim == 1 or (lim == 2 and float(trange[k, 0]) < float(trange[k, 1])):
-                flags[k] |= int(TENDON_ROW_LIMIT_LOWER) | int(TENDON_ROW_LIMIT_UPPER)
-            if float(frictionloss[k]) > 0.0:
-                flags[k] |= int(TENDON_ROW_FRICTION)
-            has_mass[k] = bool(
-                float(armature[k]) != 0.0 or float(stiffness[k]) > 0.0 or float(damping[k]) > 0.0 or tendon_actuators[k]
-            )
-            if flags[k] or has_mass[k]:
-                art[k] = a
+            elif bad_divisor[k]:
+                warnings.warn(
+                    f"SolverSteel: tendon '{name}' has a non-positive pulley divisor; ignored.",
+                    NewtonWarning,
+                    stacklevel=3,
+                )
+            else:
+                warnings.warn(
+                    f"SolverSteel: tendon '{name}' must move DOFs of exactly one articulation "
+                    f"(touches {sorted({int(x) for x in art_of[owner == k]})}); cross-articulation and DOF-free "
+                    "tendons are ignored.",
+                    NewtonWarning,
+                    stacklevel=3,
+                )
+        a_of = np.where(one_art, lowest, 0).astype(np.int32)
+        valid = one_art & ~multi_dof & ~bad_divisor & (response_dof_count[a_of] > 0)
+        limit_on = (limited == 1) | ((limited == 2) & (trange[:, 0] < trange[:, 1]))
+        flags = np.where(valid & limit_on, int(TENDON_ROW_LIMIT_LOWER) | int(TENDON_ROW_LIMIT_UPPER), 0)
+        flags = (flags | np.where(valid & (frictionloss > 0.0), int(TENDON_ROW_FRICTION), 0)).astype(np.int32)
+        actuated = np.bincount(tendon_actuators.tendon[tendon_actuators.tendon >= 0], minlength=n)[:n] > 0
+        has_mass = valid & ((armature != 0.0) | (stiffness > 0.0) | (damping > 0.0) | actuated)
+        if keep is not None and keep.count == n:
+            # A term once present keeps its row or mass slot; its value alone switches it off.
+            kept = valid & (keep.art_np >= 0)
+            flags[kept] |= keep.flags_np[kept] & int(TENDON_ROW_FRICTION)
+            has_mass[kept] |= keep.mass_np[kept]
+        enforced = (flags != 0) | has_mass
+        art[enforced] = a_of[enforced]
 
         with_margin = [
             labels[k] if k < len(labels) and labels[k] else f"tendon_{k}"
@@ -1440,15 +1455,15 @@ class TendonPlan:
         if active.size == 0:
             return plan
         actuator_count = tendon_actuators.actuator_count
+        # Each enforced tendon's actuators, in actuator order.
+        driven = np.flatnonzero(tendon_actuators.tendon >= 0)
+        driven = driven[art[tendon_actuators.tendon[driven]] >= 0]
+        driven_tendon = tendon_actuators.tendon[driven]
+        actuator_list = driven[np.argsort(driven_tendon, kind="stable")]
         actuator_start = np.zeros(n + 1, dtype=np.int32)
-        actuator_list: list[int] = []
-        rows = np.zeros(n, dtype=np.int32)
-        for k in range(n):
-            if art[k] >= 0:
-                rows[k] = bin(int(flags[k])).count("1")
-                for act in tendon_actuators[k]:
-                    actuator_list.append(act)
-            actuator_start[k + 1] = len(actuator_list)
+        actuator_start[1:] = np.cumsum(np.bincount(driven_tendon, minlength=n)[:n])
+        bits = (flags[:, None] >> np.arange(3, dtype=np.int32)) & 1
+        rows = np.where(art >= 0, bits.sum(axis=1), 0).astype(np.int32)
         world = np.zeros(n, dtype=np.int32)
         world[active] = art_to_world[art[active]]
 
@@ -1460,6 +1475,7 @@ class TendonPlan:
         plan.flags_np = flags
         plan.range_np = trange
         plan.springlength_np = springlength
+        plan.mass_np = has_mass & (art >= 0)
         plan._paths = (ttype, joint_adr, joint_num, tjoint, wrap_adr, wrap_num, wrap_type, wrap_shape)
         plan.art = wp.array(art, dtype=wp.int32, device=device)
         plan.world = wp.array(world, dtype=wp.int32, device=device)
@@ -1469,7 +1485,9 @@ class TendonPlan:
         plan.force = wp.zeros((n, 3), dtype=float, device=device)
         plan.spring_length = wp.zeros(n, dtype=wp.vec2, device=device)
         plan.actuator_start = wp.array(actuator_start, dtype=wp.int32, device=device)
-        plan.actuator_list = wp.array(np.asarray(actuator_list or [0], dtype=np.int32), dtype=wp.int32, device=device)
+        plan.actuator_list = wp.array(
+            np.asarray(actuator_list if actuator_list.size else [0], dtype=np.int32), dtype=wp.int32, device=device
+        )
         plan.actuator_flags = wp.array(tendon_actuators.flags, dtype=wp.int32, device=device)
         plan.actuator_start_np = actuator_start
         plan.actuator_list_np = np.asarray(actuator_list, dtype=np.int32)
@@ -1608,22 +1626,25 @@ class TendonPlan:
     def _index_array(mask: np.ndarray, device) -> wp.array | None:
         return wp.array(np.flatnonzero(mask).astype(np.int32), dtype=wp.int32, device=device) if mask.any() else None
 
-    class _ActuatorIndex(list):
-        """Per tendon, the indices of the supported actuators that drive it."""
+    class _ActuatorIndex:
+        """Per actuator, the tendon it drives when Steel supports it (``tendon``, -1 otherwise), and its flags."""
 
         actuator_count = 0
+        tendon = None
         flags = None
 
     @classmethod
     def _tendon_actuators(cls, mujoco, tendon_count: int) -> _ActuatorIndex:
         """Collect the TENDON-transmission actuators Steel supports; warn about the ones it cannot model."""
-        index = cls._ActuatorIndex([] for _ in range(tendon_count))
+        index = cls._ActuatorIndex()
+        index.tendon = np.zeros(0, dtype=np.int64)
         trntype_attr = getattr(mujoco, "actuator_trntype", None)
         if trntype_attr is None or trntype_attr.shape[0] == 0:
             index.flags = np.zeros(1, dtype=np.int32)
             return index
         count = int(trntype_attr.shape[0])
         index.actuator_count = count
+        index.tendon = np.full(count, -1, dtype=np.int64)
         trntype = trntype_attr.numpy()
         trnid = mujoco.actuator_trnid.numpy()
         dyntype = mujoco.actuator_dyntype.numpy()
@@ -1660,7 +1681,7 @@ class TendonPlan:
                 flags[act] |= int(ACTUATOR_CTRL_LIMITED)
             if limited(int(forcelimited[act]), int(has_forcerange[act])):
                 flags[act] |= int(ACTUATOR_FORCE_LIMITED)
-            index[tendon].append(act)
+            index.tendon[act] = tendon
         index.flags = flags
         return index
 
@@ -1891,13 +1912,8 @@ class TendonPlan:
         self.eval_lengths(
             model, model.joint_q, model.body_q, wp.array(np.arange(self.count, dtype=np.int32), device=model.device)
         )
-        length0 = self.length.numpy()
-        band = np.empty((self.count, 2), dtype=np.float32)
-        for k in range(self.count):
-            lo, hi = (float(v) for v in self.springlength_np[k])
-            if lo == -1.0:
-                lo = hi = float(length0[k])
-            elif hi < lo:
-                hi = lo
-            band[k] = (lo, hi)
-        self.spring_length.assign(band)
+        length0 = self.length.numpy()[: self.count]
+        lo, hi = self.springlength_np[:, 0], self.springlength_np[:, 1]
+        auto = lo == -1.0
+        band = np.stack((np.where(auto, length0, lo), np.where(auto, length0, np.maximum(hi, lo))), axis=1)
+        self.spring_length.assign(band.astype(np.float32))

@@ -143,6 +143,15 @@ class _SleepState:
         """Bodies whose friction-patch history can be carried; only row-free sleeping qualifies."""
         return self.frozen_bodies if self.skip_constraints and self.carry_frozen_patches else None
 
+    def pin_articulations(self, articulations: np.ndarray) -> None:
+        """Keep ``articulations`` awake from now on (they gained per-step tendon terms), waking all if any is new."""
+        pinned = self.pinned.numpy()
+        if np.all(pinned[articulations] != 0):
+            return
+        pinned[articulations] = 1
+        self.pinned.assign(pinned)
+        self.wake()
+
     def wake(self):
         """Wake every component and invalidate state-change history."""
         requested = self.solver._mass_update_requested

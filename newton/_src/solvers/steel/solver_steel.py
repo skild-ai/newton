@@ -3587,6 +3587,16 @@ class SolverSteel(SolverBase, CouplingInterface):
         constraint raises :class:`NotImplementedError`. Capacity status in
         :attr:`constraint_overflow` is not cleared, see :meth:`reset`.
 
+        Tendon and actuator changes re-derive the MuJoCo-style tendon tables: which tendons have mass
+        terms, the spring rest bands, the ``dampratio`` gains and the control and force-limit flags, and
+        request a mass-matrix refresh. Joint DOF and reference-pose changes re-read the joint references in
+        fixed tendon lengths. A friction-loss row or mass term once present keeps its slot when its value returns
+        to zero. A tendon or actuator change that would add or remove tendon rows (a limit switched on or off,
+        friction loss on a tendon without a friction row), or add tendon mass terms to an articulation size
+        whose mass matrix is diagonal or sparse-factored, raises :class:`NotImplementedError`; reconstruct the
+        solver instead. Tendon and actuator notifications read the model on the host and replace the tendon
+        tables, so issue them outside CUDA graph capture and recapture afterwards.
+
         Body, inertial, joint DOF, DOF inertial and shape changes discard the warm-start
         impulses of the worlds selected by ``world_mask``. With friction patches, shape changes
         also discard the anchors of the bodies whose collision geometry changed, in every world.
@@ -3649,6 +3659,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._refresh_passive_spring_rest_q()
             # Fixed tendon lengths add sum(c * ref) for the joint references (mujoco:dof_ref).
             self._tendon.refresh_length_offset(self.model)
+        if flags & (ModelFlags.TENDON_PROPERTIES | ModelFlags.ACTUATOR_PROPERTIES):
+            self._refresh_tendon_plan()
         if flags & ModelFlags.SHAPE_PROPERTIES:
             self._refresh_shape_materials()
         if flags & ModelFlags.JOINT_PROPERTIES:
@@ -4544,14 +4556,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         the connect rows; their armature, spring-dampers and actuators are mass-matrix terms. Lengths and
         Jacobians are rebuilt every step.
         """
-        self._tendon = TendonPlan.build(
-            model,
-            body_to_articulation=(
-                self._body_to_articulation.numpy() if self._body_to_articulation is not None else None
-            ),
-            art_to_world=self._model_plan.articulation_world,
-            response_dof_count=self._model_plan.response_dof_count,
-        )
+        self._tendon = self._new_tendon_plan(model)
         self._tendon_count = self._tendon.count
         if model.tendon_count:
             warnings.warn(
@@ -4560,20 +4565,140 @@ class SolverSteel(SolverBase, CouplingInterface):
                 NewtonWarning,
                 stacklevel=4,
             )
-        self._tendon.resolve_spring_lengths(model)
-        self._tendon.resolve_dampratio(model)
-        if self._tendon.has_rows:
-            gap = np.full(self._tendon_count, self._tendon_limit_gap_base, dtype=np.float64)
-            if self._tendon_limit_activation_speed_scale > 0.0:
-                coupled = self._closure_coupled_joints(model)
-                if coupled:
-                    for k in np.flatnonzero(self._tendon.limited_np()):
-                        if not coupled.isdisjoint(self._tendon.touched_joints(model, int(k))):
-                            gap[k] = np.inf
-            self._tendon.configure_limit_gate(gap, model.device)
         self._tendon_mass_sizes = frozenset(self._tendon.mass_sizes)
         # Tendon friction loss uses the joint-friction row type and its box projection.
         self._dense_joint_friction_rows = bool(self._joint_friction_warp_kernels) or self._tendon.has_friction_rows
+
+    def _new_tendon_plan(self, model, keep: TendonPlan | None = None) -> TendonPlan:
+        """Build a tendon plan from the model's current attributes, with its rest values and limit gate resolved.
+
+        ``keep`` is the plan being replaced; its friction-loss rows and mass terms carry over (see
+        :meth:`TendonPlan.build`).
+        """
+        plan = TendonPlan.build(
+            model,
+            body_to_articulation=(
+                self._body_to_articulation.numpy() if self._body_to_articulation is not None else None
+            ),
+            art_to_world=self._model_plan.articulation_world,
+            response_dof_count=self._model_plan.response_dof_count,
+            keep=keep,
+        )
+        plan.resolve_spring_lengths(model)
+        plan.resolve_dampratio(model)
+        if plan.has_rows:
+            gap = np.full(plan.count, self._tendon_limit_gap_base, dtype=np.float64)
+            if self._tendon_limit_activation_speed_scale > 0.0:
+                coupled = self._closure_coupled_joints(model)
+                if coupled:
+                    for k in np.flatnonzero(plan.limited_np()):
+                        if not coupled.isdisjoint(plan.touched_joints(model, int(k))):
+                            gap[k] = np.inf
+            plan.configure_limit_gate(gap, model.device)
+        return plan
+
+    def _refresh_tendon_plan(self) -> None:
+        """Re-read the tendon and tendon-actuator properties after a ``TENDON_PROPERTIES`` or ``ACTUATOR_PROPERTIES``
+        notification.
+
+        Values the kernels read every step (gains, ranges, stiffness, damping, armature, friction loss) need no
+        refresh; this rebuilds what construction derives from them: which tendons have mass terms, the spring
+        rest bands, the resolved ``dampratio`` gains, the control and force-limit flags and the joint-reference
+        offsets. A friction-loss row or mass term once present keeps its slot when its value returns to zero.
+
+        New tendon mass terms on an articulation size without them move that size onto the unfused CRBA path
+        the tendon kernels add to (:meth:`_add_tendon_mass_sizes`). Edits that change the tendon rows (a limit
+        switched on or off, friction loss on a tendon without a friction row), or that add mass terms to a size
+        whose mass matrix is diagonal or sparse-factored, raise :class:`NotImplementedError`; reconstruct the
+        solver for those.
+        """
+        model = self.model
+        old = self._tendon
+        with warnings.catch_warnings():
+            # Construction already reported the tendons and actuators this solver ignores.
+            warnings.simplefilter("ignore", NewtonWarning)
+            new = self._new_tendon_plan(model, keep=old if old.count else None)
+        if not old.count and not new.count:
+            return
+        changed = []
+        if old.has_rows != new.has_rows or (
+            new.has_rows
+            and (not np.array_equal(new.flags_np, old.flags_np) or not np.array_equal(new.reserve_np, old.reserve_np))
+        ):
+            changed.append("which tendons have limit or friction-loss rows")
+        added_sizes = frozenset(new.mass_sizes) - self._tendon_mass_sizes
+        if not self._can_add_tendon_mass_sizes(added_sizes, first_tendons=not old.count):
+            changed.append("mass terms on articulations whose mass matrix is diagonal or sparse")
+        if changed:
+            raise NotImplementedError(
+                f"SolverSteel: this tendon or actuator change alters {', '.join(changed)}; reconstruct the solver."
+            )
+        # Keep the spatial-armature history when the scratch layout is unchanged.
+        old_index = getattr(old, "mass_scratch_index", None)
+        new_index = getattr(new, "mass_scratch_index", None)
+        if (
+            old_index is not None
+            and new_index is not None
+            and np.array_equal(old_index.numpy(), new_index.numpy())
+            and old.mass_J_prev.shape == new.mass_J_prev.shape
+        ):
+            wp.copy(new.mass_J_prev, old.mass_J_prev)
+            wp.copy(new.mass_has_prev, old.mass_has_prev)
+        if getattr(old, "_history_snapshot", None) is not None:
+            new.reserve_history_snapshot()
+        if (
+            new.has_rows
+            and self._tendon_world_index is not None
+            and not np.array_equal(new.art_np >= 0, old.art_np >= 0)
+        ):
+            # Ordered row reservations walk each world's enforced tendons.
+            self._tendon_world_index = self._ordered_world_index(np.where(new.art_np >= 0, new.world_np, -1))
+        self._tendon = new
+        self._tendon_count = new.count
+        if added_sizes:
+            self._add_tendon_mass_sizes(added_sizes)
+        if self._sleeping is not None and new.count:
+            self._sleeping.pin_articulations(new.art_np[new.art_np >= 0])
+        # Tendon armature, springs and actuator gains enter the factored mass matrix.
+        self._mass_update_requested.fill_(1)
+
+    def _can_add_tendon_mass_sizes(self, sizes: frozenset[int], *, first_tendons: bool) -> bool:
+        """Whether tendon mass terms can join ``sizes`` without reconstructing the solver.
+
+        A size qualifies when its mass matrix is assembled densely and factored by Cholesky: not structurally
+        diagonal, not sparse-factored and not the sparse-diagonal response. A model gaining its first enforced
+        tendons must also not run a fast path that construction enables only without tendons.
+        """
+        if first_tendons and (
+            self._sparse_mass_matrix_size is not None or self._sparse_diagonal_contact_solve or self._latency_fused
+        ):
+            return False
+        return not any(
+            size in self._diagonal_mass_sizes
+            or size == self._sparse_mass_matrix_size
+            or size == self._sparse_diagonal_response_size
+            for size in sizes
+        )
+
+    def _add_tendon_mass_sizes(self, sizes: frozenset[int]) -> None:
+        """Let tendon mass terms enter the dense mass matrices of ``sizes``.
+
+        The tendon kernels add to ``H`` after CRBA, so a size whose CRBA was fused with its Cholesky factor
+        (which never stores ``H``) switches to the separate CRBA fill and factor kernels, as construction picks
+        for sizes with tendon mass terms; :meth:`_stage1_crba` then zeroes ``H`` before every fill.
+        """
+        self._tendon_mass_sizes = self._tendon_mass_sizes | sizes
+        device_arch = self.model.device.arch
+        for size in sizes:
+            if (
+                self._crba_cholesky_kernels_by_size[size] is None
+                and self._crba_cholesky_warp_kernels_by_size[size] is None
+            ):
+                continue
+            self._crba_cholesky_kernels_by_size[size] = None
+            self._crba_cholesky_warp_kernels_by_size[size] = None
+            if self._execution_plan.use_tiled_cholesky(size):
+                self._cholesky_kernels_by_size[size] = _get_cholesky_kernel(size, device_arch, self._tile_threads)
 
     def _tendon_dense_rows_per_world(self) -> int:
         """Most dense rows any world's tendons can take in one step (0 without tendon rows)."""
@@ -10244,6 +10369,28 @@ class SolverSteel(SolverBase, CouplingInterface):
             device=self.model.device,
         )
 
+    def _ordered_world_index(self, element_world) -> tuple:
+        """Per-world element lists for ``deterministic=RUN_TO_RUN`` row reservations; ``-1`` elements are left out."""
+        device = self.model.device
+        element_world = np.asarray(element_world, dtype=np.int64)
+        listed = np.flatnonzero(element_world >= 0)
+        elements = listed[np.argsort(element_world[listed], kind="stable")]
+        counts = np.bincount(element_world[listed], minlength=self._world_count)
+        start = np.concatenate(([0], np.cumsum(counts))).astype(np.int32)
+        # CUDA reservation launches: the worlds with elements, grouped by the power of two of 32 to 1024
+        # threads that covers each world's element count.
+        listed_worlds = np.flatnonzero(counts).astype(np.int32)
+        block_dims = np.clip(1 << np.ceil(np.log2(counts[listed_worlds])).astype(np.int64), 32, 1024)
+        launches = [
+            (int(block_dim), wp.array(listed_worlds[block_dims == block_dim], dtype=wp.int32, device=device))
+            for block_dim in np.unique(block_dims)
+        ]
+        return (
+            wp.array(start, dtype=wp.int32, device=device),
+            wp.array(elements.astype(np.int32), dtype=wp.int32, device=device),
+            launches,
+        )
+
     def _init_ordered_rows(self, model: Model) -> None:
         """Build the per-world element lists that order row reservations with ``deterministic=RUN_TO_RUN``."""
         device = model.device
@@ -10256,26 +10403,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         if not self._ordered_rows or self._art_to_world is None:
             return
 
-        def world_index(element_world):
-            element_world = np.asarray(element_world, dtype=np.int64)
-            listed = np.flatnonzero(element_world >= 0)
-            elements = listed[np.argsort(element_world[listed], kind="stable")]
-            counts = np.bincount(element_world[listed], minlength=self._world_count)
-            start = np.concatenate(([0], np.cumsum(counts))).astype(np.int32)
-            # CUDA reservation launches: the worlds with elements, grouped by the power of two of 32 to 1024
-            # threads that covers each world's element count.
-            listed_worlds = np.flatnonzero(counts).astype(np.int32)
-            block_dims = np.clip(1 << np.ceil(np.log2(counts[listed_worlds])).astype(np.int64), 32, 1024)
-            launches = [
-                (int(block_dim), wp.array(listed_worlds[block_dims == block_dim], dtype=wp.int32, device=device))
-                for block_dim in np.unique(block_dims)
-            ]
-            return (
-                wp.array(start, dtype=wp.int32, device=device),
-                wp.array(elements.astype(np.int32), dtype=wp.int32, device=device),
-                launches,
-            )
-
+        world_index = self._ordered_world_index
         art_world = self._art_to_world.numpy()
         self._articulation_world_index = world_index(art_world)
         cursor_size = max(len(art_world), self._mimic_count, self._connect_count, self._tendon_count, 1)

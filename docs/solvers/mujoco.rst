@@ -735,7 +735,10 @@ created near a bound, as set by ``tendon_limit_activation_gap``. Steel requires 
 tendon to move the DOFs of a single articulation and enforces limits rigidly: it does not
 model ``solref``/``solimp`` softening, force-space limit gains, the limit ``margin``,
 actuator activation dynamics, or tendon equality constraints. It does not simulate the
-routed tendons of :meth:`~newton.ModelBuilder.add_tendon`.
+routed tendons of :meth:`~newton.ModelBuilder.add_tendon`. After
+``notify_model_changed(TENDON_PROPERTIES)`` it picks up new values, including a stiffness,
+damping, armature or actuator switched on from zero; an edit that adds or removes limit or
+friction-loss rows raises :class:`NotImplementedError` and needs a new solver.
 
 For force-based limit gains, set ``model.mujoco.tendon_limit_ke`` (stiffness
 [N/m]) and ``tendon_limit_kd`` (damping [N s/m]), select force-space authoring
