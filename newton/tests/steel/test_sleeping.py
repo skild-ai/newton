@@ -1537,8 +1537,8 @@ class TestSteelSleepingProduction(unittest.TestCase):
     pass
 
 
-def test_replicated_stacks_sleep_with_deterministic_contacts(test, device):
-    """Let resting stacks in 16 worlds fall asleep with the default thresholds and a deterministic contact order."""
+def test_replicated_stacks_sleep(test, device):
+    """Let resting stacks in 16 worlds fall asleep with the default thresholds and either contact order."""
     tower = newton.ModelBuilder()
     for k in range(4):
         for i in range(5):
@@ -1547,17 +1547,19 @@ def test_replicated_stacks_sleep_with_deterministic_contacts(test, device):
     builder = newton.ModelBuilder()
     builder.add_ground_plane()
     builder.replicate(tower, 16, spacing=(2.0, 2.0, 0.0))
-    model = builder.finalize(device=device)
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
-    solver = SolverSteel(model, enable_sleeping=True)
-    observables = solver.observables({SolverSteel.ObservableKind.BODY_AWAKE})
-    contacts = pipeline.contacts()
-    states, control = [model.state(), model.state()], model.control()
-    for _ in range(480):
-        pipeline.collide(states[0], contacts)
-        solver.step(states[0], states[1], control, contacts, 1.0 / 240.0, observables=observables)
-        states.reverse()
-    test.assertEqual(int(observables.body_awake.numpy().sum()), 0)
+    for deterministic in (False, True):
+        with test.subTest(deterministic=deterministic):
+            model = builder.finalize(device=device)
+            pipeline = newton.CollisionPipeline(model, deterministic=deterministic)
+            solver = SolverSteel(model, enable_sleeping=True)
+            observables = solver.observables({SolverSteel.ObservableKind.BODY_AWAKE})
+            contacts = pipeline.contacts()
+            states, control = [model.state(), model.state()], model.control()
+            for _ in range(480):
+                pipeline.collide(states[0], contacts)
+                solver.step(states[0], states[1], control, contacts, 1.0 / 240.0, observables=observables)
+                states.reverse()
+            test.assertEqual(int(observables.body_awake.numpy().sum()), 0)
 
 
 for _name in (
@@ -1584,7 +1586,7 @@ for _name in (
     "test_solver_body_attribute_notification_wakes_its_island",
     "test_mimic_articulation_stays_awake",
     "test_stiffness_without_a_spring_lets_articulations_sleep",
-    "test_replicated_stacks_sleep_with_deterministic_contacts",
+    "test_replicated_stacks_sleep",
 ):
     add_function_test(TestSteelSleepingProduction, _name, globals()[_name], devices=devices)
 

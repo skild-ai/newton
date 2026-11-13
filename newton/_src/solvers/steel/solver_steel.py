@@ -2054,7 +2054,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         contact_compliance: bool = False,
         enable_sleeping: bool = False,
         sleep_linear_threshold: float = 0.05,
-        sleep_angular_threshold: float = 0.15,
+        sleep_angular_threshold: float = 0.3,
         sleep_quiet_time: float = 0.5,
         sleep_skip_constraints: bool = True,
         articulated_contact_response: Literal["immediate", "propagation"] = "immediate",

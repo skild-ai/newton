@@ -1,1 +1,0 @@
-Add `SolverSteel` sleeping guidance for resting stacks that stay awake with the default contact order: a deterministic `CollisionPipeline` may reduce their residual motion, and a larger `sleep_angular_threshold` lets them sleep with more of it.
