@@ -2511,13 +2511,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 shapes (other notifications and changes to static or kinematic owners wake
                 every island). Driven articulations (nonzero drive gains) and articulations with
                 passive springs (nonzero :attr:`~newton.Model.joint_stiffness` on a PRISMATIC,
-                REVOLUTE or D6 tree joint) stay awake. Sleeping checks body speeds at the end of
-                each step. With the default collision pipeline the contact order depends on GPU
-                scheduling, and the residual motion this leaves in a resting stack can keep it from
-                meeting ``sleep_quiet_time``. A deterministic contact order
-                (``CollisionPipeline(deterministic=True)``, see :ref:`Deterministic Contacts`) may
-                reduce that motion; when angular motion is the limiting condition, a larger
-                ``sleep_angular_threshold`` lets islands sleep with more residual motion.
+                REVOLUTE or D6 tree joint) stay awake. For resting stacks that stay awake with the
+                default contact order, see :ref:`Tuning Solver Reference`.
                 Sleeping is configured at construction; rebuild captured graphs to change it. Construction raises :class:`ValueError` with ``contact_warmstart``
                 or ``velocity_iterations``, or for a model without articulations, and
                 :class:`NotImplementedError` with ``articulated_contact_response="propagation"`` and
