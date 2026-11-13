@@ -188,39 +188,45 @@ def _wrap_inside(end: wp.vec4, radius: float) -> tuple[float, wp.vec2, wp.vec2]:
     if cos_g > 1.0 - _WRAP_MINVAL:
         return 0.0, pnt, pnt
     G = wp.acos(cos_g)
-    z = float(1.0 - 1.0e-7)
-    f = wp.asin(A * z) + wp.asin(B * z) - 2.0 * wp.asin(z) + G
+    # Newton on phi = asin(z) from z = 1 (mujoco_warp 3.17): iterating on z from 1 - 1e-7 fails in float32.
+    phi = float(0.5 * wp.pi)
+    z = float(1.0)
+    asin_az = wp.asin(A)
+    asin_bz = wp.asin(B)
+    f = asin_az + asin_bz - wp.pi + G
     if f > 0.0:
         return 0.0, pnt, pnt
     it = int(0)
-    converged = bool(True)
     while it < 20 and wp.abs(f) > 1.0e-6:
         sq_z = z * z
         df = (
-            A / wp.max(_WRAP_MINVAL, wp.sqrt(1.0 - sq_z * A * A))
-            + B / wp.max(_WRAP_MINVAL, wp.sqrt(1.0 - sq_z * B * B))
-            - 2.0 / wp.max(_WRAP_MINVAL, wp.sqrt(1.0 - sq_z))
+            wp.cos(phi)
+            * (
+                A / wp.max(_WRAP_MINVAL, wp.sqrt(1.0 - sq_z * A * A))
+                + B / wp.max(_WRAP_MINVAL, wp.sqrt(1.0 - sq_z * B * B))
+            )
+            - 2.0
         )
         if df > -_WRAP_MINVAL:
-            converged = False
-            break
-        z1 = z - _safe_div(f, df)
-        if z1 > z:
-            converged = False
-            break
-        z = z1
-        f = wp.asin(A * z) + wp.asin(B * z) - 2.0 * wp.asin(z) + G
+            return 0.0, pnt, pnt
+        phi1 = phi - _safe_div(f, df)
+        if phi1 > phi:
+            return 0.0, pnt, pnt
+        phi = phi1
+        z = wp.sin(phi)
+        asin_az = wp.asin(A * z)
+        asin_bz = wp.asin(B * z)
+        f = asin_az + asin_bz - 2.0 * phi + G
         if f > 1.0e-6:
-            converged = False
-            break
+            return 0.0, pnt, pnt
         it += 1
-    if not converged or it >= 20:
+    if it >= 20:
         return 0.0, pnt, pnt
     vec = end1
-    ang = wp.asin(z) - wp.asin(B * z)
+    ang = phi - asin_bz
     if end[0] * end[3] - end[1] * end[2] > 0.0:
         vec = end0
-        ang = wp.asin(z) - wp.asin(A * z)
+        ang = phi - asin_az
     vec = _normalized(vec)
     pnt = wp.vec2(
         radius * (wp.cos(ang) * vec[0] - wp.sin(ang) * vec[1]),

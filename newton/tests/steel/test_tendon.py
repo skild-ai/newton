@@ -544,6 +544,27 @@ def test_tendon_actuator_force_range_caps_the_summed_force(test, device):
             test.assertAlmostEqual(run.qd("m"), 1.5 * steps * dt, delta=1.0e-5)
 
 
+def test_tendon_inside_sphere_wrap_matches_mujoco(test, device):
+    """A span wrapping a sphere whose side site is inside it matches MuJoCo's length and varies continuously.
+
+    The reference lengths are MuJoCo 3.17's ten_length for these points (unit sphere at the origin, side site at
+    its center); the iteration on z from 1 - 1e-7 failed in float32 here and fell back to the midpoint (4.788 m).
+    """
+    a = (-1.7458, -0.1959, 3.3557)
+    cases = {(-0.0199, -1.1801, -0.9182): 4.714231404, (-0.0199, -1.1801, -0.9192): 4.715135496}
+    for b, expected in cases.items():
+        mjcf = f"""<mujoco>{_HEAD}<worldbody><geom name="ball" type="sphere" size="1"/><site name="side" pos="0 0 0"/>
+          <site name="b" pos="{b[0]} {b[1]} {b[2]}"/>
+          <body name="m" pos="{a[0]} {a[1]} {a[2]}"><joint name="m" type="slide" axis="1 0 0"/>
+          <geom type="box" size="0.05 0.05 0.05" mass="1"/><site name="a" pos="0 0 0"/></body>
+        </worldbody><tendon><spatial><site site="a"/><geom geom="ball" sidesite="side"/><site site="b"/></spatial>
+        </tendon></mujoco>"""
+        with test.subTest(b=b):
+            run = _Run(mjcf, device, iterations=4)
+            run.step(1.0e-3, 1)
+            test.assertAlmostEqual(float(run.solver.tendon_lengths().numpy()[0]), expected, delta=2.0e-5)
+
+
 class TestSteelTendon(unittest.TestCase):
     pass
 
@@ -570,6 +591,7 @@ for _name in (
     "test_tendon_position_dampratio_is_critically_damped",
     "test_tendon_fixed_length_includes_the_joint_reference",
     "test_tendon_actuator_force_range_caps_the_summed_force",
+    "test_tendon_inside_sphere_wrap_matches_mujoco",
 ):
     add_function_test(TestSteelTendon, _name, globals()[_name], devices=get_test_devices())
 
