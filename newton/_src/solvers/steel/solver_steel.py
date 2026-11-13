@@ -1494,8 +1494,8 @@ class SolverSteel(SolverBase, CouplingInterface):
       stay stable only for roughly ``dt * sqrt(stiffness / m_eff) < 2`` per DOF.
     - Joint limits: with ``enable_joint_limits=True``, every finite
       :attr:`~newton.Model.joint_limit_lower` / :attr:`~newton.Model.joint_limit_upper` of a
-      PRISMATIC, REVOLUTE or D6 DOF is a unilateral row, and so is each non-negative
-      ``min_distance`` / ``max_distance`` of a DISTANCE joint that roots its articulation (the
+      PRISMATIC, REVOLUTE or D6 DOF is a unilateral row, and so is each positive
+      ``min_distance`` and non-negative ``max_distance`` of a DISTANCE joint that roots its articulation (the
       limits of its first DOF) on the distance between the joint's two anchors; any other DISTANCE
       joint raises :class:`NotImplementedError` when limits are enabled. Joint limits are not
       enforced by default. Joint velocity limits (:attr:`~newton.Model.joint_velocity_limit`) are
@@ -4266,8 +4266,8 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         With ``enable_joint_limits`` each finite position limit of a responding PRISMATIC, REVOLUTE or D6 DOF whose
         activation gap is ``inf`` is a row in every step, mirroring the joint-limit row builder; a bound at or beyond
-        the builder's unlimited default ``MAXVAL`` has no row. With ``enable_joint_friction`` each responding,
-        non-kinematic DOF with positive friction is one row in every step.
+        the builder's unlimited default ``MAXVAL`` has no row; so is each bound of a root DISTANCE joint. With
+        ``enable_joint_friction`` each responding, non-kinematic DOF with positive friction is one row in every step.
         """
         limit_rows = np.zeros(max(self._world_count, 1), dtype=np.int64)
         friction_rows = np.zeros_like(limit_rows)
@@ -4281,6 +4281,18 @@ class SolverSteel(SolverBase, CouplingInterface):
                 0,
             )
             self._add_articulation_rows(limit_rows, per_dof, self._joint_limit_sizes)
+        if self._distance_limit_count:
+            joints = self._distance_limit_joint.numpy()
+            dofs = model.joint_qd_start.numpy()[joints]
+            lower = model.joint_limit_lower.numpy()[dofs]
+            upper = model.joint_limit_upper.numpy()[dofs]
+            per_joint = np.where(
+                np.isinf(self._joint_limit_gap.numpy()[dofs]),
+                ((lower > 0.0) & (lower < MAXVAL)).astype(np.int64) + ((upper >= 0.0) & (upper < MAXVAL)),
+                0,
+            )
+            worlds = self._art_to_world.numpy()[model.joint_articulation.numpy()[joints]]
+            np.add.at(limit_rows, worlds, per_joint)
         if self._joint_friction_warp_kernels:
             friction = model.joint_friction.numpy()
             with np.errstate(invalid="ignore"):

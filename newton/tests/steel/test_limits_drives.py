@@ -3069,6 +3069,12 @@ _TETHER_DT = 1.0 / 480.0
 
 def _build_tether(device, *, start, lower=-1.0, upper=-1.0, velocity=(0.0, 0.0, 0.0), gravity=True):
     """Build a 1 kg weight on a root DISTANCE joint anchored at ``_TETHER_ANCHOR``; return ``(model, body)``."""
+    builder = _tether_builder(start=start, lower=lower, upper=upper, velocity=velocity, gravity=gravity)
+    return builder.finalize(device=device), 0
+
+
+def _tether_builder(*, start, lower=-1.0, upper=-1.0, velocity=(0.0, 0.0, 0.0), gravity=True):
+    """Return a builder holding a 1 kg weight on a root DISTANCE joint anchored at ``_TETHER_ANCHOR``."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81 if gravity else 0.0))
     weight = builder.add_link(
         xform=wp.transform(wp.vec3(*start), wp.quat_identity()), mass=1.0, inertia=wp.mat33(np.eye(3) * 1.0e-3)
@@ -3084,7 +3090,7 @@ def _build_tether(device, *, start, lower=-1.0, upper=-1.0, velocity=(0.0, 0.0, 
     # The builder starts a DISTANCE joint at the anchor; place the weight at ``start``.
     builder.joint_q[0:3] = list(np.array(start) - _TETHER_ANCHOR)
     builder.joint_qd[0:3] = list(velocity)
-    return builder.finalize(device=device), weight
+    return builder
 
 
 def _tether_distances(model, body, steps, *, capture=False, **solver_kwargs):
@@ -3226,6 +3232,59 @@ def test_captured_distance_joint_limit_matches_eager_steps(test, device):
     np.testing.assert_allclose(captured, eager[1::2], atol=1.0e-6)
 
 
+def test_zero_min_distance_is_no_bound(test, device):
+    """Let a weight pass through the anchor with ``min_distance=0``, as with no lower bound."""
+    distances = {}
+    for lower in (0.0, -1.0):
+        model, body = _build_tether(
+            device, start=(0.1, 0.0, 1.0), lower=lower, velocity=(-1.0, 0.0, 0.0), gravity=False
+        )
+        distances[lower] = _tether_distances(model, body, 120, enable_joint_limits=True)
+    np.testing.assert_array_equal(distances[0.0], distances[-1.0])
+    test.assertAlmostEqual(distances[0.0][-1], 120 * _TETHER_DT - 0.1, delta=1.0e-4)
+
+
+def test_distance_rows_count_toward_the_capacity_warning(test, device):
+    """Warn at construction when a bounded DISTANCE joint's rows alone exceed ``articulation_constraint_max``."""
+    model, _ = _build_tether(device, start=(0.3, 0.0, 1.0), lower=0.1, upper=0.5)
+    with test.assertWarnsRegex(newton.exceptions.NewtonWarning, r"need at least 2 dense rows"):
+        SolverSteel(
+            model, enable_joint_limits=True, joint_limit_activation_gap=float("inf"), articulation_constraint_max=1
+        )
+
+
+def test_multi_world_distance_limits_match_single_worlds(test, device):
+    """Match each world of a mixed batch to its own single-world run, bitwise across two ``RUN_TO_RUN`` runs."""
+    worlds = [
+        {"start": (0.3, 0.0, 0.9), "upper": 0.4},
+        {"start": (0.3, 0.0, 1.0), "lower": 0.2, "velocity": (-1.0, 0.0, 0.0)},
+        {"start": (0.4, 0.0, 1.0), "lower": 0.4, "upper": 0.4},
+        {"start": (0.3, 0.0, 0.9)},
+    ]
+    options = {"enable_joint_limits": True, "deterministic": wp.DeterministicMode.RUN_TO_RUN}
+    scene = newton.ModelBuilder()
+    for world in worlds:
+        scene.add_world(_tether_builder(**world))
+    model = scene.finalize(device=device)
+
+    def run():
+        solver = SolverSteel(model, **options)
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        for _ in range(120):
+            solver.step(state_0, state_1, control, None, _TETHER_DT)
+            state_0, state_1 = state_1, state_0
+        return state_0.body_q.numpy()
+
+    batched = run()
+    np.testing.assert_array_equal(run(), batched)
+    for i, world in enumerate(worlds):
+        with test.subTest(world=i):
+            single, body = _build_tether(device, **world)
+            expected = _tether_distances(single, body, 120, **options)[-1]
+            test.assertAlmostEqual(float(np.linalg.norm(batched[i, :3] - _TETHER_ANCHOR)), expected, delta=1.0e-6)
+
+
 class TestSteelDistanceJointLimits(unittest.TestCase):
     """DISTANCE joint ``min_distance`` / ``max_distance`` as joint-limit rows on the anchor distance."""
 
@@ -3237,6 +3296,9 @@ for _name, _func in (
     ("test_distance_joint_below_a_link_is_rejected", test_distance_joint_below_a_link_is_rejected),
     ("test_distance_joint_bounds_are_read_every_step", test_distance_joint_bounds_are_read_every_step),
     ("test_distance_row_is_the_anchor_distance_rate", test_distance_row_is_the_anchor_distance_rate),
+    ("test_zero_min_distance_is_no_bound", test_zero_min_distance_is_no_bound),
+    ("test_distance_rows_count_toward_the_capacity_warning", test_distance_rows_count_toward_the_capacity_warning),
+    ("test_multi_world_distance_limits_match_single_worlds", test_multi_world_distance_limits_match_single_worlds),
 ):
     add_function_test(TestSteelDistanceJointLimits, _name, _func, devices=get_test_devices())
 add_function_test(

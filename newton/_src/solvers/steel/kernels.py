@@ -8521,7 +8521,8 @@ def build_distance_limit_rows(
 ):
     """Allocate and fill the anchor-distance limit rows of the root DISTANCE joint of one articulation per thread.
 
-    A bound is active when it is non-negative and below ``MAXVAL``, the builder's convention. The distance is
+    A lower bound is active when positive and an upper bound when non-negative, both below ``MAXVAL``, as in
+    :class:`~newton.solvers.SolverXPBD`; a zero minimum distance is no bound. The distance is
     ``|p|``, the child anchor's position in the parent anchor frame (the joint's linear coordinates). With the
     joint velocity ``(v, w)`` of the child COM in that frame, its rate is ``n . v + (r x n) . w`` for ``n = p / |p|``
     and ``r = p - p_com``, so each row spans only the joint's own six DOFs.
@@ -8537,7 +8538,7 @@ def build_distance_limit_rows(
         dof = joint_qd_start[joint]
         lower = joint_limit_lower[dof]
         upper = joint_limit_upper[dof]
-        has_lower = lower >= 0.0 and lower < MAXVAL
+        has_lower = lower > 0.0 and lower < MAXVAL
         has_upper = upper >= 0.0 and upper < MAXVAL
         if not has_lower and not has_upper:
             continue
