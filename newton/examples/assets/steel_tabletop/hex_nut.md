@@ -5,5 +5,9 @@ Skild AI team with an in-house generator. The USD holds the visual thread
 surface, convex collision pieces that keep the open bore, and the authored mass
 properties.
 
-Copyright 2026 Skild AI. Created by the Skild AI team and contributed under
-Apache-2.0.
+The creator confirmed in skild-ai/newton#27 that the asset is Skild AI's and
+that no third-party models, textures, fonts or reference geometry were used.
+
+SPDX-FileCopyrightText: Copyright (c) 2026 Skild AI
+
+SPDX-License-Identifier: Apache-2.0
