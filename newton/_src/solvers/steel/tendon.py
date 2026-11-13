@@ -424,6 +424,7 @@ def evaluate_tendon(
     tendon_wrap_shape: wp.array[int],
     tendon_wrap_sidesite: wp.array[int],
     tendon_wrap_prm: wp.array[float],
+    tendon_length_offset: wp.array[float],
     joint_q_start: wp.array[int],
     joint_qd_start: wp.array[int],
     shape_body: wp.array[int],
@@ -445,6 +446,8 @@ def evaluate_tendon(
     length = float(0.0)
     rate = float(0.0)
     if tendon_type[tendon] == TENDON_TYPE_FIXED:
+        # joint_q is MuJoCo's qpos minus the joint reference, so the offset sum(c * ref) restores MuJoCo's length.
+        length = tendon_length_offset[tendon]
         adr = tendon_joint_adr[tendon]
         for e in range(adr, adr + tendon_joint_num[tendon]):
             joint = tendon_joint[e]
@@ -524,6 +527,28 @@ def evaluate_tendon(
 
 
 @wp.kernel
+def fixed_tendon_length_offsets(
+    tendon_type: wp.array[int],
+    tendon_joint_adr: wp.array[int],
+    tendon_joint_num: wp.array[int],
+    tendon_joint: wp.array[int],
+    tendon_coef: wp.array[float],
+    joint_qd_start: wp.array[int],
+    dof_ref: wp.array[float],
+    # outputs
+    tendon_length_offset: wp.array[float],
+):
+    """Each fixed tendon's length at zero joint coordinates, ``sum(c * ref)`` [m or rad]; 0 for spatial tendons."""
+    k = wp.tid()
+    offset = float(0.0)
+    if tendon_type[k] == TENDON_TYPE_FIXED:
+        adr = tendon_joint_adr[k]
+        for e in range(adr, adr + tendon_joint_num[k]):
+            offset += tendon_coef[e] * dof_ref[joint_qd_start[tendon_joint[e]]]
+    tendon_length_offset[k] = offset
+
+
+@wp.kernel
 def eval_tendon_lengths(
     tendon_index: wp.array[int],
     tendon_type: wp.array[int],
@@ -537,6 +562,7 @@ def eval_tendon_lengths(
     tendon_wrap_shape: wp.array[int],
     tendon_wrap_sidesite: wp.array[int],
     tendon_wrap_prm: wp.array[float],
+    tendon_length_offset: wp.array[float],
     joint_q_start: wp.array[int],
     joint_qd_start: wp.array[int],
     shape_body: wp.array[int],
@@ -559,7 +585,7 @@ def eval_tendon_lengths(
     length, _rate = evaluate_tendon(
         ctx, tendon, tendon_type, tendon_joint_adr, tendon_joint_num, tendon_joint, tendon_coef,
         tendon_wrap_adr, tendon_wrap_num, tendon_wrap_type, tendon_wrap_shape, tendon_wrap_sidesite,
-        tendon_wrap_prm, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type, shape_scale,
+        tendon_wrap_prm, tendon_length_offset, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type, shape_scale,
         body_com, no_int, no_int, no_int, no_S, joint_q, body_q, no_S, joint_q, no_J,
     )  # fmt: skip
     tendon_length[tendon] = length
@@ -618,6 +644,7 @@ def gate_tendon_limit_rows(
     tendon_wrap_shape: wp.array[int],
     tendon_wrap_sidesite: wp.array[int],
     tendon_wrap_prm: wp.array[float],
+    tendon_length_offset: wp.array[float],
     joint_q_start: wp.array[int],
     joint_qd_start: wp.array[int],
     shape_body: wp.array[int],
@@ -656,7 +683,7 @@ def gate_tendon_limit_rows(
     length, speed = evaluate_tendon(
         ctx, k, tendon_type, tendon_joint_adr, tendon_joint_num, tendon_joint, tendon_coef,
         tendon_wrap_adr, tendon_wrap_num, tendon_wrap_type, tendon_wrap_shape, tendon_wrap_sidesite,
-        tendon_wrap_prm, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type, shape_scale,
+        tendon_wrap_prm, tendon_length_offset, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type, shape_scale,
         body_com, body_to_articulation, body_to_joint, joint_ancestor, joint_S_s, joint_q, body_q, body_qd,
         v_hat, no_J,
     )  # fmt: skip
@@ -681,6 +708,7 @@ def gate_fixed_tendon_limit_rows(
     tendon_joint_num: wp.array[int],
     tendon_joint: wp.array[int],
     tendon_coef: wp.array[float],
+    tendon_length_offset: wp.array[float],
     joint_q_start: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_q: wp.array[float],
@@ -690,9 +718,9 @@ def gate_fixed_tendon_limit_rows(
     step_rows: wp.array[int],
     tendon_length: wp.array[float],
 ):
-    """:func:`gate_tendon_limit_rows` for fixed tendons: ``L = sum c q`` and ``dL/dt = sum c v_hat``."""
+    """:func:`gate_tendon_limit_rows` for fixed tendons: ``L = sum c (q + ref)`` and ``dL/dt = sum c v_hat``."""
     k = tendon_list[wp.tid()]
-    length = float(0.0)
+    length = tendon_length_offset[k]
     speed = float(0.0)
     adr = tendon_joint_adr[k]
     for e in range(adr, adr + tendon_joint_num[k]):
@@ -814,6 +842,7 @@ def populate_tendon_rows_for_size(
     tendon_wrap_shape: wp.array[int],
     tendon_wrap_sidesite: wp.array[int],
     tendon_wrap_prm: wp.array[float],
+    tendon_length_offset: wp.array[float],
     tendon_range: wp.array[wp.vec2],
     tendon_frictionloss: wp.array[float],
     joint_q_start: wp.array[int],
@@ -866,7 +895,7 @@ def populate_tendon_rows_for_size(
     length, rate = evaluate_tendon(
         ctx, k, tendon_type, tendon_joint_adr, tendon_joint_num, tendon_joint, tendon_coef,
         tendon_wrap_adr, tendon_wrap_num, tendon_wrap_type, tendon_wrap_shape, tendon_wrap_sidesite,
-        tendon_wrap_prm, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type, shape_scale,
+        tendon_wrap_prm, tendon_length_offset, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type, shape_scale,
         body_com, body_to_articulation, body_to_joint, joint_ancestor, joint_S_s, joint_q, body_q, body_qd,
         joint_q, J_group,
     )  # fmt: skip
@@ -930,6 +959,7 @@ def apply_tendon_mass_terms_for_size(
     tendon_wrap_shape: wp.array[int],
     tendon_wrap_sidesite: wp.array[int],
     tendon_wrap_prm: wp.array[float],
+    tendon_length_offset: wp.array[float],
     joint_q_start: wp.array[int],
     joint_qd_start: wp.array[int],
     shape_body: wp.array[int],
@@ -998,6 +1028,7 @@ def apply_tendon_mass_terms_for_size(
     jqd = float(0.0)
     jqd_prev = float(0.0)
     if fixed:
+        length = tendon_length_offset[k]
         for e in range(j_adr, j_end):
             joint = tendon_joint[e]
             coef = tendon_coef[e]
@@ -1009,7 +1040,7 @@ def apply_tendon_mass_terms_for_size(
         length, rate = evaluate_tendon(
             ctx, k, tendon_type, tendon_joint_adr, tendon_joint_num, tendon_joint, tendon_coef,
             tendon_wrap_adr, tendon_wrap_num, tendon_wrap_type, tendon_wrap_shape, tendon_wrap_sidesite,
-            tendon_wrap_prm, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type, shape_scale,
+            tendon_wrap_prm, tendon_length_offset, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type, shape_scale,
             body_com, body_to_articulation, body_to_joint, joint_ancestor, joint_S_s, joint_q, body_q, body_qd,
             joint_q, J_scratch,
         )  # fmt: skip
@@ -1299,6 +1330,8 @@ class TendonPlan:
         device = model.device
         if active.size or length_only.size:
             plan.length = wp.zeros(n, dtype=float, device=device)
+            plan.length_offset = wp.zeros(n, dtype=float, device=device)
+            plan.refresh_length_offset(model)
         if length_only.size:
             plan.length_index = wp.array(length_only.astype(np.int32), dtype=wp.int32, device=device)
         if active.size == 0:
@@ -1364,6 +1397,27 @@ class TendonPlan:
             plan.mass_J_prev = wp.zeros((rows_scratch, max_size), dtype=float, device=device)
             plan.mass_has_prev = wp.zeros(n, dtype=wp.int32, device=device)
         return plan
+
+    def refresh_length_offset(self, model) -> None:
+        """Re-read each fixed tendon's ``sum(c * ref)`` [m or rad] from ``mujoco:dof_ref`` on the device.
+
+        MuJoCo's fixed tendon length is ``sum(c * qpos)``, and Newton's :attr:`~newton.State.joint_q` is
+        ``qpos - ref`` after MJCF import, so the joint references enter the length as a constant offset.
+        """
+        if self.length is None:
+            return
+        ref = getattr(getattr(model, "mujoco", None), "dof_ref", None)
+        if ref is None or ref.shape[0] == 0:
+            self.length_offset.zero_()
+            return
+        inputs = self.model_inputs(model)
+        wp.launch(
+            fixed_tendon_length_offsets,
+            dim=self.length_offset.shape[0],
+            inputs=[inputs[0], *inputs[1:5], model.joint_qd_start, ref],
+            outputs=[self.length_offset],
+            device=model.device,
+        )
 
     def limited_np(self) -> np.ndarray:
         """Mask of the enforced tendons with range-limit rows."""
@@ -1549,6 +1603,7 @@ class TendonPlan:
             arr("tendon_wrap_shape", wp.int32),
             arr("tendon_wrap_sidesite", wp.int32),
             arr("tendon_wrap_prm", wp.float32),
+            self.length_offset,
         ]
 
     def eval_lengths(self, model, joint_q: wp.array, body_q: wp.array, tendon_index: wp.array) -> None:

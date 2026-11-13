@@ -485,6 +485,25 @@ def test_tendon_armature_history_restarts_on_reset(test, device):
             test.assertAlmostEqual(run.q("m"), fresh.q("m"), delta=1.0e-6)
 
 
+def test_tendon_fixed_length_includes_the_joint_reference(test, device):
+    """A fixed tendon's length is sum(c * qpos) with qpos = joint_q + ref, as MuJoCo's ten_length."""
+    ref, k, dt = 0.2, 100.0, 1.0e-3
+    mjcf = f"""<mujoco>{_HEAD}<worldbody><body name="frame"><geom type="sphere" size="0.02" mass="0.1"/>
+      <body name="m" pos="0 0 1"><joint name="m" type="slide" axis="1 0 0" ref="{ref}"/>
+      <geom type="box" size="0.05 0.05 0.05" mass="1"/></body></body>
+    </worldbody><tendon><fixed stiffness="{k}" springlength="0"><joint joint="m" coef="1"/></fixed>
+      <fixed limited="true" range="0.25 1"><joint joint="m" coef="1"/></fixed></tendon></mujoco>"""
+    for mode in _MODES:
+        with test.subTest(solve_mode=mode):
+            run = _Run(mjcf, device, solve_mode=mode, iterations=16)
+            run.step(dt, 1)
+            np.testing.assert_allclose(run.solver.tendon_lengths().numpy(), [ref, ref], atol=1.0e-6)
+            # The spring pulls the length -k ref; the lower limit at 0.25 pushes back harder, so the slider moves
+            # +0.05 m to it. With the ref dropped, the spring is relaxed and the limit sits 0.25 m away.
+            run.step(dt, 300)
+            test.assertAlmostEqual(run.q("m") + ref, 0.25, delta=2.0e-3)
+
+
 class TestSteelTendon(unittest.TestCase):
     pass
 
@@ -508,6 +527,7 @@ for _name in (
     "test_tendon_friction_follows_an_upper_only_limit_row",
     "test_tendon_spring_is_slack_inside_its_dead_band",
     "test_tendon_armature_history_restarts_on_reset",
+    "test_tendon_fixed_length_includes_the_joint_reference",
 ):
     add_function_test(TestSteelTendon, _name, globals()[_name], devices=get_test_devices())
 

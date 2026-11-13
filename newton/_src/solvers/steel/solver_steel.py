@@ -3645,6 +3645,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._mass_update_requested.fill_(1)
         if flags & (ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES):
             self._refresh_passive_spring_rest_q()
+            # Fixed tendon lengths add sum(c * ref) for the joint references (mujoco:dof_ref).
+            self._tendon.refresh_length_offset(self.model)
         if flags & ModelFlags.SHAPE_PROPERTIES:
             self._refresh_shape_materials()
         if flags & ModelFlags.JOINT_PROPERTIES:
@@ -5067,6 +5069,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     joint_num,
                     tendon_joint,
                     tendon_coef,
+                    tendon.length_offset,
                     model.joint_q_start,
                     model.joint_qd_start,
                     state_in.joint_q,
