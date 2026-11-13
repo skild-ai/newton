@@ -308,7 +308,7 @@ repository examples spend tuning effort, not a shared solver API.
        ``mu_torsional`` times the normal load) or 6 (also rolling, bounded by
        ``mu_rolling`` times the normal load), under every
        ``articulated_contact_response``. The MJCF importer fills
-       ``steel:condim`` from the geom ``condim``.
+       ``steel:condim`` from the geom ``condim`` and USD from ``mjc:condim``.
        The experimental ``contact_compliance`` option solves hydroelastic
        contacts with positive stiffness as implicit spring-dampers instead, with
        the ``"immediate"`` articulated contact response or ``solve_mode="colored"``; it

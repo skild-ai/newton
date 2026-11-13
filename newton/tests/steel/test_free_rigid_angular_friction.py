@@ -1814,28 +1814,42 @@ class TestFreeRigidAngularFrictionImport(unittest.TestCase):
         self.assertGreater(speeds[3], 0.25)
         self.assertLess(speeds[6], 1.0e-3)
 
-    def test_usd_reads_the_authored_steel_condim(self):
-        """Read ``newton:steel:condim`` from a USD shape and leave unauthored shapes at 3."""
+    def test_usd_reads_steel_condim_then_mjc_condim(self):
+        """Read ``newton:steel:condim`` over ``mjc:condim`` from USD shapes, also into ``mujoco:condim``."""
         from pxr import Sdf, Usd, UsdGeom, UsdPhysics
 
         stage = Usd.Stage.CreateInMemory()
         UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
         UsdPhysics.Scene.Define(stage, "/physicsScene")
-        for name, authored in (("ball", 6), ("plain", None)):
+        # name -> (newton:steel:condim, mjc:condim, expected steel:condim, expected mujoco:condim)
+        cases = {
+            "steel": (6, None, 6, 3),
+            "mjc6": (None, 6, 6, 6),
+            "mjc4": (None, 4, 4, 4),
+            "mjc1": (None, 1, 3, 1),
+            "both": (4, 6, 4, 6),
+            "plain": (None, None, 3, 3),
+        }
+        for name, (steel, mjc, _, _) in cases.items():
             xform = UsdGeom.Xform.Define(stage, f"/{name}")
             UsdPhysics.RigidBodyAPI.Apply(xform.GetPrim())
             sphere = UsdGeom.Sphere.Define(stage, f"/{name}/geom")
             UsdPhysics.CollisionAPI.Apply(sphere.GetPrim())
-            if authored is not None:
-                sphere.GetPrim().CreateAttribute("newton:steel:condim", Sdf.ValueTypeNames.Int).Set(authored)
+            for attr, value in (("newton:steel:condim", steel), ("mjc:condim", mjc)):
+                if value is not None:
+                    sphere.GetPrim().CreateAttribute(attr, Sdf.ValueTypeNames.Int).Set(value)
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
         SolverSteel.register_custom_attributes(builder)
+        newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
         builder.add_usd(stage)
         model = builder.finalize(device="cpu")
         labels = list(model.shape_label)
-        condim = model.steel.condim.numpy()
-        self.assertEqual(int(condim[next(i for i, label in enumerate(labels) if label.startswith("/ball"))]), 6)
-        self.assertEqual(int(condim[next(i for i, label in enumerate(labels) if label.startswith("/plain"))]), 3)
+        steel_condim, mujoco_condim = model.steel.condim.numpy(), model.mujoco.condim.numpy()
+        for name, (_, _, steel, mujoco) in cases.items():
+            with self.subTest(name=name):
+                shape = next(i for i, label in enumerate(labels) if label.startswith(f"/{name}/"))
+                self.assertEqual(int(steel_condim[shape]), steel)
+                self.assertEqual(int(mujoco_condim[shape]), mujoco)
 
 
 if __name__ == "__main__":

@@ -1816,18 +1816,19 @@ class SolverSteel(SolverBase, CouplingInterface):
           :attr:`~newton.Model.shape_material_mu_rolling` [m] to a rolling pair. A contact takes the
           larger coefficient of its two shapes, regardless of the other shape's condim. Only contacts
           between free bodies, and free bodies on static or kinematic geometry, read it, so a condim
-          above 3 on other shapes adds no rows. USD reads it only from an explicitly authored
-          ``newton:steel:condim``. The MJCF importer reads the geom's ``condim``, which also fills
-          :class:`~newton.solvers.SolverMuJoCo`'s ``mujoco:condim``; MJCF condim 1 (frictionless in MuJoCo)
-          imports as 3, since this attribute only adds angular rows and sliding friction follows ``mu``.
-          Under friction patches, contacts
-          share a patch only if their angular coefficients match. A contact with angular rows takes up
-          to 6 free-body rows instead of 3; raise ``free_body_constraint_max`` if
-          :attr:`constraint_overflow` reports dropped rows. The solver reads ``steel:condim`` at
-          construction and, on a solver built with the rows, at :meth:`notify_model_changed` with
-          ``SHAPE_PROPERTIES``; a solver built without any condim above 3 ignores the attribute and must be
-          rebuilt to gain the rows. A negative or non-finite coefficient that a shape's condim enables
-          raises :class:`ValueError` at the same points.
+          above 3 on other shapes adds no rows. The MJCF importer reads the geom's ``condim`` and USD reads
+          ``mjc:condim``, the inputs of :class:`~newton.solvers.SolverMuJoCo`'s ``mujoco:condim``; an authored
+          USD ``newton:steel:condim`` takes precedence. Condim 1 imports as 3, since this attribute only adds
+          angular rows and sliding friction follows ``mu``. The solvers still differ: condim 1 is frictionless
+          in MuJoCo, and MuJoCo combines the two geoms' condim and friction before gating, while each shape's
+          condim here gates its own coefficient. Under friction patches, contacts share a patch only if
+          their angular coefficients match. A contact with angular rows takes up to 6 free-body rows
+          instead of 3; raise ``free_body_constraint_max`` if :attr:`constraint_overflow` reports dropped
+          rows. The solver reads ``steel:condim`` at construction and, on a solver built with the rows, at
+          :meth:`notify_model_changed` with ``SHAPE_PROPERTIES``; a solver built without a condim above 3
+          on a shape that a free-body contact can touch ignores the attribute and must be rebuilt to gain
+          the rows. A negative or non-finite coefficient that a shape's condim enables raises
+          :class:`ValueError` at the same points.
 
         One experimental per-shape attribute makes contacts adhesive:
 
@@ -1967,6 +1968,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 assignment=Model.AttributeAssignment.MODEL,
                 dtype=wp.int32,
                 default=3,
+                usd_attribute_name="*",
+                usd_value_transformer=_usd_condim,
                 mjcf_attribute_name="condim",
                 mjcf_value_transformer=_mjcf_condim,
                 urdf_attribute_name="steel:condim",
@@ -25105,3 +25108,14 @@ def _mjcf_condim(value: str, context: dict | None) -> int | None:
     """Convert an MJCF geom ``condim`` to ``steel:condim``; condim 1 keeps the default 3."""
     condim = int(value)
     return None if condim == 1 else condim
+
+
+def _usd_condim(_value, context: dict) -> int | None:
+    """Read ``newton:steel:condim``, else ``mjc:condim``, from a USD shape; condim 1 keeps the default 3."""
+    prim = context["prim"]
+    for name in ("newton:steel:condim", "mjc:condim"):
+        attr = prim.GetAttribute(name)
+        if attr and attr.HasAuthoredValue():
+            condim = int(attr.Get())
+            return None if condim == 1 and name == "mjc:condim" else condim
+    return None
