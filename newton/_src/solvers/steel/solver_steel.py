@@ -4550,6 +4550,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         self._tendon_count = self._tendon.count
         self._tendon.resolve_spring_lengths(model)
+        self._tendon.resolve_dampratio(model)
         if self._tendon.has_rows:
             gap = np.full(self._tendon_count, self._tendon_limit_gap_base, dtype=np.float64)
             if self._tendon_limit_activation_speed_scale > 0.0:

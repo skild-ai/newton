@@ -591,6 +591,56 @@ def eval_tendon_lengths(
     tendon_length[tendon] = length
 
 
+@wp.kernel
+def eval_tendon_rates(
+    tendon_index: wp.array[int],
+    tendon_type: wp.array[int],
+    tendon_joint_adr: wp.array[int],
+    tendon_joint_num: wp.array[int],
+    tendon_joint: wp.array[int],
+    tendon_coef: wp.array[float],
+    tendon_wrap_adr: wp.array[int],
+    tendon_wrap_num: wp.array[int],
+    tendon_wrap_type: wp.array[int],
+    tendon_wrap_shape: wp.array[int],
+    tendon_wrap_sidesite: wp.array[int],
+    tendon_wrap_prm: wp.array[float],
+    tendon_length_offset: wp.array[float],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    shape_body: wp.array[int],
+    shape_transform: wp.array[wp.transform],
+    shape_type: wp.array[int],
+    shape_scale: wp.array[wp.vec3],
+    body_com: wp.array[wp.vec3],
+    body_world: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    no_int: wp.array[int],
+    no_S: wp.array[wp.spatial_vector],
+    no_J: wp.array3d[float],
+    # outputs
+    tendon_rate: wp.array[float],
+):
+    """Evaluate the listed tendons' rates ``dL/dt`` from the joint velocities and the body twists FK derived from them.
+
+    Spatial spans read every end's point velocity from ``body_qd`` (no articulation matches ``art = -2``).
+    """
+    i = wp.tid()
+    ctx = TendonRowContext()
+    ctx.accumulate = 2
+    ctx.art = -2
+    _length, rate = evaluate_tendon(
+        ctx, tendon_index[i], tendon_type, tendon_joint_adr, tendon_joint_num, tendon_joint, tendon_coef,
+        tendon_wrap_adr, tendon_wrap_num, tendon_wrap_type, tendon_wrap_shape, tendon_wrap_sidesite,
+        tendon_wrap_prm, tendon_length_offset, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type,
+        shape_scale, body_com, body_world, no_int, no_int, no_S, joint_q, body_q, body_qd, joint_qd, no_J,
+    )  # fmt: skip
+    tendon_rate[i] = rate
+
+
 @wp.func
 def _gate_limit_flags(
     flags: int, length: float, speed: float, gap: float, one_side: int, speed_scale: float, dt: float, bounds: wp.vec2
@@ -1246,6 +1296,7 @@ class TendonPlan:
         self.gated = False
         self.gate_fixed_index = None
         self.gate_spatial_index = None
+        self.biasprm = None
 
     @classmethod
     def build(
@@ -1402,6 +1453,8 @@ class TendonPlan:
         plan.actuator_start = wp.array(actuator_start, dtype=wp.int32, device=device)
         plan.actuator_list = wp.array(np.asarray(actuator_list or [0], dtype=np.int32), dtype=wp.int32, device=device)
         plan.actuator_flags = wp.array(tendon_actuators.flags, dtype=wp.int32, device=device)
+        plan.actuator_start_np = actuator_start
+        plan.actuator_list_np = np.asarray(actuator_list, dtype=np.int32)
         autolimits_attr = getattr(mujoco, "autolimits", None)
         autolimits = bool(autolimits_attr.numpy()[0]) if autolimits_attr is not None else True
         cap_flag = host("tendon_actuator_force_limited", np.full(n, 2, dtype=np.int32))
@@ -1587,6 +1640,8 @@ class TendonPlan:
             actuators.biastype = m.actuator_biastype
             actuators.ctrlrange = m.actuator_ctrlrange
             actuators.forcerange = m.actuator_forcerange
+            if self.biasprm is not None:
+                actuators.biasprm = self.biasprm
             actuators.tendon_force_limited = self.tendon_force_limited
             actuators.tendon_force_range = getattr(m, "tendon_actuator_force_range", None)
             if actuators.tendon_force_range is None or actuators.tendon_force_range.shape[0] == 0:
@@ -1676,6 +1731,118 @@ class TendonPlan:
             outputs=[self.length],
             device=model.device,
         )
+
+    def resolve_dampratio(self, model) -> None:
+        """Resolve each tendon position actuator's ``dampratio`` (a positive ``biasprm[2]``) to a damping gain.
+
+        As MuJoCo's compiler: ``kv = dampratio * 2 sqrt(kp m)`` with the reflected inertia
+        ``m = 1 / (gear^2 J M^-1 J^T)`` at :attr:`~newton.Model.joint_q`, where ``M`` includes the joint and
+        tendon armature. The resolved gains go to a private ``biasprm`` copy; the model's arrays are unchanged.
+        """
+        self.biasprm = None
+        if not self.count or not self.actuator_count:
+            return
+        m = model.mujoco
+        bias = m.actuator_biasprm.numpy()
+        gain = m.actuator_gainprm.numpy()
+        biastype = m.actuator_biastype.numpy()
+        gear = m.actuator_gear.numpy()
+        start, actuator_list = self.actuator_start_np, self.actuator_list_np
+        resolve = []
+        for k in np.flatnonzero(self.art_np >= 0):
+            for e in range(int(start[k]), int(start[k + 1])):
+                act = int(actuator_list[e])
+                # MuJoCo reads a positive biasprm[2] on a position-like affine actuator as a dampratio.
+                if int(biastype[act]) == 1 and bias[act, 2] > 0.0 and abs(gain[act, 0] + bias[act, 1]) <= 1.0e-15:
+                    resolve.append((act, int(k)))
+        if not resolve:
+            return
+        armature_attr = getattr(m, "tendon_armature", None)
+        armature = (
+            armature_attr.numpy() if armature_attr is not None and armature_attr.shape[0] else np.zeros(self.count)
+        )
+        arts = {int(self.art_np[k]) for _, k in resolve}
+        need = sorted(
+            {k for _, k in resolve}
+            | {int(k) for k in np.flatnonzero((self.art_np >= 0) & (armature != 0.0)) if int(self.art_np[k]) in arts}
+        )
+        jacobian = self._jacobians_at_rest(model, need)
+        row = {k: i for i, k in enumerate(need)}
+
+        from ...sim.articulation import eval_fk, eval_mass_matrix  # noqa: PLC0415
+
+        state = model.state()
+        eval_fk(model, model.joint_q, model.joint_qd, state)
+        H = eval_mass_matrix(model, state).numpy().astype(np.float64)
+        art_start = model.articulation_start.numpy()
+        qd_start = model.joint_qd_start.numpy()
+        size = {a: int(qd_start[art_start[a + 1]] - qd_start[art_start[a]]) for a in arts}
+        mass = {a: H[a, : size[a], : size[a]].copy() for a in arts}
+        for k in need:
+            if armature[k] != 0.0:
+                a = int(self.art_np[k])
+                J = jacobian[row[k], : size[a]]
+                mass[a] += float(armature[k]) * np.outer(J, J)
+        for act, k in resolve:
+            a = int(self.art_np[k])
+            J = jacobian[row[k], : size[a]]
+            inv_weight = float(gear[act, 0]) ** 2 * float(J @ np.linalg.solve(mass[a], J))
+            kv = 0.0
+            if inv_weight > 1.0e-15:
+                kv = float(bias[act, 2]) * 2.0 * np.sqrt(float(gain[act, 0]) / inv_weight)
+            bias[act, 2] = -kv
+        self.biasprm = wp.array(bias, dtype=_vec10, device=model.device)
+
+    def _jacobians_at_rest(self, model, tendons: list[int]) -> np.ndarray:
+        """Rows ``dL/dq`` [m or rad per DOF] of ``tendons`` at :attr:`~newton.Model.joint_q`, articulation-local.
+
+        Column ``d`` is the rate of each tendon when every articulation moves only its ``d``-th DOF at unit speed.
+        """
+        from ...sim.articulation import eval_fk  # noqa: PLC0415
+
+        device = model.device
+        art_start = model.articulation_start.numpy()
+        qd_start = model.joint_qd_start.numpy()
+        dof0 = qd_start[art_start[:-1]]
+        n_dofs = qd_start[art_start[1:]] - dof0
+        width = int(max(n_dofs[int(self.art_np[k])] for k in tendons))
+        index = wp.array(np.asarray(tendons, dtype=np.int32), dtype=wp.int32, device=device)
+        rate = wp.zeros(len(tendons), dtype=float, device=device)
+        state = model.state()
+        jacobian = np.zeros((len(tendons), width), dtype=np.float64)
+        for d in range(width):
+            qd = np.zeros(model.joint_dof_count, dtype=np.float32)
+            moving = n_dofs > d
+            qd[dof0[moving] + d] = 1.0
+            joint_qd = wp.array(qd, dtype=float, device=device)
+            eval_fk(model, model.joint_q, joint_qd, state)
+            wp.launch(
+                eval_tendon_rates,
+                dim=len(tendons),
+                inputs=[
+                    index,
+                    *self.model_inputs(model),
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    model.shape_body,
+                    model.shape_transform,
+                    model.shape_type,
+                    model.shape_scale,
+                    model.body_com,
+                    model.body_world,
+                    model.joint_q,
+                    joint_qd,
+                    state.body_q,
+                    state.body_qd,
+                    self._placeholder(device, 1, wp.int32),
+                    self._placeholder(device, 1, wp.spatial_vector),
+                    self._placeholder(device, (1, 1, 1), float),
+                ],
+                outputs=[rate],
+                device=device,
+            )
+            jacobian[:, d] = rate.numpy()
+        return jacobian
 
     def resolve_spring_lengths(self, model) -> None:
         """Fix each spring's rest band from ``springlength``; ``-1`` means the length at ``Model.joint_q``."""

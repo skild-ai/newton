@@ -485,6 +485,31 @@ def test_tendon_armature_history_restarts_on_reset(test, device):
             test.assertAlmostEqual(run.q("m"), fresh.q("m"), delta=1.0e-6)
 
 
+def test_tendon_position_dampratio_is_critically_damped(test, device):
+    """A tendon position actuator's dampratio resolves to MuJoCo's kv = 2 dampratio sqrt(kp m) at the rest state.
+
+    The reflected inertia of L = q1 + 2 q2 with tendon armature a is ``m = 1 / (1/m1 + 4/m2) + a``, so dampratio 1
+    makes L a critically damped oscillator: L(t) = u + (L0 - u)(1 + wn t) exp(-wn t), with wn = sqrt(kp / m).
+    """
+    m1, m2, kp, u, armature, dt = 1.0, 2.0, 30.0, 0.5, 0.25, 1.0e-3
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>
+      {_frame(_slider("m1", "0 -0.2 1", axis="1 0 0", mass=m1) + _slider("m2", "0 0.2 1", axis="1 0 0", mass=m2))}
+    </worldbody><tendon><fixed name="t" armature="{armature}"><joint joint="m1" coef="1"/><joint joint="m2" coef="2"/>
+    </fixed></tendon><actuator><position tendon="t" kp="{kp}" dampratio="1"/></actuator></mujoco>"""
+    wn = math.sqrt(kp / (1.0 / (1.0 / m1 + 4.0 / m2) + armature))
+    for mode in _MODES:
+        with test.subTest(solve_mode=mode):
+            run = _Run(mjcf, device, solve_mode=mode, ctrl=[u], iterations=16)
+            elapsed = 0.0
+            for t in (0.25, 0.5, 1.0, 2.0):
+                run.step(dt, int(round((t - elapsed) / dt)))
+                elapsed = t
+                exact = u - u * (1.0 + wn * t) * math.exp(-wn * t)
+                # implicit Euler adds O(wn dt) numerical damping
+                test.assertAlmostEqual(run.q("m1") + 2.0 * run.q("m2"), exact, delta=5.0e-3)
+            test.assertTrue(np.isfinite(run.state_0.joint_qd.numpy()).all())
+
+
 def test_tendon_fixed_length_includes_the_joint_reference(test, device):
     """A fixed tendon's length is sum(c * qpos) with qpos = joint_q + ref, as MuJoCo's ten_length."""
     ref, k, dt = 0.2, 100.0, 1.0e-3
@@ -542,6 +567,7 @@ for _name in (
     "test_tendon_friction_follows_an_upper_only_limit_row",
     "test_tendon_spring_is_slack_inside_its_dead_band",
     "test_tendon_armature_history_restarts_on_reset",
+    "test_tendon_position_dampratio_is_critically_damped",
     "test_tendon_fixed_length_includes_the_joint_reference",
     "test_tendon_actuator_force_range_caps_the_summed_force",
 ):
