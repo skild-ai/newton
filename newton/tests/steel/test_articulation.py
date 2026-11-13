@@ -1241,8 +1241,9 @@ class TestPreeliminationKernels(unittest.TestCase):
         # A world anchor and one rotational child DOF with a 2 mm lever arm.
         wp.launch(
             steel_kernels.populate_connect_J_for_size,
-            dim=1,
+            dim=steel_kernels.CONNECT_MAX_ROWS,
             inputs=[
+                arr([0]),
                 arr([0]),
                 arr([0]),
                 arr([0]),
