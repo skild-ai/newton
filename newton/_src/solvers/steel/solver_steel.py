@@ -2223,7 +2223,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 connect rows, contacts, enabled joint limits, joint velocity limits, joint friction
                 and, with ``drive_mode="rows"``, joint drives) per world. Rows beyond it are
                 dropped and reported, see :attr:`constraint_overflow`. The limit and friction-loss
-                rows of MuJoCo-style tendons are reserved on top of this capacity.
+                rows of MuJoCo-style tendons are reserved on top of this capacity; the ``articulation``
+                counts of :meth:`constraint_row_watermarks` include them, so subtract the tendon rows
+                when sizing this option from a watermark.
             free_body_constraint_max: Capacity of free-body rows per world: free-body contact rows
                 and free-body velocity-limit rows. Under the ``"propagation"`` response free-body
                 contacts use the propagation rows, so
@@ -4551,6 +4553,13 @@ class SolverSteel(SolverBase, CouplingInterface):
             response_dof_count=self._model_plan.response_dof_count,
         )
         self._tendon_count = self._tendon.count
+        if model.tendon_count:
+            warnings.warn(
+                f"SolverSteel: the model's {model.tendon_count} routed tendons (ModelBuilder.add_tendon) are not "
+                "simulated; Steel supports MuJoCo-style tendons from the mujoco:tendon_* attributes only.",
+                NewtonWarning,
+                stacklevel=4,
+            )
         self._tendon.resolve_spring_lengths(model)
         self._tendon.resolve_dampratio(model)
         if self._tendon.has_rows:

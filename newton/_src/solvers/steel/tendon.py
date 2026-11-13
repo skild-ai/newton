@@ -1345,6 +1345,7 @@ class TendonPlan:
         frictionloss = host("tendon_frictionloss", np.zeros(n, dtype=np.float32))
         armature = host("tendon_armature", np.zeros(n, dtype=np.float32))
         springlength = host("tendon_springlength", np.full((n, 2), -1.0, dtype=np.float32))
+        margin = host("tendon_margin", np.zeros(n, dtype=np.float32))
         labels = list(getattr(mujoco, "tendon_label", None) or [])
         tendon_actuators = cls._tendon_actuators(mujoco, n)
 
@@ -1415,6 +1416,17 @@ class TendonPlan:
             if flags[k] or has_mass[k]:
                 art[k] = a
 
+        with_margin = [
+            labels[k] if k < len(labels) and labels[k] else f"tendon_{k}"
+            for k in np.flatnonzero(valid & ((flags & int(TENDON_ROW_LIMIT_LOWER)) != 0) & (margin != 0.0))
+        ]
+        if with_margin:
+            warnings.warn(
+                f"SolverSteel: tendon margin is not supported and is ignored on {len(with_margin)} limited tendons "
+                f"(first: '{with_margin[0]}'); tendon_limit_activation_gap sets when their limit rows activate.",
+                NewtonWarning,
+                stacklevel=3,
+            )
         active = np.flatnonzero(art >= 0)
         # Tendons without rows or mass terms get their length from a length-only pass every step.
         length_only = np.flatnonzero(valid & (flags == 0) & ~has_mass)

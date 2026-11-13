@@ -485,6 +485,20 @@ def test_tendon_armature_history_restarts_on_reset(test, device):
             test.assertAlmostEqual(run.q("m"), fresh.q("m"), delta=1.0e-6)
 
 
+def test_tendon_margin_and_routed_tendons_warn(test, device):
+    """Steel warns about what it ignores: a limited tendon's margin and the routed tendons of add_tendon."""
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>{_frame(_slider("m", "0 0 1", axis="1 0 0"))}</worldbody>
+    <tendon><fixed name="t" limited="true" range="-1 1" margin="0.1"><joint joint="m" coef="1"/></fixed></tendon>
+    </mujoco>"""
+    with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "margin is not supported.*'t'"):
+        _Run(mjcf, device, iterations=4)
+    builder = newton.ModelBuilder()
+    body = builder.add_body(xform=wp.transform(p=(0.0, 0.0, 0.5)), mass=1.0)
+    builder.add_tendon([newton.TendonGuide(body=-1, offset=(0.0, 0.0, 1.0)), newton.TendonGuide(body=body)])
+    with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "1 routed tendons"):
+        SolverSteel(builder.finalize(device=device))
+
+
 def test_tendon_position_dampratio_is_critically_damped(test, device):
     """A tendon position actuator's dampratio resolves to MuJoCo's kv = 2 dampratio sqrt(kp m) at the rest state.
 
@@ -606,6 +620,7 @@ for _name in (
     "test_tendon_friction_follows_an_upper_only_limit_row",
     "test_tendon_spring_is_slack_inside_its_dead_band",
     "test_tendon_armature_history_restarts_on_reset",
+    "test_tendon_margin_and_routed_tendons_warn",
     "test_tendon_position_dampratio_is_critically_damped",
     "test_tendon_fixed_length_includes_the_joint_reference",
     "test_tendon_actuator_force_range_caps_the_summed_force",
