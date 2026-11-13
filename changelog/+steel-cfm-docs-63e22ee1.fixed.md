@@ -1,1 +1,0 @@
-Correct the `SolverSteel` `cfm` documentation: it scales each scalar row's Gauss-Seidel step by `A / (A + cfm)` and leaves the converged solution of unregularized rows unchanged, while a normal row regularized by `contact_regularization` settles at a velocity residual of `-g (A + cfm) lambda`; use `contact_regularization` or `contact_compliance` to soften contacts.

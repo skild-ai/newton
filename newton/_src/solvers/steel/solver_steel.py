@@ -2097,20 +2097,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             iterations: Number of projected Gauss-Seidel iterations per step.
             baumgarte: Baumgarte position-correction factor of contact and joint-limit rows,
                 as a fraction of the position error removed per step.
-            cfm: Diagonal shift [inverse effective mass] added to the unit response
-                ``A = J H^-1 J^T`` that each scalar row's Gauss-Seidel step divides by. It scales
-                every step by ``A / (A + cfm)`` and leaves the solution an unregularized row
-                converges to unchanged, so there it only damps an unconverged sweep, like
-                ``relaxation`` below 1, and matters only where it approaches ``A`` (about ``1 / m``
-                for a contact through a free body's center of mass). A normal row regularized by
-                ``contact_regularization`` ``g`` settles at a velocity residual of
-                ``-g * (A + cfm) * lambda``; for a single resting row under a constant load this
-                scales the penetration by ``(A + cfm) / A``. It also floors the regularization of
-                ``enable_bilateral_preelimination``. To soften contacts use
-                ``contact_regularization`` or ``contact_compliance``. Drive rows of
-                ``drive_mode="rows"`` and the coupled contact solves of a ``friction_mode`` other
-                than ``"fixed_normal"`` use their own response, and compliant normal rows of
-                ``contact_compliance`` replace cfm with their compliance term.
+            cfm: Shift added to each row's step denominator ``J H^-1 J^T``. It damps unconverged
+                sweeps and leaves the converged solution of unregularized rows unchanged, so it does
+                not soften constraints; use ``contact_regularization`` or ``contact_compliance``.
             relaxation: Successive over-relaxation factor of the PGS sweep.
             update_mass_matrix_interval: Rebuild and refactor the mass matrix every this many
                 calls to :meth:`step`; ``1`` rebuilds it every step. Larger values reuse a
