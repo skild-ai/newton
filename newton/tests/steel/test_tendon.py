@@ -565,6 +565,24 @@ def test_tendon_inside_sphere_wrap_matches_mujoco(test, device):
             test.assertAlmostEqual(float(run.solver.tendon_lengths().numpy()[0]), expected, delta=2.0e-5)
 
 
+def test_tendon_armature_history_survives_coupled_iteration_restarts(test, device):
+    """A coupler's restarted solve of a step starts from the same spatial-armature dJ/dt history as the first."""
+    dt = 1.0e-3
+    mjcf = f"""<mujoco>{_HEAD}<worldbody><site name="w" pos="0 0 2.5"/>{_frame(_slider("m", "1 0 1", axis="1 0 0"))}
+    </worldbody><tendon><spatial armature="1"><site site="w"/><site site="m_s"/></spatial></tendon></mujoco>"""
+    run = _Run(mjcf, device, qd={"m": 1.0}, iterations=8)
+    solver = run.solver
+    solver.coupling_notify_iteration_restarts(True)
+    run.step(dt, 1)
+    kinematic = newton.StateFlags.JOINT_Q | newton.StateFlags.JOINT_QD
+    solver.coupling_notify_input_state_update(run.state_0, kinematic, dt=dt)
+    solver.step(run.state_0, run.state_1, run.control, None, dt)
+    first = run.state_1.joint_qd.numpy().copy()
+    solver.coupling_notify_input_state_update(run.state_0, newton.StateFlags.NONE, iteration_restart=True, dt=dt)
+    solver.step(run.state_0, run.state_1, run.control, None, dt)
+    np.testing.assert_allclose(run.state_1.joint_qd.numpy(), first, atol=1.0e-7)
+
+
 class TestSteelTendon(unittest.TestCase):
     pass
 
@@ -592,6 +610,7 @@ for _name in (
     "test_tendon_fixed_length_includes_the_joint_reference",
     "test_tendon_actuator_force_range_caps_the_summed_force",
     "test_tendon_inside_sphere_wrap_matches_mujoco",
+    "test_tendon_armature_history_survives_coupled_iteration_restarts",
 ):
     add_function_test(TestSteelTendon, _name, globals()[_name], devices=get_test_devices())
 

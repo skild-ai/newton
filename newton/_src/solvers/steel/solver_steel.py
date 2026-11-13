@@ -3955,7 +3955,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         iteration_restart: bool = False,
         dt: float = 0.0,
     ) -> None:
-        """Schedule a save or rewind of the carried friction-patch history for the next step.
+        """Schedule a save or rewind of the carried friction-patch and tendon-armature history for the next step.
 
         A kinematic write (joint or body state flags) also drops the carried kinematics of every
         articulation with ``reuse_kinematics`` on. When the coupler may restart a step, the next step
@@ -3974,7 +3974,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         if kinematic:
             # The coupler wrote the input state; the carried kinematics are stale.
             self._fk_id_valid.zero_()
-        if not self._friction_anchors_enabled or not self._coupling_iteration_restarts:
+        tendon_history = getattr(self._tendon, "mass_has_prev", None) is not None
+        if not (self._friction_anchors_enabled or tendon_history) or not self._coupling_iteration_restarts:
             return
         # step() runs both, so a graph captured from the coupled step records them; a reset cancels both.
         if iteration_restart:
@@ -4001,6 +4002,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         if enabled:
             # Reserve outside graph capture; the coupled step saves the history, possibly while capturing.
             self._friction_patches.reserve_history_snapshot()
+            self._tendon.reserve_history_snapshot()
 
     @override
     def coupling_eval_gravity_acceleration(
@@ -7747,8 +7749,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         """Run the stages of :meth:`step` after its input checks."""
         if self._coupling_patch_history_restore_pending:
             self._friction_patches.restore_history()
+            self._tendon.restore_history()
         elif self._coupling_patch_history_snapshot_pending:
             self._friction_patches.snapshot_history()
+            self._tendon.snapshot_history()
         self._coupling_patch_history_restore_pending = False
         self._coupling_patch_history_snapshot_pending = False
         if self._contact_torsion_enabled:

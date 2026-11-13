@@ -1518,6 +1518,28 @@ class TendonPlan:
             device=model.device,
         )
 
+    def reserve_history_snapshot(self) -> None:
+        """Allocate the copy :meth:`snapshot_history` writes; call outside graph capture."""
+        if getattr(self, "mass_has_prev", None) is not None and getattr(self, "_history_snapshot", None) is None:
+            self._history_snapshot = (wp.empty_like(self.mass_J_prev), wp.empty_like(self.mass_has_prev))
+
+    def snapshot_history(self) -> None:
+        """Save the spatial-armature ``dJ/dt`` history so a repeated solve of the same step can restore it."""
+        if getattr(self, "mass_has_prev", None) is None:
+            return
+        self.reserve_history_snapshot()
+        J_prev, has_prev = self._history_snapshot
+        wp.copy(J_prev, self.mass_J_prev)
+        wp.copy(has_prev, self.mass_has_prev)
+
+    def restore_history(self) -> None:
+        """Restore the history saved by :meth:`snapshot_history`."""
+        if getattr(self, "_history_snapshot", None) is None:
+            return
+        J_prev, has_prev = self._history_snapshot
+        wp.copy(self.mass_J_prev, J_prev)
+        wp.copy(self.mass_has_prev, has_prev)
+
     def limited_np(self) -> np.ndarray:
         """Mask of the enforced tendons with range-limit rows."""
         limit = int(TENDON_ROW_LIMIT_LOWER) | int(TENDON_ROW_LIMIT_UPPER)
