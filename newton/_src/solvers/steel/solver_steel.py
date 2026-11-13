@@ -2347,13 +2347,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 the free-body contact rows, then the velocity limits. ``"contact_then_internal"``
                 runs every iteration of the contact rows first, then every iteration of the
                 internal rows (drive, mimic, connect, joint-limit and joint-friction rows) and
-                the velocity limits. The internal rows' corrections are not fed back into another
-                contact sweep, so a contact load that an internal row must carry, such as a body
-                resting on a link at its joint limit, reaches that row only through the position
-                correction. This can leave substantial penetration, more so for heavy loads on light
-                links, and a heavy enough body falls through; more iterations within each phase do not
-                restore the interleaving. Use ``"interleaved"`` or ``"phased"`` when contacts load
-                internal rows. ``"phased"`` approximates the order PhysX uses for grasping: each
+                the velocity limits. Internal-row corrections never reach the contacts, so a contact
+                load carried by an internal row (e.g. a body on a link at its joint limit) sinks, and a
+                heavy one falls through at any iteration count; use ``"interleaved"`` or ``"phased"``
+                there. ``"phased"`` approximates the order PhysX uses for grasping: each
                 iteration solves the internal rows, then the contact rows, then the velocity
                 limits, each in a launch of its own; the propagation responses use this order
                 with ``"interleaved"`` as well. Contact torsion and contact compliance require
