@@ -818,6 +818,9 @@ class TendonActuators:
     ctrlrange: wp.array[wp.vec2]
     forcerange: wp.array[wp.vec2]
     ctrl: wp.array[float]
+    tendon_force_limited: wp.array[int]
+    """Per tendon, nonzero when ``actuatorfrcrange`` caps the summed force of its actuators."""
+    tendon_force_range: wp.array[wp.vec2]
 
 
 @wp.kernel
@@ -934,6 +937,16 @@ def populate_tendon_rows_for_size(
         )  # fmt: skip
 
 
+@wp.func
+def _cap_scale(total: float, cap: wp.vec2) -> float:
+    """Scale bringing a tendon's summed actuator force ``total`` into ``cap`` (1 inside it)."""
+    if total < cap[0] and total != 0.0:
+        return cap[0] / total
+    if total > cap[1] and total != 0.0:
+        return cap[1] / total
+    return 1.0
+
+
 @wp.kernel
 def apply_tendon_mass_terms_for_size(
     tendon_list: wp.array[int],
@@ -1001,7 +1014,8 @@ def apply_tendon_mass_terms_for_size(
       as Steel's passive joint modes. Inside a dead band the spring is slack and adds no implicit stiffness.
     - Actuators on ``x = gear L``: the affine force ``f = c0 + c1 x + c2 dx/dt`` with its restoring part
       implicit like a joint drive (``K += gear^2 (k dt^2 + b dt)``, ``f -= k dt dx/dt``, ``k = max(-c1, 0)``,
-      ``b = max(-c2, 0)``), the explicit force clamped to the force range as a drive's effort limit.
+      ``b = max(-c2, 0)``), the explicit force clamped to the force range as a drive's effort limit. A tendon's
+      ``actuatorfrcrange`` scales its actuators' forces so their sum stays in range, as MuJoCo.
 
     The mass term is added only where CRBA rebuilt ``H`` this step; the forces every step.
     """
@@ -1078,7 +1092,14 @@ def apply_tendon_mass_terms_for_size(
         tendon_force[k, 1] = spring
         force += spring
 
-    for e in range(actuators.start[k], actuators.start[k + 1]):
+    # MuJoCo's actuator_force is c0 + c1 x + c2 dx/dt clamped to its force range. The applied drive also carries the
+    # implicit gain's -k dt dx/dt and is clamped the same way, as a joint drive's effort limit.
+    a_start = actuators.start[k]
+    a_end = actuators.start[k + 1]
+    total = float(0.0)
+    total_drive = float(0.0)
+    geared_drive = float(0.0)
+    for e in range(a_start, a_end):
         act = actuators.actuator[e]
         gear = actuators.gear[act][0]
         x = gear * length
@@ -1101,12 +1122,25 @@ def apply_tendon_mass_terms_for_size(
             c2 += bp[2]
         k_act = wp.max(-c1, 0.0)
         b_act = wp.max(-c2, 0.0)
-        drive = c0 + c1 * x + c2 * dx - k_act * dt * dx
+        actuator = c0 + c1 * x + c2 * dx
+        drive = actuator - k_act * dt * dx
         if (act_flags & ACTUATOR_FORCE_LIMITED) != 0:
+            actuator = wp.clamp(actuator, actuators.forcerange[act][0], actuators.forcerange[act][1])
             drive = wp.clamp(drive, actuators.forcerange[act][0], actuators.forcerange[act][1])
-        actuator_force[act] = drive
+        actuator_force[act] = actuator
+        total += actuator
+        total_drive += drive
+        geared_drive += gear * drive
         K += gear * gear * (k_act * dt * dt + b_act * dt)
-        force += gear * drive
+    # The tendon's actuatorfrcrange caps the summed actuator force by scaling every actuator's force, as MuJoCo.
+    if a_end > a_start and actuators.tendon_force_limited[k] != 0:
+        cap = actuators.tendon_force_range[k]
+        scale = _cap_scale(total, cap)
+        if scale != 1.0:
+            for e in range(a_start, a_end):
+                actuator_force[actuators.actuator[e]] *= scale
+        geared_drive *= _cap_scale(total_drive, cap)
+    force += geared_drive
 
     # Every world's tendons add into the same H and joint forces, so the atomic adds contend: skip the zero
     # entries of J (a fixed tendon spans a few DOFs) rather than add zeros.
@@ -1368,6 +1402,12 @@ class TendonPlan:
         plan.actuator_start = wp.array(actuator_start, dtype=wp.int32, device=device)
         plan.actuator_list = wp.array(np.asarray(actuator_list or [0], dtype=np.int32), dtype=wp.int32, device=device)
         plan.actuator_flags = wp.array(tendon_actuators.flags, dtype=wp.int32, device=device)
+        autolimits_attr = getattr(mujoco, "autolimits", None)
+        autolimits = bool(autolimits_attr.numpy()[0]) if autolimits_attr is not None else True
+        cap_flag = host("tendon_actuator_force_limited", np.full(n, 2, dtype=np.int32))
+        cap_range = host("tendon_actuator_force_range", np.zeros((n, 2), dtype=np.float32))
+        cap = (cap_flag == 1) | ((cap_flag == 2) & autolimits & (cap_range[:, 0] < cap_range[:, 1]))
+        plan.tendon_force_limited = wp.array(cap.astype(np.int32), dtype=wp.int32, device=device)
         plan.actuator_force = wp.zeros(max(actuator_count, 1), dtype=float, device=device)
         sizes = response_dof_count[art[active]]
         plan.sizes = {
@@ -1547,6 +1587,10 @@ class TendonPlan:
             actuators.biastype = m.actuator_biastype
             actuators.ctrlrange = m.actuator_ctrlrange
             actuators.forcerange = m.actuator_forcerange
+            actuators.tendon_force_limited = self.tendon_force_limited
+            actuators.tendon_force_range = getattr(m, "tendon_actuator_force_range", None)
+            if actuators.tendon_force_range is None or actuators.tendon_force_range.shape[0] == 0:
+                actuators.tendon_force_range = self._placeholder(device, self.count, wp.vec2)
             ctrl = getattr(getattr(control, "mujoco", None), "ctrl", None) if control is not None else None
             if ctrl is None:
                 if getattr(self, "_zero_ctrl", None) is None:
@@ -1571,6 +1615,8 @@ class TendonPlan:
             actuators.ctrlrange = vec2
             actuators.forcerange = vec2
             actuators.ctrl = floats
+            actuators.tendon_force_limited = ints
+            actuators.tendon_force_range = vec2
         return actuators
 
     def _placeholder(self, device, shape, dtype) -> wp.array:

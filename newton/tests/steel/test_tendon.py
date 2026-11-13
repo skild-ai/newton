@@ -504,6 +504,21 @@ def test_tendon_fixed_length_includes_the_joint_reference(test, device):
             test.assertAlmostEqual(run.q("m") + ref, 0.25, delta=2.0e-3)
 
 
+def test_tendon_actuator_force_range_caps_the_summed_force(test, device):
+    """A tendon's actuatorfrcrange scales its actuators' forces so their sum stays in range, as MuJoCo."""
+    dt, steps = 1.0e-3, 100
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>{_frame(_slider("m", "0 0 1", axis="1 0 0"))}</worldbody>
+    <tendon><fixed name="t" actuatorfrcrange="-1 1"><joint joint="m" coef="1"/></fixed></tendon>
+    <actuator><motor tendon="t"/><motor tendon="t" gear="2"/></actuator></mujoco>"""
+    for mode in _MODES:
+        with test.subTest(solve_mode=mode):
+            run = _Run(mjcf, device, solve_mode=mode, ctrl=[10.0, 10.0], iterations=8)
+            run.step(dt, steps)
+            # both actuator forces are 10, sum to 20 and scale to 0.5; the joint force is 1 * 0.5 + 2 * 0.5 N
+            np.testing.assert_allclose(run.solver.tendon_actuator_forces().numpy(), [0.5, 0.5], atol=1.0e-6)
+            test.assertAlmostEqual(run.qd("m"), 1.5 * steps * dt, delta=1.0e-5)
+
+
 class TestSteelTendon(unittest.TestCase):
     pass
 
@@ -528,6 +543,7 @@ for _name in (
     "test_tendon_spring_is_slack_inside_its_dead_band",
     "test_tendon_armature_history_restarts_on_reset",
     "test_tendon_fixed_length_includes_the_joint_reference",
+    "test_tendon_actuator_force_range_caps_the_summed_force",
 ):
     add_function_test(TestSteelTendon, _name, globals()[_name], devices=get_test_devices())
 
