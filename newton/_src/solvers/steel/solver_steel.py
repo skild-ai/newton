@@ -2054,7 +2054,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         contact_compliance: bool = False,
         enable_sleeping: bool = False,
         sleep_linear_threshold: float = 0.05,
-        sleep_angular_threshold: float = 0.15,
+        sleep_angular_threshold: float = 0.3,
         sleep_quiet_time: float = 0.5,
         sleep_skip_constraints: bool = True,
         articulated_contact_response: Literal["immediate", "propagation"] = "immediate",
@@ -2511,7 +2511,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 shapes (other notifications and changes to static or kinematic owners wake
                 every island). Driven articulations (nonzero drive gains) and articulations with
                 passive springs (nonzero :attr:`~newton.Model.joint_stiffness` on a PRISMATIC,
-                REVOLUTE or D6 tree joint) stay awake.
+                REVOLUTE or D6 tree joint) stay awake. For resting stacks that stay awake with the
+                default contact order, see :ref:`Tuning Solver Reference`.
                 Sleeping is configured at construction; rebuild captured graphs to change it. Construction raises :class:`ValueError` with ``contact_warmstart``
                 or ``velocity_iterations``, or for a model without articulations, and
                 :class:`NotImplementedError` with ``articulated_contact_response="propagation"`` and
