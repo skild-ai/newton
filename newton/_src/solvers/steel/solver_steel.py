@@ -1601,6 +1601,10 @@ class SolverSteel(SolverBase, CouplingInterface):
     in a device kernel (for example an RL termination term) or call
     :meth:`check_constraint_capacity` outside graph capture.
 
+    Treat overflow as a sizing error and raise the capacity until no world is flagged. Which contacts keep their
+    rows is described under ``deterministic``. As that set changes, a contact that penetrated while it had no rows
+    is pushed out by the position correction when it regains them, which can add energy and make the state diverge.
+
     Global articulations are solved together with world 0. A kinematic global free body
     (for example a moving platform) contacts the bodies of every world.
 
