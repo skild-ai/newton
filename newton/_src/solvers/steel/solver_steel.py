@@ -2097,10 +2097,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             iterations: Number of projected Gauss-Seidel iterations per step.
             baumgarte: Baumgarte position-correction factor of contact and joint-limit rows,
                 as a fraction of the position error removed per step.
-            cfm: Constraint force mixing added to every row's effective-mass diagonal,
-                which regularizes redundant rows. Drive rows of ``drive_mode="rows"`` use
-                their exact unit response instead, and the coupled contact solves of a
-                ``friction_mode`` other than ``"fixed_normal"`` leave it off their contact blocks.
+            cfm: Shift added to each row's step denominator ``J H^-1 J^T``. It damps unconverged
+                sweeps, leaves the converged solution of unregularized rows unchanged and scales the
+                penetration of rows regularized by ``contact_regularization``; to soften contacts use
+                ``contact_regularization`` or ``contact_compliance``.
             relaxation: Successive over-relaxation factor of the PGS sweep.
             update_mass_matrix_interval: Rebuild and refactor the mass matrix every this many
                 calls to :meth:`step`; ``1`` rebuilds it every step. Larger values reuse a

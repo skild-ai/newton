@@ -1473,5 +1473,76 @@ add_function_test(
 )
 
 
+def test_cfm_damps_the_sweep_and_keeps_its_solution(test, device):
+    """Scale a limit row's step by ``A / (A + cfm)`` and converge to the same rigid stop for any cfm."""
+    inertia = 0.5
+    response = 1.0 / inertia
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * inertia))
+    joint = builder.add_joint_revolute(-1, link, axis=(0.0, 1.0, 0.0), limit_lower=-1.0, limit_upper=0.0, armature=0.0)
+    builder.add_articulation([joint])
+    model = builder.finalize(device=device)
+    qd0 = 2.0
+
+    def end_speed(cfm, iterations):
+        solver = SolverSteel(model, cfm=cfm, iterations=iterations, enable_joint_limits=True)
+        state_0, state_1 = model.state(), model.state()
+        state_0.joint_qd.assign([qd0])
+        solver.step(state_0, state_1, model.control(), None, DT)
+        return float(state_1.joint_qd.numpy()[0])
+
+    # One sweep at the limit (phi = 0) leaves cfm / (A + cfm) of the approach speed.
+    test.assertAlmostEqual(end_speed(response, 1), 0.5 * qd0, delta=1.0e-5)
+    test.assertAlmostEqual(end_speed(3.0 * response, 1), 0.75 * qd0, delta=1.0e-5)
+    test.assertAlmostEqual(end_speed(1.0e-7, 1), 0.0, delta=1.0e-5)
+    # The converged sweep stops the joint whatever cfm is; a softening cfm would leave cfm * lambda.
+    test.assertAlmostEqual(end_speed(3.0 * response, 64), 0.0, delta=1.0e-5)
+
+
+def test_cfm_scales_a_regularized_contact_penetration(test, device):
+    """Scale the resting penetration of a regularized contact by ``(A + cfm) / A``."""
+    g, beta, dt = 0.5, 0.2, 1.0 / 240.0
+    penetration = {}
+    for cfm in (0.0, 1.0):
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        body = builder.add_body(
+            xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()), mass=1.0, inertia=wp.mat33(np.eye(3) * 0.004)
+        )
+        builder.add_shape_sphere(body, radius=0.1, cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0))
+        model = builder.finalize(device=device)
+        solver = SolverSteel(model, cfm=cfm, baumgarte=beta, contact_regularization=g, iterations=64)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        for _ in range(240):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, dt)
+            state_0, state_1 = state_1, state_0
+        penetration[cfm] = 0.1 - float(state_0.body_q.numpy()[0, 2])
+    # One row through the COM of a 1 kg body: A = 1, and the row settles at g (A + cfm) m |gravity| dt^2 / beta.
+    expected = g * 9.81 * dt * dt / beta
+    test.assertAlmostEqual(penetration[0.0], expected, delta=0.03 * expected)
+    test.assertAlmostEqual(penetration[1.0], 2.0 * expected, delta=0.03 * expected)
+
+
+class TestSteelCfmOption(unittest.TestCase):
+    """What the ``cfm`` option changes in the Gauss-Seidel sweep."""
+
+
+add_function_test(
+    TestSteelCfmOption,
+    "test_cfm_damps_the_sweep_and_keeps_its_solution",
+    test_cfm_damps_the_sweep_and_keeps_its_solution,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestSteelCfmOption,
+    "test_cfm_scales_a_regularized_contact_penetration",
+    test_cfm_scales_a_regularized_contact_penetration,
+    devices=get_test_devices(),
+)
+
+
 if __name__ == "__main__":
     unittest.main()
