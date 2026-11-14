@@ -2098,8 +2098,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             baumgarte: Baumgarte position-correction factor of contact and joint-limit rows,
                 as a fraction of the position error removed per step.
             cfm: Shift added to each row's step denominator ``J H^-1 J^T``. It damps unconverged
-                sweeps and leaves the converged solution of unregularized rows unchanged, so it does
-                not soften constraints; use ``contact_regularization`` or ``contact_compliance``.
+                sweeps, leaves the converged solution of unregularized rows unchanged and scales the
+                penetration of rows regularized by ``contact_regularization``; to soften contacts use
+                ``contact_regularization`` or ``contact_compliance``.
             relaxation: Successive over-relaxation factor of the PGS sweep.
             update_mass_matrix_interval: Rebuild and refactor the mass matrix every this many
                 calls to :meth:`step`; ``1`` rebuilds it every step. Larger values reuse a
