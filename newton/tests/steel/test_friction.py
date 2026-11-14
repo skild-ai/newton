@@ -792,25 +792,27 @@ DT = 1.0 / 240.0
 G = 9.81
 
 
-def _box_on_slope(device, slope_angle, mu, articulated):
-    """A box on the ground under gravity tilted by ``slope_angle``, free or on three prismatic joints."""
+def _box_on_slope(device, slope_angle, mu, articulated, half_extents=(0.1, 0.1, 0.1), rotating=False):
+    """A box on the ground under gravity tilted by ``slope_angle``, free or on a D6 joint.
+
+    The D6 joint has three prismatic axes, and three revolute axes as well when ``rotating``.
+    """
     builder = newton.ModelBuilder(gravity=(G * np.sin(slope_angle), 0.0, -G * np.cos(slope_angle)))
     builder.default_shape_cfg.mu = mu
-    xform = wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity())
+    hx, hy, hz = half_extents
+    xform = wp.transform(wp.vec3(0.0, 0.0, hz), wp.quat_identity())
     if articulated:
         link = builder.add_link(xform=xform)
-        builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_shape_box(link, hx=hx, hy=hy, hz=hz)
         axis = newton.ModelBuilder.JointDofConfig
+        axes = [axis(axis=newton.Axis.X), axis(axis=newton.Axis.Y), axis(axis=newton.Axis.Z)]
         joint = builder.add_joint_d6(
-            -1,
-            link,
-            linear_axes=[axis(axis=newton.Axis.X), axis(axis=newton.Axis.Y), axis(axis=newton.Axis.Z)],
-            parent_xform=xform,
+            -1, link, linear_axes=axes, angular_axes=list(axes) if rotating else [], parent_xform=xform
         )
         builder.add_articulation([joint])
     else:
         body = builder.add_body(xform=xform)
-        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_shape_box(body, hx=hx, hy=hy, hz=hz)
     builder.add_ground_plane()
     return builder.finalize(device=device)
 
@@ -841,12 +843,38 @@ def test_every_mode_holds_inside_the_cone(test, device):
                 test.assertAlmostEqual(height, 0.1, delta=1.0e-3)
 
 
-def test_sliding_follows_each_modes_coulomb_update(test, device):
-    """Slide outside the friction cone: exact for current and coulomb_newton, approximate for bisection.
+def test_coupled_modes_hold_near_the_cone_boundary(test, device):
+    """Hold a slab at 97% of its friction limit, free and on a six-axis D6 joint.
 
-    ``g (sin a - mu cos a)`` is the exact sliding acceleration. The bisection modes solve the normal
-    impulse to a fixed tolerance per sweep and slide slightly faster on free bodies; the de Saxce bias
-    also lifts a sliding free body off the ground.
+    A contact off the center of mass has an anisotropic tangent block; each bisection probe must minimize the
+    tangent quadratic on the friction disk, since scaling the sticking impulse onto it lets the slab slide away.
+    """
+    mu, ratio, steps = 0.5, 0.97, 240
+    for articulated in (False, True):
+        for mode in MODES:
+            with test.subTest(articulated=articulated, mode=mode):
+                model = _box_on_slope(
+                    device, math.atan(ratio * mu), mu, articulated, half_extents=(0.12, 0.08, 0.06), rotating=True
+                )
+                solver = SolverSteel(model, friction_mode=mode, friction_anchor_beta=0.0)
+                pipeline = newton.CollisionPipeline(model)
+                contacts = pipeline.contacts()
+                state_0, state_1 = model.state(), model.state()
+                newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+                start = state_0.body_q.numpy()[0, :3].copy()
+                control = model.control()
+                for _ in range(steps):
+                    pipeline.collide(state_0, contacts)
+                    solver.step(state_0, state_1, control, contacts, DT)
+                    state_0, state_1 = state_1, state_0
+                slip = float(np.linalg.norm(state_0.body_q.numpy()[0, :3] - start))
+                test.assertLess(slip, 1.0e-3)
+
+
+def test_sliding_follows_each_modes_coulomb_update(test, device):
+    """Slide outside the friction cone at ``g (sin a - mu cos a)``, the exact sliding acceleration, in every mode.
+
+    The de Saxce bias also lifts a sliding free body off the ground.
     """
     slope_angle, mu, steps = 0.6, 0.3, 120
     expected = G * (np.sin(slope_angle) - mu * np.cos(slope_angle)) * steps * DT
@@ -855,19 +883,12 @@ def test_sliding_follows_each_modes_coulomb_update(test, device):
         for mode in MODES:
             results[(articulated, mode)] = _slide_friction_mode(device, mode, slope_angle, mu, articulated, steps)
     for articulated in (False, True):
-        for mode in ("fixed_normal", "coulomb_newton"):
+        for mode in MODES:
             with test.subTest(articulated=articulated, mode=mode):
                 velocity, height = results[(articulated, mode)]
                 test.assertAlmostEqual(float(velocity[0]), expected, delta=0.005 * expected)
-                test.assertAlmostEqual(height, 0.1, delta=1.0e-3)
-    for mode in ("bisection", "bisection_desaxce"):
-        with test.subTest(articulated=True, mode=mode):
-            velocity, height = results[(True, mode)]
-            test.assertAlmostEqual(float(velocity[0]), expected, delta=0.005 * expected)
-        with test.subTest(articulated=False, mode=mode):
-            velocity, height = results[(False, mode)]
-            test.assertGreater(float(velocity[0]), expected)
-            test.assertAlmostEqual(float(velocity[0]), expected, delta=0.08 * expected)
+                if articulated or mode != "bisection_desaxce":
+                    test.assertAlmostEqual(height, 0.1, delta=1.0e-3)
     # The de Saxce bias raises the normal target velocity of a sliding free-body contact.
     test.assertAlmostEqual(results[(False, "bisection")][1], 0.1, delta=1.0e-4)
     test.assertGreater(results[(False, "bisection_desaxce")][1], 0.1 + 1.0e-3)
@@ -946,21 +967,36 @@ _ZERO_LOAD_BLOCKS = {
 }
 
 
-@wp.func_native(
-    "#if defined(__CUDA_ARCH__)\n"
-    + FRICTION_PAIR_CUDA
-    + coupled_contact_cuda("coulomb_newton")
-    + """
+_COLORED_BLOCK_SOLVE = """
     const float* b = block.data;
     float n, t1, t2;
-    contact_block_solve(b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], 0.0f, b[9], 0.0f, 0.0f, 0.0f, n, t1, t2);
+    contact_block_solve(b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], 0.0f, b[9], b[10], b[11], b[12], n, t1, t2);
     out.data[0] = n;
     out.data[1] = t1;
     out.data[2] = t2;
 #endif
 """
+
+
+@wp.func_native(
+    "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA + coupled_contact_cuda("coulomb_newton") + _COLORED_BLOCK_SOLVE
 )
 def _coulomb_newton_block_native(block: wp.array[float], out: wp.array[float]): ...
+
+
+@wp.func_native(
+    "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA + coupled_contact_cuda("bisection") + _COLORED_BLOCK_SOLVE
+)
+def _bisection_block_native(block: wp.array[float], out: wp.array[float]): ...
+
+
+@wp.func_native(
+    "#if defined(__CUDA_ARCH__)\n"
+    + FRICTION_PAIR_CUDA
+    + coupled_contact_cuda("bisection_desaxce")
+    + _COLORED_BLOCK_SOLVE
+)
+def _bisection_desaxce_block_native(block: wp.array[float], out: wp.array[float]): ...
 
 
 @wp.kernel
@@ -968,17 +1004,39 @@ def _coulomb_newton_block_kernel(block: wp.array[float], out: wp.array[float]):
     _coulomb_newton_block_native(block, out)
 
 
-def _coulomb_newton_colored_block(device, block):
-    """Solve one block with the colored sweep's ``contact_block_solve`` from zero impulses."""
+@wp.kernel
+def _bisection_block_kernel(block: wp.array[float], out: wp.array[float]):
+    _bisection_block_native(block, out)
+
+
+@wp.kernel
+def _bisection_desaxce_block_kernel(block: wp.array[float], out: wp.array[float]):
+    _bisection_desaxce_block_native(block, out)
+
+
+_COLORED_BLOCK_KERNELS = {
+    "coulomb_newton": _coulomb_newton_block_kernel,
+    "bisection": _bisection_block_kernel,
+    "bisection_desaxce": _bisection_desaxce_block_kernel,
+}
+
+
+def _colored_block(device, block, friction_mode="coulomb_newton"):
+    """Solve one block with the colored sweep's ``contact_block_solve``; omitted old impulses are zero."""
     out = wp.zeros(3, dtype=float, device=device)
+    padded = np.zeros(13, dtype=np.float32)
+    padded[: len(block)] = block
     wp.launch(
-        _coulomb_newton_block_kernel, dim=1, inputs=[wp.array(block, dtype=float, device=device), out], device=device
+        _COLORED_BLOCK_KERNELS[friction_mode],
+        dim=1,
+        inputs=[wp.array(padded, dtype=float, device=device), out],
+        device=device,
     )
     return out.numpy()
 
 
-def _coulomb_newton_mf_block(device, block):
-    """Solve one free-body contact block with the matrix-free kernel's Coulomb Newton update from zero impulses.
+def _mf_block(device, block, friction_mode="coulomb_newton"):
+    """Solve one free-body contact block with the matrix-free kernel's coupled update; omitted old impulses are zero.
 
     Unit Jacobians ``J = e_i`` with responses ``M^-1 J^T = G e_i`` give the rows the Delassus block ``G``, and the
     body's velocity is ``u``. The contact row has no diagonal, so only the coupled update moves it.
@@ -994,7 +1052,9 @@ def _coulomb_newton_mf_block(device, block):
     meta[0, :3, 1] = np.array([0.0, 1.0, 1.0], dtype=np.float32).view(np.int32)
     row_types = [PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION]
     meta[0, :3, 3] = np.array(row_types, dtype=np.int64) | (np.array([-1, 0, 0], dtype=np.int64) << 16)
-    impulses = wp.zeros((1, 4), dtype=float, device=device)
+    old = np.zeros(4, dtype=np.float32)
+    old[: len(block) - 10] = block[10:13]
+    impulses = wp.array([old], dtype=float, device=device)
     velocity = np.zeros(6, dtype=np.float32)
     velocity[:3] = u
     kernel = _get_pgs_solve_mf_gs_kernel(
@@ -1004,7 +1064,7 @@ def _coulomb_newton_mf_block(device, block):
         wp.get_device(device).arch,
         has_dense_velocity_limit_rows=False,
         shared_metadata=True,
-        friction_mode="coulomb_newton",
+        friction_mode=friction_mode,
     )
     wp.launch_tiled(
         kernel,
@@ -1054,11 +1114,101 @@ def _coulomb_newton_mf_block(device, block):
 def test_coulomb_newton_normal_impulse_stays_nonnegative(test, device):
     """Keep the coupled Coulomb Newton normal impulse at or above zero where the root search ends below zero load."""
     for name, block in _ZERO_LOAD_BLOCKS.items():
-        for route, solve in (("colored", _coulomb_newton_colored_block), ("serial", _coulomb_newton_mf_block)):
+        for route, solve in (("colored", _colored_block), ("serial", _mf_block)):
             with test.subTest(block=name, route=route):
                 normal, *tangent = solve(device, np.array(block, dtype=np.float32))
                 test.assertGreaterEqual(normal, 0.0)
                 test.assertLessEqual(float(np.linalg.norm(tangent)), block[9] * normal * (1.0 + 1.0e-6))
+
+
+# Contact blocks whose sticking impulse leaves the friction disk along an anisotropic tangent block.
+# Values: u_n, u_t1, u_t2, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2, G_t2t2, mu.
+_SLIDING_BLOCKS = {
+    "decoupled": (-0.5, 1.0, 0.3, 1.0, 0.0, 0.0, 1.0, 0.6, 0.5, 0.5),
+    "coupled": (-0.5, 0.8, -0.4, 1.2, 0.3, -0.2, 0.9, -0.5, 0.6, 0.6),
+}
+
+
+def _disk_minimizer(tangent_block, velocity, radius):
+    """Minimize ``0.5 x^T A x + velocity^T x`` over ``|x| <= radius`` in float64."""
+    eigenvalues, basis = np.linalg.eigh(tangent_block)
+    rotated = -basis.T @ velocity
+    if np.linalg.norm(rotated / eigenvalues) <= radius:
+        return basis @ (rotated / eigenvalues)
+    lo, hi = 0.0, np.linalg.norm(rotated) / radius
+    for _ in range(200):
+        alpha = 0.5 * (lo + hi)
+        lo, hi = (alpha, hi) if np.linalg.norm(rotated / (eigenvalues + alpha)) > radius else (lo, alpha)
+    return basis @ (rotated / (eigenvalues + hi))
+
+
+def _bisection_reference(block, desaxce):
+    """The normal impulse whose disk-minimizing tangent pair zeroes the normal velocity, in float64."""
+    u_n, u_t, (g_nn, *g_nt), (g_11, g_12, g_22), mu = block[0], np.array(block[1:3]), block[3:6], block[6:9], block[9]
+    g_nt, tangent_block = np.array(g_nt), np.array([[g_11, g_12], [g_12, g_22]])
+    target = mu * np.linalg.norm(u_t) if desaxce else 0.0
+
+    def solve(normal):
+        tangent = _disk_minimizer(tangent_block, u_t + g_nt * normal, mu * normal)
+        return u_n + g_nn * normal + g_nt @ tangent - target, tangent
+
+    lo, hi = 0.0, 100.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if solve(mid)[0] < 0.0 else (lo, mid)
+    return np.array([hi, *solve(hi)[1]])
+
+
+def test_bisection_solves_the_tangent_pair_on_the_disk(test, device):
+    """Match the bisection modes' coupled update to the disk minimizer at the root normal impulse."""
+    for mode in ("bisection", "bisection_desaxce"):
+        for name, block in _SLIDING_BLOCKS.items():
+            expected = _bisection_reference(block, mode == "bisection_desaxce")
+            for route, solve in (("colored", _colored_block), ("serial", _mf_block)):
+                with test.subTest(mode=mode, block=name, route=route):
+                    result = solve(device, np.array(block, dtype=np.float32), mode)
+                    np.testing.assert_allclose(result, expected, rtol=1.0e-4, atol=1.0e-5)
+
+
+# An ill-conditioned block whose coupled sticking solution lies well inside the cone, reached from nonzero impulses.
+# Values: u_n, u_t1, u_t2, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2, G_t2t2, mu, old impulses (normal, tangent 1, tangent 2).
+_ILL_CONDITIONED_STICKING_BLOCK = (
+    *(25.8318977356, -25.1314468384, 32.4639778137),
+    *(28.9735565186, -27.5162124634, 35.8052368164, 26.2391510010, -34.0760879517, 44.3519554138),
+    1.08889448643,
+    *(0.362457841635, -0.0915545076132, 0.380765765905),
+)
+
+
+def test_bisection_leaves_an_ill_conditioned_sticking_contact_at_rest(test, device):
+    """Reach the sticking solution of an ill-conditioned block: the contact's velocity ends at zero."""
+    block = np.array(_ILL_CONDITIONED_STICKING_BLOCK, dtype=np.float32)
+    g_nn, g_nt1, g_nt2, g_11, g_12, g_22 = block[3:9].astype(np.float64)
+    delassus = np.array([[g_nn, g_nt1, g_nt2], [g_nt1, g_11, g_12], [g_nt2, g_12, g_22]])
+    for route, solve in (("colored", _colored_block), ("serial", _mf_block)):
+        with test.subTest(route=route):
+            result = solve(device, block, "bisection").astype(np.float64)
+            velocity = block[:3].astype(np.float64) + delassus @ (result - block[10:13].astype(np.float64))
+            test.assertLess(float(np.abs(velocity).max()), 1.0e-3)
+
+
+# Blocks whose tangent impulse cancels the normal one and sticks at every load, so no load zeroes u_n.
+# Values: u_n, u_t1, u_t2, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2, G_t2t2, mu.
+_JAMMED_BLOCKS = {
+    "singular": (-0.5, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.2),
+    "near_singular": (-0.5, 0.0, 0.0, 1.0000005, 1.0, 0.0, 1.0, 0.0, 1.0, 1.2),
+}
+
+
+def test_bisection_keeps_a_jammed_contact_near_the_frictionless_load(test, device):
+    """Stop the bisection search near the frictionless load on a block that has no root."""
+    for mode in ("bisection", "bisection_desaxce"):
+        for name, block in _JAMMED_BLOCKS.items():
+            for route, solve in (("colored", _colored_block), ("serial", _mf_block)):
+                with test.subTest(mode=mode, block=name, route=route):
+                    normal, *tangent = solve(device, np.array(block, dtype=np.float32), mode)
+                    test.assertLessEqual(normal, 1.0)
+                    test.assertLessEqual(float(np.linalg.norm(tangent)), block[9] * normal * (1.0 + 1.0e-6))
 
 
 class TestSteelFrictionMode(unittest.TestCase):
@@ -1075,6 +1225,10 @@ for _fn in (
     test_unsupported_combinations_raise,
     test_sparse_factors_require_the_current_mode,
     test_coulomb_newton_normal_impulse_stays_nonnegative,
+    test_coupled_modes_hold_near_the_cone_boundary,
+    test_bisection_solves_the_tangent_pair_on_the_disk,
+    test_bisection_leaves_an_ill_conditioned_sticking_contact_at_rest,
+    test_bisection_keeps_a_jammed_contact_near_the_frictionless_load,
 ):
     add_function_test(TestSteelFrictionMode, _fn.__name__, _fn, devices=cuda_devices)
 

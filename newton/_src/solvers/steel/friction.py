@@ -265,7 +265,8 @@ _COUPLED_CONTACT_HEAD = """
         }
 """
 
-# Repeats the arithmetic of _MF_BISECTION_FRICTION_SOURCE in solver_steel.py; change both together.
+# Repeats the arithmetic of _MF_BISECTION_FRICTION_SOURCE and _DENSE_BISECTION_FRICTION_SOURCE in solver_steel.py;
+# change all three together.
 _COUPLED_CONTACT_BISECTION = """
         if (G_nn < 1.0e-20f) return;
         // At zero load the cone also zeroes the sliding pair.
@@ -276,55 +277,103 @@ _COUPLED_CONTACT_BISECTION = """
             new_lambda_t2 = 0.0f;
             return;
         }
-        float lo = 0.0f;
-        float hi = fmaxf(old_lambda_n * 2.0f, (target_vel_n - u_n) / G_nn + old_lambda_n);
-        hi = fmaxf(hi, 1.0f);
-        float f_lo = u_n_at_zero - target_vel_n, f_hi = -1.0f;
-        for (int _bi = 0; _bi < 20; _bi++) {
-            float mid = 0.5f * (lo + hi);
-            float d_n = mid - old_lambda_n;
-            float ut1_eff = u_t1 + G_nt1 * d_n;
-            float ut2_eff = u_t2 + G_nt2 * d_n;
-            float det = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
-            float d_t1 = 0.0f, d_t2 = 0.0f;
-            if (fabsf(det) > 1.0e-20f) {
-                d_t1 = (-ut1_eff * G_t2t2 + ut2_eff * G_t1t2) / det;
-                d_t2 = ( ut1_eff * G_t1t2 - ut2_eff * G_t1t1) / det;
+        // A contact whose coupled sticking solution lies inside the cone needs no search. The cofactor solve is
+        // refined once and accepted only if it leaves the contact at rest; ill-conditioned blocks fall back.
+        const float minor_nn = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
+        const float minor_n1 = G_nt2 * G_t1t2 - G_nt1 * G_t2t2;
+        const float minor_n2 = G_nt1 * G_t1t2 - G_nt2 * G_t1t1;
+        const float det_block = G_nn * minor_nn + G_nt1 * minor_n1 + G_nt2 * minor_n2;
+        bool sticks = false;
+        if (minor_nn > 0.0f && det_block > 1.0e-6f * G_nn * minor_nn) {
+            const float inv_det = 1.0f / det_block;
+            const float minor_11 = G_nn * G_t2t2 - G_nt2 * G_nt2;
+            const float minor_12 = G_nt1 * G_nt2 - G_nn * G_t1t2;
+            const float minor_22 = G_nn * G_t1t1 - G_nt1 * G_nt1;
+            const float r_n = u_n - target_vel_n;
+            float d_n = 0.0f, d_t1 = 0.0f, d_t2 = 0.0f;
+            float e_n = r_n, e_t1 = u_t1, e_t2 = u_t2;
+            for (int _refine = 0; _refine < 2; _refine++) {
+                d_n -= (minor_nn * e_n + minor_n1 * e_t1 + minor_n2 * e_t2) * inv_det;
+                d_t1 -= (minor_n1 * e_n + minor_11 * e_t1 + minor_12 * e_t2) * inv_det;
+                d_t2 -= (minor_n2 * e_n + minor_12 * e_t1 + minor_22 * e_t2) * inv_det;
+                e_n = r_n + G_nn * d_n + G_nt1 * d_t1 + G_nt2 * d_t2;
+                e_t1 = u_t1 + G_nt1 * d_n + G_t1t1 * d_t1 + G_t1t2 * d_t2;
+                e_t2 = u_t2 + G_nt2 * d_n + G_t1t2 * d_t1 + G_t2t2 * d_t2;
             }
-            float trial_t1 = old_lambda_t1 + d_t1;
-            float trial_t2 = old_lambda_t2 + d_t2;
-            float flimit = mu * mid;
-            float tmag = sqrtf(trial_t1 * trial_t1 + trial_t2 * trial_t2);
-            if (tmag > flimit && tmag > 1.0e-20f) {
-                float sc = flimit / tmag;
-                trial_t1 *= sc;
-                trial_t2 *= sc;
+            const float scale = fabsf(r_n) + fabsf(u_t1) + fabsf(u_t2)
+                + G_nn * fabsf(d_n) + G_t1t1 * fabsf(d_t1) + G_t2t2 * fabsf(d_t2);
+            const float stick_n = old_lambda_n + d_n;
+            const float stick_t1 = old_lambda_t1 + d_t1;
+            const float stick_t2 = old_lambda_t2 + d_t2;
+            if (fabsf(e_n) + fabsf(e_t1) + fabsf(e_t2) <= 1.0e-5f * scale && stick_n >= 0.0f
+                && sqrtf(stick_t1 * stick_t1 + stick_t2 * stick_t2) <= mu * stick_n) {
+                new_lambda_n = stick_n;
+                new_lambda_t1 = stick_t1;
+                new_lambda_t2 = stick_t2;
+                sticks = true;
             }
-            float d_t1_actual = trial_t1 - old_lambda_t1;
-            float d_t2_actual = trial_t2 - old_lambda_t2;
-            float u_n_trial = u_n + G_nn * d_n + G_nt1 * d_t1_actual + G_nt2 * d_t2_actual;
-            if (u_n_trial < target_vel_n) { lo = mid; f_lo = u_n_trial - target_vel_n; }
-            else { hi = mid; f_hi = u_n_trial - target_vel_n; }
         }
-        // Interpolate the root in the final bracket, whose width scales with the initial one.
-        new_lambda_n = f_hi >= 0.0f ? lo - f_lo * (hi - lo) / (f_hi - f_lo) : 0.5f * (lo + hi);
-        float d_n_final = new_lambda_n - old_lambda_n;
-        float ut1_f = u_t1 + G_nt1 * d_n_final;
-        float ut2_f = u_t2 + G_nt2 * d_n_final;
-        float det_f = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
-        float d_t1_f = 0.0f, d_t2_f = 0.0f;
-        if (fabsf(det_f) > 1.0e-20f) {
-            d_t1_f = (-ut1_f * G_t2t2 + ut2_f * G_t1t2) / det_f;
-            d_t2_f = ( ut1_f * G_t1t2 - ut2_f * G_t1t1) / det_f;
-        }
-        new_lambda_t1 = old_lambda_t1 + d_t1_f;
-        new_lambda_t2 = old_lambda_t2 + d_t2_f;
-        float flimit_f = mu * new_lambda_n;
-        float tmag_f = sqrtf(new_lambda_t1 * new_lambda_t1 + new_lambda_t2 * new_lambda_t2);
-        if (tmag_f > flimit_f && tmag_f > 1.0e-20f) {
-            float sc_f = flimit_f / tmag_f;
-            new_lambda_t1 *= sc_f;
-            new_lambda_t2 *= sc_f;
+        if (!sticks) {
+            // Each probe solves the tangent pair on the friction disk of its load, like fixed_normal, and returns
+            // the normal velocity residual of that load and pair.
+            float pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy;
+            friction_pair_setup(
+                G_t1t1, G_t1t2, G_t2t2, pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy);
+            const auto probe = [&](float lambda_n, float& tangent1, float& tangent2) {
+                const float d_n = lambda_n - old_lambda_n;
+                const float radius = fmaxf(mu * lambda_n, 0.0f);
+                const float2 pair = friction_pair_solve(
+                    pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy, u_t1 + G_nt1 * d_n,
+                    u_t2 + G_nt2 * d_n, old_lambda_t1, old_lambda_t2, radius, 1.0f);
+                const float mag = sqrtf(pair.x * pair.x + pair.y * pair.y);
+                const float sc = mag > radius ? radius / mag : 1.0f;
+                tangent1 = pair.x * sc;
+                tangent2 = pair.y * sc;
+                return u_n + G_nn * d_n + G_nt1 * (tangent1 - old_lambda_t1) + G_nt2 * (tangent2 - old_lambda_t2)
+                    - target_vel_n;
+            };
+            // One probe call site keeps one inlined copy of the disk solve. The first probe is the current
+            // load, close to the root in later sweeps. Friction can raise the root above the frictionless one,
+            // so the bracket doubles until it holds the root; Illinois regula falsi, exact where the residual
+            // is linear in the load, narrows it, and the last probe takes the root interpolated in it.
+            float lo = 0.0f, f_lo = u_n_at_zero - target_vel_n;
+            float hi = 0.0f, f_hi = 0.0f;
+            bool bracketed = false, last_probe = false;
+            int last_side = 0;
+            float x = fmaxf(old_lambda_n, -f_lo / G_nn);
+            // A singular block whose coupled solution sticks at every load has no root; stop once it sticks.
+            const bool jammed = minor_nn > 0.0f && det_block <= 1.0e-6f * G_nn * minor_nn
+                && minor_n1 * minor_n1 + minor_n2 * minor_n2 <= mu * mu * minor_nn * minor_nn;
+            for (int _it = 0; _it < 64; _it++) {
+                const float f_x = probe(x, new_lambda_t1, new_lambda_t2);
+                new_lambda_n = x;
+                // Within what a 1e-5 relative error in the load would leave.
+                if (last_probe || fabsf(f_x) <= 1.0e-5f * G_nn * x) break;
+                if (jammed && f_x < 0.0f
+                    && new_lambda_t1 * new_lambda_t1 + new_lambda_t2 * new_lambda_t2 < 0.999f * mu * mu * x * x)
+                    break;
+                if (f_x < 0.0f) {
+                    lo = x;
+                    f_lo = f_x;
+                    if (last_side < 0) f_hi *= 0.5f;
+                    last_side = -1;
+                } else {
+                    hi = x;
+                    f_hi = f_x;
+                    bracketed = true;
+                    if (last_side > 0) f_lo *= 0.5f;
+                    last_side = 1;
+                }
+                if (!bracketed) {
+                    x *= 2.0f;
+                } else if (hi - lo <= 1.0e-5f * hi || _it >= 62) {
+                    x = lo - f_lo * (hi - lo) / (f_hi - f_lo);
+                    last_probe = true;
+                } else {
+                    x = (lo * f_hi - hi * f_lo) / (f_hi - f_lo);
+                    if (!(x > lo && x < hi)) x = 0.5f * (lo + hi);
+                }
+            }
         }
     };
 """

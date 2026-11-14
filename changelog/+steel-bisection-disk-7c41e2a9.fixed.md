@@ -1,0 +1,1 @@
+Fix `SolverSteel` `friction_mode="bisection"` and `"bisection_desaxce"` letting bodies slide near the friction limit: each probe of the normal impulse now solves the tangent pair on the friction disk instead of scaling the sticking impulse onto it, and the bracket grows until it holds the root.
