@@ -4752,8 +4752,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         """Forces [N or N·m] of the actuators driving tendons in the last :meth:`step`, one per ``mujoco:actuator``.
 
         Each is MuJoCo's ``actuator_force`` at the step's input state: the force on its actuator coordinate
-        (``gear`` times the tendon length), clamped to its force range and scaled by the tendon's
-        ``actuatorfrcrange``. The force applied during the step also carries the implicit stiffness term
+        (``gear`` times the tendon length), scaled by the tendon's ``actuatorfrcrange`` and then clamped
+        to its own force range. The force applied during the step also carries the implicit stiffness term
         ``-k dt dx/dt``, so the two differ while the coordinate moves. Actuators with other transmissions, or
         that this solver ignores, read 0. Returns ``None`` when no tendon actuator is enforced.
 

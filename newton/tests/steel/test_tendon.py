@@ -629,6 +629,27 @@ def test_tendon_auto_limit_follows_autolimits(test, device):
             test.assertAlmostEqual(run.q("m"), 0.1 if stops else steps * dt, delta=1.0e-3)
 
 
+def test_tendon_force_range_scales_before_actuator_clamps(test, device):
+    """The tendon's actuatorfrcrange scales the unclamped actuator forces; each forcerange clamps afterwards.
+
+    Forces 10 and 0.5 sum to 10.5 and scale by 1 / 10.5 into the [-1, 1] cap, which leaves both inside their own
+    [-2, 2] range: 0.952 and 0.048, so 0.952 + 2 * 0.048 = 1.048 N on the joint, as MuJoCo's mj_fwdActuation.
+    Clamping first would give 2 and 0.5, scaled to 0.8 and 0.2 and 1.2 N.
+    """
+    dt, steps = 1.0e-3, 100
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>{_frame(_slider("m", "0 0 1", axis="1 0 0"))}</worldbody>
+    <tendon><fixed name="t" actuatorfrcrange="-1 1"><joint joint="m" coef="1"/></fixed></tendon>
+    <actuator><motor tendon="t" forcerange="-2 2"/><motor tendon="t" gear="2" forcerange="-2 2"/></actuator>
+    </mujoco>"""
+    for mode in _MODES:
+        with test.subTest(solve_mode=mode):
+            run = _Run(mjcf, device, solve_mode=mode, ctrl=[10.0, 0.5], iterations=8)
+            run.step(dt, steps)
+            forces = np.array([10.0, 0.5]) / 10.5
+            np.testing.assert_allclose(run.solver.tendon_actuator_forces().numpy(), forces, atol=1.0e-6)
+            test.assertAlmostEqual(run.qd("m"), (forces[0] + 2.0 * forces[1]) * steps * dt, delta=1.0e-5)
+
+
 def test_tendon_property_changes_reach_the_solver(test, device):
     """notify_model_changed(TENDON_PROPERTIES) re-derives the spring terms; edits that add tendon rows raise.
 
@@ -843,6 +864,7 @@ for _name in (
     "test_tendon_fixed_length_includes_the_joint_reference",
     "test_tendon_actuator_force_range_caps_the_summed_force",
     "test_tendon_auto_limit_follows_autolimits",
+    "test_tendon_force_range_scales_before_actuator_clamps",
     "test_tendon_property_changes_reach_the_solver",
     "test_tendon_stiffness_switched_on_by_notify",
     "test_tendon_friction_loss_switched_by_notify",

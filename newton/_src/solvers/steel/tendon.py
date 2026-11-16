@@ -1003,6 +1003,28 @@ def populate_tendon_rows_for_size(
 
 
 @wp.func
+def _actuator_affine(actuators: TendonActuators, act: int, x: float, dx: float) -> wp.vec3:
+    """Unclamped force of an affine tendon actuator at coordinate ``x`` and rate ``dx``, and its stiffness and
+    damping gains ``(force, k, b)``: the ``-d force/dx`` and ``-d force/d(dx)`` that enter the mass matrix."""
+    u = actuators.ctrl[act]
+    if (actuators.flags[act] & ACTUATOR_CTRL_LIMITED) != 0:
+        u = wp.clamp(u, actuators.ctrlrange[act][0], actuators.ctrlrange[act][1])
+    gp = actuators.gainprm[act]
+    c0 = gp[0] * u
+    c1 = float(0.0)
+    c2 = float(0.0)
+    if actuators.gaintype[act] == _GAIN_AFFINE:
+        c1 += gp[1] * u
+        c2 += gp[2] * u
+    if actuators.biastype[act] == _BIAS_AFFINE:
+        bp = actuators.biasprm[act]
+        c0 += bp[0]
+        c1 += bp[1]
+        c2 += bp[2]
+    return wp.vec3(c0 + c1 * x + c2 * dx, wp.max(-c1, 0.0), wp.max(-c2, 0.0))
+
+
+@wp.func
 def _cap_scale(total: float, cap: wp.vec2) -> float:
     """Scale bringing a tendon's summed actuator force ``total`` into ``cap`` (1 inside it)."""
     if total < cap[0] and total != 0.0:
@@ -1157,55 +1179,40 @@ def apply_tendon_mass_terms_for_size(
         tendon_force[k, 1] = spring
         force += spring
 
-    # MuJoCo's actuator_force is c0 + c1 x + c2 dx/dt clamped to its force range. The applied drive also carries the
-    # implicit gain's -k dt dx/dt and is clamped the same way, as a joint drive's effort limit.
+    # MuJoCo's actuator_force is c0 + c1 x + c2 dx/dt, scaled so the tendon's summed force stays in its
+    # actuatorfrcrange and then clamped to the actuator's own force range, in that order (mj_fwdActuation). The
+    # applied drive also carries the implicit gain's -k dt dx/dt and is limited the same way, as a joint drive's
+    # effort limit.
     a_start = actuators.start[k]
     a_end = actuators.start[k + 1]
     total = float(0.0)
     total_drive = float(0.0)
-    geared_drive = float(0.0)
     for e in range(a_start, a_end):
         act = actuators.actuator[e]
         gear = actuators.gear[act][0]
-        x = gear * length
         dx = gear * velocity
-        u = actuators.ctrl[act]
-        act_flags = actuators.flags[act]
-        if (act_flags & ACTUATOR_CTRL_LIMITED) != 0:
-            u = wp.clamp(u, actuators.ctrlrange[act][0], actuators.ctrlrange[act][1])
-        gp = actuators.gainprm[act]
-        c0 = gp[0] * u
-        c1 = float(0.0)
-        c2 = float(0.0)
-        if actuators.gaintype[act] == _GAIN_AFFINE:
-            c1 += gp[1] * u
-            c2 += gp[2] * u
-        if actuators.biastype[act] == _BIAS_AFFINE:
-            bp = actuators.biasprm[act]
-            c0 += bp[0]
-            c1 += bp[1]
-            c2 += bp[2]
-        k_act = wp.max(-c1, 0.0)
-        b_act = wp.max(-c2, 0.0)
-        actuator = c0 + c1 * x + c2 * dx
-        drive = actuator - k_act * dt * dx
-        if (act_flags & ACTUATOR_FORCE_LIMITED) != 0:
-            actuator = wp.clamp(actuator, actuators.forcerange[act][0], actuators.forcerange[act][1])
-            drive = wp.clamp(drive, actuators.forcerange[act][0], actuators.forcerange[act][1])
-        actuator_force[act] = actuator
-        total += actuator
-        total_drive += drive
-        geared_drive += gear * drive
-        K += gear * gear * (k_act * dt * dt + b_act * dt)
-    # The tendon's actuatorfrcrange caps the summed actuator force by scaling every actuator's force, as MuJoCo.
+        affine = _actuator_affine(actuators, act, gear * length, dx)
+        total += affine[0]
+        total_drive += affine[0] - affine[1] * dt * dx
+        K += gear * gear * (affine[1] * dt * dt + affine[2] * dt)
+    scale = float(1.0)
+    scale_drive = float(1.0)
     if a_end > a_start and actuators.tendon_force_limited[k] != 0:
         cap = actuators.tendon_force_range[k]
         scale = _cap_scale(total, cap)
-        if scale != 1.0:
-            for e in range(a_start, a_end):
-                actuator_force[actuators.actuator[e]] *= scale
-        geared_drive *= _cap_scale(total_drive, cap)
-    force += geared_drive
+        scale_drive = _cap_scale(total_drive, cap)
+    for e in range(a_start, a_end):
+        act = actuators.actuator[e]
+        gear = actuators.gear[act][0]
+        dx = gear * velocity
+        affine = _actuator_affine(actuators, act, gear * length, dx)
+        actuator = scale * affine[0]
+        drive = scale_drive * (affine[0] - affine[1] * dt * dx)
+        if (actuators.flags[act] & ACTUATOR_FORCE_LIMITED) != 0:
+            actuator = wp.clamp(actuator, actuators.forcerange[act][0], actuators.forcerange[act][1])
+            drive = wp.clamp(drive, actuators.forcerange[act][0], actuators.forcerange[act][1])
+        actuator_force[act] = actuator
+        force += gear * drive
 
     # Every world's tendons add into the same H and joint forces, so the atomic adds contend: skip the zero
     # entries of J (a fixed tendon spans a few DOFs) rather than add zeros.
