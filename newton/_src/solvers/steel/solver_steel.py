@@ -4619,7 +4619,8 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         New tendon mass terms on an articulation size without them move that size onto the unfused CRBA path
         the tendon kernels add to (:meth:`_add_tendon_mass_sizes`). Edits that change the tendon rows (a limit
-        switched on or off, friction loss on a tendon without a friction row), or that add mass terms to a size
+        switched on or off, friction loss on a tendon without a friction row, a limit range narrowed or widened
+        across twice its activation gap, which changes the rows it reserves), or that add mass terms to a size
         whose mass matrix is diagonal or sparse-factored, raise :class:`NotImplementedError`; reconstruct the
         solver for those.
         """
@@ -4632,11 +4633,14 @@ class SolverSteel(SolverBase, CouplingInterface):
         if not old.count and not new.count:
             return
         changed = []
-        if old.has_rows != new.has_rows or (
-            new.has_rows
-            and (not np.array_equal(new.flags_np, old.flags_np) or not np.array_equal(new.reserve_np, old.reserve_np))
-        ):
+        if old.has_rows != new.has_rows or (new.has_rows and not np.array_equal(new.flags_np, old.flags_np)):
             changed.append("which tendons have limit or friction-loss rows")
+        elif new.has_rows and not np.array_equal(new.reserve_np, old.reserve_np):
+            # A gated tendon reserves one limit row while its range is wider than twice its activation gap, two
+            # otherwise, so a range edit across that width changes the reserved row capacity.
+            changed.append(
+                "how many limit rows a tendon reserves (its range crossed twice tendon_limit_activation_gap)"
+            )
         added_sizes = frozenset(new.mass_sizes) - self._tendon_mass_sizes
         if not self._can_add_tendon_mass_sizes(added_sizes, first_tendons=not old.count):
             changed.append("mass terms on articulations whose mass matrix is diagonal or sparse")

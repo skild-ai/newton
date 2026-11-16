@@ -686,6 +686,27 @@ def test_tendon_property_changes_reach_the_solver(test, device):
                 run.solver.notify_model_changed(flags)
 
 
+def test_tendon_range_edits_report_the_reserved_rows(test, device):
+    """A limit range edited within its reserved rows takes effect; one that needs more rows says so.
+
+    A gated tendon whose range is wider than twice its activation gap reserves one limit row. Moving the bound
+    keeps that row, so the slider stops at the new bound. Narrowing the range below twice the gap would need two
+    rows, which raises with that reason rather than claiming that the set of limited tendons changed.
+    """
+    dt = 1.0e-3
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>{_frame(_slider("m", "0 0 1", axis="1 0 0"))}</worldbody><tendon>
+      <fixed limited="true" range="-1 1"><joint joint="m" coef="1"/></fixed></tendon></mujoco>"""
+    flags = newton.ModelFlags.TENDON_PROPERTIES
+    run = _Run(mjcf, device, qd={"m": 1.0}, iterations=8, tendon_limit_activation_gap=0.05)
+    run.model.mujoco.tendon_range.assign(np.array([[-1.0, 0.2]], dtype=np.float32))
+    run.solver.notify_model_changed(flags)
+    run.step(dt, 400)
+    test.assertAlmostEqual(run.q("m"), 0.2, delta=1.0e-3)
+    run.model.mujoco.tendon_range.assign(np.array([[0.17, 0.23]], dtype=np.float32))
+    with test.assertRaisesRegex(NotImplementedError, "how many limit rows a tendon reserves"):
+        run.solver.notify_model_changed(flags)
+
+
 def _fresh_copy(run, mode, **solver_kwargs):
     """A solver constructed from ``run``'s current model, stepping a copy of its current state."""
     if mode == "colored":
@@ -866,6 +887,7 @@ for _name in (
     "test_tendon_auto_limit_follows_autolimits",
     "test_tendon_force_range_scales_before_actuator_clamps",
     "test_tendon_property_changes_reach_the_solver",
+    "test_tendon_range_edits_report_the_reserved_rows",
     "test_tendon_stiffness_switched_on_by_notify",
     "test_tendon_friction_loss_switched_by_notify",
     "test_tendon_inside_sphere_wrap_matches_mujoco",
