@@ -2205,6 +2205,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 default) keeps the spring force explicit, the scheme of MuJoCo's ``implicitfast``
                 integrator. Tendon actuators are always folded in like joint drives, with their force
                 range applied as an effort limit. Tendon range limits and friction loss are dense rows.
+
+                .. experimental::
+
+                    ``tendon_passive_mode`` and Steel's MuJoCo-style tendon support may change without
+                    the normal deprecation period.
             tendon_limit_activation_gap: Distance from a tendon range bound [m or rad, the tendon
                 length's unit] at which its limit row is created, the tendon counterpart of
                 ``joint_limit_activation_gap``. ``inf`` creates both limit rows of every limited tendon
@@ -2219,6 +2224,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 for that step and is corrected the next. A gated tendon whose range is wider than twice
                 its gap reserves one limit row instead of two and keeps only the bound nearer its
                 predicted length, which saves dense-row memory. Friction-loss rows are always created.
+
+                .. experimental::
+
+                    ``tendon_limit_activation_gap`` may change without the normal deprecation period.
             articulation_constraint_max: Capacity of rows involving articulated bodies (mimic and
                 connect rows, contacts, enabled joint limits, joint velocity limits, joint friction
                 and, with ``drive_mode="rows"``, joint drives) per world. Rows beyond it are
@@ -4732,6 +4741,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         One entry per ``mujoco:tendon`` attribute row, including tendons without a limit, spring,
         friction loss, or actuator; tendons this solver ignores read 0. Returns ``None`` when the model
         has no tendon this solver can evaluate.
+
+        .. experimental::
+
+            This method may change without the normal deprecation period.
         """
         return self._tendon.length
 
@@ -4743,6 +4756,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         ``actuatorfrcrange``. The force applied during the step also carries the implicit stiffness term
         ``-k dt dx/dt``, so the two differ while the coordinate moves. Actuators with other transmissions, or
         that this solver ignores, read 0. Returns ``None`` when no tendon actuator is enforced.
+
+        .. experimental::
+
+            This method may change without the normal deprecation period.
         """
         if not self._tendon_count or not self._tendon.actuator_count:
             return None
@@ -4756,6 +4773,11 @@ class SolverSteel(SolverBase, CouplingInterface):
         force, each conjugate to the tendon length. Actuator forces are reported by
         :meth:`tendon_actuator_forces`. ``dt`` must be the step size [s] of that step.
         Returns ``None`` when the model has no enforced tendon.
+
+        .. experimental::
+
+            This method, its ``dt`` argument and its column layout may change without the normal
+            deprecation period.
         """
         if not self._tendon_count:
             return None
