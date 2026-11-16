@@ -1046,6 +1046,190 @@ def _cap_scale(total: float, cap: wp.vec2) -> float:
 
 
 @wp.kernel
+def invert_tendon_mass_factor_for_size(
+    group_to_art: wp.array[int],
+    mass_update_mask: wp.array[int],
+    dense_response_art: wp.array[int],
+    L_group: wp.array3d[float],
+    n_dofs: int,
+    Hinv_group: wp.array3d[float],
+):
+    """Form ``H^-1`` from the refreshed Cholesky factor, one thread per column.
+
+    The propagation response of articulations with tendon mass terms applies it in place of the tree pass.
+    """
+    idx, c = wp.tid()
+    art = group_to_art[idx]
+    if mass_update_mask[art] == 0 or dense_response_art[art] == 0:
+        return
+    for i in range(n_dofs):
+        val = float(0.0)
+        if i == c:
+            val = 1.0
+        for k in range(i):
+            val -= L_group[idx, i, k] * Hinv_group[idx, k, c]
+        Hinv_group[idx, i, c] = val / L_group[idx, i, i]
+    for i_rev in range(n_dofs):
+        i = n_dofs - 1 - i_rev
+        val = Hinv_group[idx, i, c]
+        for k in range(i + 1, n_dofs):
+            val -= L_group[idx, k, i] * Hinv_group[idx, k, c]
+        Hinv_group[idx, i, c] = val / L_group[idx, i, i]
+
+
+@wp.kernel
+def project_tendon_link_impulses_for_size(
+    group_to_art: wp.array[int],
+    dense_response_art: wp.array[int],
+    articulation_active: wp.array[int],
+    articulation_start: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_qd_start: wp.array[int],
+    body_to_joint: wp.array[int],
+    joint_S_flat: wp.array2d[float],
+    body_com_rel: wp.array2d[float],
+    joint_impulse: wp.array[float],
+    body_impulses: wp.array2d[float],
+):
+    """Project an articulation's accumulated link impulses to joint space, ``tau = X^T p``, and clear them."""
+    art = group_to_art[wp.tid()]
+    if dense_response_art[art] == 0:
+        return
+    joint_start = articulation_start[art]
+    joint_end = articulation_start[art + 1]
+    for g in range(joint_qd_start[joint_start], joint_qd_start[joint_end]):
+        joint_impulse[g] = 0.0
+    if articulation_active.shape[0] > 0:
+        if articulation_active[art] == 0:
+            return
+    for joint in range(joint_start, joint_end):
+        b = joint_child[joint]
+        force = wp.vec3(body_impulses[b, 0], body_impulses[b, 1], body_impulses[b, 2])
+        torque = wp.vec3(body_impulses[b, 3], body_impulses[b, 4], body_impulses[b, 5])
+        if wp.length_sq(force) == 0.0 and wp.length_sq(torque) == 0.0:
+            continue
+        for r in range(6):
+            body_impulses[b, r] = 0.0
+        # Each joint on the link's root path sees the wrench about its own child's center of mass.
+        walk = joint
+        for _depth in range(joint_end - joint_start):
+            if walk < 0:
+                break
+            c = joint_child[walk]
+            offset = wp.vec3(
+                body_com_rel[b, 0] - body_com_rel[c, 0],
+                body_com_rel[b, 1] - body_com_rel[c, 1],
+                body_com_rel[b, 2] - body_com_rel[c, 2],
+            )
+            moment = torque + wp.cross(offset, force)
+            for g in range(joint_qd_start[walk], joint_qd_start[walk + 1]):
+                tau = float(0.0)
+                for r in range(3):
+                    tau += joint_S_flat[g, r] * force[r] + joint_S_flat[g, 3 + r] * moment[r]
+                joint_impulse[g] = joint_impulse[g] + tau
+            parent = joint_parent[walk]
+            walk = int(-1)
+            if parent >= 0:
+                walk = body_to_joint[parent]
+
+
+@wp.kernel
+def apply_tendon_mass_inverse_for_size(
+    group_to_art: wp.array[int],
+    dense_response_art: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    Hinv_group: wp.array3d[float],
+    n_dofs: int,
+    joint_impulse: wp.array[float],
+    v_out: wp.array[float],
+):
+    """Add ``H^-1 tau`` of the projected link impulses to the joint velocities, one thread per DOF."""
+    idx, i = wp.tid()
+    art = group_to_art[idx]
+    if dense_response_art[art] == 0:
+        return
+    dof_start = articulation_dof_start[art]
+    delta = float(0.0)
+    for k in range(n_dofs):
+        delta += Hinv_group[idx, i, k] * joint_impulse[dof_start + k]
+    v_out[dof_start + i] = v_out[dof_start + i] + delta
+
+
+@wp.kernel
+def compute_tendon_link_response_for_size(
+    group_to_art: wp.array[int],
+    dense_response_art: wp.array[int],
+    articulation_start: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_qd_start: wp.array[int],
+    body_to_joint: wp.array[int],
+    joint_S_flat: wp.array2d[float],
+    body_com_rel: wp.array2d[float],
+    body_has_rows: wp.array[int],
+    L_group: wp.array3d[float],
+    n_dofs: int,
+    max_joints: int,
+    Z: wp.array3d[float],
+    body_response: wp.array3d[float],
+):
+    """Self-response ``X_b H^-1 X_b^T`` of each row-bearing link, with ``H`` holding the tendon mass terms.
+
+    ``X_b`` is the link's center-of-mass Jacobian; one thread per articulation and link.
+    """
+    idx, local = wp.tid()
+    art = group_to_art[idx]
+    joint_start = articulation_start[art]
+    joint_count = articulation_start[art + 1] - joint_start
+    if dense_response_art[art] == 0 or local >= joint_count:
+        return
+    b = joint_child[joint_start + local]
+    if body_has_rows[b] == 0:
+        return
+    dof_start = articulation_dof_start[art]
+    z = idx * max_joints + local
+    for i in range(n_dofs):
+        for r in range(6):
+            Z[z, i, r] = 0.0
+    walk = joint_start + local
+    for _depth in range(joint_count):
+        if walk < 0:
+            break
+        c = joint_child[walk]
+        offset = wp.vec3(
+            body_com_rel[b, 0] - body_com_rel[c, 0],
+            body_com_rel[b, 1] - body_com_rel[c, 1],
+            body_com_rel[b, 2] - body_com_rel[c, 2],
+        )
+        for g in range(joint_qd_start[walk], joint_qd_start[walk + 1]):
+            ang = wp.vec3(joint_S_flat[g, 3], joint_S_flat[g, 4], joint_S_flat[g, 5])
+            lin = wp.vec3(joint_S_flat[g, 0], joint_S_flat[g, 1], joint_S_flat[g, 2]) + wp.cross(ang, offset)
+            i = g - dof_start
+            for r in range(3):
+                Z[z, i, r] = lin[r]
+                Z[z, i, 3 + r] = ang[r]
+        parent = joint_parent[walk]
+        walk = int(-1)
+        if parent >= 0:
+            walk = body_to_joint[parent]
+    # Z <- L^-1 X^T; the response is Z^T Z.
+    for r in range(6):
+        for i in range(n_dofs):
+            val = Z[z, i, r]
+            for k in range(i):
+                val -= L_group[idx, i, k] * Z[z, k, r]
+            Z[z, i, r] = val / L_group[idx, i, i]
+    for r in range(6):
+        for c2 in range(6):
+            acc = float(0.0)
+            for i in range(n_dofs):
+                acc += Z[z, i, r] * Z[z, i, c2]
+            body_response[b, r, c2] = acc
+
+
+@wp.kernel
 def apply_tendon_mass_terms_for_size(
     tendon_list: wp.array[int],
     tendon_art: wp.array[int],

@@ -790,6 +790,9 @@ What is modeled:
   ``actuatorfrcrange`` scales its actuators' forces and each actuator's ``forcerange`` clamps
   afterwards, in MuJoCo's order. A position actuator's ``dampratio`` resolves to a damping gain
   from the tendon's reflected inertia at the reference pose.
+- **Contacts.** Contacts respond through these mass-matrix terms under both of Steel's contact
+  responses. The propagation response applies the link impulses of such articulations with the
+  inverse of the dense mass matrix, because the terms couple DOFs across the kinematic tree.
 
 Differences from :class:`~newton.solvers.SolverMuJoCo`:
 

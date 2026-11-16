@@ -246,12 +246,16 @@ from .tendon import (
     TendonPlan,
     accumulate_tendon_mass_terms_for_size,
     allocate_tendon_slots,
+    apply_tendon_mass_inverse_for_size,
     apply_tendon_mass_terms_for_size,
     clear_tendon_armature_history,
+    compute_tendon_link_response_for_size,
     gate_fixed_tendon_limit_rows,
     gate_tendon_limit_rows,
     gather_tendon_forces,
+    invert_tendon_mass_factor_for_size,
     populate_tendon_rows_for_size,
+    project_tendon_link_impulses_for_size,
 )
 
 # SolverSteel rejects models with ``requires_grad``, so no kernel needs an adjoint.
@@ -2206,6 +2210,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 default) keeps the spring force explicit, the scheme of MuJoCo's ``implicitfast``
                 integrator. Tendon actuators are always folded in like joint drives, with their force
                 range applied as an effort limit. Tendon range limits and friction loss are dense rows.
+                Contacts see these mass terms under either ``articulated_contact_response``.
 
                 .. experimental::
 
@@ -2606,6 +2611,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 velocity-limit rows dense, and contacts between two links of the same
                 articulation dense unless ``propagation_same_articulation_rows`` is set. The
                 tree factorization is rebuilt every step, independently of
+                ``update_mass_matrix_interval``. Articulations with tendon mass terms (armature,
+                stiffness, damping or tendon actuators) keep their propagation rows, but those
+                terms couple DOFs across the tree, so their link impulses are applied with ``H^-1``
+                of the dense mass matrix instead of the tree pass and each row's response is
+                scaled to the link's dense-matrix response; that inverse follows
                 ``update_mass_matrix_interval``.
 
                 .. deprecated:: 1.8
@@ -2624,7 +2634,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 to articulation groups with 0- or 1-DOF joints (optionally under a free root);
                 other groups, and worlds with more cache-eligible active bodies than
                 ``propagation_cached_response_body_max``, keep the tree walk, selected per
-                world on the device. Which is faster depends on the model.
+                world on the device. Articulations with tendon mass terms are not cached. Which is
+                faster depends on the model.
             propagation_cached_response_body_max: Capacity of the cached responses in
                 contact-active bodies of cache-eligible articulations per world; free bodies
                 do not count. At least 1.
@@ -4709,6 +4720,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         for sizes with tendon mass terms; :meth:`_stage1_crba` then zeroes ``H`` before every fill.
         """
         self._tendon_mass_sizes = self._tendon_mass_sizes | sizes
+        if self._propagation_active:
+            self._allocate_tendon_dense_response(sizes)
         device_arch = self.model.device.arch
         for size in sizes:
             if (
@@ -8056,6 +8069,20 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._stage2_cholesky_loop(size)
             if size in self._Linv_by_size:
                 self._stage2_invert_lower_factor(size)
+            if size in self._tendon_Hinv_by_size:
+                wp.launch(
+                    invert_tendon_mass_factor_for_size,
+                    dim=(self._n_arts_by_size[size], size),
+                    inputs=[
+                        self._group_to_art[size],
+                        self._mass_update_mask,
+                        self._tendon_dense_response_art,
+                        self._L_by_size[size],
+                        size,
+                    ],
+                    outputs=[self._tendon_Hinv_by_size[size]],
+                    device=model.device,
+                )
             if self._inverse_cholesky_kernels_by_size[size] is not None:
                 wp.launch(
                     self._inverse_cholesky_kernels_by_size[size],
@@ -11926,6 +11953,12 @@ class SolverSteel(SolverBase, CouplingInterface):
         # Tree groups whose responses are cached, with the warps of their extraction kernel.
         self._propagation_cached_warps: dict[int, int] = {}
         self._propagation_cache_max_bodies = 0
+        # Tree sizes with tendon mass terms respond through H^-1; see _allocate_tendon_dense_response.
+        self._tendon_Hinv_by_size: dict[int, wp.array] = {}
+        self._tendon_link_response_scratch: dict[int, wp.array] = {}
+        self._tendon_dense_response_art = None
+        self._tendon_joint_impulse = None
+        self._propagation_body_response_dense = None
         if self._articulated_contact_response == "immediate" or not self._size_groups or self._model_plan is None:
             return
 
@@ -12021,6 +12054,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             for size in self._propagation_tree_sizes:
                 # The cached-response setup kernel covers 0/1-DOF and free-root trees only.
                 if not self._propagation_native_tree[size] or self._propagation_multidof_tree[size]:
+                    continue
+                # The cache holds tree responses, which miss the tendon mass terms.
+                if size in self._tendon_mass_sizes:
                     continue
                 warps = _cached_response_extraction_warps(
                     self._propagation_max_joints[size],
@@ -12348,6 +12384,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             if self._propagation_cached_warps
             else None
         )
+        self._allocate_tendon_dense_response(self._tendon_mass_sizes)
         if self._propagation_colored:
             self._init_colored_kernels(model)
         else:
@@ -12877,6 +12914,29 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
             )
         self._propagation_refresh_twists(force=True)
+        for size, scratch in self._tendon_link_response_scratch.items():
+            wp.launch(
+                compute_tendon_link_response_for_size,
+                dim=(self._n_arts_by_size[size], self._propagation_max_joints[size]),
+                inputs=[
+                    self._group_to_art[size],
+                    self._tendon_dense_response_art,
+                    model.articulation_start,
+                    self._articulation_dof_start,
+                    model.joint_parent,
+                    model.joint_child,
+                    model.joint_qd_start,
+                    self._body_to_joint,
+                    self._propagation_joint_S_flat,
+                    self._propagation_body_com_rel,
+                    self._propagation_body_split_seen,
+                    self._L_by_size[size],
+                    size,
+                    self._propagation_max_joints[size],
+                ],
+                outputs=[scratch, self._propagation_body_response_dense],
+                device=model.device,
+            )
         wp.launch(
             compute_propagation_effective_mass_and_rhs,
             dim=self._world_count * self._propagation_max_constraints,
@@ -12888,6 +12948,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_J_b,
                 self._propagation_body_response,
                 self._propagation_body_response_split,
+                self._body_to_articulation,
+                self._tendon_dense_response_art if self._tendon_Hinv_by_size else None,
+                self._propagation_body_response_dense,
                 self._propagation_phi,
                 self._propagation_row_type,
                 self._propagation_target_velocity,
@@ -12973,53 +13036,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         """
         model = self.model
         for size in self._propagation_tree_sizes:
-            arts = self._propagation_tree_arts[size]
-            n_arts = self._propagation_tree_art_count[size]
-            if self._propagation_native_tree[size]:
-                wp.launch_tiled(
-                    self._propagation_refresh_kernels[size],
-                    dim=[n_arts],
-                    inputs=[
-                        arts,
-                        self._propagation_tree_activity,
-                        self._art_to_world,
-                        self._dense_contact_world_flag,
-                        int(force),
-                        model.articulation_start,
-                        model.joint_parent,
-                        model.joint_child,
-                        model.joint_qd_start,
-                        self._propagation_joint_parent_slot,
-                        *self._propagation_refresh_level_args(size),
-                        self._propagation_joint_S_flat,
-                        self._propagation_body_com_rel,
-                        self._v_out,
-                    ],
-                    outputs=[self._propagation_body_qd],
-                    block_dim=32,
-                    device=model.device,
-                )
-            else:
-                wp.launch(
-                    refresh_propagation_tree_body_qd_for_size,
-                    dim=n_arts,
-                    inputs=[
-                        arts,
-                        self._propagation_tree_activity,
-                        self._art_to_world,
-                        self._dense_contact_world_flag,
-                        int(force),
-                        model.articulation_start,
-                        model.joint_parent,
-                        model.joint_child,
-                        model.joint_qd_start,
-                        self._propagation_joint_S_flat,
-                        self._propagation_body_com_rel,
-                        self._v_out,
-                    ],
-                    outputs=[self._propagation_body_qd],
-                    device=model.device,
-                )
+            self._propagation_refresh_tree_twists(size, force=force)
         if self._has_free_rigid_bodies:
             wp.launch(
                 refresh_propagation_free_body_qd_from_vout,
@@ -13028,6 +13045,57 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._free_rigid_body_indices,
                     self._body_to_articulation,
                     self._articulation_dof_start,
+                    self._v_out,
+                ],
+                outputs=[self._propagation_body_qd],
+                device=model.device,
+            )
+
+    def _propagation_refresh_tree_twists(self, size: int, *, force: bool) -> None:
+        """Recompute the link twists of one tree size group from ``v_out``."""
+        model = self.model
+        arts = self._propagation_tree_arts[size]
+        n_arts = self._propagation_tree_art_count[size]
+        if self._propagation_native_tree[size]:
+            wp.launch_tiled(
+                self._propagation_refresh_kernels[size],
+                dim=[n_arts],
+                inputs=[
+                    arts,
+                    self._propagation_tree_activity,
+                    self._art_to_world,
+                    self._dense_contact_world_flag,
+                    int(force),
+                    model.articulation_start,
+                    model.joint_parent,
+                    model.joint_child,
+                    model.joint_qd_start,
+                    self._propagation_joint_parent_slot,
+                    *self._propagation_refresh_level_args(size),
+                    self._propagation_joint_S_flat,
+                    self._propagation_body_com_rel,
+                    self._v_out,
+                ],
+                outputs=[self._propagation_body_qd],
+                block_dim=32,
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                refresh_propagation_tree_body_qd_for_size,
+                dim=n_arts,
+                inputs=[
+                    arts,
+                    self._propagation_tree_activity,
+                    self._art_to_world,
+                    self._dense_contact_world_flag,
+                    int(force),
+                    model.articulation_start,
+                    model.joint_parent,
+                    model.joint_child,
+                    model.joint_qd_start,
+                    self._propagation_joint_S_flat,
+                    self._propagation_body_com_rel,
                     self._v_out,
                 ],
                 outputs=[self._propagation_body_qd],
@@ -13063,6 +13131,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
             )
         for size in self._propagation_tree_sizes:
+            if size in self._tendon_Hinv_by_size:
+                self._propagation_propagate_impulses_dense(size)
+                continue
             arts = self._propagation_tree_arts[size]
             n_arts = self._propagation_tree_art_count[size]
             tree_inputs = [
@@ -13130,6 +13201,82 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[self._propagation_body_qd, self._propagation_body_impulses, self._v_out],
                 device=model.device,
             )
+
+    def _allocate_tendon_dense_response(self, sizes: frozenset[int]) -> None:
+        """Route the propagation response of the tree sizes in ``sizes`` through the dense mass matrix.
+
+        Tendon armature, spring-dampers and actuator gains add ``K J^T J`` to ``H``, which couples DOFs across
+        the tree, so the articulated-body factorization cannot hold them. These sizes keep their propagation
+        rows but apply the accumulated link impulses with ``H^-1`` instead of the tree pass, and scale each row's
+        response by the link's exact self-response (:func:`compute_propagation_effective_mass_and_rhs`). Their
+        responses are not cached.
+        """
+        model = self.model
+        device = model.device
+        if self._propagation_body_response_dense is None and self._propagation_active:
+            # Stand-ins until a size needs them; the kernels read neither without a flagged articulation.
+            self._propagation_body_response_dense = self._propagation_body_response
+        added = [s for s in sorted(sizes) if s in self._propagation_tree_sizes and s not in self._tendon_Hinv_by_size]
+        if not added:
+            return
+        if self._tendon_dense_response_art is None:
+            self._tendon_dense_response_art = wp.zeros(model.articulation_count, dtype=wp.int32, device=device)
+            self._tendon_joint_impulse = wp.zeros(model.joint_dof_count, dtype=wp.float32, device=device)
+            self._propagation_body_response_dense = wp.zeros_like(self._propagation_body_response)
+        flags = self._tendon_dense_response_art.numpy()
+        eligible = self._propagation_cache_art_eligible.numpy()
+        for size in added:
+            n_arts = self._n_arts_by_size[size]
+            self._tendon_Hinv_by_size[size] = wp.zeros((n_arts, size, size), dtype=wp.float32, device=device)
+            self._tendon_link_response_scratch[size] = wp.zeros(
+                (n_arts * self._propagation_max_joints[size], size, 6), dtype=wp.float32, device=device
+            )
+            arts = self._propagation_tree_arts[size].numpy()
+            flags[arts] = 1
+            # A size that gains its first tendon mass term after construction leaves the response cache.
+            eligible[arts] = 0
+            self._propagation_cached_warps.pop(size, None)
+            self._propagation_cached_kernels.pop(size, None)
+        self._tendon_dense_response_art.assign(flags)
+        self._propagation_cache_art_eligible.assign(eligible)
+
+    def _propagation_propagate_impulses_dense(self, size: int) -> None:
+        """Apply a size group's link impulses through ``H^-1``, which holds the tendon mass terms the trees miss."""
+        model = self.model
+        n_arts = self._n_arts_by_size[size]
+        wp.launch(
+            project_tendon_link_impulses_for_size,
+            dim=n_arts,
+            inputs=[
+                self._group_to_art[size],
+                self._tendon_dense_response_art,
+                self._propagation_tree_activity,
+                model.articulation_start,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_qd_start,
+                self._body_to_joint,
+                self._propagation_joint_S_flat,
+                self._propagation_body_com_rel,
+            ],
+            outputs=[self._tendon_joint_impulse, self._propagation_body_impulses],
+            device=model.device,
+        )
+        wp.launch(
+            apply_tendon_mass_inverse_for_size,
+            dim=(n_arts, size),
+            inputs=[
+                self._group_to_art[size],
+                self._tendon_dense_response_art,
+                self._articulation_dof_start,
+                self._tendon_Hinv_by_size[size],
+                size,
+                self._tendon_joint_impulse,
+            ],
+            outputs=[self._v_out],
+            device=model.device,
+        )
+        self._propagation_refresh_tree_twists(size, force=True)
 
     def _launch_mf_gs_phase(
         self,
