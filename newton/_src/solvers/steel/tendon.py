@@ -947,11 +947,22 @@ def populate_tendon_rows_for_size(
     i = wp.tid()
     k = tendon_list[i]
     base = tendon_slot[k]
+    ctx = TendonRowContext()
     if base < 0:
+        if tendon_flags[k] != 0:
+            # The rows were requested but dropped for capacity: still report the length of this step.
+            ctx.accumulate = 0
+            length, _rate = evaluate_tendon(
+                ctx, k, tendon_type, tendon_joint_adr, tendon_joint_num, tendon_joint, tendon_coef,
+                tendon_wrap_adr, tendon_wrap_num, tendon_wrap_type, tendon_wrap_shape, tendon_wrap_sidesite,
+                tendon_wrap_prm, tendon_length_offset, joint_q_start, joint_qd_start, shape_body, shape_transform, shape_type, shape_scale,
+                body_com, body_to_articulation, body_to_joint, joint_ancestor, joint_S_s, joint_q, body_q, body_qd,
+                joint_q, J_group,
+            )  # fmt: skip
+            tendon_length[k] = length
         return
     art = tendon_art[k]
     world = art_to_world[art]
-    ctx = TendonRowContext()
     ctx.accumulate = 1
     ctx.art = art
     ctx.group_idx = art_group_idx[art]
