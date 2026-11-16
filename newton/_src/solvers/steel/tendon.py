@@ -32,7 +32,7 @@ import warp as wp
 from ...core.reset import reset_world_selected
 from ...exceptions import NewtonWarning
 from ...geometry import GeoType
-from ...sim import BodyFlags
+from ...sim import BodyFlags, JointType
 from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
@@ -1793,12 +1793,44 @@ class TendonPlan:
             device=model.device,
         )
 
+    def reference_pose(self, model, *, spring: bool) -> tuple[wp.array, wp.array]:
+        """Joint coordinates and body transforms of MuJoCo's ``qpos0`` pose, or of ``qpos_spring`` with ``spring``.
+
+        MuJoCo's ``qpos`` is ``joint_q + ref`` on PRISMATIC, REVOLUTE and D6 coordinates, so ``qpos0 = ref`` is
+        ``joint_q = 0`` there and ``qpos_spring = springref`` is :attr:`~newton.Model.joint_rest_q`. BALL joints
+        are at the identity (their rest rotation with ``spring``), and FREE and DISTANCE joints keep
+        :attr:`~newton.Model.joint_q` in both poses, as in :class:`~newton.solvers.SolverMuJoCo`.
+        """
+        from ...sim.articulation import eval_fk  # noqa: PLC0415
+
+        q = model.joint_q.numpy().astype(np.float32, copy=True)
+        q_start = model.joint_q_start.numpy()
+        joint_type = model.joint_type.numpy()
+        coord_type = np.repeat(joint_type, np.diff(q_start))
+        rest = model.joint_rest_q.numpy() if spring and model.joint_rest_q is not None else None
+        scalar = (
+            (coord_type == int(JointType.PRISMATIC))
+            | (coord_type == int(JointType.REVOLUTE))
+            | (coord_type == int(JointType.D6))
+        )
+        q[scalar] = rest[scalar] if rest is not None else 0.0
+        for j in np.flatnonzero(joint_type == int(JointType.BALL)):
+            s = int(q_start[j])
+            quat = rest[s : s + 4] if rest is not None else None
+            q[s : s + 4] = quat if quat is not None and float(np.dot(quat, quat)) > 0.0 else (0.0, 0.0, 0.0, 1.0)
+        joint_q = wp.array(q, dtype=float, device=model.device)
+        state = model.state()
+        eval_fk(model, joint_q, model.joint_qd, state)
+        return joint_q, state.body_q
+
     def resolve_dampratio(self, model) -> None:
         """Resolve each tendon position actuator's ``dampratio`` (a positive ``biasprm[2]``) to a damping gain.
 
-        As MuJoCo's compiler: ``kv = dampratio * 2 sqrt(kp m)`` with the reflected inertia
-        ``m = 1 / (gear^2 J M^-1 J^T)`` at :attr:`~newton.Model.joint_q`, where ``M`` includes the joint and
-        tendon armature. The resolved gains go to a private ``biasprm`` copy; the model's arrays are unchanged.
+        Follows MuJoCo's compiler: ``kv = dampratio * 2 sqrt(kp m)`` with the reflected inertia
+        ``m = 1 / (gear^2 J M^-1 J^T)`` at MuJoCo's ``qpos0`` pose (:meth:`reference_pose`), where ``M`` includes
+        the joint and tendon armature. ``M`` is Steel's full mass matrix, so tendon armature that couples sibling
+        branches enters the inertia; MuJoCo's tree-sparse matrix drops that coupling and resolves a smaller gain
+        there. The resolved gains go to a private ``biasprm`` copy; the model's arrays are unchanged.
         """
         self.biasprm = None
         if not self.count or not self.actuator_count:
@@ -1827,13 +1859,14 @@ class TendonPlan:
             {k for _, k in resolve}
             | {int(k) for k in np.flatnonzero((self.art_np >= 0) & (armature != 0.0)) if int(self.art_np[k]) in arts}
         )
-        jacobian = self._jacobians_at_rest(model, need)
+        joint_q0, body_q0 = self.reference_pose(model, spring=False)
+        jacobian = self._jacobians_at(model, need, joint_q0)
         row = {k: i for i, k in enumerate(need)}
 
-        from ...sim.articulation import eval_fk, eval_mass_matrix  # noqa: PLC0415
+        from ...sim.articulation import eval_mass_matrix  # noqa: PLC0415
 
         state = model.state()
-        eval_fk(model, model.joint_q, model.joint_qd, state)
+        wp.copy(state.body_q, body_q0)
         H = eval_mass_matrix(model, state).numpy().astype(np.float64)
         art_start = model.articulation_start.numpy()
         qd_start = model.joint_qd_start.numpy()
@@ -1854,8 +1887,8 @@ class TendonPlan:
             bias[act, 2] = -kv
         self.biasprm = wp.array(bias, dtype=_vec10, device=model.device)
 
-    def _jacobians_at_rest(self, model, tendons: list[int]) -> np.ndarray:
-        """Rows ``dL/dq`` [m or rad per DOF] of ``tendons`` at :attr:`~newton.Model.joint_q`, articulation-local.
+    def _jacobians_at(self, model, tendons: list[int], joint_q: wp.array) -> np.ndarray:
+        """Rows ``dL/dq`` [m or rad per DOF] of ``tendons`` at ``joint_q``, articulation-local.
 
         Column ``d`` is the rate of each tendon when every articulation moves only its ``d``-th DOF at unit speed.
         """
@@ -1876,7 +1909,7 @@ class TendonPlan:
             moving = n_dofs > d
             qd[dof0[moving] + d] = 1.0
             joint_qd = wp.array(qd, dtype=float, device=device)
-            eval_fk(model, model.joint_q, joint_qd, state)
+            eval_fk(model, joint_q, joint_qd, state)
             wp.launch(
                 eval_tendon_rates,
                 dim=len(tendons),
@@ -1891,7 +1924,7 @@ class TendonPlan:
                     model.shape_scale,
                     model.body_com,
                     model.body_world,
-                    model.joint_q,
+                    joint_q,
                     joint_qd,
                     state.body_q,
                     state.body_qd,
@@ -1906,12 +1939,15 @@ class TendonPlan:
         return jacobian
 
     def resolve_spring_lengths(self, model) -> None:
-        """Fix each spring's rest band from ``springlength``; ``-1`` means the length at ``Model.joint_q``."""
+        """Fix each spring's rest band from ``springlength``.
+
+        ``-1`` means the tendon's length at MuJoCo's ``qpos_spring`` pose (:meth:`reference_pose`): the scalar
+        joints at :attr:`~newton.Model.joint_rest_q`, not at the initial :attr:`~newton.Model.joint_q`.
+        """
         if not self.count:
             return
-        self.eval_lengths(
-            model, model.joint_q, model.body_q, wp.array(np.arange(self.count, dtype=np.int32), device=model.device)
-        )
+        joint_q, body_q = self.reference_pose(model, spring=True)
+        self.eval_lengths(model, joint_q, body_q, wp.array(np.arange(self.count, dtype=np.int32), device=model.device))
         length0 = self.length.numpy()[: self.count]
         lo, hi = self.springlength_np[:, 0], self.springlength_np[:, 1]
         auto = lo == -1.0

@@ -543,6 +543,40 @@ def test_tendon_dampratio_leaves_the_model_unchanged(test, device):
     test.assertAlmostEqual(float(run.solver._tendon.biasprm.numpy()[0, 2]), -2.0 * math.sqrt(120.0), places=4)
 
 
+def test_tendon_auto_spring_rests_at_the_joint_rest_pose(test, device):
+    """An automatic springlength is the tendon's length at the joints' rest pose (MuJoCo's qpos_spring).
+
+    The slider starts 0.15 m from its ``springref``, so a fixed or a spatial tendon spring swings it about the
+    rest pose as x = rest + (q0 - rest) cos(w t). A rest length taken at the initial joint_q would leave it still.
+    """
+    rest, q0, k, dt, t = 0.1, 0.25, 100.0, 5.0e-4, 0.1
+    tendons = {
+        "fixed": '<fixed stiffness="{k}"><joint joint="m" coef="1"/></fixed>',
+        "spatial": '<spatial stiffness="{k}"><site site="w"/><site site="m_s"/></spatial>',
+    }
+    exact = rest + (q0 - rest) * math.cos(math.sqrt(k) * t)
+    for kind, tendon in tendons.items():
+        mjcf = f"""<mujoco>{_HEAD}<worldbody><site name="w" pos="0 0 1"/>
+          <body name="frame"><geom type="sphere" size="0.02" mass="0.1"/><body name="m" pos="1 0 1">
+          <joint name="m" type="slide" axis="1 0 0" springref="{rest}"/><geom type="box" size="0.05 0.05 0.05" mass="1"/>
+          <site name="m_s" pos="0 0 0"/></body></body>
+        </worldbody><tendon>{tendon.format(k=k)}</tendon></mujoco>"""
+        for mode in _MODES:
+            with test.subTest(tendon=kind, solve_mode=mode):
+                run = _Run(mjcf, device, solve_mode=mode, q={"m": q0}, iterations=8)
+                run.step(dt, int(round(t / dt)))
+                test.assertAlmostEqual(run.q("m"), exact, delta=2.0e-3)
+                # A new rest pose moves the rest length with it.
+                run.model.joint_rest_q.fill_(q0)
+                run.solver.notify_model_changed(newton.ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES)
+                run.state_0.joint_q.fill_(q0)
+                run.state_0.joint_qd.zero_()
+                newton.eval_fk(run.model, run.state_0.joint_q, run.state_0.joint_qd, run.state_0)
+                run.solver.reset(run.state_0)
+                run.step(dt, 20)
+                test.assertAlmostEqual(run.q("m"), q0, delta=1.0e-6)
+
+
 def test_tendon_fixed_length_includes_the_joint_reference(test, device):
     """A fixed tendon's length is sum(c * qpos) with qpos = joint_q + ref, as MuJoCo's ten_length."""
     ref, k, dt = 0.2, 100.0, 1.0e-3
@@ -787,6 +821,7 @@ for _name in (
     "test_tendon_margin_and_routed_tendons_warn",
     "test_tendon_position_dampratio_is_critically_damped",
     "test_tendon_dampratio_leaves_the_model_unchanged",
+    "test_tendon_auto_spring_rests_at_the_joint_rest_pose",
     "test_tendon_fixed_length_includes_the_joint_reference",
     "test_tendon_actuator_force_range_caps_the_summed_force",
     "test_tendon_property_changes_reach_the_solver",
