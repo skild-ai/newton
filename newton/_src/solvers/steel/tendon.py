@@ -33,6 +33,14 @@ from ...core.reset import reset_world_selected
 from ...exceptions import NewtonWarning
 from ...geometry import GeoType
 from ...sim import BodyFlags, JointType
+from ..mujoco.enums import (
+    _ActuatorBiasType,
+    _ActuatorDynamicsType,
+    _ActuatorGainType,
+    _LimitedType,
+    _TendonType,
+    _TendonWrapType,
+)
 from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
@@ -47,11 +55,11 @@ TENDON_ROW_LIMIT_LOWER = wp.constant(1)
 TENDON_ROW_LIMIT_UPPER = wp.constant(2)
 TENDON_ROW_FRICTION = wp.constant(4)
 
-TENDON_TYPE_FIXED = wp.constant(0)
-TENDON_WRAP_SITE = wp.constant(0)
-TENDON_WRAP_GEOM = wp.constant(1)
-TENDON_WRAP_PULLEY = wp.constant(2)
-_TRN_TENDON = 2  # SolverMuJoCo.TrnType.TENDON
+# The mujoco:* attribute encodings come from the MuJoCo solver's enum module, the schema both solvers read.
+TENDON_TYPE_FIXED = wp.constant(int(_TendonType.FIXED))
+TENDON_WRAP_SITE = wp.constant(int(_TendonWrapType.SITE))
+TENDON_WRAP_GEOM = wp.constant(int(_TendonWrapType.GEOM))
+TENDON_WRAP_PULLEY = wp.constant(int(_TendonWrapType.PULLEY))
 
 _WRAP_MINVAL = wp.constant(1.0e-15)
 _WRAP_MAXVAL = wp.constant(1.0e10)
@@ -855,7 +863,8 @@ _vec6 = wp.types.vector(length=6, dtype=wp.float32)
 _vec10 = wp.types.vector(length=10, dtype=wp.float32)
 ACTUATOR_CTRL_LIMITED = wp.constant(1)
 ACTUATOR_FORCE_LIMITED = wp.constant(2)
-_AFFINE = wp.constant(1)
+_GAIN_AFFINE = wp.constant(int(_ActuatorGainType.AFFINE))
+_BIAS_AFFINE = wp.constant(int(_ActuatorBiasType.AFFINE))
 
 
 @wp.struct
@@ -1168,10 +1177,10 @@ def apply_tendon_mass_terms_for_size(
         c0 = gp[0] * u
         c1 = float(0.0)
         c2 = float(0.0)
-        if actuators.gaintype[act] == _AFFINE:
+        if actuators.gaintype[act] == _GAIN_AFFINE:
             c1 += gp[1] * u
             c2 += gp[2] * u
-        if actuators.biastype[act] == _AFFINE:
+        if actuators.biastype[act] == _BIAS_AFFINE:
             bp = actuators.biasprm[act]
             c0 += bp[0]
             c1 += bp[1]
@@ -1354,7 +1363,7 @@ class TendonPlan:
         wrap_type = host("tendon_wrap_type", np.zeros(0, dtype=np.int32))
         wrap_shape = host("tendon_wrap_shape", np.zeros(0, dtype=np.int32))
         wrap_prm = host("tendon_wrap_prm", np.zeros(0, dtype=np.float32))
-        limited = host("tendon_limited", np.full(n, 2, dtype=np.int32))
+        limited = host("tendon_limited", np.full(n, int(_LimitedType.AUTO), dtype=np.int32))
         trange = host("tendon_range", np.zeros((n, 2), dtype=np.float32))
         stiffness = host("tendon_stiffness", np.zeros(n, dtype=np.float32))
         damping = host("tendon_damping", np.zeros(n, dtype=np.float32))
@@ -1380,7 +1389,7 @@ class TendonPlan:
         multi_dof = np.zeros(n, dtype=bool)
         multi_dof[owner_f[~one_dof]] = True
         owner_s, entry_s = _ranges(wrap_adr, wrap_num, np.flatnonzero(~fixed_type))
-        pulley = wrap_type[entry_s] == 2
+        pulley = wrap_type[entry_s] == int(TENDON_WRAP_PULLEY)
         bad_divisor = np.zeros(n, dtype=bool)
         bad_divisor[owner_s[pulley & (wrap_prm[entry_s] <= 0.0)]] = True
         body = np.where(pulley, -1, shape_body[np.where(pulley, 0, wrap_shape[entry_s])])
@@ -1418,7 +1427,7 @@ class TendonPlan:
                 )
         a_of = np.where(one_art, lowest, 0).astype(np.int32)
         valid = one_art & ~multi_dof & ~bad_divisor & (response_dof_count[a_of] > 0)
-        limit_on = (limited == 1) | ((limited == 2) & (trange[:, 0] < trange[:, 1]))
+        limit_on = (limited == _LimitedType.TRUE) | ((limited == _LimitedType.AUTO) & (trange[:, 0] < trange[:, 1]))
         flags = np.where(valid & limit_on, int(TENDON_ROW_LIMIT_LOWER) | int(TENDON_ROW_LIMIT_UPPER), 0)
         flags = (flags | np.where(valid & (frictionloss > 0.0), int(TENDON_ROW_FRICTION), 0)).astype(np.int32)
         actuated = np.bincount(tendon_actuators.tendon[tendon_actuators.tendon >= 0], minlength=n)[:n] > 0
@@ -1493,9 +1502,11 @@ class TendonPlan:
         plan.actuator_list_np = np.asarray(actuator_list, dtype=np.int32)
         autolimits_attr = getattr(mujoco, "autolimits", None)
         autolimits = bool(autolimits_attr.numpy()[0]) if autolimits_attr is not None else True
-        cap_flag = host("tendon_actuator_force_limited", np.full(n, 2, dtype=np.int32))
+        cap_flag = host("tendon_actuator_force_limited", np.full(n, int(_LimitedType.AUTO), dtype=np.int32))
         cap_range = host("tendon_actuator_force_range", np.zeros((n, 2), dtype=np.float32))
-        cap = (cap_flag == 1) | ((cap_flag == 2) & autolimits & (cap_range[:, 0] < cap_range[:, 1]))
+        cap = (cap_flag == _LimitedType.TRUE) | (
+            (cap_flag == _LimitedType.AUTO) & autolimits & (cap_range[:, 0] < cap_range[:, 1])
+        )
         plan.tendon_force_limited = wp.array(cap.astype(np.int32), dtype=wp.int32, device=device)
         plan.actuator_force = wp.zeros(max(actuator_count, 1), dtype=float, device=device)
         sizes = response_dof_count[art[active]]
@@ -1579,7 +1590,7 @@ class TendonPlan:
         """Joints whose DOFs tendon ``k``'s length depends on: a fixed tendon's joints, or the tree joints above a
         spatial tendon's site and wrap bodies."""
         ttype, joint_adr, joint_num, tjoint, wrap_adr, wrap_num, wrap_type, wrap_shape = self._paths
-        if int(ttype[k]) == 0:
+        if int(ttype[k]) == int(TENDON_TYPE_FIXED):
             return {int(j) for j in tjoint[int(joint_adr[k]) : int(joint_adr[k]) + int(joint_num[k])]}
         if getattr(self, "_parent_joint", None) is None:
             tree = np.flatnonzero(model.joint_articulation.numpy() >= 0)
@@ -1588,7 +1599,7 @@ class TendonPlan:
             self._shape_body = model.shape_body.numpy()
         joints = set()
         for e in range(int(wrap_adr[k]), int(wrap_adr[k]) + int(wrap_num[k])):
-            if int(wrap_type[e]) == 2:
+            if int(wrap_type[e]) == int(TENDON_WRAP_PULLEY):
                 continue
             body = int(self._shape_body[int(wrap_shape[e])])
             while body in self._parent_joint and self._parent_joint[body] not in joints:
@@ -1613,7 +1624,7 @@ class TendonPlan:
         one_side = gated & (width > 2.0 * np.where(gated, gap, 0.0))
         self.gated = True
         self.reserve_np = self.rows_np - one_side.astype(np.int32)
-        fixed = self._paths[0] == 0
+        fixed = self._paths[0] == int(TENDON_TYPE_FIXED)
         self.gate_fixed_index = self._index_array(gated & fixed, device)
         self.gate_spatial_index = self._index_array(gated & ~fixed, device)
         self.gap = wp.array(np.where(gated, gap, np.inf).astype(np.float32), dtype=float, device=device)
@@ -1642,6 +1653,9 @@ class TendonPlan:
         if trntype_attr is None or trntype_attr.shape[0] == 0:
             index.flags = np.zeros(1, dtype=np.int32)
             return index
+        from ..mujoco.solver_mujoco import SolverMuJoCo  # noqa: PLC0415
+
+        trn_tendon = int(SolverMuJoCo.TrnType.TENDON)
         count = int(trntype_attr.shape[0])
         index.actuator_count = count
         index.tendon = np.full(count, -1, dtype=np.int64)
@@ -1655,7 +1669,7 @@ class TendonPlan:
         autolimits = bool(autolimits_attr.numpy()[0]) if autolimits_attr is not None else True
 
         def limited(flag, has_range):
-            return flag == 1 or (flag == 2 and autolimits and has_range != 0)
+            return flag == _LimitedType.TRUE or (flag == _LimitedType.AUTO and autolimits and has_range != 0)
 
         ctrllimited = mujoco.actuator_ctrllimited.numpy()
         has_ctrlrange = mujoco.actuator_has_ctrlrange.numpy()
@@ -1663,10 +1677,14 @@ class TendonPlan:
         has_forcerange = mujoco.actuator_has_forcerange.numpy()
         flags = np.zeros(count, dtype=np.int32)
         for act in range(count):
-            if int(trntype[act]) != _TRN_TENDON:
+            if int(trntype[act]) != trn_tendon:
                 continue
             name = labels[act] if act < len(labels) and labels[act] else f"actuator_{act}"
-            if int(dyntype[act]) != 0 or int(gaintype[act]) not in (0, 1) or int(biastype[act]) not in (0, 1):
+            if (
+                int(dyntype[act]) != _ActuatorDynamicsType.NONE
+                or int(gaintype[act]) not in (_ActuatorGainType.FIXED, _ActuatorGainType.AFFINE)
+                or int(biastype[act]) not in (_ActuatorBiasType.NONE, _ActuatorBiasType.AFFINE)
+            ):
                 warnings.warn(
                     f"SolverSteel: tendon actuator '{name}' needs activation dynamics or a non-affine gain/bias, "
                     "which Steel does not model; ignored.",
@@ -1846,7 +1864,11 @@ class TendonPlan:
             for e in range(int(start[k]), int(start[k + 1])):
                 act = int(actuator_list[e])
                 # MuJoCo reads a positive biasprm[2] on a position-like affine actuator as a dampratio.
-                if int(biastype[act]) == 1 and bias[act, 2] > 0.0 and abs(gain[act, 0] + bias[act, 1]) <= 1.0e-15:
+                if (
+                    int(biastype[act]) == _ActuatorBiasType.AFFINE
+                    and bias[act, 2] > 0.0
+                    and abs(gain[act, 0] + bias[act, 1]) <= 1.0e-15
+                ):
                     resolve.append((act, int(k)))
         if not resolve:
             return

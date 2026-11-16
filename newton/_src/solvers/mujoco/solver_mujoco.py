@@ -62,7 +62,7 @@ from .constants import (
     SOLREF_MODE_RAW,
 )
 from .enums import EqType as _EqType
-from .enums import _ActuatorBiasType, _ActuatorDynamicsType, _ActuatorGainType
+from .enums import _ActuatorBiasType, _ActuatorDynamicsType, _ActuatorGainType, _TendonType, _TendonWrapType
 from .equality import (
     MJC_OBJ_BODY,
     MjcEqualityTargetKind,
@@ -1171,7 +1171,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """Resolve the USD tendon type, including the schema's spatial default."""
         attr = prim.GetAttribute("mjc:type")
         value = attr.Get() if attr else None
-        return {"fixed": 0, "spatial": 1}.get(str(value).lower() if value is not None else "spatial", -1)
+        return {"fixed": int(_TendonType.FIXED), "spatial": int(_TendonType.SPATIAL)}.get(
+            str(value).lower() if value is not None else "spatial", -1
+        )
 
     @staticmethod
     def _parse_mjc_spatial_tendon_wrap_rows(prim, context: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1180,7 +1182,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         Path indices may repeat relationship targets. Segments and side-site indices
         address this expanded path, while divisors are indexed by segment number.
         """
-        if SolverMuJoCo._mjc_tendon_type(prim) != 1:
+        if SolverMuJoCo._mjc_tendon_type(prim) != _TendonType.SPATIAL:
             return []
 
         def read_array(name: str) -> list:
@@ -1222,7 +1224,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 if not math.isfinite(divisor) or divisor <= 0.0:
                     raise ValueError(f"mjc:path:divisors entry for segment {segment} must be finite and positive")
                 if segment > last_segment:
-                    rows.append({"mujoco:tendon_wrap_type": 2, "mujoco:tendon_wrap_prm": divisor})
+                    rows.append(
+                        {"mujoco:tendon_wrap_type": int(_TendonWrapType.PULLEY), "mujoco:tendon_wrap_prm": divisor}
+                    )
                 last_segment = segment
 
             shape_path = str(targets[path_index])
@@ -1246,7 +1250,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
             rows.append(
                 {
-                    "mujoco:tendon_wrap_type": 0 if is_site else 1,
+                    "mujoco:tendon_wrap_type": int(_TendonWrapType.SITE if is_site else _TendonWrapType.GEOM),
                     "mujoco:tendon_wrap_shape": shape_index,
                     "mujoco:tendon_wrap_sidesite": side_shape,
                 }
@@ -3841,7 +3845,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             ttype = int(tendon_type_np[i]) if tendon_type_np is not None else 0
 
             # Pre-validate wrapping path before creating the tendon in the spec.
-            if ttype == 0:
+            if ttype == _TendonType.FIXED:
                 # Fixed tendon: build joint wraps list
                 joint_start = int(tendon_joint_adr[i])
                 joint_num = int(tendon_joint_num[i])
@@ -3903,7 +3907,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     )
                     continue
 
-            elif ttype == 1:
+            elif ttype == _TendonType.SPATIAL:
                 # Spatial tendon: validate wrap path arrays and bounds
                 if tendon_wrap_adr_np is None or tendon_wrap_num_np is None:
                     warnings.warn(
@@ -3932,7 +3936,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         spatial_wraps_valid = False
                         break
                     wtype = int(tendon_wrap_type_np[w])
-                    if wtype == 0:  # site
+                    if wtype == _TendonWrapType.SITE:
                         if site_mapping.get(int(tendon_wrap_shape_np[w])) is None:
                             warnings.warn(
                                 f"Skipping spatial tendon '{tendon_label}': wrap site at index {w} "
@@ -3942,7 +3946,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                             )
                             spatial_wraps_valid = False
                             break
-                    elif wtype == 1:  # geom
+                    elif wtype == _TendonWrapType.GEOM:
                         if shape_mapping.get(int(tendon_wrap_shape_np[w])) is None:
                             warnings.warn(
                                 f"Skipping spatial tendon '{tendon_label}': wrap geom at index {w} "
@@ -3952,7 +3956,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                             )
                             spatial_wraps_valid = False
                             break
-                    elif wtype == 2:  # pulley
+                    elif wtype == _TendonWrapType.PULLEY:
                         divisor = float(tendon_wrap_prm_np[w]) if tendon_wrap_prm_np is not None else 0.0
                         if divisor <= 0.0:
                             warnings.warn(
@@ -4037,15 +4041,15 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     t.springlength[1] = val[0]
 
             # Add wrapping path (all elements pre-validated above)
-            if ttype == 0:
+            if ttype == _TendonType.FIXED:
                 for joint_name, coef in fixed_wraps:
                     t.wrap_joint(joint_name, coef)
-            elif ttype == 1:
+            elif ttype == _TendonType.SPATIAL:
                 for w in range(wrap_start, wrap_start + wrap_num):
                     wtype = int(tendon_wrap_type_np[w])
-                    if wtype == 0:
+                    if wtype == _TendonWrapType.SITE:
                         t.wrap_site(site_mapping[int(tendon_wrap_shape_np[w])])
-                    elif wtype == 1:
+                    elif wtype == _TendonWrapType.GEOM:
                         geom_name = shape_mapping[int(tendon_wrap_shape_np[w])]
                         sidesite_name = ""
                         if tendon_wrap_sidesite_np is not None:
@@ -4061,7 +4065,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                                     )
                                     sidesite_name = ""
                         t.wrap_geom(geom_name, sidesite_name)
-                    elif wtype == 2:
+                    elif wtype == _TendonWrapType.PULLEY:
                         t.wrap_pulley(float(tendon_wrap_prm_np[w]))
                     # else: unknown wtype — already rejected during pre-validation
 
