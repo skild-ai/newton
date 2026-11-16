@@ -12,7 +12,7 @@ import warp as wp
 
 import newton
 from newton.solvers import SolverMuJoCo, SolverSteel
-from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_test_devices
 
 G = 9.81
 _HEAD = (
@@ -357,6 +357,34 @@ def test_tendon_rows_beyond_the_contact_budget_are_kept(test, device):
             q = np.array([run.q(f"m{i}") for i in range(count)])
             # a free 1 kg slider pushed by 10 N would travel 0.2 m; the limit holds it at 0.05 m
             np.testing.assert_allclose(q, 0.05, atol=2.0e-3)
+
+
+def test_tendon_length_is_reported_when_its_rows_are_dropped(test, device):
+    """A tendon whose limit rows do not fit the dense row capacity still reports this step's length.
+
+    Mimic rows are reserved before the tendon rows. Two of them leave one free row of the three
+    (``articulation_constraint_max=1`` plus the tendon's two), so the tendon's pair is dropped whole.
+    """
+    sliders = "".join(_slider(f"s{i}", f"0 {0.3 * i} 1") for i in range(4))
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>{_frame(sliders)}</worldbody>
+      <tendon><fixed limited="true" range="-5 5"><joint joint="s0" coef="1"/><joint joint="s1" coef="1"/></fixed>
+      </tendon><equality><joint joint1="s2" joint2="s0"/><joint joint1="s3" joint2="s1"/></equality></mujoco>"""
+    q = {"s0": 0.3, "s1": 0.2, "s2": 0.3, "s3": 0.2}
+    for mode in _MODES:
+        with test.subTest(solve_mode=mode):
+            run = _Run(
+                mjcf, device, solve_mode=mode, q=q, gravity=0.0, articulation_constraint_max=1,
+                tendon_limit_activation_gap=float("inf"),
+            )  # fmt: skip
+            capture = StdOutCapture()  # the step prints the row-overflow warning
+            capture.begin()
+            try:
+                run.step(1.0e-3, 1)
+                wp.synchronize()
+            finally:
+                capture.end()
+            test.assertTrue(run.solver.constraint_overflow.numpy()[0])
+            test.assertAlmostEqual(float(run.solver.tendon_lengths().numpy()[0]), 0.5, delta=1.0e-6)
 
 
 def test_tendon_limit_rows_are_gated_by_distance(test, device):
@@ -1208,6 +1236,14 @@ for _name in (
     "test_tendon_armature_switched_on_by_notify_under_propagation",
 ):
     add_function_test(TestSteelTendon, _name, globals()[_name], devices=get_test_devices())
+# The dropped rows print the device-side overflow warning, which the test captures itself.
+add_function_test(
+    TestSteelTendon,
+    "test_tendon_length_is_reported_when_its_rows_are_dropped",
+    test_tendon_length_is_reported_when_its_rows_are_dropped,
+    devices=get_test_devices(),
+    check_output=False,
+)
 
 
 if __name__ == "__main__":
