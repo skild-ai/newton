@@ -118,7 +118,10 @@ GPU models); Newton only tests ``RUN_TO_RUN``.
    * - :class:`~solvers.SolverSteel`
      - Yes
      - Reserves constraint rows in a fixed per-world order instead of with
-       atomic counters, so it costs about as much as the default.
+       atomic counters, so it costs about as much as the default. The
+       mass-matrix terms and forces of an articulation's tendons are added
+       in a fixed order by a second launch, which costs little for tens of
+       tendons and 25-40% of the step for 256 tendons on one hand.
        ``RUN_TO_RUN`` only; ``GPU_TO_GPU`` raises. The ``BODY_PARENT_F``
        observable sums contact wrenches with atomics and is outside the
        guarantee. See ``python -m newton.examples steel_determinism_arms``.
