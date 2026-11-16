@@ -2171,7 +2171,7 @@ class TendonPlan:
         branches enters the inertia; MuJoCo's tree-sparse matrix drops that coupling and resolves a smaller gain
         there. The resolved gains go to a private ``biasprm`` copy; the model's arrays are unchanged.
         """
-        self.biasprm = None
+        previous, self.biasprm = self.biasprm, None
         if not self.count or not self.actuator_count:
             return
         m = model.mujoco
@@ -2228,7 +2228,19 @@ class TendonPlan:
             if inv_weight > 1.0e-15:
                 kv = float(bias[act, 2]) * 2.0 * np.sqrt(float(gain[act, 0]) / inv_weight)
             bias[act, 2] = -kv
-        self.biasprm = wp.array(bias, dtype=_vec10, device=model.device)
+        if previous is not None and previous.shape[0] == bias.shape[0]:
+            # Keep the array a captured step reads.
+            previous.assign(bias)
+            self.biasprm = previous
+        else:
+            self.biasprm = wp.array(bias, dtype=_vec10, device=model.device)
+
+    def refresh_dampratio(self, model) -> bool:
+        """Resolve the ``dampratio`` gains again after the reflected inertia changed; ``True`` when any exist."""
+        if self.biasprm is None:
+            return False
+        self.resolve_dampratio(model)
+        return self.biasprm is not None
 
     def _jacobians_at(self, model, tendons: list[int], joint_q: wp.array) -> np.ndarray:
         """Rows ``dL/dq`` [m or rad per DOF] of ``tendons`` at ``joint_q``, articulation-local.

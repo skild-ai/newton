@@ -3614,7 +3614,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         Tendon and actuator changes re-derive the MuJoCo-style tendon tables: which tendons have mass
         terms, the spring rest bands, the ``dampratio`` gains and the control and force-limit flags, and
         request a mass-matrix refresh. Joint DOF and reference-pose changes re-read the joint references in
-        fixed tendon lengths. A friction-loss row or mass term once present keeps its slot when its value returns
+        fixed tendon lengths. Joint, joint DOF, DOF inertial, reference-pose and body inertial changes resolve
+        the ``dampratio`` gains of tendon position actuators again, from the new reflected inertia. A friction-loss row or mass term once present keeps its slot when its value returns
         to zero. A tendon or actuator change that would add or remove tendon rows (a limit switched on or off,
         friction loss on a tendon without a friction row), or add tendon mass terms to an articulation size
         whose mass matrix is diagonal or sparse-factored, raises :class:`NotImplementedError`; reconstruct the
@@ -3631,9 +3632,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         place. A captured
         notification reads the arrays it was captured with; after replacing a model array,
         notify eagerly or recapture. Body notifications read ``body_flags`` on the host.
-        Sleeping, and the positive-restitution check of sparse mass factors (with restitution
-        enabled), also read model data on the host, so issue those
-        notifications outside CUDA graph capture.
+        Sleeping, the positive-restitution check of sparse mass factors (with restitution
+        enabled) and the ``dampratio`` gains of tendon position actuators also read model data on
+        the host, so issue those notifications outside CUDA graph capture.
 
         With ``enable_joint_friction``, an eager joint DOF or DOF force notification also reads
         :attr:`~newton.Model.joint_friction` and ``steel:joint_friction_load_coefficient`` on the host and
@@ -3687,6 +3688,15 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._tendon.resolve_spring_lengths(self.model)
         if flags & (ModelFlags.TENDON_PROPERTIES | ModelFlags.ACTUATOR_PROPERTIES):
             self._refresh_tendon_plan()
+        elif flags & (
+            ModelFlags.JOINT_PROPERTIES
+            | dof_inertial
+            | ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES
+            | ModelFlags.BODY_INERTIAL_PROPERTIES
+        ):
+            # A dampratio gain follows the tendon's reflected inertia at the reference pose.
+            if self._tendon.refresh_dampratio(self.model):
+                self._mass_update_requested.fill_(1)
         if flags & ModelFlags.SHAPE_PROPERTIES:
             self._refresh_shape_materials()
         if flags & ModelFlags.JOINT_PROPERTIES:

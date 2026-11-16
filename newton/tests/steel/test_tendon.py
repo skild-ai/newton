@@ -622,6 +622,33 @@ def test_tendon_dampratio_leaves_the_model_unchanged(test, device):
     test.assertAlmostEqual(float(run.solver._tendon.biasprm.numpy()[0, 2]), -2.0 * math.sqrt(120.0), places=4)
 
 
+def test_tendon_dampratio_follows_inertia_changes(test, device):
+    """A body mass or joint armature change re-resolves dampratio: kv = 2 dampratio sqrt(kp m) with the new inertia."""
+    kp = 30.0
+    mjcf = f"""<mujoco>{_HEAD}<worldbody>{_frame(_slider("m", "0 0 1", axis="1 0 0"))}</worldbody>
+    <tendon><fixed name="t"><joint joint="m" coef="1"/></fixed></tendon>
+    <actuator><position tendon="t" kp="{kp}" dampratio="1"/></actuator></mujoco>"""
+    run = _Run(mjcf, device)
+    model = run.model
+
+    def kv():
+        return -float(run.solver._tendon.biasprm.numpy()[0, 2])
+
+    test.assertAlmostEqual(kv(), 2.0 * math.sqrt(kp * 1.0), places=4)
+    body = int(model.joint_child.numpy()[run.joint("m")])
+    mass = model.body_mass.numpy()
+    mass[body] = 4.0
+    model.body_mass.assign(mass)
+    run.solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+    test.assertAlmostEqual(kv(), 2.0 * math.sqrt(kp * 4.0), places=4)
+    armature = model.joint_armature.numpy()
+    armature[model.joint_qd_start.numpy()[run.joint("m")]] = 5.0
+    model.joint_armature.assign(armature)
+    run.solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+    test.assertAlmostEqual(kv(), 2.0 * math.sqrt(kp * 9.0), places=4)
+    test.assertEqual(float(model.mujoco.actuator_biasprm.numpy()[0, 2]), 1.0)
+
+
 def test_tendon_auto_spring_rests_at_the_joint_rest_pose(test, device):
     """An automatic springlength is the tendon's length at the joints' rest pose (MuJoCo's qpos_spring).
 
@@ -1216,6 +1243,7 @@ for _name in (
     "test_tendon_position_dampratio_is_critically_damped",
     "test_tendon_dampratio_inertia_is_taken_at_the_reference_pose",
     "test_tendon_dampratio_leaves_the_model_unchanged",
+    "test_tendon_dampratio_follows_inertia_changes",
     "test_tendon_auto_spring_rests_at_the_joint_rest_pose",
     "test_tendon_fixed_length_includes_the_joint_reference",
     "test_tendon_actuator_force_range_caps_the_summed_force",
