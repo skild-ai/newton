@@ -452,6 +452,20 @@ def test_tendon_spring_is_slack_inside_its_dead_band(test, device):
             test.assertAlmostEqual(float(run.solver.tendon_forces(dt).numpy()[0, 1]), 0.0, delta=1.0e-6)
 
 
+def _guyed_slider_speed(q, q_start, qd_start, armature=1.0):
+    """Speed of the unit slider of the guyed-slider model at ``q`` after starting at ``q_start`` with ``qd_start``.
+
+    The tendon runs from the world site, 1.45 m above the slider's site, to the slider at x = 1 + q, so
+    ``J = dL/dq = x / sqrt(x^2 + 1.45^2)``. No force does work along the slider, so the kinetic energy
+    ``(1 + armature J^2) qd^2 / 2`` is conserved and the armature slows the slider as J grows.
+    """
+
+    def inertia(x):
+        return 1.0 + armature * x * x / (x * x + 1.45**2)
+
+    return qd_start * math.sqrt(inertia(1.0 + q_start) / inertia(1.0 + q))
+
+
 def test_tendon_armature_history_restarts_on_reset(test, device):
     """A reset, or notify_state_changed, restarts the spatial-tendon armature dJ/dt history.
 
@@ -483,6 +497,11 @@ def test_tendon_armature_history_restarts_on_reset(test, device):
             run.step(dt, 1)
             test.assertAlmostEqual(run.qd("m"), fresh.qd("m"), delta=1.0e-6)
             test.assertAlmostEqual(run.q("m"), fresh.q("m"), delta=1.0e-6)
+            # From the restarted history the armature term then slows the slider as energy conservation requires:
+            # 6.4e-3 m/s over these steps, which a solver without the tendon term would not lose.
+            run.step(dt, 99)
+            test.assertAlmostEqual(run.qd("m"), _guyed_slider_speed(run.q("m"), 1.0, 1.0), delta=2.0e-4)
+            test.assertLess(run.qd("m"), 1.0 - 2.0e-3)
 
 
 def test_tendon_margin_and_routed_tendons_warn(test, device):
@@ -853,6 +872,13 @@ def test_tendon_armature_history_survives_coupled_iteration_restarts(test, devic
     solver.coupling_notify_input_state_update(run.state_0, newton.StateFlags.NONE, iteration_restart=True, dt=dt)
     solver.step(run.state_0, run.state_1, run.control, None, dt)
     np.testing.assert_allclose(run.state_1.joint_qd.numpy(), first, atol=1.0e-7)
+    # Both solves carry the armature's -a J dJ/dt qd term, which slows the slider by 1.7e-4 m/s in this step; a
+    # restart that lost the history, or a solver without the tendon term, would leave the speed unchanged.
+    dof = run.model.joint_qd_start.numpy()[run.joint("m")]
+    q_new = float(run.state_1.joint_q.numpy()[run.model.joint_q_start.numpy()[run.joint("m")]])
+    expected = _guyed_slider_speed(q_new, run.q("m"), run.qd("m"))
+    test.assertAlmostEqual(float(first[dof]), expected, delta=5.0e-6)
+    test.assertLess(float(first[dof]), run.qd("m") - 1.0e-4)
 
 
 class TestSteelTendon(unittest.TestCase):
