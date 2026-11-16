@@ -726,19 +726,8 @@ automatic conversion between native ``Model.tendon_*`` routes and
 target resolution use the provider path; see
 :doc:`/concepts/usd_parsing` for supported path attributes.
 
-:class:`~newton.solvers.SolverSteel` simulates the same ``model.mujoco.tendon_*`` data,
-so one model runs on both solvers. Range limits and friction loss become constraint
-rows; armature, the stiffness/damping spring-damper and actuators with a tendon
-transmission are folded into the mass matrix along the tendon Jacobian, with the
-spring integration selected by its ``tendon_passive_mode`` option. Limit rows are only
-created near a bound, as set by ``tendon_limit_activation_gap``. Steel requires each
-tendon to move the DOFs of a single articulation and enforces limits rigidly: it does not
-model ``solref``/``solimp`` softening, force-space limit gains, the limit ``margin``,
-actuator activation dynamics, or tendon equality constraints. It does not simulate the
-routed tendons of :meth:`~newton.ModelBuilder.add_tendon`. After
-``notify_model_changed(TENDON_PROPERTIES)`` it picks up new values, including a stiffness,
-damping, armature or actuator switched on from zero; an edit that adds or removes limit or
-friction-loss rows raises :class:`NotImplementedError` and needs a new solver.
+:class:`~newton.solvers.SolverSteel` also simulates this ``model.mujoco.tendon_*`` data; see
+`Tendons on SolverSteel`_ below.
 
 For force-based limit gains, set ``model.mujoco.tendon_limit_ke`` (stiffness
 [N/m]) and ``tendon_limit_kd`` (damping [N s/m]), select force-space authoring
@@ -763,6 +752,67 @@ already be enabled in the imported model.
     model.mujoco.tendon_limit_kd.fill_(20.0)
     model.mujoco.tendon_solref_limit_mode.zero_()  # Newton force-space mode
     solver.notify_model_changed(newton.ModelFlags.TENDON_PROPERTIES)
+
+
+Tendons on SolverSteel
+~~~~~~~~~~~~~~~~~~~~~~
+
+.. experimental::
+
+    Steel's tendon support, its ``tendon_passive_mode`` and ``tendon_limit_activation_gap``
+    options and its ``tendon_lengths()``, ``tendon_forces()`` and ``tendon_actuator_forces()``
+    methods may change without the normal deprecation period.
+
+:class:`~newton.solvers.SolverSteel` simulates the same ``model.mujoco.tendon_*`` and
+tendon-actuator data, so a model authored for :class:`~newton.solvers.SolverMuJoCo` needs no
+tendon-specific changes. Steel reads the provider attributes only: tendons reach it through the
+MJCF importer, the USD ``MjcTendon`` / ``MjcActuator`` path or the authoring helpers above, and
+its two tendon options are solver arguments with no USD attribute. It does not simulate the
+routed tendons of :meth:`~newton.ModelBuilder.add_tendon` and warns when a model has them.
+
+What is modeled:
+
+- **Paths.** Fixed tendons over 1-DoF joints, with the joint references
+  (``mujoco:dof_ref``) in the length as MuJoCo's ``sum(c * qpos)``, and spatial tendons through
+  sites, sphere and cylinder wraps with side sites, and pulley divisors.
+- **Limits and friction loss.** ``range`` limits are one-sided rows and ``frictionloss`` is a
+  boxed row. Limits are rigid. A limit row is only created near its bound, as set by
+  ``tendon_limit_activation_gap``.
+- **Armature, springs and dampers.** These are folded into the mass matrix along the tendon
+  Jacobian, the way Steel treats joint drives. ``tendon_passive_mode`` keeps the spring force
+  explicit with implicit damping (``"implicit_damping"``, the default, the scheme of MuJoCo's
+  ``implicitfast`` integrator) or makes the stiffness implicit too (``"implicit"``). The
+  ``springlength`` dead band is honored. An automatic ``springlength`` is the tendon's length at
+  MuJoCo's spring reference pose, with the scalar joints at :attr:`~newton.Model.joint_rest_q`,
+  not at the model's initial :attr:`~newton.Model.joint_q`.
+- **Actuators.** Motor, position, velocity and affine ``general`` actuators with a tendon
+  transmission, read from ``control.mujoco.ctrl``, are implicit in their gains. A tendon's
+  ``actuatorfrcrange`` scales its actuators' forces and each actuator's ``forcerange`` clamps
+  afterwards, in MuJoCo's order. A position actuator's ``dampratio`` resolves to a damping gain
+  from the tendon's reflected inertia at the reference pose.
+
+Differences from :class:`~newton.solvers.SolverMuJoCo`:
+
+- Steel uses its full mass matrix, so tendon armature couples sibling branches. MuJoCo's
+  tree-sparse matrix drops that coupling. The same holds for the inertia behind ``dampratio``:
+  with armature across siblings Steel resolves a larger gain (2.93 against MuJoCo's 2.63 for two
+  sibling sliders with tendon armature 0.25 and gear 2).
+- A saturated actuator keeps its implicit gain; only the explicit force is clamped.
+- Not modeled: ``solref``/``solimp`` softening, force-space limit gains, the limit ``margin``
+  (a nonzero margin warns), actuators with activation dynamics or a non-affine gain or bias
+  (they warn and are ignored), and tendon equality constraints.
+- A tendon must move the DOFs of one articulation. Sites on the world or on kinematic bodies
+  are allowed; a tendon across two articulations warns and is ignored.
+
+After ``notify_model_changed`` with :attr:`~newton.ModelFlags.TENDON_PROPERTIES` or
+:attr:`~newton.ModelFlags.ACTUATOR_PROPERTIES` Steel re-derives its tendon tables, including a
+stiffness, damping, armature or actuator switched on from zero. A friction-loss row or mass
+term keeps its slot when its value returns to zero. Spring rest lengths also follow
+:attr:`~newton.ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES`. Three edits raise
+:class:`NotImplementedError` and need a new solver: one that adds or removes limit or
+friction-loss rows; a limit range moved across twice its activation gap, which changes the rows
+it reserves; and mass terms added to an articulation whose mass matrix is diagonal or
+sparse-factored. On CUDA that last case includes an articulation with a single DOF.
 
 
 .. _mujoco-collision-pipeline:
