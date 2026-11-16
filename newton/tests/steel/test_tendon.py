@@ -56,21 +56,25 @@ class _Run:
         ctrl=None,
         joint_f=None,
         parent_body=False,
+        gravity=-G,
+        contacts=False,
+        mjcf_kwargs=None,
         **solver_kwargs,
     ):
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -G))
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, gravity))
         parent = -1
         if parent_body:
             parent = builder.add_link(mass=0.0)
             builder.add_articulation([builder.add_joint_fixed(parent=-1, child=parent)])
-        builder.add_mjcf(mjcf, parent_body=parent)
+        builder.add_mjcf(mjcf, parent_body=parent, **(mjcf_kwargs or {}))
         builder.joint_armature = [0.0] * len(builder.joint_armature)
         self.model = builder.finalize(device=device)
         self.labels = list(self.model.joint_label)
         joint_q, joint_qd = self.model.joint_q.numpy(), self.model.joint_qd.numpy()
         for values, target, start in ((q, joint_q, "joint_q_start"), (qd, joint_qd, "joint_qd_start")):
             for name, value in (values or {}).items():
-                target[getattr(self.model, start).numpy()[self.joint(name)]] = value
+                first = getattr(self.model, start).numpy()[self.joint(name)]
+                target[first : first + np.size(value)] = value
         self.model.joint_q.assign(joint_q)
         self.model.joint_qd.assign(joint_qd)
         if solve_mode == "colored":
@@ -84,6 +88,8 @@ class _Run:
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         self.control = self.model.control()
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        self.pipeline = newton.CollisionPipeline(self.model) if contacts else None
+        self.contacts = self.pipeline.contacts() if contacts else None
         if ctrl is not None:
             self.control.mujoco.ctrl.assign(ctrl)
         if joint_f:
@@ -97,14 +103,16 @@ class _Run:
 
     def step(self, dt, steps):
         for _ in range(steps):
-            self.solver.step(self.state_0, self.state_1, self.control, None, dt)
+            if self.pipeline is not None:
+                self.pipeline.collide(self.state_0, self.contacts)
+            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
-    def q(self, name):
-        return float(self.state_0.joint_q.numpy()[self.model.joint_q_start.numpy()[self.joint(name)]])
+    def q(self, name, offset=0):
+        return float(self.state_0.joint_q.numpy()[self.model.joint_q_start.numpy()[self.joint(name)] + offset])
 
-    def qd(self, name):
-        return float(self.state_0.joint_qd.numpy()[self.model.joint_qd_start.numpy()[self.joint(name)]])
+    def qd(self, name, offset=0):
+        return float(self.state_0.joint_qd.numpy()[self.model.joint_qd_start.numpy()[self.joint(name)] + offset])
 
 
 _MODES = ("serial", "colored")
@@ -969,6 +977,190 @@ def test_tendon_mass_terms_are_bitwise_run_to_run(test, device):
         np.testing.assert_array_equal(run().view(np.uint32), first.view(np.uint32))
 
 
+_NO_GRAVITY = '<option gravity="0 0 0"/><default><geom condim="1" friction="0 0 0"/></default>'
+_ARM_GEOM = '<geom type="box" size="0.25 0.02 0.02" pos="0.25 0 0" mass="0.2"/>'
+# Arm inertia about its hinge: a 0.5 x 0.04 m box of 0.2 kg centered 0.25 m out.
+_ARM_INERTIA = 0.2 * ((0.5**2 + 0.04**2) / 12.0 + 0.25**2)
+_PROPAGATION = {"articulated_contact_response": "propagation"}
+
+
+def _base(children):
+    """A fixed root whose own geom takes no part in collisions."""
+    return (
+        f'<body name="base"><geom type="sphere" size="0.02" mass="0.1" contype="0" conaffinity="0"/>{children}</body>'
+    )
+
+
+def _arm(name, pos, inner=""):
+    return f'<body name="{name}" pos="{pos}"><joint name="{name}" type="hinge" axis="0 0 1"/>{_ARM_GEOM}{inner}</body>'
+
+
+def _ball(pos, mass=0.5):
+    return (
+        f'<body name="ball" pos="{pos}"><freejoint name="ball"/><geom type="sphere" size="0.05" mass="{mass}"/></body>'
+    )
+
+
+def test_tendon_armature_reaches_propagation_contacts(test, device):
+    """A contact on a tendon-coupled arm responds through the tendon armature under the propagation response.
+
+    Two sibling arms of hinge inertia ``I`` share a tendon ``q1 - q2`` with armature ``a``, so
+    ``H = I + a [[1, -1], [-1, 1]]``. A ball of mass ``m`` and speed ``v0`` hits arm 1 squarely at radius ``r``.
+    The contact is inelastic: with ``y = H^-1 e1`` the impulse is ``p = m v0 / (1 + m r^2 y1)``, the arms leave at
+    ``r p y`` and the ball at ``v0 - p / m``. The articulated-body tree of the propagation response has no place
+    for the off-tree armature term; without it arm 2 would stay at rest.
+    """
+    a, m, v0, r, dt = 20.0, 0.5, 2.0, 0.4, 2.0e-3
+    mjcf = f"""<mujoco>{_NO_GRAVITY}<worldbody>{_base(_arm("h1", "0 0 0") + _arm("h2", "0 0 0.5"))}
+      {_ball(f"{r} 0.075 0", m)}</worldbody>
+      <tendon><fixed armature="{a}"><joint joint="h1" coef="1"/><joint joint="h2" coef="-1"/></fixed></tendon>
+    </mujoco>"""
+    y = np.linalg.solve(_ARM_INERTIA * np.eye(2) + a * np.array([[1.0, -1.0], [-1.0, 1.0]]), [1.0, 0.0])
+    p = m * v0 / (1.0 + m * r * r * y[0])
+    for mode in _MODES:
+        with test.subTest(solve_mode=mode):
+            run = _Run(
+                mjcf, device, solve_mode=mode, gravity=0.0, contacts=True, qd={"ball": (0.0, -v0)}, iterations=8,
+                **_PROPAGATION,
+            )  # fmt: skip
+            run.step(dt, 6)
+            # The arms have turned 0.02 rad since the impact, which changes the contact geometry by O(1e-3).
+            test.assertAlmostEqual(run.qd("h1"), -r * p * y[0], delta=2.0e-2)
+            test.assertAlmostEqual(run.qd("h2"), -r * p * y[1], delta=2.0e-2)
+            test.assertAlmostEqual(run.qd("ball", 1), -(v0 - p / m), delta=1.0e-2)
+
+
+def test_tendon_single_joint_armature_converges_in_one_propagation_iteration(test, device):
+    """A tendon armature on the struck joint itself scales the row's effective mass, not only the velocity update.
+
+    A ball of mass ``m`` hits a slider of mass ``M`` whose own tendon has armature ``a``: both leave at
+    ``m v0 / (m + M + a)``. A propagation row that kept the tree's effective mass ``M`` would under-step by
+    ``M / (M + a)`` per iteration; with the dense-factor response one iteration is exact.
+    """
+    a, m, big_m, v0, dt = 20.0, 1.0, 1.0, 1.0, 2.0e-3
+    mjcf = f"""<mujoco>{_NO_GRAVITY}<worldbody>{_base(_slider("s1", "0 0 0", axis="1 0 0", mass=big_m))}
+      {_ball("-0.105 0 0", m)}</worldbody>
+      <tendon><fixed armature="{a}"><joint joint="s1" coef="1"/></fixed></tendon></mujoco>"""
+    speed = m * v0 / (m + big_m + a)
+    for mode in _MODES:
+        with test.subTest(solve_mode=mode):
+            run = _Run(
+                mjcf, device, solve_mode=mode, gravity=0.0, contacts=True, qd={"ball": (v0,)}, iterations=1,
+                **_PROPAGATION,
+            )  # fmt: skip
+            run.step(dt, 6)
+            test.assertAlmostEqual(run.qd("s1"), speed, delta=1.0e-4)
+            test.assertAlmostEqual(run.qd("ball"), speed, delta=1.0e-4)
+
+
+def test_tendon_actuated_gripper_holds_a_box_under_propagation(test, device):
+    """A tendon position actuator's grip force reaches the contacts of the propagation response in full.
+
+    Two sibling finger sliders share the tendon ``(q_l + q_r) / 2`` driven by a position actuator, which squeezes
+    a box with ``N = kp c / 2`` per finger. With friction 1.3 times the critical ``m g / (2 N)`` the box must not
+    slip. The actuator's implicit gains ``dt kv + dt^2 kp`` are tendon mass terms; a contact response without
+    them scales the normal force by about ``H0 / H`` and drops the box.
+    """
+    kp, kv, c, m, dt = 1000.0, 100.0, 0.02, 0.1, 2.0e-3
+    mu = 1.3 * m * G / (kp * c)
+    fingers = "".join(
+        f'<body name="{name}" pos="0 {y} 0"><joint name="{name}" type="slide" axis="0 {axis} 0"/>'
+        '<geom type="box" size="0.04 0.02 0.04" mass="0.1"/></body>'
+        for name, y, axis in (("fl", -0.05, 1), ("fr", 0.05, -1))
+    )
+    mjcf = f"""<mujoco><compiler autolimits="true"/><option gravity="0 0 {-G}"/>
+      <default><geom friction="{mu} 0 0"/></default><worldbody>{_base(fingers)}
+      <body name="box"><freejoint name="box"/><geom type="box" size="0.03 0.03 0.03" mass="{m}"/></body></worldbody>
+      <tendon><fixed name="t"><joint joint="fl" coef="0.5"/><joint joint="fr" coef="0.5"/></fixed></tendon>
+      <actuator><position tendon="t" kp="{kp}" kv="{kv}"/></actuator></mujoco>"""
+    for mode in _MODES:
+        with test.subTest(solve_mode=mode):
+            run = _Run(mjcf, device, solve_mode=mode, contacts=True, ctrl=[c], iterations=16, **_PROPAGATION)
+            run.step(dt, 150)
+            test.assertAlmostEqual(run.q("box", 2), 0.0, delta=1.0e-3)
+            test.assertAlmostEqual(run.q("fl"), 0.0, delta=1.0e-3)
+            test.assertAlmostEqual(run.q("fr"), 0.0, delta=1.0e-3)
+
+
+def test_tendon_mass_terms_reach_same_articulation_propagation_rows(test, device):
+    """Contacts between two links of one articulation see the tendon mass terms as propagation rows too.
+
+    Arm 1 swings into arm 2; a tendon ``q1 - q3`` with armature ``a`` couples it to a third arm that nothing
+    touches. No generalized force acts on joint 3, so its momentum ``(I + a) w3 - a w1`` keeps its initial value
+    ``-a w0`` through the impact, whether the contact is a dense row (the default) or a propagation row
+    (``propagation_same_articulation_rows``).
+    """
+    a, w0, dt = 20.0, 3.0, 2.0e-3
+    mjcf = f"""<mujoco>{_NO_GRAVITY}<worldbody>
+      {_base(_arm("h1", "0 0 0") + _arm("h2", "0 0.15 0") + _arm("h3", "0 0 0.5"))}</worldbody>
+      <tendon><fixed armature="{a}"><joint joint="h1" coef="1"/><joint joint="h3" coef="-1"/></fixed></tendon>
+    </mujoco>"""
+    for mode, same_rows in [(m, s) for m in _MODES for s in (False, True)]:
+        with test.subTest(solve_mode=mode, propagation_same_articulation_rows=same_rows):
+            run = _Run(
+                mjcf, device, solve_mode=mode, gravity=0.0, contacts=True, qd={"h1": w0}, iterations=16,
+                mjcf_kwargs={"enable_self_collisions": True}, propagation_same_articulation_rows=same_rows,
+                **_PROPAGATION,
+            )  # fmt: skip
+            run.step(dt, 100)
+            test.assertLess(run.qd("h1"), 0.9 * w0)  # arm 1 has hit arm 2
+            momentum = (_ARM_INERTIA + a) * run.qd("h3") - a * run.qd("h1")
+            test.assertAlmostEqual(momentum, -a * w0, delta=2.0e-3 * a * w0)
+
+
+def test_tendon_propagation_response_follows_a_stale_mass_matrix(test, device):
+    """With ``update_mass_matrix_interval`` above one, the propagation response reuses the factor like the dense rows.
+
+    A ball hits the distal link of a two-link finger whose joints share a tendon with armature. The finger's mass
+    matrix changes with its pose, so both responses work from a factor up to three steps old; they agree because
+    the tendon sizes' propagation response is refreshed with that factor.
+    """
+    mjcf = f"""<mujoco>{_NO_GRAVITY}<worldbody>{_base(_arm("h1", "0 0 0", inner=_arm("h2", "0.5 0 0")))}
+      {_ball("0.8 0.075 0")}</worldbody>
+      <tendon><fixed armature="0.05"><joint joint="h1" coef="1"/><joint joint="h2" coef="-1"/></fixed></tendon>
+    </mujoco>"""
+    options = {"gravity": 0.0, "contacts": True, "qd": {"ball": (0.0, -2.0)}, "iterations": 32}
+    reference = _Run(mjcf, device, update_mass_matrix_interval=4, **options)
+    reference.step(2.0e-3, 100)
+    test.assertLess(reference.q("h2"), -0.05)  # the ball has pushed the distal link
+    for mode in _MODES:
+        with test.subTest(solve_mode=mode):
+            run = _Run(mjcf, device, solve_mode=mode, update_mass_matrix_interval=4, **options, **_PROPAGATION)
+            run.step(2.0e-3, 100)
+            for name in ("h1", "h2"):
+                test.assertAlmostEqual(run.q(name), reference.q(name), delta=2.0e-3)
+                test.assertAlmostEqual(run.qd(name), reference.qd(name), delta=2.0e-2)
+
+
+def test_tendon_armature_switched_on_by_notify_under_propagation(test, device):
+    """Tendon mass terms that appear at runtime move their articulation size onto the dense propagation response.
+
+    The arms' tendon starts without mass terms (only a separate slider has a damped tendon), so the arms take the
+    tree pass and, on CUDA, the cached responses. After the armature is switched on and notified, the solver
+    matches one constructed with it.
+    """
+    mjcf = f"""<mujoco>{_NO_GRAVITY}<worldbody>{_base(_arm("h1", "0 0 0") + _arm("h2", "0 0 0.5"))}
+      {_ball("0.4 0.1 0")}{_slider("anchor", "5 0 0", axis="1 0 0")}</worldbody><tendon>
+      <fixed><joint joint="h1" coef="1"/><joint joint="h2" coef="-1"/></fixed>
+      <fixed damping="1"><joint joint="anchor" coef="1"/></fixed></tendon></mujoco>"""
+    for mode in _MODES:
+        with test.subTest(solve_mode=mode):
+            options = {"iterations": 8, **_PROPAGATION}
+            run = _Run(mjcf, device, solve_mode=mode, gravity=0.0, contacts=True, qd={"ball": (0.0, -2.0)}, **options)
+            run.step(2.0e-3, 5)
+            run.model.mujoco.tendon_armature.assign(np.array([20.0, 0.0], dtype=np.float32))
+            run.solver.notify_model_changed(newton.ModelFlags.TENDON_PROPERTIES)
+            fresh, state_0, state_1 = _fresh_copy(run, mode, **options)
+            contacts = run.pipeline.contacts()
+            for _ in range(40):
+                run.pipeline.collide(state_0, contacts)
+                fresh.step(state_0, state_1, run.control, contacts, 2.0e-3)
+                state_0, state_1 = state_1, state_0
+            run.step(2.0e-3, 40)
+            test.assertLess(run.qd("h2"), -1.0)  # the armature drags arm 2 along
+            np.testing.assert_allclose(run.state_0.joint_qd.numpy(), state_0.joint_qd.numpy(), atol=1.0e-5)
+
+
 class TestSteelTendon(unittest.TestCase):
     pass
 
@@ -1008,6 +1200,12 @@ for _name in (
     "test_tendon_inside_sphere_wrap_matches_mujoco",
     "test_tendon_armature_history_survives_coupled_iteration_restarts",
     "test_tendon_mass_terms_are_bitwise_run_to_run",
+    "test_tendon_armature_reaches_propagation_contacts",
+    "test_tendon_single_joint_armature_converges_in_one_propagation_iteration",
+    "test_tendon_actuated_gripper_holds_a_box_under_propagation",
+    "test_tendon_mass_terms_reach_same_articulation_propagation_rows",
+    "test_tendon_propagation_response_follows_a_stale_mass_matrix",
+    "test_tendon_armature_switched_on_by_notify_under_propagation",
 ):
     add_function_test(TestSteelTendon, _name, globals()[_name], devices=get_test_devices())
 
