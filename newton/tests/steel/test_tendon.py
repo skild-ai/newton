@@ -543,6 +543,30 @@ def test_tendon_position_dampratio_is_critically_damped(test, device):
             test.assertTrue(np.isfinite(run.state_0.joint_qd.numpy()).all())
 
 
+def test_tendon_dampratio_inertia_is_taken_at_the_reference_pose(test, device):
+    """A dampratio's reflected inertia is evaluated at MuJoCo's qpos0, not at the model's initial joint_q.
+
+    The tendon's moment arm on the hinge changes with the angle, so its reflected inertia does too. Two solvers
+    built from models that differ only in their initial hinge angle must resolve the same damping gain, and so
+    trace the same motion from a common start state.
+    """
+    dt, steps = 1.0e-3, 200
+    mjcf = f"""<mujoco>{_HEAD}<worldbody><site name="w" pos="-0.2 0 1.3"/><body name="arm" pos="0 0 1">
+      <joint name="h" type="hinge" axis="0 1 0"/><geom type="capsule" fromto="0 0 0 0.3 0 0" size="0.02" mass="0.3"/>
+      <site name="a" pos="0.15 0 0.05"/></body></worldbody><tendon><spatial name="t"><site site="w"/><site site="a"/>
+    </spatial></tendon><actuator><position tendon="t" kp="30" dampratio="1"/></actuator></mujoco>"""
+    angles = []
+    for start in (0.0, 0.9):
+        run = _Run(mjcf, device, q={"h": start}, ctrl=[0.3], iterations=8)
+        run.state_0.joint_q.zero_()
+        newton.eval_fk(run.model, run.state_0.joint_q, run.state_0.joint_qd, run.state_0)
+        run.solver.reset(run.state_0)
+        run.step(dt, steps)
+        angles.append(run.q("h"))
+    test.assertGreater(abs(angles[0]), 1.0e-2)
+    test.assertAlmostEqual(angles[1], angles[0], delta=1.0e-6)
+
+
 def test_tendon_dampratio_leaves_the_model_unchanged(test, device):
     """Resolving dampratio writes the solver's copy of biasprm, so a later kp change re-resolves the same ratio."""
     mjcf = f"""<mujoco>{_HEAD}<worldbody>{_frame(_slider("m", "0 0 1", axis="1 0 0"))}</worldbody>
@@ -906,6 +930,7 @@ for _name in (
     "test_tendon_armature_history_restarts_on_reset",
     "test_tendon_margin_and_routed_tendons_warn",
     "test_tendon_position_dampratio_is_critically_damped",
+    "test_tendon_dampratio_inertia_is_taken_at_the_reference_pose",
     "test_tendon_dampratio_leaves_the_model_unchanged",
     "test_tendon_auto_spring_rests_at_the_joint_rest_pose",
     "test_tendon_fixed_length_includes_the_joint_reference",
