@@ -1089,6 +1089,7 @@ def apply_tendon_mass_terms_for_size(
     dt: float,
     implicit_spring: int,
     scratch_index: wp.array[int],
+    ordered: int,
     # in/out
     J_scratch: wp.array3d[float],
     J_prev: wp.array2d[float],
@@ -1098,6 +1099,7 @@ def apply_tendon_mass_terms_for_size(
     tendon_length: wp.array[float],
     tendon_force: wp.array2d[float],
     actuator_force: wp.array[float],
+    mass_term: wp.array[wp.vec2],
 ):
     """Fold a tendon's armature, spring-damper and actuators into the mass matrix and the joint forces.
 
@@ -1116,6 +1118,10 @@ def apply_tendon_mass_terms_for_size(
       ``actuatorfrcrange`` scales its actuators' forces so their sum stays in range, as MuJoCo.
 
     The mass term is added only where CRBA rebuilt ``H`` this step; the forces every step.
+
+    The tendons of an articulation add into the same entries of ``H`` and of the joint forces, so the sums
+    depend on the order in which their threads arrive. With ``ordered`` the kernel stores ``(K, f)`` in
+    ``mass_term`` instead, and :func:`accumulate_tendon_mass_terms_for_size` adds them in a fixed order.
     """
     i = wp.tid()
     k = tendon_list[i]
@@ -1225,6 +1231,18 @@ def apply_tendon_mass_terms_for_size(
         actuator_force[act] = actuator
         force += gear * drive
 
+    # Only armature reads the previous Jacobian; without it, restart the backward difference cold.
+    if not fixed:
+        if armature != 0.0:
+            for d in range(n_dofs):
+                J_prev[s, d] = J_scratch[s, 0, d]
+            has_prev[k] = 1
+        else:
+            has_prev[k] = 0
+    if ordered != 0:
+        mass_term[k] = wp.vec2(K, force)
+        return
+
     # Every world's tendons add into the same H and joint forces, so the atomic adds contend: skip the zero
     # entries of J (a fixed tendon spans a few DOFs) rather than add zeros.
     g = art_group_idx[art]
@@ -1253,13 +1271,71 @@ def apply_tendon_mass_terms_for_size(
             jd = J_scratch[s, 0, d]
             if jd != 0.0:
                 joint_tau[ctx.dof_start + d] += jd * force
-    # Only armature reads the previous Jacobian; without it, restart the backward difference cold.
-    if armature != 0.0:
-        for d in range(n_dofs):
-            J_prev[s, d] = J_scratch[s, 0, d]
-        has_prev[k] = 1
-    else:
-        has_prev[k] = 0
+
+
+@wp.kernel
+def accumulate_tendon_mass_terms_for_size(
+    art_list: wp.array[int],
+    row_entry_start: wp.array[int],
+    row_entry_tendon: wp.array[int],
+    row_entry: wp.array[int],
+    art_spatial_start: wp.array[int],
+    art_spatial: wp.array[int],
+    mass_term: wp.array[wp.vec2],
+    art_group_idx: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    mass_update_mask: wp.array[int],
+    n_dofs: int,
+    tendon_joint_adr: wp.array[int],
+    tendon_joint_num: wp.array[int],
+    tendon_joint: wp.array[int],
+    tendon_coef: wp.array[float],
+    joint_qd_start: wp.array[int],
+    scratch_index: wp.array[int],
+    J_scratch: wp.array3d[float],
+    # in/out
+    H_group: wp.array3d[float],
+    joint_tau: wp.array[float],
+):
+    """Add the ``(K, f)`` terms of an articulation's tendons to one row of ``H`` and one joint force, in a fixed order.
+
+    One thread owns row ``r`` of one articulation, so every sum has a fixed order: the
+    ``deterministic=RUN_TO_RUN`` form of the accumulation in :func:`apply_tendon_mass_terms_for_size`, which
+    leaves the terms in ``mass_term``. ``row_entry`` lists the fixed-tendon coefficients on that DOF by tendon
+    index; the articulation's spatial tendons follow, also by index, with their dense Jacobian rows.
+    """
+    a, r = wp.tid()
+    art = art_list[a]
+    g = art_group_idx[art]
+    dof_start = articulation_dof_start[art]
+    update_mass = mass_update_mask[art] != 0
+    tau = float(0.0)
+    row = a * n_dofs + r
+    for i in range(row_entry_start[row], row_entry_start[row + 1]):
+        k = row_entry_tendon[i]
+        K = mass_term[k][0]
+        coef = tendon_coef[row_entry[i]]
+        tau += coef * mass_term[k][1]
+        if K != 0.0 and update_mass:
+            jr = K * coef
+            j_adr = tendon_joint_adr[k]
+            for f in range(j_adr, j_adr + tendon_joint_num[k]):
+                H_group[g, r, joint_qd_start[tendon_joint[f]] - dof_start] += jr * tendon_coef[f]
+    for i in range(art_spatial_start[a], art_spatial_start[a + 1]):
+        k = art_spatial[i]
+        s = scratch_index[k]
+        jr = J_scratch[s, 0, r]
+        if jr != 0.0:
+            K = mass_term[k][0]
+            tau += jr * mass_term[k][1]
+            if K != 0.0 and update_mass:
+                jr *= K
+                for c in range(n_dofs):
+                    jc = J_scratch[s, 0, c]
+                    if jc != 0.0:
+                        H_group[g, r, c] += jr * jc
+    if tau != 0.0:
+        joint_tau[dof_start + r] += tau
 
 
 @wp.kernel
@@ -1341,6 +1417,8 @@ class TendonPlan:
         self.gate_fixed_index = None
         self.gate_spatial_index = None
         self.biasprm = None
+        self.mass_order: dict[int, tuple] = {}
+        self.mass_term = None
 
     @classmethod
     def build(
@@ -1557,6 +1635,45 @@ class TendonPlan:
             plan.mass_J_prev = wp.zeros((rows_scratch, max_size), dtype=float, device=device)
             plan.mass_has_prev = wp.zeros(n, dtype=wp.int32, device=device)
         return plan
+
+    def build_mass_order(self, model) -> None:
+        """Build the tables that add the mass terms in a fixed order with ``deterministic=RUN_TO_RUN``.
+
+        Per size: the articulations with mass terms, for each of their mass-matrix rows the fixed-tendon
+        coefficients on that DOF by tendon index, and each one's spatial tendons by index
+        (:func:`accumulate_tendon_mass_terms_for_size`).
+        """
+        self.mass_order = {}
+        if not self.mass_sizes:
+            return
+        device = model.device
+        self.mass_term = wp.zeros(self.count, dtype=wp.vec2, device=device)
+        ttype, joint_adr, joint_num, tjoint = self._paths[:4]
+        art = self.art_np
+        qd_start = model.joint_qd_start.numpy()
+        art_dof_start = qd_start[model.articulation_start.numpy()[:-1]]
+        for size, tendon_list in self.mass_sizes.items():
+            tendons = np.sort(tendon_list.numpy())
+            arts = np.unique(art[tendons])
+            slot = np.searchsorted(arts, art[tendons])
+            is_fixed = ttype[tendons] == int(TENDON_TYPE_FIXED)
+            fixed = tendons[is_fixed]
+            count = joint_num[fixed].astype(np.int64)
+            entry_tendon = np.repeat(fixed, count)
+            entry = (
+                np.repeat(joint_adr[fixed], count) + np.arange(count.sum()) - np.repeat(np.cumsum(count) - count, count)
+            )
+            row = np.repeat(slot[is_fixed], count) * size + qd_start[tjoint[entry]] - art_dof_start[art[entry_tendon]]
+            order = np.lexsort((entry, entry_tendon, row))
+            row_start = np.searchsorted(row[order], np.arange(arts.size * size + 1))
+            spatial_start = np.searchsorted(slot[~is_fixed], np.arange(arts.size + 1))
+            tables = (arts, row_start, entry_tendon[order], entry[order], spatial_start, tendons[~is_fixed])
+            self.mass_order[size] = tuple(
+                wp.array(np.asarray(values, dtype=np.int32), dtype=wp.int32, device=device)
+                if len(values)
+                else wp.zeros(1, dtype=wp.int32, device=device)
+                for values in tables
+            )
 
     def refresh_length_offset(self, model) -> None:
         """Re-read each fixed tendon's ``sum(c * ref)`` [m or rad] from ``mujoco:dof_ref`` on the device.

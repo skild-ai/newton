@@ -244,6 +244,7 @@ from .sparse_mass_matrix import _get_crba_sparse_factor_kernel, _SparseMassMatri
 from .sparse_pgs import _get_pgs_solve_sparse_kernel
 from .tendon import (
     TendonPlan,
+    accumulate_tendon_mass_terms_for_size,
     allocate_tendon_slots,
     apply_tendon_mass_terms_for_size,
     clear_tendon_armature_history,
@@ -2677,6 +2678,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 contact set. ``GPU_TO_GPU`` is not supported: passing it raises :class:`ValueError`, and an
                 inherited one emits a :class:`~newton.exceptions.NewtonWarning` and runs ``RUN_TO_RUN``.
                 :attr:`deterministic` reports the mode that runs, after any fallback.
+                The mass-matrix terms and joint forces of an articulation's tendons are added in a fixed
+                order, in a second launch with one thread per mass-matrix row; its cost grows with the
+                number of tendons that share a DOF.
                 ``BODY_PARENT_F`` sums contact wrenches with atomics, so it is outside this guarantee.
                 Steel's kernel modules always opt out of Warp's ``deterministic`` module option, so a
                 process-wide ``wp.config.deterministic`` only selects this mode.
@@ -4597,6 +4601,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         plan.resolve_spring_lengths(model)
         plan.resolve_dampratio(model)
+        if self._ordered_rows:
+            plan.build_mass_order(model)
         if plan.has_rows:
             gap = np.full(plan.count, self._tendon_limit_gap_base, dtype=np.float64)
             if self._tendon_limit_activation_speed_scale > 0.0:
@@ -9914,6 +9920,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     dt,
                     int(self._tendon_passive_mode == "implicit"),
                     tendon.mass_scratch_index,
+                    int(self._ordered_rows),
                 ],
                 outputs=[
                     tendon.mass_J,
@@ -9924,7 +9931,30 @@ class SolverSteel(SolverBase, CouplingInterface):
                     tendon.length,
                     tendon.force,
                     tendon.actuator_force,
+                    tendon.mass_term if self._ordered_rows else tendon._placeholder(model.device, 1, wp.vec2),
                 ],
+                device=model.device,
+            )
+            if not self._ordered_rows:
+                continue
+            # deterministic=RUN_TO_RUN: add the stored terms in a fixed order, one thread per mass-matrix row.
+            order = tendon.mass_order[size]
+            wp.launch(
+                accumulate_tendon_mass_terms_for_size,
+                dim=(order[0].shape[0], size),
+                inputs=[
+                    *order,
+                    tendon.mass_term,
+                    self._art_group_idx,
+                    self._articulation_dof_start,
+                    self._mass_update_mask,
+                    size,
+                    *tendon.model_inputs(model)[1:5],
+                    model.joint_qd_start,
+                    tendon.mass_scratch_index,
+                    tendon.mass_J,
+                ],
+                outputs=[self._H_by_size[size], state_aug._joint_tau],
                 device=model.device,
             )
 

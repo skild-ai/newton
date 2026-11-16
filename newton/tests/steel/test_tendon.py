@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton.solvers import SolverSteel
+from newton.solvers import SolverMuJoCo, SolverSteel
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 G = 9.81
@@ -905,6 +905,70 @@ def test_tendon_armature_history_survives_coupled_iteration_restarts(test, devic
     test.assertLess(float(first[dof]), run.qd("m") - 1.0e-4)
 
 
+def _shared_dof_tendons_mjcf(count):
+    """Three hinge arms whose DOFs are shared by ``count`` fixed tendons, two spatial tendons and position actuators."""
+    rng = np.random.default_rng(7)
+    arms = "".join(
+        f'<body name="a{i}" pos="{0.2 * i} 0 0"><joint name="j{i}" type="hinge" axis="0 1 0"/>'
+        f'<geom type="box" size="0.05 0.02 0.1" pos="0 0 -0.1" mass="0.2"/><site name="s{i}" pos="0 0 -0.2"/></body>'
+        for i in range(3)
+    )
+    tendons, actuators = "", ""
+    for t in range(count):
+        coef = rng.uniform(-1.0, 1.0, 3)
+        joints = "".join(f'<joint joint="j{i}" coef="{coef[i]:.4f}"/>' for i in range(3))
+        tendons += (
+            f'<fixed name="t{t}" stiffness="{rng.uniform(1.0, 20.0):.3f}" damping="{rng.uniform(0.01, 0.2):.3f}" '
+            f'armature="{rng.uniform(0.001, 0.01):.4f}" springlength="0">{joints}</fixed>'
+        )
+        if t % 8 == 0:
+            actuators += f'<position tendon="t{t}" kp="{rng.uniform(1.0, 5.0):.3f}" kv="0.05"/>'
+    for end, rest in ((1, 0.2), (2, 0.4)):
+        tendons += (
+            f'<spatial stiffness="30" damping="0.1" armature="0.005" springlength="{rest}">'
+            f'<site site="s0"/><site site="s{end}"/></spatial>'
+        )
+    return (
+        f"<mujoco>{_HEAD}<worldbody>{_frame(arms)}</worldbody>"
+        f"<tendon>{tendons}</tendon><actuator>{actuators}</actuator></mujoco>"
+    )
+
+
+def test_tendon_mass_terms_are_bitwise_run_to_run(test, device):
+    """With ``deterministic=RUN_TO_RUN``, tendons that share DOFs add their mass terms and forces in a fixed order.
+
+    34 tendons with springs, dampers, armature and actuators act on the same three DOFs in each of 16 worlds,
+    so their sums into the mass matrix and the joint forces depend on the order of the additions. Three runs
+    must agree bit for bit.
+    """
+    worlds = 16
+
+    def run():
+        world = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -G))
+        SolverMuJoCo.register_custom_attributes(world)
+        SolverSteel.register_custom_attributes(world)
+        world.add_mjcf(_shared_dof_tendons_mjcf(32))
+        world.joint_armature = [0.0] * len(world.joint_armature)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -G))
+        builder.replicate(world, worlds)
+        model = builder.finalize(device=device)
+        speed = np.linspace(0.5, 1.5, worlds)[:, None] * np.array([1.0, -2.0, 1.5])
+        model.joint_qd.assign(speed.reshape(-1).astype(np.float32))
+        solver = SolverSteel(model, deterministic=wp.DeterministicMode.RUN_TO_RUN)
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        control.mujoco.ctrl.fill_(0.1)
+        for _ in range(20):
+            solver.step(state_0, state_1, control, None, 0.002)
+            state_0, state_1 = state_1, state_0
+        return np.concatenate([state_0.joint_q.numpy(), state_0.joint_qd.numpy()])
+
+    first = run()
+    test.assertTrue(np.isfinite(first).all())
+    test.assertGreater(float(np.abs(first).max()), 1.0e-3)
+    for _ in range(2):
+        np.testing.assert_array_equal(run().view(np.uint32), first.view(np.uint32))
+
+
 class TestSteelTendon(unittest.TestCase):
     pass
 
@@ -943,6 +1007,7 @@ for _name in (
     "test_tendon_friction_loss_switched_by_notify",
     "test_tendon_inside_sphere_wrap_matches_mujoco",
     "test_tendon_armature_history_survives_coupled_iteration_restarts",
+    "test_tendon_mass_terms_are_bitwise_run_to_run",
 ):
     add_function_test(TestSteelTendon, _name, globals()[_name], devices=get_test_devices())
 
