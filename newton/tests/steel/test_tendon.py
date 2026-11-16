@@ -611,6 +611,24 @@ def test_tendon_actuator_force_range_caps_the_summed_force(test, device):
             test.assertAlmostEqual(run.qd("m"), 1.5 * steps * dt, delta=1.0e-5)
 
 
+def test_tendon_auto_limit_follows_autolimits(test, device):
+    """A tendon with limited="auto" is limited by its range only while the model's autolimits is set.
+
+    The slider moves at 1 m/s toward a range bound 0.1 m away. With autolimits off, the automatic tendon keeps
+    going, as tendon actuators' automatic control and force ranges do, and an explicit limited="true" still stops.
+    """
+    dt, steps = 1.0e-3, 300
+    for limited, autolimits, stops in (("auto", True, True), ("auto", False, False), ("true", False, True)):
+        mjcf = f"""<mujoco>{_HEAD}<worldbody>{_frame(_slider("m", "0 0 1", axis="1 0 0"))}</worldbody><tendon>
+          <fixed limited="{limited}" range="-1 0.1"><joint joint="m" coef="1"/></fixed></tendon></mujoco>"""
+        with test.subTest(limited=limited, autolimits=autolimits):
+            run = _Run(mjcf, device, qd={"m": 1.0}, iterations=8)
+            run.model.mujoco.autolimits.fill_(autolimits)
+            run.solver = SolverSteel(run.model, iterations=8)
+            run.step(dt, steps)
+            test.assertAlmostEqual(run.q("m"), 0.1 if stops else steps * dt, delta=1.0e-3)
+
+
 def test_tendon_property_changes_reach_the_solver(test, device):
     """notify_model_changed(TENDON_PROPERTIES) re-derives the spring terms; edits that add tendon rows raise.
 
@@ -824,6 +842,7 @@ for _name in (
     "test_tendon_auto_spring_rests_at_the_joint_rest_pose",
     "test_tendon_fixed_length_includes_the_joint_reference",
     "test_tendon_actuator_force_range_caps_the_summed_force",
+    "test_tendon_auto_limit_follows_autolimits",
     "test_tendon_property_changes_reach_the_solver",
     "test_tendon_stiffness_switched_on_by_notify",
     "test_tendon_friction_loss_switched_by_notify",

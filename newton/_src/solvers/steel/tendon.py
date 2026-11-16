@@ -1427,7 +1427,11 @@ class TendonPlan:
                 )
         a_of = np.where(one_art, lowest, 0).astype(np.int32)
         valid = one_art & ~multi_dof & ~bad_divisor & (response_dof_count[a_of] > 0)
-        limit_on = (limited == _LimitedType.TRUE) | ((limited == _LimitedType.AUTO) & (trange[:, 0] < trange[:, 1]))
+        autolimits_attr = getattr(mujoco, "autolimits", None)
+        autolimits = bool(autolimits_attr.numpy()[0]) if autolimits_attr is not None else True
+        limit_on = (limited == _LimitedType.TRUE) | (
+            (limited == _LimitedType.AUTO) & autolimits & (trange[:, 0] < trange[:, 1])
+        )
         flags = np.where(valid & limit_on, int(TENDON_ROW_LIMIT_LOWER) | int(TENDON_ROW_LIMIT_UPPER), 0)
         flags = (flags | np.where(valid & (frictionloss > 0.0), int(TENDON_ROW_FRICTION), 0)).astype(np.int32)
         actuated = np.bincount(tendon_actuators.tendon[tendon_actuators.tendon >= 0], minlength=n)[:n] > 0
@@ -1500,8 +1504,6 @@ class TendonPlan:
         plan.actuator_flags = wp.array(tendon_actuators.flags, dtype=wp.int32, device=device)
         plan.actuator_start_np = actuator_start
         plan.actuator_list_np = np.asarray(actuator_list, dtype=np.int32)
-        autolimits_attr = getattr(mujoco, "autolimits", None)
-        autolimits = bool(autolimits_attr.numpy()[0]) if autolimits_attr is not None else True
         cap_flag = host("tendon_actuator_force_limited", np.full(n, int(_LimitedType.AUTO), dtype=np.int32))
         cap_range = host("tendon_actuator_force_range", np.zeros((n, 2), dtype=np.float32))
         cap = (cap_flag == _LimitedType.TRUE) | (
