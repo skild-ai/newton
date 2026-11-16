@@ -798,8 +798,9 @@ Differences from :class:`~newton.solvers.SolverMuJoCo`:
 
 - Steel uses its full mass matrix, so tendon armature couples sibling branches. MuJoCo's
   tree-sparse matrix drops that coupling. The same holds for the inertia behind ``dampratio``:
-  with armature across siblings Steel resolves a larger gain (2.93 against MuJoCo's 2.63 for two
-  sibling sliders with tendon armature 0.25 and gear 2).
+  with armature across siblings Steel resolves a larger gain (4.74 against MuJoCo's 4.33 for two
+  sibling 1 kg sliders sharing a tendon with armature 0.25, driven with ``kp`` 30, ``dampratio`` 1
+  and gear 2).
 - A saturated actuator keeps its implicit gain; only the explicit force is clamped.
 - Not modeled: ``solref``/``solimp`` softening, force-space limit gains, the limit ``margin``
   (a nonzero margin warns), actuators with activation dynamics or a non-affine gain or bias
