@@ -43,7 +43,13 @@ def configure_free_rigid_angular_friction(solver, model, torsional: float | None
     overridden = torsional is not None or rolling is not None
     # Kernel argument for a model without steel:condim; the gate kernel ignores it.
     solver._free_rigid_condim_placeholder = wp.zeros(1, dtype=wp.int32, device=model.device)
-    solver._free_rigid_angular_rows = bool(overridden or (values is not None and np.any(values >= 4)))
+    routed = False
+    if values is not None:
+        shape_body = model.shape_body.numpy()
+        route = _free_route_body_mask(solver)
+        reachable = solver._has_free_rigid_bodies & ((shape_body < 0) | (route[np.maximum(shape_body, 0)] != 0))
+        routed = bool(np.any(values[reachable] >= 4))
+    solver._free_rigid_angular_rows = bool(overridden or routed)
     if not solver._free_rigid_angular_rows:
         return
     if values is not None:
@@ -101,15 +107,7 @@ def free_rigid_route_bodies(solver) -> wp.array | None:
     """
     if not solver._free_rigid_angular_rows:
         return None
-    model = solver.model
-    route = np.zeros(max(model.body_count, 1), dtype=np.int32)
-    if model.body_count and solver._has_free_rigid_bodies:
-        body_art = solver._body_to_articulation.numpy()[: model.body_count]
-        response = solver._articulation_response_dof_count.numpy()
-        free = solver._is_free_rigid.numpy()
-        safe = np.maximum(body_art, 0)
-        route[: model.body_count] = (body_art < 0) | (response[safe] == 0) | (free[safe] != 0)
-    return wp.array(route, dtype=wp.int32, device=model.device)
+    return wp.array(_free_route_body_mask(solver), dtype=wp.int32, device=solver.model.device)
 
 
 def launch_free_rigid_angular_friction_rows(solver, state_aug, contacts, threads: int) -> None:
@@ -314,3 +312,16 @@ def _check_gated_coefficients(model, condim: np.ndarray) -> None:
         values = array.numpy()[condim >= gate]
         if not np.all(np.isfinite(values)) or np.any(values < 0.0):
             raise ValueError(f"{name} must be finite and non-negative on shapes with steel:condim {gate} or above")
+
+
+def _free_route_body_mask(solver) -> np.ndarray:
+    """Return 1 for each body whose contacts can take the free-body route, padded to at least one entry."""
+    model = solver.model
+    route = np.zeros(max(model.body_count, 1), dtype=np.int32)
+    if model.body_count and solver._has_free_rigid_bodies:
+        body_art = solver._body_to_articulation.numpy()[: model.body_count]
+        response = solver._articulation_response_dof_count.numpy()
+        free = solver._is_free_rigid.numpy()
+        safe = np.maximum(body_art, 0)
+        route[: model.body_count] = (body_art < 0) | (response[safe] == 0) | (free[safe] != 0)
+    return route
