@@ -1,0 +1,1 @@
+Raise the default `SolverSteel` `sleep_angular_threshold` from 0.15 to 0.3 rad/s so that resting stacks fall asleep with the default contact order. Pass `sleep_angular_threshold=0.15` to keep the previous behavior.

@@ -1537,6 +1537,31 @@ class TestSteelSleepingProduction(unittest.TestCase):
     pass
 
 
+def test_replicated_stacks_sleep(test, device):
+    """Let resting stacks in 16 worlds fall asleep with the default thresholds and either contact order."""
+    tower = newton.ModelBuilder()
+    for k in range(4):
+        for i in range(5):
+            body = tower.add_body(xform=wp.transform(wp.vec3(0.5 * k, 0.0, 0.05 + 0.1005 * i), wp.quat_identity()))
+            tower.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(mu=0.7))
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    builder.replicate(tower, 16, spacing=(2.0, 2.0, 0.0))
+    for deterministic in (False, True):
+        with test.subTest(deterministic=deterministic):
+            model = builder.finalize(device=device)
+            pipeline = newton.CollisionPipeline(model, deterministic=deterministic)
+            solver = SolverSteel(model, enable_sleeping=True)
+            observables = solver.observables({SolverSteel.ObservableKind.BODY_AWAKE})
+            contacts = pipeline.contacts()
+            states, control = [model.state(), model.state()], model.control()
+            for _ in range(480):
+                pipeline.collide(states[0], contacts)
+                solver.step(states[0], states[1], control, contacts, 1.0 / 240.0, observables=observables)
+                states.reverse()
+            test.assertEqual(int(observables.body_awake.numpy().sum()), 0)
+
+
 for _name in (
     "test_anchored_articulations_sleep_and_wake",
     "test_graph_replay_sleeps_and_wakes",
@@ -1561,6 +1586,7 @@ for _name in (
     "test_solver_body_attribute_notification_wakes_its_island",
     "test_mimic_articulation_stays_awake",
     "test_stiffness_without_a_spring_lets_articulations_sleep",
+    "test_replicated_stacks_sleep",
 ):
     add_function_test(TestSteelSleepingProduction, _name, globals()[_name], devices=devices)
 
