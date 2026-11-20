@@ -1571,6 +1571,9 @@ class SolverSteel(SolverBase, CouplingInterface):
       when its ``target_kind`` / ``target`` link names a loop joint or mimic constraint
       between the row's own bodies or joints. Particles are not simulated.
     - Gradients are not supported.
+    - Bias (Coriolis and centrifugal) forces are explicit, so articulated chains with high joint
+      speeds can gain energy; a smaller ``dt`` reduces it and more ``iterations`` do not. See
+      :ref:`Tuning Solver Reference`.
 
     On CUDA, branched articulations use sparse mass factors when
     every articulated (non-free-body) response group shares one joint topology with at most
