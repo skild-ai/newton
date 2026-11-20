@@ -1812,11 +1812,11 @@ def _build_slider_augmented_drives(device, *, effort_limit=1.0e6, damping=0.0):
 
 
 def _reference_trajectory(steps, *, effort_limit=1.0e6, damping=0.0):
-    """Backward-Euler PD drive: ``(m + a + dt kd + dt^2 ke) qdd = clamp(u0) - c qd``."""
+    """Backward-Euler PD drive and damping: ``(m + a + dt kd + dt^2 ke + dt c) qdd = clamp(u0) - c qd``."""
     q = 0.0
     qd = 0.0
     history = []
-    effective_mass = MASS + ARMATURE + DT * KD + DT * DT * KE
+    effective_mass = MASS + ARMATURE + DT * KD + DT * DT * KE + DT * damping
     for _ in range(steps):
         u0 = -(KE * (q - TARGET_POS + DT * qd) + KD * (qd - TARGET_VEL))
         u0 = float(np.clip(u0, -effort_limit, effort_limit))
@@ -1862,7 +1862,7 @@ def test_drive_force_is_clamped_to_the_effort_limit(test, device):
 
 
 def test_passive_joint_damping_is_applied(test, device):
-    """Apply Model.joint_damping as a passive joint force."""
+    """Apply Model.joint_damping as an implicit passive joint force."""
     np.testing.assert_allclose(
         _solver_trajectory(_build_slider_augmented_drives(device, damping=3.0), 120),
         _reference_trajectory(120, damping=3.0),

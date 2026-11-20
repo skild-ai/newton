@@ -1,0 +1,1 @@
+Integrate passive `Model.joint_damping` implicitly in `SolverSteel`, as for drive damping, which removes the explicit step-size limit `dt * damping / m_eff < 2`. Damped trajectories change at first order in `dt`; no migration is required.
