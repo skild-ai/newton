@@ -23,6 +23,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 
 
 @wp.kernel
@@ -120,6 +121,7 @@ class Example:
 
     def __init__(self, viewer, args):
         # Store viewer and arguments
+        self.clamps = cable_solver.CableClamps(args)
         self.viewer = viewer
         self.args = args
 
@@ -127,8 +129,7 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 10
-        self.sim_iterations = 5
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 5, propagation=(2, 4))
         self.update_step_interval = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
 
@@ -189,10 +190,7 @@ class Example:
 
             # Fix the first body to make it kinematic
             first_body = rod_bodies[0]
-            builder.body_mass[first_body] = 0.0
-            builder.body_inv_mass[first_body] = 0.0
-            builder.body_inertia[first_body] = wp.mat33(0.0)
-            builder.body_inv_inertia[first_body] = wp.mat33(0.0)
+            self.clamps.pin(builder, first_body, moving=True)
             kinematic_body_indices.append(first_body)
 
             # Store for twist application and testing
@@ -206,14 +204,19 @@ class Example:
         builder.add_ground_plane()
 
         # Color particles and rigid bodies for VBD solver
-        builder.color()
+        self.clamps.finish(builder)
+        if not self.clamps.steel:
+            builder.color()
 
         # Finalize model
         self.model = builder.finalize()
 
         self.collision_pipeline = newton.CollisionPipeline(self.model)
-        self.solver = newton.solvers.SolverVBD(
+        self.clamps.bind(self.model)
+        self.solver = cable_solver.make_solver(
             self.model,
+            args,
+            contact_rows=3 * self.collision_pipeline.rigid_contact_max + 6 * len(self.clamps.bodies),
             iterations=self.sim_iterations,
         )
 
@@ -247,10 +250,11 @@ class Example:
                 kernel=spin_first_capsules_kernel,
                 dim=self.kinematic_bodies.shape[0],
                 inputs=[self.kinematic_bodies, self.first_twist_rates, self.sim_dt],
-                outputs=[self.state_0.body_q, self.state_1.body_q],
+                outputs=self.clamps.pose_buffers(self.state_0, self.state_1),
             )
 
             # Apply forces to the model
+            self.clamps.update(self.state_0, self.sim_dt)
             self.viewer.apply_forces(self.state_0)
 
             # Collision detection and contact refresh cadence.
@@ -258,7 +262,8 @@ class Example:
             if refresh_contacts:
                 self.collision_pipeline.collide(self.state_0, self.contacts)
 
-            self.solver.set_rigid_history_update(refresh_contacts)
+            if not self.clamps.steel:
+                self.solver.set_rigid_history_update(refresh_contacts)
             self.solver.step(
                 self.state_0,
                 self.state_1,
@@ -287,6 +292,7 @@ class Example:
 
     def test_final(self):
         """Test cable twist simulation for stability and correctness (called after simulation)."""
+        cable_solver.check_capacity(self.solver)
 
         # Use instance variables for consistency with initialization
         segment_length = self.cable_length / self.num_elements
@@ -329,7 +335,7 @@ class Example:
 
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
-    viewer, args = newton.examples.init()
+    viewer, args = newton.examples.init(cable_solver.create_parser())
 
     # Create example and run
     newton.examples.run(Example(viewer, args), args)

@@ -26,6 +26,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 
 
 def _y_dirs_xy() -> list[wp.vec3]:
@@ -39,14 +40,14 @@ def _y_dirs_xy() -> list[wp.vec3]:
 
 class Example:
     def __init__(self, viewer, args):
+        self.clamps = cable_solver.CableClamps(args)
         self.viewer = viewer
         self.args = args
 
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 20
-        self.sim_iterations = 5
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 20, 5, propagation=(4, 16))
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         # Cable parameters.
@@ -101,22 +102,24 @@ class Example:
         tip_edge_idx = num_segments_per_branch - 1
         pinned_body = int(self.graph_bodies[tip_edge_idx])
         self.pinned_body = pinned_body
-        builder.body_mass[pinned_body] = 0.0
-        builder.body_inv_mass[pinned_body] = 0.0
-        builder.body_inertia[pinned_body] = wp.mat33(0.0)
-        builder.body_inv_inertia[pinned_body] = wp.mat33(0.0)
+        self.clamps.pin(builder, pinned_body)
 
         if getattr(args, "ground", True):
             builder.add_ground_plane()
 
-        builder.color(balance_colors=False)
+        self.clamps.finish(builder)
+        if not self.clamps.steel:
+            builder.color(balance_colors=False)
         sim_device = wp.get_device(args.device) if args.device else None
         self.model = builder.finalize(device=sim_device)
         self.model.set_gravity((0.0, 0.0, float(getattr(args, "gravity_z", -9.81))))
 
         self.collision_pipeline = newton.CollisionPipeline(self.model)
-        self.solver = newton.solvers.SolverVBD(
+        self.clamps.bind(self.model)
+        self.solver = cable_solver.make_solver(
             self.model,
+            args,
+            contact_rows=3 * self.collision_pipeline.rigid_contact_max + 6 * len(self.clamps.bodies),
             iterations=self.sim_iterations,
         )
 
@@ -166,6 +169,7 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
+        cable_solver.check_capacity(self.solver)
         if self.state_0.body_q is None or self.model.joint_parent is None or self.model.joint_child is None:
             raise RuntimeError("Body/joint state is not available.")
 
@@ -220,5 +224,5 @@ class Example:
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    viewer, args = newton.examples.init(cable_solver.create_parser())
     newton.examples.run(Example(viewer, args), args)

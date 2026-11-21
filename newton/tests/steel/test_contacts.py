@@ -436,6 +436,7 @@ def _launch_dense_contact_builders(
             body_q,
             patches,
             *anchors,
+            0,
         ],
         outputs=[serial],
         device=device,

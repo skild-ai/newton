@@ -137,6 +137,21 @@ structural rest. After editing rest rotations in
 :meth:`newton.solvers.SolverVBD.notify_model_changed` with
 :attr:`newton.ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES`.
 
+:class:`newton.solvers.SolverSteel` supports rod joints on CUDA with
+``articulated_contact_response="immediate"`` and either ``solve_mode="serial"`` or
+``solve_mode="colored"``. For a step of duration :math:`h`, Steel maps generalized
+velocity to strain rate with the rod Jacobian :math:`J_r`. The material contributes
+:math:`J_r^T(hD + h^2 K)J_r` to the articulation mass, where :math:`D` and
+:math:`K` are the local damping and stiffness tangents. A closing rod joint
+contributes through both of its endpoints. Contact impulses use the resulting
+factored mass throughout the matrix-free sweep.
+
+To enable Dahl hysteresis, call
+:meth:`newton.solvers.SolverSteel.register_custom_attributes` before finalizing
+the model and set ``model.steel.dahl_eps_max`` and ``model.steel.dahl_tau`` for
+the participating rod joints. The cable examples accept ``--solver steel
+--solve-mode colored --device cuda:0``.
+
 To showcase how an articulation state is initialized using reduced coordinates, let's consider an example where we create an articulation with a single revolute joint and initialize
 its joint angle to 0.5 and joint velocity to 10.0:
 

@@ -1840,6 +1840,19 @@ add_example_test(
     use_viewer=True,
     test_suffix="steel",
 )
+for scene, frames in (
+    ("multiphysics.example_franka_cable_ik_pick_place", 450),
+    ("multiphysics.example_mujoco_franka_vbd_cable_admm_solver", 435),
+):
+    for mode in ("serial", "colored"):
+        add_example_test(
+            TestMultiphysicsExamples,
+            name=scene,
+            devices=cuda_test_devices,
+            test_options={"solver": "steel", "solve-mode": mode, "num-frames": frames},
+            use_viewer=True,
+            test_suffix=f"native_steel_{mode}",
+        )
 add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_franka_cloth_block",

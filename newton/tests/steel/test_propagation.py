@@ -1775,15 +1775,20 @@ def test_cross_response_effective_mass_matches_reference_operator(test, device):
     dense_slots = _routed_slots(reference, contact_count, DENSE_PATH)
     test.assertGreater(len(dense_slots), 0)
 
-    for response in SAME_ARTICULATION_RESPONSES:
-        with test.subTest(response=response):
-            solver = SolverSteel(
-                model,
-                iterations=0,
-                cfm=PGS_CFM,
-                **_response(response),
-                propagation_same_articulation_rows=True,
-            )
+    from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415
+
+    for response, split in [(r, sp) for r in SAME_ARTICULATION_RESPONSES for sp in (False, True)]:
+        with test.subTest(response=response, split=split):
+            # The step uses the split response like every other row (each joint's term weighted by its
+            # row-bearing bodies); unsplit, it is the exact two-link response.
+            with kernel_overrides({"propagation_split_same_articulation_rows": split}):
+                solver = SolverSteel(
+                    model,
+                    iterations=0,
+                    cfm=PGS_CFM,
+                    **_response(response),
+                    propagation_same_articulation_rows=True,
+                )
             state, routed_count = _step_once(model, solver)
             test.assertEqual(routed_count, contact_count)
             rows = _routed_slots(solver, contact_count, PROPAGATION_PATH)
@@ -1832,6 +1837,10 @@ def test_cross_response_effective_mass_matches_reference_operator(test, device):
                         test.assertLess(abs(diagonal), 1.0e-6)
                         continue
                     checked[int(row_type[r])] += 1
+                    if split:
+                        # Splitting only weights each joint's own term up: the step is never stiffer.
+                        test.assertGreater(diagonal, expected * (1.0 - 1.0e-3), f"row {r} of contact {contact}")
+                        continue
                     test.assertLess(
                         abs(diagonal - expected) / expected,
                         1.0e-3,
@@ -2963,10 +2972,10 @@ class TestSteelTreePlan(unittest.TestCase):
         self.assertEqual(sorted(group.segment_joints.numpy().tolist()), list(range(model.joint_count)))
 
     def test_serial_and_unsafe_topologies_fall_back(self):
-        """Return no plan for wholly serial, aliased, cross-articulation and loop-trimmed topologies."""
+        """Return no plan for wholly serial, aliased and cross-articulation topologies; plan around loop joints."""
         model, _, _ = _build_model(chain=True)
         self.assertIsNone(_SteelTreePlan.build(model, _tree_ends(model)))
-        for unsafe in ("alias", "foreign_parent", "loop"):
+        for unsafe in ("alias", "foreign_parent"):
             with self.subTest(unsafe=unsafe):
                 model = _build_fingers(articulations=2)
                 ends = _tree_ends(model).copy()
@@ -2974,13 +2983,19 @@ class TestSteelTreePlan(unittest.TestCase):
                     children = model.joint_child.numpy().copy()
                     children[2] = children[1]
                     model.joint_child.assign(children)
-                elif unsafe == "foreign_parent":
+                else:
                     parents = model.joint_parent.numpy().copy()
                     parents[1] = model.joint_child.numpy()[model.articulation_start.numpy()[1]]
                     model.joint_parent.assign(parents)
-                else:
-                    ends[0] -= 1
                 self.assertIsNone(_SteelTreePlan.build(model, ends))
+        # Joints past an articulation's tree end (its loop-closing joints) stay out of the plan.
+        model = _build_fingers(articulations=2)
+        ends = _tree_ends(model).copy()
+        ends[0] -= 1
+        plan = _SteelTreePlan.build(model, ends)
+        self.assertIsNotNone(plan)
+        planned = np.concatenate([group.segment_joints.numpy() for group in plan.groups])
+        self.assertNotIn(int(ends[0]), planned.tolist())
 
 
 def test_serial_selection_skips_tree_setup(test, device):

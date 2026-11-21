@@ -63,6 +63,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 from newton.examples.vbd._viewer import com_from_node, node_xyz, set_viewer_camera
 
 
@@ -105,12 +106,12 @@ class Example:
     def __init__(self, viewer, args=None):
         self.viewer = viewer
         self.args = args
+        self.clamps = cable_solver.CableClamps(args)
 
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 10
-        self.sim_iterations = 10
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 10, propagation=(5, 10))
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.cable_length = self.NUM_ELEMENTS * self.SEGMENT_LENGTH
@@ -138,7 +139,8 @@ class Example:
                 )
                 self._make_kinematic(builder, bodies[0])
                 self._make_kinematic(builder, bodies[-1])
-                builder.add_articulation(joints, label=f"analytic_bend_articulation_{i}")
+                if not self.clamps.steel:
+                    builder.add_articulation(joints, label=f"analytic_bend_articulation_{i}")
                 self.bend_cases.append({"target": target, "bodies": bodies, "tip": bodies[-1]})
 
         if mode in ("all", "twist", "twist_max"):
@@ -155,13 +157,19 @@ class Example:
                 )
                 self._make_kinematic(builder, bodies[0])
                 self._make_kinematic(builder, bodies[-1])
-                builder.add_articulation(joints, label=f"analytic_twist_articulation_{i}")
+                if not self.clamps.steel:
+                    builder.add_articulation(joints, label=f"analytic_twist_articulation_{i}")
                 self.twist_cases.append({"target": target, "bodies": bodies, "tip": bodies[-1]})
 
-        builder.color()
+        self.clamps.finish(builder)
+        if not self.clamps.steel:
+            builder.color()
         self.model = builder.finalize()
 
-        self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations)
+        self.clamps.bind(self.model)
+        self.solver = cable_solver.make_solver(
+            self.model, args, self.sim_iterations, contact_rows=max(32, 6 * len(self.clamps.bodies))
+        )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
@@ -220,15 +228,12 @@ class Example:
             twist_stiffness=twist_stiffness,
             twist_damping=twist_damping,
             label=label,
-            wrap_in_articulation=False,
+            wrap_in_articulation=self.clamps.steel,
         )
         return list(bodies), list(joints)
 
     def _make_kinematic(self, builder, body_index: int) -> None:
-        builder.body_mass[body_index] = 0.0
-        builder.body_inv_mass[body_index] = 0.0
-        builder.body_inertia[body_index] = wp.mat33(0.0)
-        builder.body_inv_inertia[body_index] = wp.mat33(0.0)
+        self.clamps.pin(builder, body_index)
 
     def _load_scale(self, t: float) -> float:
         if t >= self.RAMP_TIME:
@@ -331,8 +336,9 @@ class Example:
                 _set_kinematic_targets_kernel,
                 dim=len(self._kinematic_pos_np),
                 inputs=[self._kinematic_indices, self._kinematic_pos, self._kinematic_rot],
-                outputs=[self.state_0.body_q, self.state_1.body_q],
+                outputs=self.clamps.pose_buffers(self.state_0, self.state_1),
             )
+            self.clamps.update(self.state_0, self.sim_dt)
             self.viewer.apply_forces(self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
@@ -487,6 +493,7 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
+        cable_solver.check_capacity(self.solver)
         bend_tip_errors = []
         bend_angle_rms_errors = []
         bend_shape_errors = []
@@ -543,7 +550,7 @@ class Example:
 
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
+    parser = cable_solver.create_parser()
     parser.add_argument(
         "--cable-analytic-mode",
         metavar="MODE",

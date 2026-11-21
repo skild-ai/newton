@@ -29,8 +29,8 @@ from pxr import Usd, UsdGeom
 import newton
 import newton.examples
 import newton.usd
+from newton.examples.cable import solver as cable_solver
 from newton.math import quat_between_vectors_robust
-from newton.solvers import SolverVBD
 
 CONTACT_KE = 1.0e5
 CONTACT_KD = 0.0
@@ -126,6 +126,7 @@ def _apply_gizmo_force(
 
 @wp.kernel
 def _sync_cable_anchors(
+    source: wp.array[wp.transform],
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     plug_idx: int,
@@ -135,14 +136,15 @@ def _sync_cable_anchors(
 ):
     """Copy the plug transform into kinematic cable bodies."""
     tid = wp.tid()
-    plug_tf = body_q[plug_idx]
+    plug_tf = source[plug_idx]
     plug_pos = wp.transform_get_translation(plug_tf)
     plug_rot = wp.transform_get_rotation(plug_tf)
     idx = anchor_indices[tid]
     anchor_world = plug_pos + wp.quat_rotate(plug_rot, anchor_offsets[tid])
     cable_rot = wp.normalize(wp.mul(plug_rot, anchor_rotations[tid]))
     body_q[idx] = wp.transform(anchor_world, cable_rot)
-    body_qd[idx] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    if body_qd:
+        body_qd[idx] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 @wp.kernel
@@ -236,6 +238,7 @@ class Example:
         self.sim_substeps = 6
         self.sim_dt = self.frame_dt / self.sim_substeps
 
+        self.clamps = cable_solver.CableClamps(args)
         self.viewer = viewer
         self.pick_stiffness = 50.0
         self.pick_damping = 10.0
@@ -345,10 +348,7 @@ class Example:
 
         # Lock the kinematic prefix and the far cable end.
         for idx in (*rod_bodies[:CABLE_KINEMATIC_COUNT], rod_bodies[-1]):
-            builder.body_mass[idx] = 0.0
-            builder.body_inv_mass[idx] = 0.0
-            builder.body_inertia[idx] = wp.mat33(0.0)
-            builder.body_inv_inertia[idx] = wp.mat33(0.0)
+            self.clamps.pin(builder, idx, moving=(idx != rod_bodies[-1]))
 
         anchor_body_ids = tuple(rod_bodies[:CABLE_KINEMATIC_COUNT])
         anchor_offsets = tuple(
@@ -356,7 +356,9 @@ class Example:
         )
         anchor_rots = tuple(cable_quats[i] for i in range(CABLE_KINEMATIC_COUNT))
 
-        builder.color()
+        self.clamps.finish(builder)
+        if not self.clamps.steel:
+            builder.color()
         self.model = builder.finalize()
 
         self._cable_anchor_indices = wp.array(anchor_body_ids, dtype=int, device=self.model.device)
@@ -399,8 +401,14 @@ class Example:
 
         self._initial_body_q = self.state_0.body_q.numpy().copy()
 
-        self.solver = SolverVBD(
+        self.clamps.bind(self.model)
+        self.solver = cable_solver.make_solver(
             self.model,
+            args,
+            enable_joint_limits=True,
+            contact_rows=3 * self.collision_pipeline.rigid_contact_max
+            + 6 * len(self.clamps.bodies)
+            + self.model.joint_dof_count,
             iterations=12,
             rigid_body_contact_buffer_size=256,
         )
@@ -450,7 +458,8 @@ class Example:
                 dim=CABLE_KINEMATIC_COUNT,
                 inputs=(
                     self.state_0.body_q,
-                    self.state_0.body_qd,
+                    self.clamps.targets if self.clamps.steel else self.state_0.body_q,
+                    None if self.clamps.steel else self.state_0.body_qd,
                     self._plug_body,
                     self._cable_anchor_indices,
                     self._cable_anchor_offsets,
@@ -458,23 +467,25 @@ class Example:
                 ),
                 device=self.model.device,
             )
+            self.clamps.update(self.state_0, self.sim_dt)
             self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
             # Snap each capsule's +Z to the next capsule's start endpoint so
             # collision/render geometry follows the deformed centerline.
-            wp.launch(
-                kernel=_align_cable_orientations,
-                dim=self._cable_align_count,
-                inputs=(
-                    self.state_0.body_q,
-                    self._cable_align_indices,
-                    self._cable_align_next,
-                    self._cable_align_next_start_offsets,
-                ),
-                device=self.model.device,
-            )
+            if not self.clamps.steel:
+                wp.launch(
+                    kernel=_align_cable_orientations,
+                    dim=self._cable_align_count,
+                    inputs=(
+                        self.state_0.body_q,
+                        self._cable_align_indices,
+                        self._cable_align_next,
+                        self._cable_align_next_start_offsets,
+                    ),
+                    device=self.model.device,
+                )
 
     def step(self):
         gp = wp.transform_get_translation(self.gizmo_tf)
@@ -492,13 +503,14 @@ class Example:
 
         self.sim_time += self.frame_dt
 
-        counts = self.solver.body_body_contact_counts.numpy()
-        buf = self.solver.body_body_contact_buffer_pre_alloc
-        overflow = np.where(counts > buf)[0]
-        if len(overflow):
-            for i in overflow:
-                label = self.model.body_label[i] if hasattr(self.model, "body_label") else i
-                print(f"[contact overflow] body {label} (idx={i}): {counts[i]} contacts (buffer={buf})")
+        if not self.clamps.steel:
+            counts = self.solver.body_body_contact_counts.numpy()
+            buf = self.solver.body_body_contact_buffer_pre_alloc
+            overflow = np.where(counts > buf)[0]
+            if len(overflow):
+                for i in overflow:
+                    label = self.model.body_label[i] if hasattr(self.model, "body_label") else i
+                    print(f"[contact overflow] body {label} (idx={i}): {counts[i]} contacts (buffer={buf})")
 
         # Snap gizmo to the plug when the user isn't dragging it.
         gizmo_active = bool(getattr(self.viewer, "gizmo_is_using", False))
@@ -518,6 +530,7 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
+        cable_solver.check_capacity(self.solver)
         body_q = self.state_0.body_q.numpy()
         initial_q = self._initial_body_q
         for i in range(len(body_q)):
@@ -527,5 +540,5 @@ class Example:
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    viewer, args = newton.examples.init(cable_solver.create_parser())
     newton.examples.run(Example(viewer, args), args)

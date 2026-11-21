@@ -44,6 +44,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 from newton.examples.vbd._viewer import node_xyz, set_viewer_camera
 
 
@@ -60,6 +61,43 @@ def _set_kinematic_targets_kernel(
     target = wp.transform(positions[tid], rotations[tid])
     body_q0[body] = target
     body_q1[body] = target
+
+
+@wp.kernel
+def _cantilever_reference(
+    forces: wp.array[wp.float64],
+    dt: wp.float64,
+    substeps: int,
+    length: wp.float64,
+    stiffness: wp.float64,
+    damping: wp.float64,
+    stress_bound: wp.float64,
+    decay: wp.float64,
+    displacement: wp.array3d[wp.float64],
+):
+    """Small-angle moment balance for independent hinges under the commanded tip load."""
+    case, joint = wp.tid()
+    angle = wp.float64(0.0)
+    stress = wp.float64(0.0)
+    # The measured node is at the start of the last link, the force acts at its COM.
+    node_arm = length * wp.float64(joint)
+    force_arm = node_arm + wp.float64(0.5) * length
+    bound = wp.float64(case) * stress_bound
+    for frame in range(forces.shape[0]):
+        moment = force_arm * forces[frame]
+        for _step in range(substeps):
+            increment = wp.float64(0.0)
+            sign = wp.sign(moment - stiffness * angle - stress)
+            asymptote = sign * bound
+            for _iteration in range(5):
+                exponential = wp.exp(-wp.abs(increment) / decay)
+                end_stress = asymptote + (stress - asymptote) * exponential
+                residual = stiffness * (angle + increment) + damping * increment / dt + end_stress - moment
+                tangent = stiffness + damping / dt + (bound - sign * stress) * exponential / decay
+                increment -= residual / tangent
+            angle += increment
+            stress = asymptote + (stress - asymptote) * wp.exp(-wp.abs(increment) / decay)
+        displacement[case, joint, frame] = angle * node_arm
 
 
 class Example:
@@ -91,14 +129,14 @@ class Example:
     SETTLE_TIME = 2.0
 
     def __init__(self, viewer, args=None):
+        self.clamps = cable_solver.CableClamps(args)
         self.viewer = viewer
         self.args = args
 
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 10
-        self.sim_iterations = 10
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 10, propagation=(2, 4))
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.video_mode = getattr(args, "cable_dahl_mode", "all") if args is not None else "all"
         if self.video_mode not in {"all", "bend", "twist"}:
@@ -108,7 +146,8 @@ class Example:
         self.cycle_duration = self.NUM_PHASES * self.PHASE_DURATION
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-        newton.solvers.SolverVBD.register_custom_attributes(builder)
+        solver_type = newton.solvers.SolverSteel if self.clamps.steel else newton.solvers.SolverVBD
+        solver_type.register_custom_attributes(builder)
 
         self.cases: list[dict] = []
         for name, mode, has_dahl in (
@@ -131,10 +170,13 @@ class Example:
                 }
             )
 
-        builder.color()
+        self.clamps.finish(builder)
+        if not self.clamps.steel:
+            builder.color()
         self.model = builder.finalize()
         self._configure_dahl_attributes()
-        self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations)
+        self.clamps.bind(self.model)
+        self.solver = cable_solver.make_solver(self.model, args, self.sim_iterations)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -228,10 +270,7 @@ class Example:
         if mode == "twist":
             kinematic_bodies.append(int(rod_bodies[-1]))
         for body in kinematic_bodies:
-            builder.body_mass[body] = 0.0
-            builder.body_inv_mass[body] = 0.0
-            builder.body_inertia[body] = wp.mat33(0.0)
-            builder.body_inv_inertia[body] = wp.mat33(0.0)
+            self.clamps.pin(builder, body)
 
         return list(map(int, rod_bodies)), (joint_count_before, joint_count_after)
 
@@ -254,8 +293,9 @@ class Example:
             s, e = case["joint_range"]
             eps_max[s:e] = self.DAHL_EPS_MAX
             tau[s:e] = self.DAHL_TAU
-        self.model.vbd.dahl_eps_max.assign(eps_max)
-        self.model.vbd.dahl_tau.assign(tau)
+        material = self.model.steel if self.clamps.steel else self.model.vbd
+        material.dahl_eps_max.assign(eps_max)
+        material.dahl_tau.assign(tau)
 
     def _drive_at_time(self, t: float) -> float:
         if t >= self.cycle_duration:
@@ -331,8 +371,9 @@ class Example:
                 _set_kinematic_targets_kernel,
                 dim=len(self.twist_cases),
                 inputs=[self._kinematic_indices, self._kinematic_pos, self._kinematic_rot],
-                outputs=[self.state_0.body_q, self.state_1.body_q],
+                outputs=self.clamps.pose_buffers(self.state_0, self.state_1),
             )
+            self.clamps.update(self.state_0, self.sim_dt)
             self.viewer.apply_forces(self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
@@ -681,6 +722,7 @@ class Example:
             )
 
     def test_final(self) -> None:
+        cable_solver.check_capacity(self.solver)
         metrics = self.analysis_metrics()
         bend_rows = {row["name"]: row for row in metrics["bend_rows"]}
         twist_rows = {row["name"]: row for row in metrics["twist_rows"]}
@@ -695,9 +737,13 @@ class Example:
         self._assert_subspace_containment(metrics)
 
     def _assert_bend_metrics(self, elastic: dict, dahl: dict) -> None:
+        if self.clamps.steel:
+            self._check_cantilever_reference()
+
         for row in (elastic, dahl):
             assert math.isfinite(row["max_deflection"]) and math.isfinite(row["residual"])
-            assert row["max_deflection"] > 0.03, f"{row['label']} barely deflected: {row}"
+            if not self.clamps.steel:
+                assert row["max_deflection"] > 0.03, f"{row['label']} barely deflected: {row}"
             rel = row["max_deflection"] / self.cable_length
             assert rel < 0.30, f"{row['label']} left the small-deflection bend regime: {row}"
 
@@ -713,11 +759,39 @@ class Example:
         assert dahl_residual_rel > 3.0 * elastic_residual_rel, (
             f"Dahl bend residual should exceed elastic residual fraction: elastic={elastic}, dahl={dahl}"
         )
-        assert dahl_residual_rel > 0.05, f"Dahl bend residual too small: {dahl}"
+        if not self.clamps.steel:
+            assert dahl_residual_rel > 0.05, f"Dahl bend residual too small: {dahl}"
 
         for row in (elastic, dahl):
             assert row["max_tip_x"] / self.cable_length < 0.30, f"excessive bend foreshortening: {row}"
             assert row["max_tip_y"] / self.cable_length < 0.005, f"pure bend drifted out of plane: {row}"
+
+    def _check_cantilever_reference(self) -> None:
+        forces = wp.array(self.history_force, dtype=wp.float64, device=self.model.device)
+        contributions = wp.empty((2, self.NUM_ELEMENTS - 1, len(forces)), dtype=wp.float64, device=self.model.device)
+        wp.launch(
+            _cantilever_reference,
+            dim=contributions.shape[:2],
+            inputs=[
+                forces,
+                self.sim_dt,
+                self.sim_substeps,
+                self.SEGMENT_LENGTH,
+                self.BEND_STIFFNESS,
+                self.BEND_DAMPING,
+                self.DAHL_EPS_MAX * self.BEND_STIFFNESS,
+                self.DAHL_TAU,
+            ],
+            outputs=[contributions],
+            device=self.model.device,
+        )
+        traces = contributions.numpy().sum(axis=1)
+        for name, expected in zip(("bend_elastic", "bend_dahl"), traces, strict=True):
+            actual = self.history_bend_down[name]
+            # The reference is quasi-static and linear in hinge rotation. Allow a
+            # small fraction of the total bend for inertia and finite-angle effects.
+            np.testing.assert_allclose(actual, expected, rtol=0, atol=0.02 * max(expected), err_msg=name)
+            np.testing.assert_allclose(actual[-1], expected[-1], rtol=0.05, atol=2.0e-6, err_msg=f"{name} residual")
 
     def _assert_twist_metrics(self, elastic: dict, dahl: dict) -> None:
         for row in (elastic, dahl):
@@ -752,7 +826,7 @@ class Example:
 
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
+    parser = cable_solver.create_parser()
     parser.add_argument(
         "--cable-dahl-mode",
         metavar="MODE",

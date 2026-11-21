@@ -19,6 +19,7 @@ import warp as wp
 from .friction import friction_pair_candidate
 from .friction_patches import WARP_DETERMINISM_OFF, patch_normal_load
 from .kernels import (
+    PGS_CONSTRAINT_TYPE_CONNECT,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
@@ -497,8 +498,8 @@ def pgs_solve_propagation_contact_cpu(
         residual = jv + propagation_rhs[world, i]
         old_impulse = propagation_impulses[world, i]
         delta = -residual * eff_inv
-        if row_type == PGS_CONSTRAINT_TYPE_CONTACT and regularize != 0:
-            # Regularized rows (weight w < 1) also relax the impulse toward zero.
+        if (row_type == PGS_CONSTRAINT_TYPE_CONTACT and regularize != 0) or row_type == PGS_CONSTRAINT_TYPE_CONNECT:
+            # Regularized rows (weight w < 1) also relax the impulse toward zero; a rod closure always does.
             w = propagation_row_w[world, i]
             delta = delta * w - (1.0 - w) * old_impulse
         new_impulse = old_impulse + omega * delta

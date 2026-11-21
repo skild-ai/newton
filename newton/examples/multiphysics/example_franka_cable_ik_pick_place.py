@@ -8,6 +8,9 @@ deformable cable and move it to a target location. The arm is simulated
 by MuJoCo (PD position targets driven from the IK result), the cable is
 a VBD rod, and SolverCoupledProxy couples the two: the gripper bodies are
 exposed to VBD as virtual proxies so the cable detects them as contacts.
+With `--solver steel`, the arm and rod use one CUDA impulse solver. The
+native trajectory carries the midpoint low enough for the free ends to trail
+on the table, then opens the jaws and retracts.
 
 Cable geometry/material, Franka joint gains, contact parameters and the
 proxy coupling solver settings mirror IsaacLab's franka_cable_env_cfg.
@@ -24,6 +27,7 @@ Success criteria:
 Runs:
 - `python -m newton.examples franka_cable_ik_pick_place`
 - `python -m newton.examples franka_cable_ik_pick_place --rigid-solver steel`
+- `python -m newton.examples franka_cable_ik_pick_place --solver steel --solve-mode colored --device cuda:0`
 """
 
 from __future__ import annotations
@@ -36,6 +40,8 @@ import newton
 import newton.examples
 import newton.ik as ik
 import newton.utils
+from newton.examples.cable import solver as cable_solver
+from newton.examples.multiphysics import franka_cable
 from newton.solvers import SolverMuJoCo, SolverSteel, SolverVBD
 
 # Initial Franka joint configuration (7 arm + 2 finger).
@@ -102,17 +108,30 @@ def _find_label_index(labels: list[str], suffix: str) -> int:
 
 class Example:
     def __init__(self, viewer, args):
+        self.native_cable = getattr(args, "solver", "coupled") == "steel"
         self.viewer = viewer
         self.sim_time = 0.0
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = max(1, int(args.substeps))
+        # The native sweep revisits the jaw contacts in every iteration (coupled_contact_passes), so six
+        # substeps of four iterations hold the thin cable through the carry in every world.
+        native_substeps, native_iterations = 6, 4
+        default_substeps = native_substeps if self.native_cable else 10
+        self.sim_substeps = default_substeps if args.substeps is None else max(1, int(args.substeps))
+        if args.steel_iterations is None:
+            args.steel_iterations = native_iterations if self.native_cable else 24
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.use_graph = bool(args.graph_capture)
         self.world_count = max(1, int(args.world_count))
         self.payload_segments = max(2, int(args.payload_segments))
         self.payload_radius = float(args.payload_radius)
         self.rigid_solver = args.rigid_solver
+        # A high midpoint lift folds both free ends below the grasp on descent.
+        # A low carry leaves the ends supported and avoids loading a bent span into the jaws.
+        default_height = 8.0 * self.payload_radius if self.native_cable else 0.20
+        self.carry_height = default_height if args.carry_height is None else args.carry_height
+        if not np.isfinite(self.carry_height) or self.carry_height <= 0.0:
+            raise ValueError("carry height must be finite and positive")
         # Working-surface height: the cable rests on it and the arm is mounted on it.
         self.surface_z = float(CABLE_CENTER[2]) - self.payload_radius
 
@@ -122,10 +141,10 @@ class Example:
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             broad_phase="explicit",
-            shape_pairs_filtered=self._ground_shape_pairs(),
+            shape_pairs_filtered=None if self.native_cable else self._ground_shape_pairs(),
         )
         self.contacts = self.collision_pipeline.contacts()
-        if self.rigid_solver == "steel":
+        if self.native_cable or self.rigid_solver == "steel":
             # Steel sizes its contact scratch from the model before it sees a contact buffer.
             self.model.rigid_contact_max = self.contacts.rigid_contact_max
         self._build_solvers(args)
@@ -133,7 +152,8 @@ class Example:
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
-        self.solver.prepare_contacts(self.contacts)
+        if not self.native_cable:
+            self.solver.prepare_contacts(self.contacts)
 
         newton.examples.configure_coupled_view(self, args)
         if self.world_count > 1:
@@ -169,8 +189,9 @@ class Example:
     def _build_scene(self):
         template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         template.rigid_gap = 0.01
-        SolverMuJoCo.register_custom_attributes(template)
-        SolverVBD.register_custom_attributes(template)
+        if not self.native_cable:
+            SolverMuJoCo.register_custom_attributes(template)
+            SolverVBD.register_custom_attributes(template)
         self._emit_template(template)
 
         bodies_per_world = template.body_count
@@ -203,7 +224,8 @@ class Example:
             )
         ]
 
-        builder.color()
+        if not self.native_cable:
+            builder.color()
         self.model = builder.finalize()
         self.device = self.model.device
 
@@ -234,12 +256,14 @@ class Example:
 
         # Full per-body gravity compensation on the arm (IsaacLab gravcomp=1.0), so the
         # low-PD actuators do not fight gravity sag during task-space tracking.
-        gravcomp = builder.custom_attributes["mujoco:gravcomp"]
-        if gravcomp.values is None:
-            gravcomp.values = {}
-        for body in self.franka_bodies:
-            gravcomp.values[body] = 1.0
-            if self.rigid_solver == "steel":
+        if not self.native_cable:
+            gravcomp = builder.custom_attributes["mujoco:gravcomp"]
+            if gravcomp.values is None:
+                gravcomp.values = {}
+            for body in self.franka_bodies:
+                gravcomp.values[body] = 1.0
+        if self.native_cable or self.rigid_solver == "steel":
+            for body in self.franka_bodies:
                 builder.body_disable_gravity[body] = True
 
         # VBD cable.
@@ -304,6 +328,17 @@ class Example:
     # Solvers
     # ------------------------------------------------------------------
     def _build_solvers(self, args):
+        if self.native_cable:
+            self.solver = cable_solver.make_solver(
+                self.model,
+                args,
+                args.steel_iterations,
+                # Budget rows per world for the cable, two jaw patches, and arm limits.
+                contact_rows=24 * self.payload_segments + 64,
+                enable_joint_limits=True,
+                coupled_contact_passes=int(args.coupled_contact_passes),
+            )
+            return
         if self.rigid_solver == "steel":
             rigid_name = "steel"
 
@@ -439,6 +474,7 @@ class Example:
     def _build_keyframes(self):
         cx, cy, cz = CABLE_CENTER[0], CABLE_CENTER[1], CABLE_CENTER[2]
         approach_z = cz + 0.20
+        carry_z = cz + self.carry_height
         # TCP target at the cable centerline so the fingers close around the thin
         # (radius 5 mm) cable rather than above it.
         grasp_z = cz
@@ -452,8 +488,8 @@ class Example:
                 [1.0, cx, cy, approach_z, qx, qy, qz, qw, GRIP_OPEN],  # approach above cable
                 [0.5, cx, cy, grasp_z, qx, qy, qz, qw, GRIP_OPEN],  # descend to cable
                 [1.0, cx, cy, grasp_z, qx, qy, qz, qw, GRIP_CLOSE],  # grasp (capture)
-                [1.0, cx, cy, approach_z, qx, qy, qz, qw, GRIP_HOLD],  # lift (hold pinch)
-                [1.0, tx, ty, approach_z, qx, qy, qz, qw, GRIP_HOLD],  # move to target
+                [1.0, cx, cy, carry_z, qx, qy, qz, qw, GRIP_HOLD],  # lift (hold pinch)
+                [1.0, tx, ty, carry_z, qx, qy, qz, qw, GRIP_HOLD],  # move to target
                 [0.5, tx, ty, grasp_z, qx, qy, qz, qw, GRIP_HOLD],  # lower
                 [0.5, tx, ty, grasp_z, qx, qy, qz, qw, GRIP_HOLD],  # settle (cable comes to rest at target)
                 [1.0, tx, ty, grasp_z, qx, qy, qz, qw, GRIP_OPEN],  # release
@@ -520,7 +556,8 @@ class Example:
             newton.examples.apply_coupled_viewer_forces(self, self.state_0)
             self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-            newton.eval_ik(self.model, self.state_1, self.state_1.joint_q, self.state_1.joint_qd)
+            if not self.native_cable:
+                newton.eval_ik(self.model, self.state_1, self.state_1.joint_q, self.state_1.joint_qd)
             if copy_last and substep == self.sim_substeps - 1:
                 self.state_0.assign(self.state_1)
             else:
@@ -540,7 +577,12 @@ class Example:
         newton.examples.log_coupled_view(self, self.contacts)
         self.viewer.end_frame()
 
+    def test_post_step(self):
+        if self.native_cable:
+            franka_cable.check_carry(self, CABLE_LENGTH, lift_key=3, placement_key=6)
+
     def test_final(self):
+        cable_solver.check_capacity(self.solver)
         if self.use_graph:
             assert self.graph is not None, "Graph capture was requested but no graph was captured"
 
@@ -551,6 +593,9 @@ class Example:
 
         # The cable is grasped at its midpoint and carried to the place target; verify that
         # the grasped segment was placed within 1 cm of the target (x, y) in every world.
+        if self.native_cable:
+            franka_cable.check_release(self, CABLE_LENGTH, GRIP_OPEN)
+            return
         target_xy = np.asarray(self.place_target_xy, dtype=np.float32)
         for world_idx in range(self.world_count):
             mid_body = self.payload_bodies[world_idx * self.payload_body_count_per_world + self.payload_mid_body_offset]
@@ -559,7 +604,10 @@ class Example:
 
     @staticmethod
     def create_parser():
-        parser = newton.examples.create_parser()
+        parser = cable_solver.create_parser(baseline="coupled")
+        # The jaws pinch a light cable between two articulations; the immediate response's exact Gauss-Seidel
+        # holds it at a small budget, while the propagation response's split per-body sweep slips.
+        parser.set_defaults(contact_response="immediate")
         newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
         parser.add_argument(
@@ -569,7 +617,17 @@ class Example:
             default="mujoco",
             help="Solver that owns the Franka arm.",
         )
-        parser.add_argument("--substeps", type=int, default=10, help="Coupled substeps per rendered frame.")
+        parser.add_argument(
+            "--substeps",
+            type=int,
+            default=None,
+            help="Substeps per frame (native Steel: 6; 10 for the coupled solver).",
+        )
+        parser.add_argument(
+            "--carry-height",
+            type=float,
+            help="Midpoint lift above the table-resting pose in meters (native Steel defaults to eight cable radii, coupled to 0.20 m).",
+        )
         parser.add_argument("--proxy-iterations", type=int, default=1, help="Proxy relaxation passes per substep.")
         parser.add_argument(
             "--mass-scale",
@@ -589,7 +647,18 @@ class Example:
         parser.add_argument("--vbd-iterations", type=int, default=20, help="VBD iterations per coupled substep.")
         parser.add_argument("--mujoco-iterations", type=int, default=100, help="MuJoCo solver iterations.")
         parser.add_argument("--mujoco-ls-iterations", type=int, default=20, help="MuJoCo line-search iterations.")
-        parser.add_argument("--steel-iterations", type=int, default=24, help="Steel PGS iterations.")
+        parser.add_argument(
+            "--steel-iterations",
+            type=int,
+            default=None,
+            help="Steel PGS iterations (native: 4; 24 coupled).",
+        )
+        parser.add_argument(
+            "--coupled-contact-passes",
+            type=int,
+            default=4,
+            help="Native Steel: extra passes per iteration over the jaw-on-cable contacts.",
+        )
         parser.add_argument(
             "--no-graph-capture",
             action="store_false",
@@ -602,7 +671,9 @@ class Example:
 
 if __name__ == "__main__":
     parser = Example.create_parser()
-    parser.set_defaults(num_frames=330)
+    # Preserve the established coupled benchmark. The native test includes a half second
+    # of settling after retraction. Explicit --num-frames still overrides either default.
+    parser.set_defaults(num_frames=450 if parser.parse_known_args()[0].solver == "steel" else 330)
     viewer, args = newton.examples.init(parser)
     example = Example(viewer, args)
     newton.examples.run(example, args)

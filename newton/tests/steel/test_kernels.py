@@ -755,7 +755,8 @@ class TestSteelLaunchConfig(unittest.TestCase):
             (128, 384, 101376, 16),
             (160, 384, 101376, None),
             (23, 0, 101376, None),
-            (23, 384, 8192, 16),
+            (23, 384, 8192, 8),
+            (114, 80313, 101376, 16),
             (23, 384, 2500, None),
             (100, 1, 49152, 1),
         )
@@ -765,8 +766,8 @@ class TestSteelLaunchConfig(unittest.TestCase):
 
     def test_hinv_chunk_selection_accounts_for_tile_threads(self):
         """Include tile scratch space when selecting response chunks."""
-        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, 64), 32)
-        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, 256), 16)
+        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 36800, 64), 32)
+        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 36800, 256), 16)
 
     def test_hinv_chunk_selection_caps_response_tiles(self):
         """Cap response chunks at 32 rows across articulation sizes."""

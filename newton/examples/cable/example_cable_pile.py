@@ -15,6 +15,7 @@ Success criteria:
 
 Runs:
 - `python -m newton.examples cable_pile`
+- `python -m newton.examples cable_pile --solver steel --solve-mode colored --device cuda:0`
 """
 
 import math
@@ -24,6 +25,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 
 
 class Example:
@@ -44,8 +46,7 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 10
-        self.sim_iterations = 5
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 5, propagation=(5, 12))
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         # Cable pile parameters
@@ -161,15 +162,20 @@ class Example:
                     label=f"cable_l{layer}_{lane}",
                 )
 
-        builder.color()
+        if getattr(args, "solver", "vbd") == "vbd":
+            builder.color()
 
         self.model = builder.finalize()
         # Size persistent contact history before graph capture.
         self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="sticky")
         self.contacts = self.collision_pipeline.contacts()
 
-        self.solver = newton.solvers.SolverVBD(
+        self.solver = cable_solver.make_solver(
             self.model,
+            args,
+            # Three rows (normal and two tangents) for up to eight contacts per segment; the pipeline's
+            # worst-case contact count would reserve several times more rows than the pile ever uses.
+            contact_rows=min(3 * self.collision_pipeline.rigid_contact_max, 24 * self.model.body_count),
             iterations=self.sim_iterations,
             rigid_body_contact_buffer_size=256,
             rigid_contact_history=True,
@@ -226,6 +232,7 @@ class Example:
 
     def test_final(self):
         """Test cable pile simulation for stability and correctness (called after simulation)."""
+        cable_solver.check_capacity(self.solver)
         cable_radius = 0.012
         cable_diameter = 2.0 * cable_radius
 
@@ -257,5 +264,5 @@ class Example:
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    viewer, args = newton.examples.init(cable_solver.create_parser())
     newton.examples.run(Example(viewer, args), args)

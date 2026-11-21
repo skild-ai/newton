@@ -162,6 +162,7 @@ def _counting_example(module, substeps: int, *, use_graph: bool, recorder: _Reco
     """An example whose simulate() runs against counting states and a counting solver on the CPU."""
     example = module.Example.__new__(module.Example)
     coords = 9
+    example.native_cable = False
     example.sim_substeps = substeps
     example.sim_dt = 1.0 / (60.0 * substeps)
     example.use_graph = use_graph

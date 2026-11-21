@@ -36,6 +36,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 from newton.examples.vbd._viewer import node_xyz, set_viewer_camera
 
 
@@ -76,12 +77,12 @@ class Example:
     def __init__(self, viewer, args=None):
         self.viewer = viewer
         self.args = args
+        self.clamps = cable_solver.CableClamps(args)
 
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 10
-        self.sim_iterations = 10
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 10, propagation=(2, 4))
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.cases: list[dict] = []
@@ -105,17 +106,15 @@ class Example:
                 twist_stiffness=self.TWIST_STIFFNESS,
                 twist_damping=self.TWIST_DAMPING,
                 label=f"twist_transfer_{label}",
-                wrap_in_articulation=False,
+                wrap_in_articulation=self.clamps.steel,
             )
             root_body = int(bodies[0])
             tip_body = int(bodies[-1])
             for body in (root_body, tip_body):
-                builder.body_mass[body] = 0.0
-                builder.body_inv_mass[body] = 0.0
-                builder.body_inertia[body] = wp.mat33(0.0)
-                builder.body_inv_inertia[body] = wp.mat33(0.0)
+                self.clamps.pin(builder, body, moving=(body == root_body))
 
-            builder.add_articulation(list(joints), label=f"twist_transfer_{label}_articulation")
+            if not self.clamps.steel:
+                builder.add_articulation(list(joints), label=f"twist_transfer_{label}_articulation")
             self.cases.append(
                 {
                     "label": label,
@@ -124,9 +123,14 @@ class Example:
                 }
             )
 
-        builder.color()
+        self.clamps.finish(builder)
+        if not self.clamps.steel:
+            builder.color()
         self.model = builder.finalize()
-        self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations)
+        self.clamps.bind(self.model)
+        self.solver = cable_solver.make_solver(
+            self.model, args, self.sim_iterations, contact_rows=max(32, 6 * len(self.clamps.bodies))
+        )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -250,8 +254,9 @@ class Example:
                 _spin_roots_kernel,
                 dim=len(self.cases),
                 inputs=[self._root_indices, self._twist_rate_wp, self.sim_dt],
-                outputs=[self.state_0.body_q, self.state_1.body_q],
+                outputs=self.clamps.pose_buffers(self.state_0, self.state_1),
             )
+            self.clamps.update(self.state_0, self.sim_dt)
             self.viewer.apply_forces(self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
@@ -349,6 +354,7 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
+        cable_solver.check_capacity(self.solver)
         body_q = self.state_0.body_q.numpy()
         body_qd = self.state_0.body_qd.numpy()
         assert np.isfinite(body_q).all(), "non-finite body transforms"
@@ -391,7 +397,7 @@ class Example:
 
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
+    parser = cable_solver.create_parser()
     parser.set_defaults(num_frames=int(60 * (Example.RAMP_TIME + Example.HOLD_TIME)) + 30)
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

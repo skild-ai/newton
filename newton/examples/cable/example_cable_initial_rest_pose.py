@@ -29,6 +29,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 
 
 def _create_helix_points(
@@ -57,8 +58,7 @@ class Example:
 
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 5
-        self.sim_iterations = 5
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 5, 5, propagation=(4, 8))
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
 
@@ -132,14 +132,14 @@ class Example:
         self.cable_bodies = [left_bodies, right_bodies]
 
         builder.add_ground_plane()
-        builder.color(balance_colors=False)
+        if getattr(args, "solver", "vbd") == "vbd":
+            builder.color(balance_colors=False)
         self.model = builder.finalize(device=args.device)
 
         self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="latest")
         self.contacts = self.collision_pipeline.contacts()
-        self.solver = newton.solvers.SolverVBD(
-            self.model,
-            iterations=self.sim_iterations,
+        self.solver = cable_solver.make_solver(
+            self.model, args, self.sim_iterations, contact_rows=3 * self.collision_pipeline.rigid_contact_max
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -200,6 +200,7 @@ class Example:
 
     def test_final(self):
         """Verify both cable simulations remain finite and bounded."""
+        cable_solver.check_capacity(self.solver)
         body_q = self.state_0.body_q.numpy()
         body_qd = self.state_0.body_qd.numpy()
         body_indices = [body for cable_bodies in self.cable_bodies for body in cable_bodies]
@@ -210,6 +211,6 @@ class Example:
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    viewer, args = newton.examples.init(cable_solver.create_parser())
     example = Example(viewer, args)
     newton.examples.run(example, args)

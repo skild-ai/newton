@@ -195,7 +195,8 @@ class TreeArgs:
 
     art_to_world: wp.array[int]
     dense_contact_world_flag: wp.array[int]
-    articulation_start: wp.array[int]
+    # Tree joint range of each articulation, interleaved [first, end) pairs.
+    articulation_joint_range: wp.array[int]
     joint_parent: wp.array[int]
     joint_child: wp.array[int]
     joint_qd_start: wp.array[int]
@@ -363,7 +364,7 @@ def get_fused_iteration_kernel(
                         if wp.static(tree_natives[s][2]):
                             wp.static(tree_natives[s][1])(
                                 slot.world_groups[k], slot.group_to_art, articulation_active, tree[0].art_to_world,
-                                tree[0].dense_contact_world_flag, force_refresh, tree[0].articulation_start,
+                                tree[0].dense_contact_world_flag, force_refresh, tree[0].articulation_joint_range,
                                 tree[0].joint_parent, tree[0].joint_child, tree[0].joint_qd_start,
                                 tree[0].joint_parent_slot, tree[0].level_joint, tree[0].level_offsets,
                                 tree[0].level_art_start, tree[0].S_flat, tree[0].com_rel, v_out, body_qd,
@@ -371,7 +372,7 @@ def get_fused_iteration_kernel(
                         else:
                             wp.static(tree_natives[s][1])(
                                 slot.world_groups[k], slot.group_to_art, articulation_active, tree[0].art_to_world,
-                                tree[0].dense_contact_world_flag, force_refresh, tree[0].articulation_start,
+                                tree[0].dense_contact_world_flag, force_refresh, tree[0].articulation_joint_range,
                                 tree[0].joint_parent, tree[0].joint_child, tree[0].joint_qd_start,
                                 tree[0].joint_parent_slot, tree[0].S_flat, tree[0].com_rel, v_out, body_qd,
                             )  # fmt: skip
@@ -398,7 +399,7 @@ def get_fused_iteration_kernel(
                 if warp_id == 0:
                     wp.static(gemv_native)(
                         world, world_count, cache[0].world_flag, cache[0].body_count, colored.body_list,
-                        cache[0].art_eligible, body_to_articulation, tree[0].articulation_start,
+                        cache[0].art_eligible, body_to_articulation, tree[0].articulation_joint_range,
                         tree[0].joint_qd_start, cache[0].R, cache[0].B, cache[0].qd_base, body_impulses, body_qd,
                         v_out,
                     )  # fmt: skip
@@ -408,7 +409,7 @@ def get_fused_iteration_kernel(
                     for k in range(slot.world_offsets[world], slot.world_offsets[world + 1]):
                         wp.static(tree_natives[s][0])(
                             slot.world_groups[k], slot.group_to_art, articulation_active, tree[0].art_to_world,
-                            slot.guard_flag, tree[0].articulation_start, tree[0].joint_parent, tree[0].joint_child,
+                            slot.guard_flag, tree[0].articulation_joint_range, tree[0].joint_parent, tree[0].joint_child,
                             tree[0].joint_qd_start, tree[0].joint_parent_slot, tree[0].S_flat, tree[0].com_rel,
                             tree[0].U, tree[0].D_inv, body_impulses, body_qd, v_out,
                         )  # fmt: skip

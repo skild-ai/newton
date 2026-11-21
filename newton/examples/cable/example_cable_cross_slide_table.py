@@ -34,6 +34,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 
 TABLE_RECT_HALF_X = 0.050
 TABLE_RECT_HALF_Y = 0.060
@@ -407,13 +408,13 @@ def add_visual_bar(
 class Example:
     def __init__(self, viewer, args):
         # Store viewer and configure simulation cadence.
+        self.clamps = cable_solver.CableClamps(args)
         self.viewer = viewer
 
         fps = 60
         self.frame_dt = 1.0 / fps
         self.sim_time = 0.0
-        self.sim_substeps = 10
-        sim_iterations = 5
+        self.sim_substeps, sim_iterations = cable_solver.budget(args, 10, 192 if self.clamps.steel else 5)
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         # Cable and mechanism dimensions.
@@ -729,7 +730,14 @@ class Example:
         kinematic_body_base_xforms = [builder.body_q[body] for body in kinematic_body_indices]
 
         builder.add_ground_plane()
-        builder.color(balance_colors=False)
+        if self.clamps.steel:
+            for body in driven_pulley_bodies:
+                root = builder.add_joint_free(body)
+                builder.add_articulation([root])
+                self.clamps.pin(builder, body, moving=True)
+            self.clamps.finish(builder)
+        else:
+            builder.color(balance_colors=False)
 
         # Finalize the model and use VBD with explicit broad-phase contacts.
         sim_device = wp.get_device(args.device) if args.device else None
@@ -738,8 +746,16 @@ class Example:
 
         # Preserve cable-pulley friction state and preallocate it before CUDA graph capture.
         self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="latest")
-        self.solver = newton.solvers.SolverVBD(
+        self.clamps.bind(self.model)
+        # Reserve four contact points per cable segment (normal and two tangents),
+        # three ball-closure rows and four slide-limit rows. Round to whole warps.
+        row_budget = 12 * len(self.cable_bodies) + 3 + 4
+        self.solver = cable_solver.make_solver(
             self.model,
+            args,
+            parallel_tree=True,
+            enable_joint_limits=True,
+            contact_rows=32 * math.ceil(row_budget / 32),
             iterations=sim_iterations,
             rigid_contact_history=True,
             rigid_body_contact_buffer_size=256,
@@ -747,6 +763,9 @@ class Example:
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
+        if self.clamps.steel:
+            for state in (self.state_0, self.state_1):
+                newton.eval_ik(self.model, state, state.joint_q, state.joint_qd)
         self.control = self.model.control()
         self.contacts = self.collision_pipeline.contacts()
 
@@ -801,12 +820,12 @@ class Example:
                     self.input_drive_radius,
                     self.input_pulley_angles,
                     self.target_table_xy,
-                    self.state_0.body_q,
-                    self.state_1.body_q,
+                    *self.clamps.pose_buffers(self.state_0, self.state_1),
                 ],
                 device=self.model.device,
             )
 
+            self.clamps.update(self.state_0, self.sim_dt)
             self.viewer.apply_forces(self.state_0)
             self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
@@ -892,6 +911,7 @@ class Example:
 
     def test_final(self):
         """Validate table drift and final mechanism bounds."""
+        cable_solver.check_capacity(self.solver)
         if self.state_0.body_q is None:
             raise RuntimeError("Body state is not available.")
 
@@ -917,8 +937,17 @@ class Example:
                 f"{TABLE_TRACKING_RMS_ERROR_TOLERANCE:.4f} m."
             )
 
+    @staticmethod
+    def create_parser():
+        parser = cable_solver.create_parser()
+        # The table moves only through cable tension wrapped around the pulleys. The immediate response's exact
+        # Gauss-Seidel over the whole mechanism tracks the commanded path; the propagation response's per-body
+        # sweep transmits that tension too slowly and the table drifts off the path at any affordable budget.
+        parser.set_defaults(contact_response="immediate")
+        return parser
+
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    viewer, args = newton.examples.init(Example.create_parser())
     example = Example(viewer, args)
     newton.examples.run(example, args)

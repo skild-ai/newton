@@ -445,8 +445,12 @@ def _check_propagation_coverage(test, model, options):
     test.assertGreater(np.bincount(row_bodies[row_bodies >= 0]).max(), 2)
     body_count = solver._propagation_body_count.numpy()
     body_list = solver._propagation_body_list.numpy()
-    # Only the colored sweep and the cached response read the body map.
-    reads_body_map = options.get("solve_mode") == "colored" or options["propagation_cached_response"]
+    # The colored sweep, the serial unit sweep (twists staged by local slot) and the cached response read the body map.
+    reads_body_map = (
+        options.get("solve_mode") == "colored"
+        or options["propagation_cached_response"]
+        or solver._propagation_serial_units
+    )
     test.assertEqual(solver._propagation_world_bodies is not None, reads_body_map)
     if options["propagation_cached_response"]:
         test.assertTrue(np.all(solver._propagation_cache_world_flag.numpy() == 1))
