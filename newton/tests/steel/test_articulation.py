@@ -2333,7 +2333,7 @@ def test_unsupported_joint_springs_warn(test, device):
         return model, state_0, state_1
 
     model, state_0, state_1 = single_joint("ball")
-    with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "springs on 3 DOF"):
+    with test.assertWarnsRegex(newton.NewtonWarning, "springs on 3 DOF"):
         solver = SolverSteel(model)
     solver.step(state_0, state_1, model.control(), None, 1.0e-3)
     np.testing.assert_allclose(state_1.joint_qd.numpy(), 0.0)
@@ -2346,7 +2346,7 @@ def test_unsupported_joint_springs_warn(test, device):
 
 def test_deprecated_spring_spellings(test, device):
     """Map the deprecated spring spellings onto the passive spring stiffness and rest coordinate."""
-    deprecated = newton.exceptions.NewtonDeprecationWarning
+    deprecated = newton.NewtonDeprecationWarning
     builder = newton.ModelBuilder()
     link = builder.add_link()
     with test.assertWarnsRegex(deprecated, "spring_stiffness is deprecated"):
@@ -2372,7 +2372,7 @@ def test_deprecated_spring_spellings(test, device):
 
 def test_deprecated_status_members(test, device):
     """Delegate Steel's deprecated status members to check_constraint_capacity()."""
-    deprecated = newton.exceptions.NewtonDeprecationWarning
+    deprecated = newton.NewtonDeprecationWarning
     builder = newton.ModelBuilder()
     link = builder.add_link()
     builder.add_articulation([builder.add_joint_revolute(-1, link)])

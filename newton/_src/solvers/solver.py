@@ -601,7 +601,7 @@ class SolverBase:
     """Whether this solver leaves the bodies flagged in :attr:`Model.body_disable_gravity` without gravity.
 
     Constructing a solver that does not on a model with a flagged body emits a
-    :class:`~newton.exceptions.NewtonWarning`.
+    :class:`~newton.NewtonWarning`.
     """
 
     _module_options_revision = 0

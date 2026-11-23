@@ -1464,7 +1464,7 @@ def test_stiffness_without_a_spring_lets_articulations_sleep(test, device):
         pipeline = newton.CollisionPipeline(model, rigid_contact_max=512, deterministic=True)
         if stiffness:
             # Steel warns about stiffness on DOFs it applies no spring to.
-            with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "springs on 18 DOF"):
+            with test.assertWarnsRegex(newton.NewtonWarning, "springs on 18 DOF"):
                 solver = newton.solvers.SolverSteel(model, **PROFILE)
         else:
             solver = newton.solvers.SolverSteel(model, **PROFILE)

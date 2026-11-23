@@ -1865,7 +1865,7 @@ class SolverSteel(SolverBase, CouplingInterface):
           reads it only from an explicitly authored ``newton:steel:jointFrictionLoadCoefficient``, not from
           ``physxJoint:jointFriction``, because the rows interact with drives differently from PhysX. The
           earlier spelling ``newton:steel:joint_friction_load_coefficient`` is read with a
-          :class:`~newton.exceptions.NewtonDeprecationWarning` when the current name is not authored.
+          :class:`~newton.NewtonDeprecationWarning` when the current name is not authored.
 
           .. experimental::
 

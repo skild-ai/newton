@@ -835,7 +835,7 @@ def test_kinematic_runtime_toggle(
     def toggle_warning():
         # Colored Steel asks for a recapture when a kinematic articulation root appears or disappears.
         if isinstance(solver, newton.solvers.SolverSteel) and solver._propagation_colored:
-            return test.assertWarnsRegex(newton.exceptions.NewtonWarning, "recapture graphs")
+            return test.assertWarnsRegex(newton.NewtonWarning, "recapture graphs")
         return contextlib.nullcontext()
 
     state_0, state_1 = model.state(), model.state()

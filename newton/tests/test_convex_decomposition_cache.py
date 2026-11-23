@@ -88,7 +88,7 @@ class TestConvexDecompositionCache(unittest.TestCase):
         }
         per_component_key = _convex_cache.hash_inputs(mesh, "coacd", settings)
         _convex_cache.write(self.cache_dir, per_component_key, [(self.vertices + 5, self.faces.copy())])
-        with self.assertWarnsRegex(newton.exceptions.NewtonWarning, "more disconnected components"):
+        with self.assertWarnsRegex(newton.NewtonWarning, "more disconnected components"):
             self._build(merge=True, max_convex_hull=1)
         self.assertEqual(self.coacd.call_count, 1)
 

@@ -2900,12 +2900,12 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
     def test_usd_reads_the_legacy_coefficient_name_with_a_warning(self):
         """Read newton:steel:joint_friction_load_coefficient with a deprecation warning unless the current name is set."""
         legacy = "newton:steel:joint_friction_load_coefficient"
-        with self.assertWarnsRegex(newton.exceptions.NewtonDeprecationWarning, f"'{legacy}' on joint prim"):
+        with self.assertWarnsRegex(newton.NewtonDeprecationWarning, f"'{legacy}' on joint prim"):
             coefficients = _usd_hinge_coefficients({"legacy": {legacy: 0.4}})
         self.assertAlmostEqual(coefficients["/World/legacy_hinge"], 0.4, places=6)
 
         with warnings.catch_warnings():
-            warnings.simplefilter("error", newton.exceptions.NewtonDeprecationWarning)
+            warnings.simplefilter("error", newton.NewtonDeprecationWarning)
             coefficients = _usd_hinge_coefficients(
                 {"both": {"newton:steel:jointFrictionLoadCoefficient": 0.3, legacy: 0.9}}
             )
