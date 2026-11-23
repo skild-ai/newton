@@ -543,7 +543,7 @@ class Model:
         "body_inertia": AttributeSpec(AttributeFrequency.BODY, update_flags=ModelFlags.BODY_INERTIAL_PROPERTIES),
         "body_inv_inertia": AttributeSpec(AttributeFrequency.BODY, update_flags=ModelFlags.BODY_INERTIAL_PROPERTIES),
         "body_mass": AttributeSpec(AttributeFrequency.BODY, update_flags=ModelFlags.BODY_INERTIAL_PROPERTIES),
-        "body_disable_gravity": AttributeSpec(AttributeFrequency.BODY, update_flags=ModelFlags.BODY_PROPERTIES),
+        "body_disable_gravity": AttributeSpec(AttributeFrequency.BODY, update_flags=ModelFlags.NONE),
         "body_inv_mass": AttributeSpec(AttributeFrequency.BODY, update_flags=ModelFlags.BODY_INERTIAL_PROPERTIES),
         "body_flags": AttributeSpec(AttributeFrequency.BODY, update_flags=ModelFlags.BODY_PROPERTIES),
         "body_f": AttributeSpec(AttributeFrequency.BODY),

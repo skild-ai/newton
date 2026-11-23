@@ -357,7 +357,6 @@ class Example:
                     solver=lambda view: SolverVBD(
                         model=view,
                         iterations=vbd_iterations,
-                        rigid_compliant_alm=True,
                         # Low slip threshold keeps the stack from creeping on the cloth.
                         friction_epsilon=1.0e-3,
                         particle_enable_self_contact=True,

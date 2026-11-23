@@ -1180,7 +1180,7 @@ for tabletop_task in ("bolt_sweep", "wrecking_ball", "plate_rack", "pelican_bicy
         TestRobotExamples,
         name=f"robot.example_steel_{tabletop_task}",
         devices=cuda_test_devices,
-        test_options={"usd_required": True, "num-frames": 900},
+        test_options={"requires": ("pxr.Usd",), "num-frames": 900},
         use_viewer=True,
     )
 
