@@ -3032,8 +3032,6 @@ for _test, _devices in (
 # Articulations interleaved with others within a world
 
 
-
-
 _ACTUATED_HINGE_MJCF = """
 <mujoco model="robot">
   <worldbody>

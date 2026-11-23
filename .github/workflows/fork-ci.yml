@@ -1,0 +1,132 @@
+# Checks for skild-ai/newton that the upstream workflows skip outside newton-physics/newton:
+# pre-commit (upstream uses pre-commit.ci) and post-merge CPU unit tests (ci.yml skips push
+# events on forks). Pull request unit tests come from pr.yml.
+name: Fork CI
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches:
+      - main
+      - "release-*"
+  push:
+    branches:
+      - main
+      - "release-*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHONFAULTHANDLER: "1"
+
+jobs:
+  pre-commit:
+    if: github.repository == 'skild-ai/newton'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
+        with:
+          egress-policy: audit
+
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+        with:
+          version: "0.13.5"
+          prune-cache: true
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+      - name: Restore pre-commit cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7  # v5.0.4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+      # uv-lock is covered by the check-lockfile job in pr.yml, as on pre-commit.ci.
+      - name: Run pre-commit
+        env:
+          SKIP: uv-lock
+        run: uvx --from pre-commit==4.7.0 pre-commit run --all-files --show-diff-on-failure --color always
+
+  newton-unittests:
+    if: github.repository == 'skild-ai/newton' && github.event_name != 'pull_request'
+    name: newton-unittests (ubuntu-latest, shard ${{ matrix.shard-index }}/2)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard-index: [0, 1]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
+        with:
+          egress-policy: audit
+
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+        with:
+          version: "0.13.5"
+          prune-cache: true
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+      # Same key layout as ci.yml, so pull request runs restore what main saves.
+      - name: Compute Warp kernel cache key
+        id: warp-cache-key
+        env:
+          SHARD: shard${{ matrix.shard-index }}of2
+        run: |
+          uv run --extra dev python - <<'EOF'
+          import os
+          import warp as wp
+
+          prefix = f"warp-kernels-{wp.get_cpu_kernel_cache_key()}-{os.environ['SHARD']}-"
+          print(f"Warp kernel cache key prefix: {prefix}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"prefix={prefix}\n")
+          EOF
+      - name: Run Tests
+        run: >
+          uv run --extra dev -m newton.tests
+          --strict-warnings
+          --parallel-timeout 5100
+          --no-cache-clear
+          --shard-count 2
+          --shard-index ${{ matrix.shard-index }}
+          --junit-report-xml rspec.xml
+      - name: Run ASV harness unit tests
+        run: >
+          uv run --no-sync -m newton.tests
+          --strict-warnings
+          --no-cache-clear
+          --shard-count 2
+          --shard-index ${{ matrix.shard-index }}
+          --start-directory asv/tests
+          --junit-report-xml asv-rspec.xml
+      - name: Save Warp kernel cache
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7  # v5.0.4
+        with:
+          path: ~/.cache/warp
+          key: ${{ steps.warp-cache-key.outputs.prefix }}${{ hashFiles('uv.lock', 'newton/**/*.py') }}
+      - name: Test Summary
+        uses: test-summary/action@37b508cfee6d4d080eedd00b5bb240a6a784a6a5  # v2.6
+        with:
+          paths: "*rspec.xml"
+          show: "fail"
+        if: always()
