@@ -987,8 +987,6 @@ def create_narrow_phase_primitive_kernel(
                             bb_data,
                             wp.vec3(sat_pos[ci, 0], sat_pos[ci, 1], sat_pos[ci, 2]),
                             sat_dist[ci],
-                            n_ci,
-                            margin_offset_a + margin_offset_b,
                             shape_transform,
                             shape_linear_velocity,
                             shape_angular_velocity,

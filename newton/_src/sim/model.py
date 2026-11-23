@@ -791,10 +791,7 @@ class Model:
             AttributeFrequency.JOINT_COORD, update_flags=ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES
         ),
         "joint_spring_stiffness": AttributeSpec(
-            AttributeFrequency.JOINT_DOF,
-            alias_of="joint_stiffness",
-            deprecated=True,
-            update_flags=ModelFlags.JOINT_DOF_FORCE_PROPERTIES,
+            AttributeFrequency.JOINT_DOF, alias_of="joint_stiffness", deprecated=True
         ),
         "joint_limit_lower": AttributeSpec(
             AttributeFrequency.JOINT_DOF, update_flags=ModelFlags.JOINT_DOF_FORCE_PROPERTIES
