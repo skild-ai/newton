@@ -511,6 +511,29 @@ add_function_test(
 )
 
 
+def test_propagation_interval(test, device):
+    """Propagating every third iteration still settles a clamped rod where the exact response does."""
+    with test.assertRaisesRegex(ValueError, "propagation_interval must be at least 1"):
+        newton.solvers.SolverSteel(_clamped_rod(device)[0], propagation_interval=0, **_PROPAGATION)
+    positions = {}
+    for interval in (1, 3):
+        model, _tip = _clamped_rod(device)
+        solver = newton.solvers.SolverSteel(
+            model, iterations=16, articulation_constraint_max=64, propagation_interval=interval, **_PROPAGATION
+        )
+        test.assertEqual(solver.propagation_interval, interval)
+        a, b, control = model.state(), model.state(), model.control()
+        for _ in range(120):
+            solver.step(a, b, control, None, 1.0 / 600.0)
+            a, b = b, a
+        positions[interval] = a.body_q.numpy()[:, :3]
+    test.assertTrue(np.all(np.isfinite(positions[3])))
+    np.testing.assert_allclose(positions[3], positions[1], atol=2.0e-3)
+
+
+add_function_test(TestSteelRod, "test_propagation_interval", test_propagation_interval, devices=get_cuda_test_devices())
+
+
 def test_propagation_tree_dynamics(test, device):
     """Rod trees take their unconstrained velocity from the propagation factorization, as the dense solve does."""
     from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415

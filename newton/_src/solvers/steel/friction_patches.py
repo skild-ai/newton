@@ -1154,6 +1154,7 @@ def _carry_frozen_pairs(
 @wp.kernel(enable_backward=False)
 def _store_history(
     q: wp.array[wp.transform],
+    count: wp.array[int],
     frame: _PatchFrame,
     prev: _PatchFrame,
     previous_q: wp.array[wp.transform],
@@ -1163,6 +1164,13 @@ def _store_history(
     if c < previous_q.shape[0]:
         previous_q[c] = q[c]
     if c >= frame.valid.shape[0]:
+        return
+    if c >= count[0]:
+        # Slots past the frame's contacts hold _prepare's defaults: the sorted keys, their slots and the
+        # validity are all a later frame reads there.
+        prev.keys[c] = frame.keys[c]
+        prev.indices[c] = frame.indices[c]
+        prev.valid[c] = frame.valid[c]
         return
     normal = frame.normal[c]
     if frame.valid[c] != 0 and frame.body_a[c] >= 0:
@@ -1390,6 +1398,10 @@ class _FrictionPatchState:
         # Only the current frame flags failed carries.
         self.previous.carry_failed = wp.zeros(0, dtype=int, device=device)
         self.previous_q = wp.zeros(model.body_count, dtype=wp.transform, device=device)
+        # Contact count of the frame build() prepared (the history store reads it); every slot until then.
+        # (kept referenced: rebinding _frame_count must not free it under a capture).
+        self._frame_count_all = wp.full(1, 2**31 - 1, dtype=wp.int32, device=device)
+        self._frame_count = self._frame_count_all
         # Body pairs large enough for the warp flood: at most one per _FLOOD_MIN_CONTACTS + 1
         # contacts, grown by a fixed grid of warps so the launch does not scale with capacity.
         pair_capacity = capacity // (_FLOOD_MIN_CONTACTS + 1) + 1
@@ -1493,6 +1505,8 @@ class _FrictionPatchState:
         coefficients [m] and a per-body flag of the bodies whose contacts take the free-rigid route. Such
         contacts then share a patch only if their pair coefficients match.
         """
+        # The history store copies full records only for this frame's contacts.
+        self._frame_count = contacts.rigid_contact_count
         wp.launch(
             _prepare,
             dim=self.capacity,
@@ -1636,7 +1650,7 @@ class _FrictionPatchState:
         wp.launch(
             _store_history,
             dim=max(self.capacity, self.previous_q.shape[0]),
-            inputs=[state.body_q, self.current, self.previous, self.previous_q],
+            inputs=[state.body_q, self._frame_count, self.current, self.previous, self.previous_q],
             device=state.body_q.device,
         )
 

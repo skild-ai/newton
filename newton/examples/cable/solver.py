@@ -95,6 +95,8 @@ def make_solver(
             # Each step publishes its body state through the solver's own kinematics and the next step starts from
             # them instead of re-deriving them from the joint coordinates.
             reuse_kinematics=True,
+            # Rod trees propagate every third iteration; the sweep's body estimates carry the ones between.
+            propagation_interval=3 if propagation else 1,
             parallel_tree=parallel_tree,
             enable_joint_limits=enable_joint_limits,
             coupled_contact_passes=coupled_contact_passes,

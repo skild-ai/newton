@@ -1796,6 +1796,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     propagation_cached_response = _ConstructionOption()
     propagation_cached_response_body_max = _ConstructionOption()
     propagation_color_order = _ConstructionOption()
+    propagation_interval = _ConstructionOption()
     friction_combine = _ConstructionOption()
     restitution_combine = _ConstructionOption()
     free_rigid_torsional_friction = _ConstructionOption()
@@ -2096,6 +2097,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         propagation_cached_response: bool = True,
         propagation_cached_response_body_max: int = 8,
         propagation_color_order: Literal["contact", "longest_first", "rotating"] = "contact",
+        propagation_interval: int = 1,
         friction_combine: Literal["average", "min", "multiply", "max"] = "average",
         restitution_combine: Literal["average", "min", "multiply", "max"] = "average",
         free_rigid_torsional_friction: float | None = None,
@@ -2626,6 +2628,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             propagation_cached_response_body_max: Capacity of the cached responses in
                 contact-active bodies of cache-eligible articulations per world; free bodies
                 do not count. At least 1.
+            propagation_interval: With ``articulated_contact_response="propagation"``, propagate the impulses of
+                a sweep through the articulation trees every that many iterations, and after the last one. In
+                between, the sweep's own body estimates carry the impulses it keeps summing, so the exact joint
+                velocities arrive less often in exchange for fewer tree passes. 1 (default) propagates every
+                iteration. At least 1.
             propagation_color_order: Order in which ``solve_mode="colored"`` colors a world's
                 contacts and runs those left without a batch: ``"contact"`` (default) by contact
                 index, or ``"longest_first"`` by row count, longest first, then contact index. A batch takes as long as its longest
@@ -2946,6 +2953,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_same_articulation_rows = bool(propagation_same_articulation_rows)
         self._propagation_cached_response = bool(propagation_cached_response)
         self._propagation_cached_response_body_max = int(propagation_cached_response_body_max)
+        self._propagation_interval = int(propagation_interval)
+        if self._propagation_interval < 1:
+            raise ValueError("propagation_interval must be at least 1")
         if self._propagation_cached_response_body_max < 1:
             raise ValueError("propagation_cached_response_body_max must be at least 1")
         if propagation_color_order not in ("contact", "longest_first", "rotating"):
@@ -3120,8 +3130,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._tree_dynamics_sizes: set[int] = set()
         # Rod-tree groups whose factorization runs the six-lane walk.
         self._rod_tree_sizes: set[int] = set()
-        self._rod_chain_only_sizes: set[int] = set()
         self._rod_contracted = False
+        self._rod_scan_any = False
+        self._rod_scan_only_sizes: set[int] = set()
         self._rod_tree_kernels = {
             name: bool(self._kernel_overrides.get(f"rod_tree_{name}", True))
             for name in ("factor", "response", "propagate")
@@ -3392,16 +3403,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._rod_chain_flag.zero_()
                 self._rod_chain_flag_np[:] = 0
                 chain_pos[:] = -1
-            # Sizes whose rod trees are all chains: the walk kernels would skip every tree, so they are not launched.
-            self._rod_chain_only_sizes = (
-                {
-                    int(size)
-                    for size in self._rod_tree_sizes
-                    if all(chain[int(a)] for a in self._propagation_tree_arts[size].numpy())
-                }
-                if self._rod_chain_any
-                else set()
-            )
             self._rod_body_chain_pos = wp.array(chain_pos, dtype=wp.int32, device=model.device)
             # Contracted chains (rod_tree._CONTRACT_PREP): each chain's active links, the maps between them and the
             # snapshot twists, so iterations update only the active links.
@@ -3412,6 +3413,48 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._rod_ctr_P = wp.zeros(jc * 36, dtype=wp.float32, device=model.device)
             self._rod_ctr_a = wp.zeros(jc * 6, dtype=wp.float32, device=model.device)
             self._rod_ctr_qd0 = wp.zeros(jc * 6, dtype=wp.float32, device=model.device)
+            # Every rod tree is taken by the chain propagation pass as its chains (rod_tree._CHAIN_PROPAGATE): the walk
+            # positions where a chain starts (a joint not hanging off the previous one), per articulation, and the
+            # body accumulators that carry a chain's top wrench, twist change and twist to its children.
+            scan = np.zeros(max(model.articulation_count, 1), dtype=np.int32)
+            off = np.zeros(max(model.articulation_count, 1) + 1, dtype=np.int32)
+            starts_list = []
+            per_art = {}
+            # Trees take the chain pass while they leave the GPU idle (fewer warps, shorter dependence); once the
+            # trees alone fill it, the walk's lower arithmetic wins and branching trees keep it.
+            n_trees = sum(1 for art, _start, _end in art_ranges if not chain[int(art)])
+            trees_scan = n_trees <= 2 * max(int(getattr(model.device, "sm_count", 0) or 1), 1)
+            for art, start, end in art_ranges:
+                if not chain[int(art)] and not trees_scan:
+                    continue
+                cs = [k for k in range(start, end) if k == start or (m4[k, 3] & 16) == 0]
+                per_art[int(art)] = cs
+                scan[int(art)] = 1
+            for art in range(model.articulation_count):
+                off[art] = len(starts_list)
+                starts_list.extend(per_art.get(art, []))
+            off[model.articulation_count] = len(starts_list)
+            self._rod_scan_any = (
+                bool(scan.any())
+                and bool(self._kernel_overrides.get("rod_tree_scan", True))
+                and bool(self._kernel_overrides.get("rod_chain_scan", True))
+            )
+            if not self._rod_scan_any:
+                scan[:] = 0
+            self._rod_scan_flag = wp.array(scan, dtype=wp.int32, device=model.device)
+            self._rod_scan_only_sizes = {
+                int(size)
+                for size in self._rod_tree_sizes
+                if self._rod_scan_any and all(scan[int(a)] for a in self._propagation_tree_arts[size].numpy())
+            }
+            self._rod_tree_chain_off = wp.array(off, dtype=wp.int32, device=model.device)
+            self._rod_tree_chain_start = wp.array(
+                np.asarray(starts_list or [0], dtype=np.int32), dtype=wp.int32, device=model.device
+            )
+            bc = max(model.body_count, 1)
+            self._rod_tree_body_extra = wp.zeros((bc, 6), dtype=wp.float32, device=model.device)
+            self._rod_tree_body_d = wp.zeros((bc, 6), dtype=wp.float32, device=model.device)
+            self._rod_tree_body_o = wp.zeros((bc, 6), dtype=wp.float32, device=model.device)
             self._rod_tree_branch = wp.zeros((max(model.body_count, 1), 36), dtype=wp.float32, device=model.device)
             self._rod_tree_branch_p = wp.zeros((max(model.body_count, 1), 6), dtype=wp.float32, device=model.device)
         # Fixed-signature stand-in for the compliant residual coefficients of solve kernels without compliance.
@@ -13182,7 +13225,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._propagation_body_com_rel,
                             self._propagation_tree_U,
                             self._propagation_tree_D_inv,
-                            int(size not in self._rod_chain_only_sizes),
+                            int(size not in self._rod_scan_only_sizes),
                         ],
                         outputs=[self._propagation_tree_BR, self._propagation_tree_FR, self._propagation_tree_CR],
                         block_dim=_rod_tree.BLOCK_DIM,
@@ -13272,9 +13315,32 @@ class SolverSteel(SolverBase, CouplingInterface):
                 model.joint_qd_start,
             ]
             if size in self._rod_tree_sizes and self._rod_tree_kernels["response"]:
-                if self._rod_chain_any:
+                if self._rod_scan_any:
                     wp.launch(
                         _rod_tree.chain_response_kernel(),
+                        dim=_rod_tree.chain_launch_dim(n_arts),
+                        inputs=[
+                            n_arts,
+                            self._rod_tree_meta,
+                            arts,
+                            self._rod_scan_flag,
+                            self._propagation_tree_activity,
+                            self._propagation_joint_range,
+                            self._propagation_tree_BR,
+                            self._propagation_tree_FR,
+                            self._propagation_tree_CR,
+                            self._propagation_tree_D_inv,
+                            self._rod_tree_chain_off,
+                            self._rod_tree_chain_start,
+                            self._propagation_joint_split,
+                        ],
+                        outputs=[self._propagation_body_response, self._propagation_body_response_split],
+                        block_dim=_rod_tree.BLOCK_DIM,
+                        device=model.device,
+                    )
+                if self._rod_chain_any and self._rod_contracted:
+                    wp.launch(
+                        _rod_tree.contract_prep_kernel(),
                         dim=_rod_tree.chain_launch_dim(n_arts),
                         inputs=[
                             n_arts,
@@ -13283,36 +13349,15 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._rod_chain_flag,
                             self._propagation_tree_activity,
                             self._propagation_joint_range,
+                            self._propagation_body_seen,
                             self._propagation_tree_BR,
-                            self._propagation_tree_FR,
                             self._propagation_tree_CR,
-                            self._propagation_tree_D_inv,
-                            self._propagation_joint_split,
                         ],
-                        outputs=[self._propagation_body_response, self._propagation_body_response_split],
+                        outputs=[self._rod_ctr_count, self._rod_ctr_pos, self._rod_ctr_body, self._rod_ctr_P],
                         block_dim=_rod_tree.BLOCK_DIM,
                         device=model.device,
                     )
-                    if self._rod_contracted:
-                        wp.launch(
-                            _rod_tree.contract_prep_kernel(),
-                            dim=_rod_tree.chain_launch_dim(n_arts),
-                            inputs=[
-                                n_arts,
-                                self._rod_tree_meta,
-                                arts,
-                                self._rod_chain_flag,
-                                self._propagation_tree_activity,
-                                self._propagation_joint_range,
-                                self._propagation_body_seen,
-                                self._propagation_tree_BR,
-                                self._propagation_tree_CR,
-                            ],
-                            outputs=[self._rod_ctr_count, self._rod_ctr_pos, self._rod_ctr_body, self._rod_ctr_P],
-                            block_dim=_rod_tree.BLOCK_DIM,
-                            device=model.device,
-                        )
-                if size not in self._rod_chain_only_sizes:
+                if size not in self._rod_scan_only_sizes:
                     wp.launch(
                         _rod_tree.response_kernel(),
                         dim=_rod_tree.launch_dim(n_arts),
@@ -13320,7 +13365,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             n_arts,
                             self._rod_tree_meta,
                             arts,
-                            self._rod_chain_flag,
+                            self._rod_scan_flag,
                             self._propagation_tree_activity,
                             *factor_inputs,
                             self._propagation_joint_S_flat,
@@ -13593,7 +13638,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             if size in self._rod_tree_sizes and self._rod_tree_kernels["propagate"]:
                 # Rod trees outside the generalized solve (tree dynamics) keep their twists between sweeps.
                 if first or size not in self._tree_dynamics_sizes:
-                    if self._rod_chain_any:
+                    if self._rod_scan_any:
                         wp.launch(
                             _rod_tree.chain_refresh_kernel(),
                             dim=_rod_tree.chain_launch_dim(n_arts),
@@ -13601,18 +13646,21 @@ class SolverSteel(SolverBase, CouplingInterface):
                                 n_arts,
                                 self._rod_tree_meta,
                                 arts,
-                                self._rod_chain_flag,
+                                self._rod_scan_flag,
                                 self._propagation_tree_activity,
                                 self._propagation_joint_range,
                                 self._propagation_tree_FR,
                                 self._propagation_tree_CR,
+                                self._rod_tree_chain_off,
+                                self._rod_tree_chain_start,
+                                self._rod_tree_body_o,
                                 self._v_out,
                             ],
                             outputs=[self._propagation_body_qd],
                             block_dim=_rod_tree.BLOCK_DIM,
                             device=model.device,
                         )
-                    if size not in self._rod_chain_only_sizes:
+                    if size not in self._rod_scan_only_sizes:
                         wp.launch(
                             _rod_tree.refresh_kernel(),
                             dim=_rod_tree.launch_dim(n_arts),
@@ -13620,7 +13668,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                                 n_arts,
                                 self._rod_tree_meta,
                                 arts,
-                                self._rod_chain_flag,
+                                self._rod_scan_flag,
                                 self._propagation_tree_activity,
                                 self._propagation_joint_range,
                                 self._propagation_joint_S_flat,
@@ -13764,7 +13812,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     if size in self._propagation_cached_kernels
                     else self._propagation_cache_guard_off
                 )
-                if self._rod_chain_any:
+                if self._rod_scan_any:
                     # Staging caps the chains per SM: once they fill the GPU without it, take the unstaged pass.
                     staged = bool(
                         self._kernel_overrides.get("rod_chain_staged", n_arts <= 4 * max(int(model.device.sm_count), 1))
@@ -13776,7 +13824,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             n_arts,
                             self._rod_tree_meta,
                             arts,
-                            self._rod_chain_flag,
+                            self._rod_scan_flag,
                             self._propagation_tree_activity,
                             self._art_to_world,
                             guard,
@@ -13784,6 +13832,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._propagation_tree_BR,
                             self._propagation_tree_FR,
                             self._propagation_tree_CR,
+                            self._rod_tree_chain_off,
+                            self._rod_tree_chain_start,
+                            self._rod_tree_body_extra,
+                            self._rod_tree_body_d,
+                            self._rod_tree_body_o,
                             self._propagation_tree_u,
                             self._rod_ctr_count if self._rod_contracted else self._rod_chain_flag,
                             _rod_tree.CONTRACT_MAX if contracted else 0,
@@ -13796,7 +13849,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         block_dim=_rod_tree.CHAIN_BLOCK_DIM,
                         device=model.device,
                     )
-                if size not in self._rod_chain_only_sizes:
+                if size not in self._rod_scan_only_sizes:
                     wp.launch(
                         _rod_tree.propagate_kernel(),
                         dim=_rod_tree.launch_dim(n_arts),
@@ -13804,7 +13857,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             n_arts,
                             self._rod_tree_meta,
                             arts,
-                            self._rod_chain_flag,
+                            self._rod_scan_flag,
                             self._propagation_tree_activity,
                             self._art_to_world,
                             guard,
@@ -14250,7 +14303,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                     block_dim=32 * wpb,
                     device=model.device,
                 )
-            self._propagation_propagate_impulses(contracted=contracted)
+            # With propagation_interval k > 1 the tree propagation runs every k-th iteration and after the last; in
+            # between, the sweep's own body estimates carry the impulses it keeps summing.
+            every = self._propagation_interval
+            last = iteration == iteration_offset + iterations - 1
+            if every == 1 or last or (iteration - iteration_offset) % every == every - 1:
+                self._propagation_propagate_impulses(contracted=contracted)
             if has_velocity_limits and not contact_then_internal:
                 phase(5, iteration_offset=iteration)
         if contracted:
