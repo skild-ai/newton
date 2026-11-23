@@ -3244,6 +3244,16 @@ def test_zero_min_distance_is_no_bound(test, device):
     test.assertAlmostEqual(distances[0.0][-1], 120 * _TETHER_DT - 0.1, delta=1.0e-4)
 
 
+def test_zero_max_distance_holds_the_anchors_together(test, device):
+    """Hold coincident anchors together under gravity and a transverse push with ``max_distance=0``."""
+    model, body = _build_tether(device, start=tuple(_TETHER_ANCHOR), upper=0.0, velocity=(0.0, 0.5, 0.2))
+    modes = ("immediate", "propagation", "colored") if wp.get_device(device).is_cuda else ("immediate", "propagation")
+    for mode in modes:
+        with test.subTest(mode=mode):
+            distances = _tether_distances(model, body, 120, enable_joint_limits=True, **steel_mode_options(mode))
+            test.assertLess(distances.max(), 1.0e-5)
+
+
 def test_distance_rows_count_toward_the_capacity_warning(test, device):
     """Warn at construction when a bounded DISTANCE joint's rows alone exceed ``articulation_constraint_max``."""
     model, _ = _build_tether(device, start=(0.3, 0.0, 1.0), lower=0.1, upper=0.5)
@@ -3297,6 +3307,7 @@ for _name, _func in (
     ("test_distance_joint_bounds_are_read_every_step", test_distance_joint_bounds_are_read_every_step),
     ("test_distance_row_is_the_anchor_distance_rate", test_distance_row_is_the_anchor_distance_rate),
     ("test_zero_min_distance_is_no_bound", test_zero_min_distance_is_no_bound),
+    ("test_zero_max_distance_holds_the_anchors_together", test_zero_max_distance_holds_the_anchors_together),
     ("test_distance_rows_count_toward_the_capacity_warning", test_distance_rows_count_toward_the_capacity_warning),
     ("test_multi_world_distance_limits_match_single_worlds", test_multi_world_distance_limits_match_single_worlds),
 ):

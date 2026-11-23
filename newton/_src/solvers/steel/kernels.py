@@ -8525,7 +8525,8 @@ def build_distance_limit_rows(
     :class:`~newton.solvers.SolverXPBD`; a zero minimum distance is no bound. The distance is
     ``|p|``, the child anchor's position in the parent anchor frame (the joint's linear coordinates). With the
     joint velocity ``(v, w)`` of the child COM in that frame, its rate is ``n . v + (r x n) . w`` for ``n = p / |p|``
-    and ``r = p - p_com``, so each row spans only the joint's own six DOFs.
+    and ``r = p - p_com``, so each row spans only the joint's own six DOFs. A zero maximum distance holds ``p`` at
+    zero with two opposing rows per axis, which are always active.
     """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
@@ -8546,13 +8547,33 @@ def build_distance_limit_rows(
         p = wp.vec3(joint_q[q], joint_q[q + 1], joint_q[q + 2])
         X_j = wp.transform(p, wp.quat(joint_q[q + 3], joint_q[q + 4], joint_q[q + 5], joint_q[q + 6]))
         com = wp.transform_point(X_j * wp.transform_inverse(joint_X_c[joint]), body_com[joint_child[joint]])
+        local = dof - dof_start
+        if has_upper and upper == 0.0:
+            # The distance has no direction at coincident anchors, so bound each axis of p instead.
+            for row in range(6):
+                axis = row // 2
+                sign = 1.0 - 2.0 * float(row % 2)
+                e = wp.vec3(0.0, 0.0, 0.0)
+                e[axis] = sign
+                slot = reserve_world_rows(row_slot_mode, world_slot_counter, world, 1, element_row_cursor, art)
+                if row_slot_mode == ROW_SLOTS_COUNT or slot >= max_constraints:
+                    continue
+                e_w = wp.cross(p - com, e)
+                for i in range(3):
+                    J_group[group_idx, slot, local + i] = e[i]
+                    J_group[group_idx, slot, local + 3 + i] = e_w[i]
+                world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+                world_row_parent[world, slot] = -1
+                world_row_mu[world, slot] = 0.0
+                world_phi[world, slot] = sign * p[axis]
+                world_target_velocity[world, slot] = 0.0
+            continue
         distance = wp.length(p)
         # Coincident anchors take the parent anchor frame's x axis.
         n = wp.vec3(1.0, 0.0, 0.0)
         if distance > 1.0e-9:
             n = p / distance
         n_w = wp.cross(p - com, n)
-        local = dof - dof_start
         rate = float(0.0)
         for i in range(3):
             rate += n[i] * joint_qd[dof + i] + n_w[i] * joint_qd[dof + 3 + i]
