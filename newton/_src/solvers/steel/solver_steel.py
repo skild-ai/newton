@@ -200,6 +200,7 @@ from .kernels import (
     preelim_correct_Y_for_size,
     preelim_project_velocity_for_size,
     preelim_setup_for_size,
+    prepare_contact_recovery,
     prepare_fused_diagonal_joint_limits,
     prepare_world_contact_rows,
     prepare_world_impulses,
@@ -1463,7 +1464,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         dense Delassus solve was removed, runs ``"serial"``; and
         ``articulated_contact_response="propagation_colored"`` maps to
         ``solve_mode="colored"`` with ``"propagation"``. Each emits a
-        :class:`~newton.exceptions.NewtonDeprecationWarning`.
+        :class:`~newton.NewtonDeprecationWarning`.
 
     Like :class:`~newton.solvers.SolverFeatherstone`, the solver uses
     :attr:`~newton.State.joint_q` and :attr:`~newton.State.joint_qd` as its state and
@@ -1484,8 +1485,10 @@ class SolverSteel(SolverBase, CouplingInterface):
       damping response is unbounded, so under a large external load the drive reaction
       can exceed the limit. ``drive_mode="rows"`` instead solves one PGS row per driven DOF with the PhysX articulation force-drive
       update and clamps its impulse, which bounds the complete reaction.
-      :attr:`~newton.Model.joint_armature` and :attr:`~newton.Model.joint_damping` are
-      applied.
+      :attr:`~newton.Model.joint_armature` is applied. Positive passive
+      :attr:`~newton.Model.joint_damping` on PRISMATIC, REVOLUTE, BALL and D6 DOFs is
+      integrated implicitly by adding ``dt * damping`` to the mass diagonal in either
+      drive mode. Passive damping is independent of drive targets and effort limits.
     - Passive joint springs: :attr:`~newton.Model.joint_stiffness` and
       :attr:`~newton.Model.joint_rest_q` on PRISMATIC, REVOLUTE and D6 DOFs, applied
       explicitly as ``stiffness * (rest_q - q)`` like :class:`~newton.solvers.SolverFeatherstone`,
@@ -1577,7 +1580,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     64 DOFs, joint velocity-limit and joint friction rows are disabled, the model has no mimic or loop-closing
     joints, drives are augmented and contacts use hard point friction or persistent friction patches
     (no warm start, adhesion, regularization, velocity-only iterations, friction gap threshold, restitution,
-    contact torsion or compliance): the mass matrix is assembled and factored in
+    contact torsion, compliance or Nesterov momentum): the mass matrix is assembled and factored in
     the fill-free pattern of the kinematic tree, and constraint rows keep only the DOFs
     that support them.
     Otherwise, and for free bodies, dense factors are used. Both give the same dynamics up
@@ -1589,7 +1592,8 @@ class SolverSteel(SolverBase, CouplingInterface):
     factorization and solve each DOF by division, bitwise identical to the dense ``loop``
     kernels and equal to the ``tiled`` kernels up to float32 rounding, and take precedence
     over sparse factors. ``parallel_tree=True`` additionally traverses the independent
-    branches of each tree in parallel.
+    branches of each tree in parallel. ``nesterov_momentum=True`` keeps the dense factors and
+    skips the diagonal path.
 
     Constraint rows are stored per world with fixed capacities (``articulation_constraint_max``
     for rows of articulated bodies, ``free_body_constraint_max`` for free-body contacts, and
@@ -1628,9 +1632,13 @@ class SolverSteel(SolverBase, CouplingInterface):
         Like :class:`~newton.solvers.SolverMuJoCo`, the reconstruction uses the bodies' rigid mass
         and inertia, not :attr:`~newton.Model.joint_armature`. For a dynamic DOF the wrench
         projected onto the joint's motion subspace is therefore its generalized load
-        (:attr:`~newton.Control.joint_f`, explicit passive spring and damping forces and
-        joint-space rows) less ``armature * qdd``. Kinematic DOFs report the rigid-body load of
-        carrying their subtree along the prescribed motion.
+        (:attr:`~newton.Control.joint_f`, explicit passive spring forces, passive damping and
+        joint-space rows) less ``armature * qdd``. Positive passive damping on PRISMATIC,
+        REVOLUTE, BALL and D6 DOFs contributes ``-damping * (qd + dt * qdd)`` to that load,
+        where ``qd`` is the velocity after any velocity-limit prescaling and ``qdd`` is the
+        solved acceleration relative to that velocity. Thus ``qd + dt * qdd`` is the
+        end-of-step velocity. Kinematic DOFs report the rigid-body load of carrying their
+        subtree along the prescribed motion.
 
         The accounting has these limits:
 
@@ -1699,7 +1707,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             The solver observable API may change without prior notice.
         """
 
-        body_awake: "wp.array[wp.bool] | None" = SolverBase.Observables.field(  # noqa: RUF009
+        body_awake: wp.array[wp.bool] | None = SolverBase.Observables.field(  # noqa: RUF009
             dtype=wp.bool,
             frequency=Model.AttributeFrequency.BODY,
         )
@@ -1712,14 +1720,6 @@ class SolverSteel(SolverBase, CouplingInterface):
             ObservableKind.BODY_AWAKE,
         }
     )
-
-    supports_body_pair_reduced_contacts: bool = True
-    """:meth:`step` accepts body-pair-reduced contacts, except with ``contact_compliance=True``, where it raises.
-
-    The compliant contact law is validated only on unreduced contacts.
-
-    .. experimental::
-    """
 
     # Constructor options. Most are fixed at construction; the _StepOption ones are read at every step.
     solve_mode = _ConstructionOption()
@@ -1806,7 +1806,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         - ``steel:min_torsional_patch_radius`` [m] is the effective spin radius of the
           shape's contacts (``physxCollision:minTorsionalPatchRadius``, default 0, no
           torsion). PhysX also scales a radius with the penetration depth through
-          ``physxCollision:torsionalPatchRadius``; this solver does not.
+          ``physxCollision:torsionalPatchRadius``; this solver does not. Set it before
+          constructing the solver, which enables torsion only when a radius is positive.
 
         One experimental per-shape attribute adds rolling and spin friction rows to free-body contacts:
 
@@ -1903,6 +1904,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="rigid_body_angular_damping",
+                update_flags=ModelFlags.NONE,
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.BODY,
                 assignment=Model.AttributeAssignment.MODEL,
@@ -1914,6 +1916,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="rigid_body_linear_damping",
+                update_flags=ModelFlags.NONE,
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.BODY,
                 assignment=Model.AttributeAssignment.MODEL,
@@ -1925,6 +1928,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="rigid_body_max_linear_velocity",
+                update_flags=ModelFlags.NONE,
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.BODY,
                 assignment=Model.AttributeAssignment.MODEL,
@@ -1936,6 +1940,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="rigid_body_max_angular_velocity",
+                update_flags=ModelFlags.NONE,
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.BODY,
                 assignment=Model.AttributeAssignment.MODEL,
@@ -1984,6 +1989,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="rigid_body_max_depenetration_velocity",
+                update_flags=ModelFlags.NONE,
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.BODY,
                 assignment=Model.AttributeAssignment.MODEL,
@@ -1995,6 +2001,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="joint_friction_load_coefficient",
+                update_flags=ModelFlags.JOINT_DOF_FORCE_PROPERTIES,
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.JOINT_DOF,
                 assignment=Model.AttributeAssignment.MODEL,
@@ -2093,7 +2100,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 .. deprecated:: 1.8
                     ``"matrix_free"`` maps to ``"serial"``, and ``"split"``, whose dense Delassus
                     solve was removed, runs ``"serial"``; each emits a
-                    :class:`~newton.exceptions.NewtonDeprecationWarning`.
+                    :class:`~newton.NewtonDeprecationWarning`.
             iterations: Number of projected Gauss-Seidel iterations per step.
             baumgarte: Baumgarte position-correction factor of contact and joint-limit rows,
                 as a fraction of the position error removed per step.
@@ -2104,11 +2111,13 @@ class SolverSteel(SolverBase, CouplingInterface):
             relaxation: Successive over-relaxation factor of the PGS sweep.
             update_mass_matrix_interval: Rebuild and refactor the mass matrix every this many
                 calls to :meth:`step`; ``1`` rebuilds it every step. Larger values reuse a
-                stale factorization between rebuilds. A change of ``dt``, :meth:`reset` and
-                :meth:`notify_model_changed` still request a refresh of the affected
-                articulations. Under CUDA graph capture the
-                host-side cadence is baked into the graph, so the interval should divide the
-                number of steps captured per graph.
+                stale factorization between rebuilds. A change of ``dt`` beyond a relative
+                tolerance of ``1e-6``, :meth:`reset` and :meth:`notify_model_changed` request a
+                refresh of the affected articulations. Under CUDA graph capture the host-side
+                cadence is baked into the graph, so the interval should divide the
+                number of steps captured per graph. The timestep associated with each factor
+                is checked on the device, so replaying a graph after a step or graph with a
+                different timestep refreshes the factor even between scheduled rebuilds.
             enable_joint_limits: Enforce :attr:`~newton.Model.joint_limit_lower` and
                 :attr:`~newton.Model.joint_limit_upper` of PRISMATIC, REVOLUTE and D6 DOFs as
                 unilateral rows. When ``False`` (the default), no joint-limit rows are created,
@@ -2202,7 +2211,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             warn_constraint_overflow: Print a device-side warning the first time a world
                 exceeds a row capacity. The warning does not synchronize the host and is
                 compatible with CUDA graph capture. The host contact torsion preparation
-                emits its overflow warning as a :class:`~newton.exceptions.NewtonWarning`
+                emits its overflow warning as a :class:`~newton.NewtonWarning`
                 through :mod:`warnings` instead.
             row_watermark: Accumulate the high-water marks of the per-world row counts of
                 every row family and of the contact count on the device in every step,
@@ -2563,7 +2572,7 @@ class SolverSteel(SolverBase, CouplingInterface):
 
                 .. deprecated:: 1.8
                     ``"propagation_colored"`` maps to ``solve_mode="colored"`` with
-                    ``"propagation"`` and emits a :class:`~newton.exceptions.NewtonDeprecationWarning`.
+                    ``"propagation"`` and emits a :class:`~newton.NewtonDeprecationWarning`.
             propagation_same_articulation_rows: Solve contacts between two links of the same
                 articulation as propagation rows, with the exact cross response of the two
                 links, instead of dense rows. Requires
@@ -2629,7 +2638,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 seed walks a world's rows serially, so its cost grows with the contact rows in one world;
                 ``solve_mode="colored"`` regroups a world's contact rows by color, an order fixed by the
                 contact set. ``GPU_TO_GPU`` is not supported: passing it raises :class:`ValueError`, and an
-                inherited one emits a :class:`~newton.exceptions.NewtonWarning` and runs ``RUN_TO_RUN``.
+                inherited one emits a :class:`~newton.NewtonWarning` and runs ``RUN_TO_RUN``.
                 :attr:`deterministic` reports the mode that runs, after any fallback.
                 ``BODY_PARENT_F`` sums contact wrenches with atomics, so it is outside this guarantee.
                 Steel's kernel modules always opt out of Warp's ``deterministic`` module option, so a
@@ -2638,7 +2647,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 O'Donoghue-Candes gradient restart, as in MuJoCo's PGS solver. Each sweep starts from the
                 impulses extrapolated along the previous sweep's change, applied to the velocity through each
                 row's response; momentum restarts when a sweep's correction opposes the extrapolation.
-                Converges in fewer iterations on stacks, mass ratios and long chains; gains appear above a
+                Can converge in fewer iterations on stacks, mass ratios and long chains; gains appear above a
                 few iterations. The ``velocity_iterations`` post-pass runs the same sweep. Every world then
                 runs the general sweep, bypassing the specialized sparse, local and paired-factor solves,
                 and keeps ``8 * (articulation_constraint_max + free_body_constraint_max)`` bytes of sweep
@@ -3008,7 +3017,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._coupling_patch_history_restore_pending = False
         self._coupling_iteration_restarts = True
         self._mass_update_requested = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
-        self._last_step_dt = None
+        self._mass_factor_dt = wp.zeros(model.articulation_count, dtype=wp.float32, device=model.device)
 
         self._model_plan: _SteelModelPlan | None = None
         self._kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
@@ -3505,7 +3514,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
 
     @override
-    def notify_model_changed(self, flags: ModelFlags | int, *, world_mask: "wp.array[wp.bool] | None" = None) -> None:
+    def notify_model_changed(self, flags: ModelFlags | int, *, world_mask: wp.array[wp.bool] | None = None) -> None:
         """Refresh cached solver data after model changes.
 
         Joint (frames), joint DOF, DOF force (drive gains), DOF inertial (armature), body
@@ -3580,7 +3589,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         if flags & dof_force:
             self._refresh_passive_joint_damping()
             self._refresh_passive_spring_stiffness()
-            # Augmented drive gains enter the factored mass-matrix diagonal.
+            # Augmented drive gains and passive damping enter the factored mass diagonal.
             self._mass_update_requested.fill_(1)
         if flags & (ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES):
             self._refresh_passive_spring_rest_q()
@@ -3637,6 +3646,27 @@ class SolverSteel(SolverBase, CouplingInterface):
         if flags & ModelFlags.SHAPE_PROPERTIES and not capturing:
             validate_free_rigid_angular_friction(self)
             validate_contact_adhesion(self)
+
+    @override
+    def _non_graphable_model_flags(self) -> int:
+        # The kinematic-state refresh reads body flags on the host.
+        flags = ModelFlags.BODY_PROPERTIES
+        if self._sleeping is not None:
+            # Sleeping compares the tracked model arrays on the host to find the islands to wake.
+            flags |= (
+                ModelFlags.JOINT_PROPERTIES
+                | ModelFlags.JOINT_DOF_PROPERTIES
+                | ModelFlags.BODY_INERTIAL_PROPERTIES
+                | ModelFlags.SHAPE_PROPERTIES
+            )
+        mujoco = getattr(self.model, "mujoco", None)
+        if int(getattr(mujoco, "equality_constraint_count", 0) or 0):
+            # MuJoCo equality rows are validated on the host.
+            flags |= ModelFlags.CONSTRAINT_PROPERTIES
+        if self._enable_restitution and self._sparse_mass_matrix_size is not None:
+            # Sparse mass factors check restitution support on the host.
+            flags |= ModelFlags.SHAPE_PROPERTIES
+        return int(flags)
 
     def _validate_joint_friction(self) -> None:
         """Reject joint friction the per-DOF friction rows cannot represent."""
@@ -3716,7 +3746,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         world = np.where(world < 0, int(model.world_count), world).astype(np.int32)
         return supported[joint_dof_joint], world[joint_dof_joint]
 
-    def _clear_warmstart_history(self, world_mask: "wp.array[wp.bool] | None") -> None:
+    def _clear_warmstart_history(self, world_mask: wp.array[wp.bool] | None) -> None:
         """Discard the carried contact impulses of the selected worlds (all worlds for ``None``)."""
         if not self._contact_warmstart or self._world_count == 0:
             return
@@ -3746,7 +3776,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=self.model.device,
             )
 
-    def notify_state_changed(self, state: State, *, world_mask: "wp.array[wp.bool] | None" = None) -> None:
+    def notify_state_changed(self, state: State, *, world_mask: wp.array[wp.bool] | None = None) -> None:
         """Drop the carried kinematics of the selected worlds after writing ``state`` outside :meth:`step`.
 
         With ``reuse_kinematics`` on, the solver keeps the kinematics and inverse-dynamics terms it
@@ -3781,7 +3811,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     def reset(
         self,
         state: State,
-        world_mask: "wp.array[wp.bool] | None" = None,
+        world_mask: wp.array[wp.bool] | None = None,
         flags: StateFlags | int | None = None,
     ) -> None:
         """Clear solver-owned state of the selected worlds.
@@ -3823,7 +3853,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         if world_mask is None:
             # Restart the host-side cadence; graphs captured earlier keep the values baked into them.
             self._step = 0
-            self._last_step_dt = None
             self._buffer_index = 0
             self._ws_history_dt.zero_()
             self._ws_history_generation.fill_(CONTACT_GENERATION_NONE)
@@ -3998,7 +4027,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         endpoint_index: wp.array[int],
         endpoint_local_pos: wp.array[wp.vec3],
         out_mass: wp.array[float],
-        out_inertia: "wp.array[wp.mat33] | None" = None,
+        out_inertia: wp.array[wp.mat33] | None = None,
     ) -> None:
         """Evaluate articulated effective mass and inertia for coupling endpoints.
 
@@ -6355,6 +6384,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._contact_slot = wp.zeros((max_contacts,), dtype=wp.int32, device=device)
         self._contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device)
         self._contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device)
+        self._contact_recovery_phi = wp.empty(max_contacts, dtype=float, device=device)
         self._contact_path = wp.zeros((max_contacts,), dtype=wp.int32, device=device)
         # Rows reserved by each contact: 1 (normal only) or 3 (normal and friction).
         self._contact_slots_needed = wp.zeros((max_contacts,), dtype=wp.int32, device=device)
@@ -7375,10 +7405,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._contact_compliance:
             # Reject unsupported state before any stage can launch work.
             _contact_compliance.validate_step(self)
-            # The compliant contact law is validated on unreduced contacts only.
-            self._require_unreduced_contacts(
-                contacts, supports_body_pair_reduced_contacts=False, configuration="contact_compliance=True"
-            )
         self.validate_observables(observables, contacts)
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
             raise ValueError(
@@ -7442,10 +7468,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 # Captured steps defer errors to the device; eager steps raise during preparation.
                 self._device_torsion.deferred_errors = wp.get_stream(self.model.device).is_capturing
                 self._device_torsion.begin_step(state_in, state_out)
-        if self._last_step_dt is not None and abs(self._last_step_dt - dt) > 1.0e-8:
-            # The augmented mass matrix depends on dt through the implicit drive terms.
-            self._force_mass_update = True
-        self._last_step_dt = dt
 
         model = self.model
         if control is None:
@@ -7547,7 +7569,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     device=model.device,
                 )
                 parent_wrench_prescale = self._parent_wrench_prescale
-        self._stage1_crba(state_aug)
+        self._stage1_crba(state_aug, dt)
 
         # Stage 2: factor the augmented mass matrix of every articulation group.
         self._profile_stage("factor")
@@ -9016,13 +9038,15 @@ class SolverSteel(SolverBase, CouplingInterface):
         external body forces), :attr:`~newton.Control.joint_f`, passive joint springs and damping and the
         explicit part ``u0`` of each drive, clamped to :attr:`~newton.Model.joint_effort_limit`
         (an actuator-only clamp, as MuJoCo's ``actuatorfrcrange`` and PhysX's drive
-        ``maxForce``). The implicit part ``K = dt * kd + dt^2 * ke`` is stored in
+        ``maxForce``). The implicit drive part plus ``dt * max(joint_damping, 0)`` is stored in
         ``aug_row_K`` and added to the mass-matrix diagonal by :meth:`_stage1_crba`. With
-        ``drive_mode="rows"`` drives contribute nothing here; their rows are solved
-        with the constraints.
+        ``drive_mode="rows"`` only passive damping contributes to this diagonal; drive rows are solved
+        with the constraints. Passive damping uses ``dynamics_qd``, after velocity-limit
+        prescaling; actuator drives retain their input-state velocity.
         """
         model = self.model
         body_f = state_in.body_f if state_in.body_count else None
+        dynamics_qd = self._qd_work if self._enable_joint_velocity_limits else state_in.joint_qd
         state_aug._body_ft_s.zero_()
         common_inputs = [
             model.articulation_start,
@@ -9038,7 +9062,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             model.joint_dof_dim,
             control.joint_f,
             state_in.joint_q,
-            state_in.joint_qd,
+            dynamics_qd,
             self._passive_spring_stiffness,
             self._passive_spring_rest_q,
             self._passive_joint_damping,
@@ -9052,7 +9076,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         ]
         if self._tree_plan is not None:
             self._launch_tree_tau(tau_inputs, state_aug)
-            if self._drive_mode == "augmented" and self._articulation_max_dofs > 0:
+            if self._articulation_max_dofs > 0:
                 wp.launch(
                     eval_augmented_drives,
                     dim=model.articulation_count,
@@ -9066,6 +9090,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.joint_dof_dim,
                         state_in.joint_q,
                         state_in.joint_qd,
+                        self._passive_joint_damping,
+                        self._drive_mode == "augmented",
                         model.joint_target_ke,
                         model.joint_target_kd,
                         control.joint_target_q,
@@ -9080,7 +9106,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     block_dim=self._serial_kernel_block_dim,
                     device=model.device,
                 )
-        elif self._drive_mode == "augmented" and self._articulation_max_dofs > 0:
+        elif self._articulation_max_dofs > 0:
             wp.launch(
                 eval_rigid_tau_and_augmented_drives,
                 dim=model.articulation_count,
@@ -9088,6 +9114,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     *common_inputs,
                     self._articulation_H_rows,
                     *tau_inputs,
+                    state_in.joint_qd,
+                    self._drive_mode == "augmented",
                     model.joint_target_ke,
                     model.joint_target_kd,
                     control.joint_target_q,
@@ -9167,7 +9195,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=self.model.device,
             )
 
-    def _stage1_crba(self, state_aug: State):
+    def _stage1_crba(self, state_aug: State, dt: float):
         """Build the joint-space mass matrix of articulations due for a refresh and add drive terms."""
         model = self.model
         global_flag = 1 if ((self._step % self._update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
@@ -9175,8 +9203,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         wp.launch(
             build_mass_update_mask,
             dim=model.articulation_count,
-            inputs=[global_flag, self._mass_update_requested, self._dynamics_art_active],
-            outputs=[self._mass_update_mask],
+            inputs=[global_flag, dt, self._mass_update_requested, self._dynamics_art_active],
+            outputs=[self._mass_update_mask, self._mass_factor_dt],
             device=model.device,
         )
         if not global_flag:
@@ -9271,8 +9299,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
                 block_dim=128,
             )
-            if self._drive_mode != "augmented":
-                continue
             wp.launch(
                 apply_augmented_mass_diagonal_grouped,
                 dim=n_arts,
@@ -10414,6 +10440,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._sparse_diagonal_row_dof.fill_(-1)
 
         if contacts is not None and contacts.rigid_contact_max > 0:
+            recovery = contacts._mesh_recovery_contacts
+            recovery_phi = self._contact_recovery_phi if recovery is not None else None
             contact_build_threads = min(contacts.rigid_contact_max, _CONTACT_BUILD_THREAD_CAP)
             contact_geometry = [
                 contacts.rigid_contact_count,
@@ -10426,6 +10454,21 @@ class SolverSteel(SolverBase, CouplingInterface):
                 contacts.rigid_contact_margin0,
                 contacts.rigid_contact_margin1,
             ]
+            if recovery is not None:
+                wp.launch(
+                    prepare_contact_recovery,
+                    dim=contact_build_threads,
+                    inputs=[
+                        *contact_geometry,
+                        model.shape_body,
+                        state_in.body_q,
+                        recovery,
+                        contacts.contact_generation,
+                        self._baumgarte,
+                    ],
+                    outputs=[recovery_phi],
+                    device=model.device,
+                )
             if self._friction_anchors_enabled:
                 self._friction_patches.build(
                     model,
@@ -10436,6 +10479,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     contact_gap_limit=self._contact_gap_limit,
                     friction_gap_limit=self._friction_gap,
                     frozen_bodies=frozen_bodies,
+                    recovery_phi=recovery_phi,
                     dt=dt,
                     angular_mu=(self._free_rigid_mu_torsional, self._free_rigid_mu_rolling, self._free_rigid_route_body)
                     if self._free_rigid_angular_rows
@@ -10479,6 +10523,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     int(self._ordered_rows),
                     self._contact_torsion_shape_radius if self._propagation_torsion_rows else self._no_torsion_radius,
                     int(self._propagation_torsion_rows),
+                    recovery_phi,
                 ],
                 outputs=[
                     self._contact_world,
@@ -10527,6 +10572,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._rebound_velocity_threshold,
                     self._friction_combine_id,
                     self._restitution_combine_id,
+                    recovery_phi,
                 ],
                 outputs=[
                     self._row_type,
@@ -10652,7 +10698,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     )
 
             if self._propagation_active:
-                self._propagation_build_rows(state_in, state_aug, contacts, contact_build_threads)
+                self._propagation_build_rows(state_in, state_aug, contacts, contact_build_threads, recovery_phi)
                 if self._contact_warmstart:
                     self._gather_warmstart(contacts, route=2, dt=dt)
 
@@ -10684,6 +10730,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._rebound_velocity_threshold,
                         self._friction_combine_id,
                         self._restitution_combine_id,
+                        recovery_phi,
                     ],
                     outputs=[
                         self._mf_body_a,
@@ -11868,7 +11915,12 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_body_seen.zero_()
 
     def _propagation_build_rows(
-        self, state_in: State, state_aug: State, contacts: Contacts, contact_build_threads: int
+        self,
+        state_in: State,
+        state_aug: State,
+        contacts: Contacts,
+        contact_build_threads: int,
+        recovery_phi: wp.array[float] | None,
     ):
         """Fill the propagation rows of the allocated contacts and count them per world."""
         model = self.model
@@ -11973,6 +12025,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._rebound_velocity_threshold,
                 self._friction_combine_id,
                 self._restitution_combine_id,
+                recovery_phi,
             ],
             outputs=[
                 self._propagation_body_a,

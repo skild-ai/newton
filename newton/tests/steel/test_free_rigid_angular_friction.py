@@ -1651,8 +1651,9 @@ def test_linear_row_builder_leaves_the_angular_rows(test, device):
             0,
             0,
             0.0,
-            0,
-            0,
+            0,  # friction_combine
+            0,  # restitution_combine
+            None,  # recovery_phi
         ],
         outputs=outputs,
         device=device,
