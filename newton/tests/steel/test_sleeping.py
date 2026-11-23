@@ -1538,7 +1538,7 @@ class TestSteelSleepingProduction(unittest.TestCase):
 
 
 def test_replicated_stacks_sleep(test, device):
-    """Let resting stacks in 16 worlds fall asleep with the default thresholds and either contact order."""
+    """Let resting stacks in 16 worlds fall asleep with the deterministic contact order, or a larger angular threshold."""
     tower = newton.ModelBuilder()
     for k in range(4):
         for i in range(5):
@@ -1547,11 +1547,11 @@ def test_replicated_stacks_sleep(test, device):
     builder = newton.ModelBuilder()
     builder.add_ground_plane()
     builder.replicate(tower, 16, spacing=(2.0, 2.0, 0.0))
-    for deterministic in (False, True):
-        with test.subTest(deterministic=deterministic):
+    for deterministic, options in ((True, {}), (False, {"sleep_angular_threshold": 0.3})):
+        with test.subTest(deterministic=deterministic, **options):
             model = builder.finalize(device=device)
             pipeline = newton.CollisionPipeline(model, deterministic=deterministic)
-            solver = SolverSteel(model, enable_sleeping=True)
+            solver = SolverSteel(model, enable_sleeping=True, **options)
             observables = solver.observables({SolverSteel.ObservableKind.BODY_AWAKE})
             contacts = pipeline.contacts()
             states, control = [model.state(), model.state()], model.control()
@@ -1560,6 +1560,28 @@ def test_replicated_stacks_sleep(test, device):
                 solver.step(states[0], states[1], control, contacts, 1.0 / 240.0, observables=observables)
                 states.reverse()
             test.assertEqual(int(observables.body_awake.numpy().sum()), 0)
+
+
+def test_default_threshold_keeps_a_slow_spin_awake(test, device):
+    """Keep a supported ball spinning at 0.22 rad/s awake with the default thresholds."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
+    builder.add_shape_sphere(body, radius=0.05)
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model)
+    solver = SolverSteel(model, enable_sleeping=True)
+    observables = solver.observables({SolverSteel.ObservableKind.BODY_AWAKE})
+    contacts = pipeline.contacts()
+    states, control = [model.state(), model.state()], model.control()
+    states[0].joint_qd.assign(np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.22], dtype=np.float32))
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    for _ in range(240):
+        pipeline.collide(states[0], contacts)
+        solver.step(states[0], states[1], control, contacts, 1.0 / 240.0, observables=observables)
+        states.reverse()
+    test.assertEqual(int(observables.body_awake.numpy()[body]), 1)
+    test.assertGreater(float(states[0].body_qd.numpy()[body, 5]), 0.15)
 
 
 for _name in (
@@ -1587,6 +1609,7 @@ for _name in (
     "test_mimic_articulation_stays_awake",
     "test_stiffness_without_a_spring_lets_articulations_sleep",
     "test_replicated_stacks_sleep",
+    "test_default_threshold_keeps_a_slow_spin_awake",
 ):
     add_function_test(TestSteelSleepingProduction, _name, globals()[_name], devices=devices)
 

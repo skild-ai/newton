@@ -377,7 +377,11 @@ repository examples spend tuning effort, not a shared solver API.
        of a resting stack can keep it awake; a deterministic contact order
        (``CollisionPipeline(deterministic=True)``) may reduce that motion, and
        when angular motion is the limiting condition a larger
-       ``sleep_angular_threshold`` lets islands sleep with more residual motion. ``articulated_contact_response``
+       ``sleep_angular_threshold``, such as 0.3 rad/s, lets islands sleep with
+       more residual motion. It also puts to sleep bodies that genuinely turn
+       slower than the threshold, such as a slowly spinning ball or a box
+       turning on a slippery floor, so raise it only where such motion does not
+       matter. ``articulated_contact_response``
        selects how contacts of articulated bodies are solved: ``"immediate"`` rows of
        the generalized coordinates, or the ``"propagation"`` response,
        which solves them as body-space rows and propagates their impulses through each
