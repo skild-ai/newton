@@ -20,9 +20,15 @@ from ._src.sensors.sensor_imu import (
     SensorIMU,
 )
 
+# Tiled camera sensors
+from ._src.sensors.sensor_tiled_camera import (
+    SensorTiledCamera,
+)
+
 __all__ = [
     "SensorCamera",
     "SensorContact",
     "SensorFrameTransform",
     "SensorIMU",
+    "SensorTiledCamera",
 ]
