@@ -928,6 +928,9 @@ def test_unsupported_combinations_raise(test, device):
                 SolverSteel(model, friction_mode=mode, friction_anchor_beta=0.0, contact_compliance=True)
             with test.assertRaisesRegex(NotImplementedError, "friction_mode"):
                 SolverSteel(model, friction_mode=mode, articulated_contact_response="propagation")
+            if mode != "coulomb_newton":
+                with test.assertRaisesRegex(ValueError, "contact_warmstart"):
+                    SolverSteel(model, friction_mode=mode, friction_anchor_beta=0.0, contact_warmstart=True)
 
 
 def test_sparse_factors_require_the_current_mode(test, device):
@@ -1211,6 +1214,96 @@ def test_bisection_keeps_a_jammed_contact_near_the_frictionless_load(test, devic
                     test.assertLessEqual(float(np.linalg.norm(tangent)), block[9] * normal * (1.0 + 1.0e-6))
 
 
+def _one_dof_contact_force(model, mode, joint_f=None, steps=120, **solver_kwargs):
+    """Step ``model`` and return its reported contact force [N], averaged over the last quarter of the steps."""
+    solver = SolverSteel(model, friction_mode=mode, friction_anchor_beta=0.0, **solver_kwargs)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    observables = solver.observables({newton.solvers.SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    control = model.control()
+    if joint_f is not None:
+        control.joint_f.fill_(joint_f)
+    forces = []
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, DT, observables=observables)
+        state_0, state_1 = state_1, state_0
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        forces.append(observables.contact_f.numpy()[:count, :3].sum(axis=0))
+    return np.mean(forces[-steps // 4 :], axis=0)
+
+
+def _hinged_rod(device, mu, interference, yaw):
+    """A link on a revolute joint, pivot 0.3 m up, whose sphere tip touches the ground 0.1 m ahead.
+
+    The joint axis is +Y yawed by ``yaw`` about +Z. Statics give ``0.1 N + 0.3 T = 0.1 m g``, so friction locks
+    the rod for ``mu >= 1/3``.
+    """
+    builder = newton.ModelBuilder()
+    builder.default_shape_cfg.mu = mu
+    builder.add_ground_plane()
+    pivot = wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), yaw))
+    link = builder.add_link(xform=pivot)
+    radius = 0.02
+    tip = wp.transform(wp.vec3(0.1, 0.0, radius - 0.3 - interference), wp.quat_identity())
+    builder.add_shape_sphere(link, xform=tip, radius=radius)
+    builder.add_articulation([builder.add_joint_revolute(-1, link, axis=newton.Axis.Y, parent_xform=pivot)])
+    return builder.finalize(device=device)
+
+
+def test_bisection_bounds_the_normal_force_on_a_hinged_rod(test, device):
+    """Keep the reported forces of a one-DoF link near its frictionless load where friction locks it.
+
+    The rod's tangent block has rank one, and its coupled sticking solution leaves the contact approaching at
+    every load: the search must not raise the load toward the stop tolerance, and the reported friction must
+    balance the rod's statics.
+    """
+    for yaw in (0.0, 1.0):
+        locked = _hinged_rod(device, mu=1.0, interference=0.002, yaw=yaw)
+        weight = float(locked.body_mass.numpy()[0]) * G
+        reference = abs(_one_dof_contact_force(locked, "fixed_normal")[2]) / weight
+        test.assertGreater(reference, 100.0)
+        resting = _hinged_rod(device, mu=0.5, interference=0.0, yaw=yaw)
+        for mode in ("bisection", "bisection_desaxce"):
+            for case, model in (("locked with interference", locked), ("resting", resting)):
+                with test.subTest(yaw=yaw, mode=mode, case=case):
+                    force = _one_dof_contact_force(model, mode) / weight
+                    normal, friction = abs(force[2]), float(np.linalg.norm(force[:2]))
+                    if model is locked:
+                        test.assertAlmostEqual(normal, reference, delta=0.05 * reference)
+                    else:
+                        test.assertAlmostEqual(normal, 1.0, delta=0.05)
+                    test.assertAlmostEqual(friction, abs(normal - 1.0) / 3.0, delta=0.01 * normal)
+
+
+def test_bisection_reports_no_friction_without_tangential_mobility(test, device):
+    """Report no friction on a slider pressed square onto a wall, on the dense rows and the colored sweep.
+
+    The slider's axis is yawed off the world axes so that rounding leaves its tangent block a tiny response.
+    """
+    yaw = 0.3
+    normal = np.array([np.cos(yaw), np.sin(yaw), 0.0])
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.default_shape_cfg.mu = 0.5
+    rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), yaw)
+    radius, half_thickness = 0.05, 0.05
+    wall = (radius + half_thickness) * normal + np.array([0.0, 0.0, 0.3])
+    builder.add_shape_box(-1, xform=wp.transform(wp.vec3(*wall), rotation), hx=half_thickness, hy=0.5, hz=0.5)
+    frame = wp.transform(wp.vec3(0.0, 0.0, 0.3), rotation)
+    link = builder.add_link(xform=frame)
+    builder.add_shape_sphere(link, radius=radius)
+    builder.add_articulation([builder.add_joint_prismatic(-1, link, axis=newton.Axis.X, parent_xform=frame)])
+    model = builder.finalize(device=device)
+    for response in ("immediate", "colored"):
+        with test.subTest(response=response):
+            force = _one_dof_contact_force(model, "bisection", joint_f=1.0, **_response_options(response))
+            pressed = float(force @ normal)
+            test.assertAlmostEqual(abs(pressed), 1.0, delta=1.0e-3)
+            test.assertLess(float(np.linalg.norm(force - pressed * normal)), 1.0e-3)
+
+
 class TestSteelFrictionMode(unittest.TestCase):
     pass
 
@@ -1229,6 +1322,8 @@ for _fn in (
     test_bisection_solves_the_tangent_pair_on_the_disk,
     test_bisection_leaves_an_ill_conditioned_sticking_contact_at_rest,
     test_bisection_keeps_a_jammed_contact_near_the_frictionless_load,
+    test_bisection_bounds_the_normal_force_on_a_hinged_rod,
+    test_bisection_reports_no_friction_without_tangential_mobility,
 ):
     add_function_test(TestSteelFrictionMode, _fn.__name__, _fn, devices=cuda_devices)
 

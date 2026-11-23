@@ -259,6 +259,13 @@ _COUPLED_CONTACT_HEAD = """
             new_lambda_t2 = pair.y * scale;
         };
         const float tangent_trace = G_t1t1 + G_t2t2;
+        // A contact with no tangential mobility carries no friction.
+        const bool tangent_free = tangent_trace <= 1.0e-6f * G_nn;
+        if (tangent_free) {
+            new_lambda_t1 = 0.0f;
+            new_lambda_t2 = 0.0f;
+            return;
+        }
         if (G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2 <= 1.0e-6f * tangent_trace * tangent_trace) {
             fixed_normal_pair();
             return;
@@ -284,7 +291,7 @@ _COUPLED_CONTACT_BISECTION = """
         const float minor_n2 = G_nt1 * G_t1t2 - G_nt2 * G_t1t1;
         const float det_block = G_nn * minor_nn + G_nt1 * minor_n1 + G_nt2 * minor_n2;
         bool sticks = false;
-        if (minor_nn > 0.0f && det_block > 1.0e-6f * G_nn * minor_nn) {
+        if (!tangent_free && minor_nn > 0.0f && det_block > 1.0e-6f * G_nn * minor_nn) {
             const float inv_det = 1.0f / det_block;
             const float minor_11 = G_nn * G_t2t2 - G_nt2 * G_nt2;
             const float minor_12 = G_nt1 * G_nt2 - G_nn * G_t1t2;
@@ -319,12 +326,26 @@ _COUPLED_CONTACT_BISECTION = """
             float pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy;
             friction_pair_setup(
                 G_t1t1, G_t1t2, G_t2t2, pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy);
+            // A rank-one tangent block (a one-DoF link) moves only along its axis; the pair is the clamped axis
+            // impulse, since the disk solve would spend the budget on its rounding-level other direction.
+            const bool rank_one = !tangent_free && pair_smallest <= 1.0e-6f * pair_largest;
+            const float axis_nt = pair_vx * G_nt1 + pair_vy * G_nt2;
+            const float axis_tt = pair_scale * pair_largest;
             const auto probe = [&](float lambda_n, float& tangent1, float& tangent2) {
                 const float d_n = lambda_n - old_lambda_n;
-                const float radius = fmaxf(mu * lambda_n, 0.0f);
-                const float2 pair = friction_pair_solve(
-                    pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy, u_t1 + G_nt1 * d_n,
-                    u_t2 + G_nt2 * d_n, old_lambda_t1, old_lambda_t2, radius, 1.0f);
+                const float radius = tangent_free ? 0.0f : fmaxf(mu * lambda_n, 0.0f);
+                const float r_t1 = u_t1 + G_nt1 * d_n, r_t2 = u_t2 + G_nt2 * d_n;
+                float2 pair;
+                if (rank_one) {
+                    const float axis = pair_vx * (old_lambda_t1 - r_t1 / axis_tt)
+                        + pair_vy * (old_lambda_t2 - r_t2 / axis_tt);
+                    const float clamped = fminf(fmaxf(axis, -radius), radius);
+                    pair = make_float2(pair_vx * clamped, pair_vy * clamped);
+                } else {
+                    pair = friction_pair_solve(
+                        pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy, r_t1, r_t2, old_lambda_t1,
+                        old_lambda_t2, radius, 1.0f);
+                }
                 const float mag = sqrtf(pair.x * pair.x + pair.y * pair.y);
                 const float sc = mag > radius ? radius / mag : 1.0f;
                 tangent1 = pair.x * sc;
@@ -341,9 +362,12 @@ _COUPLED_CONTACT_BISECTION = """
             bool bracketed = false, last_probe = false;
             int last_side = 0;
             float x = fmaxf(old_lambda_n, -f_lo / G_nn);
-            // A singular block whose coupled solution sticks at every load has no root; stop once it sticks.
-            const bool jammed = minor_nn > 0.0f && det_block <= 1.0e-6f * G_nn * minor_nn
-                && minor_n1 * minor_n1 + minor_n2 * minor_n2 <= mu * mu * minor_nn * minor_nn;
+            // A singular block that sticks at every large load has no root above a probe that sticks and leaves
+            // the contact approaching. A rank-one tangent block is tested on its axis.
+            const bool jammed = !tangent_free && (rank_one
+                ? fabsf(axis_nt) <= mu * axis_tt && G_nn * axis_tt - axis_nt * axis_nt <= 1.0e-4f * G_nn * axis_tt
+                : minor_nn > 0.0f && det_block <= 1.0e-6f * G_nn * minor_nn
+                    && minor_n1 * minor_n1 + minor_n2 * minor_n2 <= mu * mu * minor_nn * minor_nn);
             for (int _it = 0; _it < 64; _it++) {
                 const float f_x = probe(x, new_lambda_t1, new_lambda_t2);
                 new_lambda_n = x;
