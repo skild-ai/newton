@@ -10116,6 +10116,7 @@ class TestMuJoCoSolverUpdateFlags(unittest.TestCase):
             # Initial state; MuJoCo reads State.body_qd.
             "body_qd",
             # Not supported by MuJoCo.
+            "body_disable_gravity",
             "joint_enabled",
             "joint_velocity_limit",
             "shape_is_solid",

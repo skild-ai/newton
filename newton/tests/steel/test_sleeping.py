@@ -21,7 +21,12 @@ from newton._src.solvers.steel.friction_patches import _FLOOD_MIN_CONTACTS
 from newton._src.solvers.steel.sleeping import _SleepState
 from newton.solvers import SolverBase, SolverSteel
 from newton.tests.steel._fixtures import PROFILE, _advance, _articulations, _parent_wrench_scene
-from newton.tests.unittest_utils import add_function_test, capture_with_cuda_driver, get_cuda_test_devices
+from newton.tests.unittest_utils import (
+    add_function_test,
+    capture_with_cuda_driver,
+    get_cuda_test_devices,
+    get_test_devices,
+)
 
 
 def _response(name: str) -> dict:
@@ -1095,6 +1100,17 @@ def test_property_notification_wakes_only_changed_islands(test, device):
     np.testing.assert_array_equal(solver._sleeping.art_awake.numpy(), [1, 0])
 
 
+def test_gravity_exclusion_edit_wakes_sleeping_bodies(test, device):
+    """Wake sleeping bodies whose gravity exclusion changed, notified with the attribute's declared flags."""
+    model, pipeline, solver, states, control = _scene(device)
+    _advance_boxes(pipeline, solver, states, control, 120)
+    np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0])
+    model.body_disable_gravity.fill_(True)
+    solver.notify_model_changed(model.get_attribute_update_flags("body_disable_gravity"))
+    _advance_boxes(pipeline, solver, states, control, 1)
+    np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 1])
+
+
 def test_frozen_patch_carry_matches_rebuild(test, device):
     """Match rebuilt friction patches by carrying frozen ones through sleep, wake and resettle."""
     _check_carry(test, device, tiles=False)
@@ -1564,6 +1580,13 @@ for _name in (
     "test_stiffness_without_a_spring_lets_articulations_sleep",
 ):
     add_function_test(TestSteelSleepingProduction, _name, globals()[_name], devices=devices)
+
+add_function_test(
+    TestSteelSleepingProduction,
+    "test_gravity_exclusion_edit_wakes_sleeping_bodies",
+    test_gravity_exclusion_edit_wakes_sleeping_bodies,
+    devices=get_test_devices(),
+)
 
 
 def test_fixed_table_does_not_merge_dynamic_islands(test, device):
