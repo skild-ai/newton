@@ -12,6 +12,7 @@ from typing import Any
 from ...geometry import ShapeFlags
 from ...sim import JointType, ModelBuilder
 from ._authoring import _ensure_mujoco_attributes, _prepare_custom_frequency_row, _tristate, _vector
+from .enums import _TendonType, _TendonWrapType
 
 
 @dataclass(frozen=True)
@@ -165,7 +166,7 @@ def add_tendon_fixed(
     joint_start = builder._custom_frequency_counts.get("mujoco:tendon_joint", 0)
     values = _tendon_values(
         builder,
-        tendon_type=0,
+        tendon_type=_TendonType.FIXED,
         joint_adr=joint_start,
         joint_num=len(entries),
         wrap_adr=0,
@@ -239,17 +240,17 @@ def add_tendon_spatial(
     for entry in path:
         if isinstance(entry, TendonWrapSite):
             _validate_shape(builder, entry.site, site=True, name="site")
-            entries.append((0, int(entry.site), -1, 0.0))
+            entries.append((int(_TendonWrapType.SITE), int(entry.site), -1, 0.0))
         elif isinstance(entry, TendonWrapGeom):
             _validate_shape(builder, entry.geom, site=False, name="geom")
             sidesite = -1 if entry.sidesite is None else int(entry.sidesite)
             if sidesite >= 0:
                 _validate_shape(builder, sidesite, site=True, name="sidesite")
-            entries.append((1, int(entry.geom), sidesite, 0.0))
+            entries.append((int(_TendonWrapType.GEOM), int(entry.geom), sidesite, 0.0))
         elif isinstance(entry, TendonWrapPulley):
             if entry.divisor <= 0.0:
                 raise ValueError("A tendon pulley divisor must be positive.")
-            entries.append((2, -1, -1, float(entry.divisor)))
+            entries.append((int(_TendonWrapType.PULLEY), -1, -1, float(entry.divisor)))
         else:
             raise TypeError(f"Unsupported spatial tendon path entry {type(entry).__name__}.")
     if not entries:
@@ -258,7 +259,7 @@ def add_tendon_spatial(
     wrap_start = builder._custom_frequency_counts.get("mujoco:tendon_wrap", 0)
     values = _tendon_values(
         builder,
-        tendon_type=1,
+        tendon_type=_TendonType.SPATIAL,
         joint_adr=0,
         joint_num=0,
         wrap_adr=wrap_start,

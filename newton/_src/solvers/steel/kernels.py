@@ -8844,6 +8844,46 @@ def count_propagation_joint_split(
                 joint = body_to_joint[parent]
 
 
+@wp.func
+def _dense_propagation_row_response(
+    world: int,
+    i: int,
+    body: int,
+    propagation_J: wp.array3d[float],
+    propagation_body_response: wp.array3d[float],
+    propagation_body_response_split: wp.array3d[float],
+    propagation_body_response_dense: wp.array3d[float],
+    propagation_MiJt: wp.array3d[float],
+) -> wp.vec2:
+    """Write one side's split response of a row on a link whose mass matrix has off-tree terms.
+
+    The tree responses miss those terms. The split response is scaled by the ratio of the link's dense-factor
+    response to its tree response along the row. Returns the side's split and exact diagonal contributions.
+    """
+    d_tree = float(0.0)
+    d_split = float(0.0)
+    d_dense = float(0.0)
+    for r in range(6):
+        tree = float(0.0)
+        split = float(0.0)
+        dense = float(0.0)
+        for c in range(6):
+            tree += propagation_body_response[body, r, c] * propagation_J[world, i, c]
+            split += propagation_body_response_split[body, r, c] * propagation_J[world, i, c]
+            dense += propagation_body_response_dense[body, r, c] * propagation_J[world, i, c]
+        propagation_MiJt[world, i, r] = split
+        d_tree += propagation_J[world, i, r] * tree
+        d_split += propagation_J[world, i, r] * split
+        d_dense += propagation_J[world, i, r] * dense
+    # The extra terms only add inertia, so the ratio is at most one.
+    if d_tree > 0.0 and d_dense < d_tree:
+        ratio = wp.max(d_dense / d_tree, 1.0e-4)
+        for r in range(6):
+            propagation_MiJt[world, i, r] = propagation_MiJt[world, i, r] * ratio
+        return wp.vec2(d_split * ratio, d_dense)
+    return wp.vec2(d_split, d_tree)
+
+
 @wp.kernel
 def compute_propagation_effective_mass_and_rhs(
     propagation_constraint_count: wp.array[int],
@@ -8853,6 +8893,9 @@ def compute_propagation_effective_mass_and_rhs(
     propagation_J_b: wp.array3d[float],
     propagation_body_response: wp.array3d[float],
     propagation_body_response_split: wp.array3d[float],
+    body_to_articulation: wp.array[int],
+    dense_response_art: wp.array[int],
+    propagation_body_response_dense: wp.array3d[float],
     propagation_phi: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
     propagation_target_velocity: wp.array2d[float],
@@ -8878,7 +8921,9 @@ def compute_propagation_effective_mass_and_rhs(
     ``M^-1`` is each touched body's own 6x6 response, so a row between two links of one
     articulation misses their cross term here; see
     :func:`refine_same_articulation_propagation_rows`. ``M^-1 J^T`` and the step use the split
-    response (mass splitting), the regularization fixed point the exact one. The bias follows the free-body
+    response (mass splitting), the regularization fixed point the exact one. A link of an articulation in
+    ``dense_response_art`` (tendon mass terms) takes its exact response from
+    ``propagation_body_response_dense`` and scales its split response to match. The bias follows the free-body
     rows: penetrating contacts get the Baumgarte term, bounded by the bodies' maximum
     depenetration velocity, and separated contacts may close ``contact_speculative_scale``
     times their gap during the step. An impacting contact whose rebound fires, judged from
@@ -8899,7 +8944,21 @@ def compute_propagation_effective_mass_and_rhs(
     d_unsplit = pgs_cfm
     # Mass splitting: a sweep sees only each body's own response, so the step uses the split
     # response, which scales each joint's share of the mobility by the row-bearing bodies sharing it.
-    if ba >= 0:
+    dense_a = False
+    dense_b = False
+    if dense_response_art.shape[0] > 0:
+        if ba >= 0:
+            dense_a = dense_response_art[body_to_articulation[ba]] != 0
+        if bb >= 0:
+            dense_b = dense_response_art[body_to_articulation[bb]] != 0
+    if dense_a:
+        side_a = _dense_propagation_row_response(
+            world, i, ba, propagation_J_a, propagation_body_response, propagation_body_response_split,
+            propagation_body_response_dense, propagation_MiJt_a,
+        )  # fmt: skip
+        d += side_a[0]
+        d_unsplit += side_a[1]
+    elif ba >= 0:
         for r in range(6):
             exact = float(0.0)
             value = float(0.0)
@@ -8909,7 +8968,14 @@ def compute_propagation_effective_mass_and_rhs(
             d_unsplit += propagation_J_a[world, i, r] * exact
             propagation_MiJt_a[world, i, r] = value
             d += propagation_J_a[world, i, r] * value
-    if bb >= 0:
+    if dense_b:
+        side_b = _dense_propagation_row_response(
+            world, i, bb, propagation_J_b, propagation_body_response, propagation_body_response_split,
+            propagation_body_response_dense, propagation_MiJt_b,
+        )  # fmt: skip
+        d += side_b[0]
+        d_unsplit += side_b[1]
+    elif bb >= 0:
         for r in range(6):
             exact = float(0.0)
             value = float(0.0)

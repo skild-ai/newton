@@ -55,4 +55,24 @@ class _ActuatorGainType(IntEnum):
     USER = 6
 
 
+# Encodings of the ``mujoco:tendon_type`` and ``mujoco:tendon_wrap_type`` attributes (MuJoCo has no tendon-type enum;
+# wrap types are Newton's own numbering). Shared by the importers, SolverMuJoCo and SolverSteel.
+class _TendonType(IntEnum):
+    FIXED = 0
+    SPATIAL = 1
+
+
+class _TendonWrapType(IntEnum):
+    SITE = 0
+    GEOM = 1
+    PULLEY = 2
+
+
+# MuJoCo's ``limited`` / ``ctrllimited`` / ``forcelimited`` tri-state, where AUTO defers to ``autolimits``.
+class _LimitedType(IntEnum):
+    FALSE = 0
+    TRUE = 1
+    AUTO = 2
+
+
 __all__ = ["EqType"]
