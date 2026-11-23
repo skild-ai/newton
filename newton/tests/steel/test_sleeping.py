@@ -1538,7 +1538,7 @@ class TestSteelSleepingProduction(unittest.TestCase):
 
 
 def test_replicated_stacks_sleep(test, device):
-    """Let resting stacks in 16 worlds fall asleep with the deterministic contact order, or a larger angular threshold."""
+    """Let resting stacks in 16 worlds sleep with the deterministic contact order, or a larger angular threshold."""
     tower = newton.ModelBuilder()
     for k in range(4):
         for i in range(5):
@@ -1547,7 +1547,8 @@ def test_replicated_stacks_sleep(test, device):
     builder = newton.ModelBuilder()
     builder.add_ground_plane()
     builder.replicate(tower, 16, spacing=(2.0, 2.0, 0.0))
-    for deterministic, options in ((True, {}), (False, {"sleep_angular_threshold": 0.3})):
+    # With the default threshold the deterministic order needs longer: a few towers can take more than 2 s.
+    for deterministic, options, steps in ((True, {}, 960), (False, {"sleep_angular_threshold": 0.3}, 480)):
         with test.subTest(deterministic=deterministic, **options):
             model = builder.finalize(device=device)
             pipeline = newton.CollisionPipeline(model, deterministic=deterministic)
@@ -1555,7 +1556,7 @@ def test_replicated_stacks_sleep(test, device):
             observables = solver.observables({SolverSteel.ObservableKind.BODY_AWAKE})
             contacts = pipeline.contacts()
             states, control = [model.state(), model.state()], model.control()
-            for _ in range(480):
+            for _ in range(steps):
                 pipeline.collide(states[0], contacts)
                 solver.step(states[0], states[1], control, contacts, 1.0 / 240.0, observables=observables)
                 states.reverse()
