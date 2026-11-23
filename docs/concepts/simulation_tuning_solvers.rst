@@ -103,10 +103,13 @@ Effort limits, target rates, armature, and friction
    ``"implicitfast"`` integrators of :class:`~newton.solvers.SolverMuJoCo`,
    can gain energy numerically when joint speeds are high relative to ``dt``,
    such as a freely swinging chain whose tip whips around. Scaling every link's
-   mass does not change this. A smaller ``dt`` reduces the error. Armature can
-   improve stability when it is large relative to the link inertia, with the
-   caveat above; validate it over the intended trajectory and duration. More
-   solver iterations do not address this unconstrained integration error.
+   mass by one factor leaves this error unchanged only when joint armature,
+   damping and drive gains scale with it; fixed values change relative to the
+   link inertia and so change the response. A smaller ``dt`` reduces the error.
+   Armature can improve stability when it is large relative to the link
+   inertia, with the caveat above; validate it over the intended trajectory and
+   duration. More solver iterations do not address this unconstrained
+   integration error.
 
 Collision frequency
    When the solver consumes contacts from :class:`~newton.CollisionPipeline`,
