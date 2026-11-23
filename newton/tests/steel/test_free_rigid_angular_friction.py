@@ -1775,12 +1775,48 @@ class TestFreeRigidAngularFrictionImport(unittest.TestCase):
         model.steel.condim.assign(np.where(model.shape_body.numpy() == hinged, 6, 3).astype(np.int32))
         self.assertFalse(SolverSteel(model)._free_rigid_angular_rows)
 
+    def test_noncolliding_condim_adds_no_angular_rows(self):
+        """Leave the rows off for a condim 6 geom on a free body that collides with nothing, which CPU accepts."""
+        model = _import_mjcf(
+            "<mujoco><worldbody>"
+            '<geom type="plane" size="1 1 0.1"/>'
+            f'<body pos="0 0 {_RADIUS}"><freejoint/><geom type="sphere" size="{_RADIUS}"/>'
+            f'<geom type="sphere" size="{_RADIUS}" condim="6" contype="0" conaffinity="0"/></body>'
+            "</worldbody></mujoco>"
+        )
+        np.testing.assert_array_equal(np.sort(model.steel.condim.numpy()), [3, 3, 6])
+        self.assertFalse(SolverSteel(model)._free_rigid_angular_rows)
+
+    def test_condim_in_a_world_without_free_bodies_adds_no_angular_rows(self):
+        """Leave the rows off for a condim 6 ground in a world without free bodies; on in the free body's world."""
+        for ground_world in (1, 0, -1):
+            with self.subTest(ground_world=ground_world):
+                builder = newton.ModelBuilder()
+                SolverSteel.register_custom_attributes(builder)
+                for world in (0, 1):
+                    builder.begin_world()
+                    if world == 0:
+                        body = builder.add_body(xform=wp.transform((0.0, 0.0, _RADIUS), wp.quat_identity()))
+                        builder.add_shape_sphere(body, radius=_RADIUS)
+                    if world == ground_world:
+                        builder.add_shape_box(-1, hx=1.0, hy=1.0, hz=0.1, custom_attributes={"steel:condim": 6})
+                    builder.end_world()
+                if ground_world == -1:
+                    builder.add_shape_box(-1, hx=1.0, hy=1.0, hz=0.1, custom_attributes={"steel:condim": 6})
+                model = builder.finalize(device="cpu")
+                if ground_world == 1:
+                    self.assertFalse(SolverSteel(model)._free_rigid_angular_rows)
+                else:
+                    with self.assertRaisesRegex(NotImplementedError, "steel:condim"):
+                        SolverSteel(model)
+
     def test_prescribed_free_body_condim_adds_no_angular_rows(self):
         """Leave the rows off for a condim 6 kinematic free body that the solver prescribes, and on for a dynamic one."""
         for kinematic in (True, False):
             with self.subTest(kinematic=kinematic):
                 builder = newton.ModelBuilder()
                 SolverSteel.register_custom_attributes(builder)
+                builder.add_ground_plane()
                 body = builder.add_body(is_kinematic=kinematic)
                 builder.add_shape_box(body, hx=0.2, hy=0.2, hz=0.1, custom_attributes={"steel:condim": 6})
                 link = builder.add_link()

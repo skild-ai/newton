@@ -15,6 +15,7 @@ against free bodies or static and kinematic geometry) receive them.
 import numpy as np
 import warp as wp
 
+from ...geometry.flags import ShapeFlags
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
@@ -44,11 +45,8 @@ def configure_free_rigid_angular_friction(solver, model, torsional: float | None
     # Kernel argument for a model without steel:condim; the gate kernel ignores it.
     solver._free_rigid_condim_placeholder = wp.zeros(1, dtype=wp.int32, device=model.device)
     routed = False
-    if values is not None:
-        shape_body = model.shape_body.numpy()
-        route = _free_route_body_mask(solver)
-        reachable = solver._has_free_rigid_bodies & ((shape_body < 0) | (route[np.maximum(shape_body, 0)] != 0))
-        routed = bool(np.any(values[reachable] >= 4))
+    if values is not None and solver._has_free_rigid_bodies:
+        routed = bool(np.any(values[_free_route_contact_shapes(solver)] >= 4))
     solver._free_rigid_angular_rows = bool(overridden or routed)
     if not solver._free_rigid_angular_rows:
         return
@@ -325,3 +323,30 @@ def _free_route_body_mask(solver) -> np.ndarray:
         safe = np.maximum(body_art, 0)
         route[: model.body_count] = (body_art < 0) | (response[safe] == 0) | (free[safe] != 0)
     return route
+
+
+def _free_route_contact_shapes(solver) -> np.ndarray:
+    """Mark the colliding shapes that can meet a free-body-route partner across a responding free body.
+
+    Collision groups other than 0 and filter pairs are ignored, so this may include shapes that never touch.
+    """
+    model = solver.model
+    shape_body, shape_world = model.shape_body.numpy(), model.shape_world.numpy()
+    body = np.maximum(shape_body, 0)
+    colliding = ((model.shape_flags.numpy() & int(ShapeFlags.COLLIDE_SHAPES)) != 0) & (
+        model.shape_collision_group.numpy() != 0
+    )
+    on_route = colliding & ((shape_body < 0) | (_free_route_body_mask(solver)[body] != 0))
+    responding = np.zeros(max(model.body_count, 1), dtype=bool)
+    responding[solver._model_plan.response_free_rigid_body_indices] = True
+    on_free = on_route & (shape_body >= 0) & responding[body]
+    # Per-world shape counts with the global (-1) world in slot 0; a global shape meets every world.
+    slot = shape_world + 1
+
+    def reachable_count(mask):
+        counts = np.bincount(slot[mask], minlength=model.world_count + 1)
+        return np.where(shape_world < 0, counts.sum(), counts[slot] + counts[0])
+
+    same_body = np.bincount(body[on_route & (shape_body >= 0)], minlength=len(responding))[body]
+    partners = np.where(on_free, reachable_count(on_route) - same_body, reachable_count(on_free))
+    return on_route & (partners > 0)

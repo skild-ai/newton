@@ -1816,9 +1816,11 @@ class SolverSteel(SolverBase, CouplingInterface):
           :attr:`~newton.Model.shape_material_mu_rolling` [m] to a rolling pair. A contact takes the
           larger coefficient of its two shapes, regardless of the other shape's condim. Only contacts
           between free bodies, and free bodies on static or kinematic geometry, read it, so a condim
-          above 3 on other shapes adds no rows. The MJCF importer reads the geom's ``condim`` and USD reads
-          ``mjc:condim``, the inputs of :class:`~newton.solvers.SolverMuJoCo`'s ``mujoco:condim``; an authored
-          USD ``newton:steel:condim`` takes precedence. Condim 1 imports as 3, since this attribute only adds
+          above 3 adds no rows on other shapes, on shapes without shape collision or in collision
+          group 0, or on shapes that no dynamic free body in their world or the global world can touch.
+          The MJCF importer reads the geom's ``condim`` and USD reads ``mjc:condim``, the inputs of
+          :class:`~newton.solvers.SolverMuJoCo`'s ``mujoco:condim``; an authored USD
+          ``newton:steel:condim`` takes precedence. Condim 1 imports as 3, since this attribute only adds
           angular rows and sliding friction follows ``mu``. The solvers still differ: condim 1 is frictionless
           in MuJoCo, and MuJoCo combines the two geoms' condim and friction before gating, while each shape's
           condim here gates its own coefficient. Under friction patches, contacts share a patch only if
