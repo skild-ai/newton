@@ -1092,12 +1092,10 @@ def spatial_cross_dual(a: wp.spatial_vector, b: wp.spatial_vector):
 
 
 @wp.func
-def compute_link_kinematics(
+def link_joint_motion(
     i: int,
     parent: int,
     child: int,
-    parent_v_s: wp.spatial_vector,
-    parent_a_s: wp.spatial_vector,
     origin: wp.vec3,
     joint_type: wp.array[int],
     joint_q_start: wp.array[int],
@@ -1111,9 +1109,11 @@ def compute_link_kinematics(
     joint_X_p: wp.array[wp.transform],
     # outputs
     joint_S_s: wp.array[wp.spatial_vector],
-    body_v_s: wp.array[wp.spatial_vector],
-    body_a_s: wp.array[wp.spatial_vector],
 ):
+    """Write joint ``i``'s motion subspace and return its joint twist and the apparent acceleration bias.
+
+    Needs only the poses of the joint's two bodies, so it runs for every joint in parallel once those exist.
+    """
     type = joint_type[i]
     q_start = joint_q_start[i]
     qd_start = joint_qd_start[i]
@@ -1165,6 +1165,49 @@ def compute_link_kinematics(
             joint_S_s,
         )
 
+    return v_j_s, c_app_s
+
+
+@wp.func
+def compute_link_kinematics(
+    i: int,
+    parent: int,
+    child: int,
+    parent_v_s: wp.spatial_vector,
+    parent_a_s: wp.spatial_vector,
+    origin: wp.vec3,
+    joint_type: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    body_q: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+    joint_X_p: wp.array[wp.transform],
+    # outputs
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_v_s: wp.array[wp.spatial_vector],
+    body_a_s: wp.array[wp.spatial_vector],
+):
+    v_j_s, c_app_s = link_joint_motion(
+        i,
+        parent,
+        child,
+        origin,
+        joint_type,
+        joint_q_start,
+        joint_qd_start,
+        joint_q,
+        joint_qd,
+        joint_axis,
+        joint_dof_dim,
+        body_q,
+        body_q_com,
+        joint_X_p,
+        joint_S_s,
+    )
     # body velocity, acceleration
     v_s = parent_v_s + v_j_s
     a_s = parent_a_s + spatial_cross(v_s, v_j_s) + c_app_s
@@ -10813,15 +10856,15 @@ def refine_same_articulation_propagation_rows_paths(
 
 @wp.func
 def _chain_B_apply(BR: wp.array2d[float], pos: int, x: wp.spatial_vector, transpose: int) -> wp.spatial_vector:
-    """``B x`` (or ``B^T x``) for the chain link at walk position ``pos`` (its row-major record in ``BR``)."""
+    """``B x`` (or ``B^T x``) for the chain link at walk position ``pos`` (row-major B leads its compact record)."""
     y = wp.spatial_vector()
     for r in range(6):
         v = float(0.0)
         for c in range(6):
             if transpose != 0:
-                v += BR[pos, c * 12 + r] * x[c]
+                v += BR[pos, c * 6 + r] * x[c]
             else:
-                v += BR[pos, r * 12 + c] * x[c]
+                v += BR[pos, r * 6 + c] * x[c]
         y[r] = v
     return y
 

@@ -464,6 +464,53 @@ add_function_test(
 )
 
 
+def test_propagation_contracted_chain(test, device):
+    """A chain with few contact-active links iterates on those links alone and ends where the full pass ends.
+
+    The clamp of a long rod is its only row, so its chain contracts to one active link; the contracted
+    iterations and the propagation of their summed impulses must match propagating every iteration.
+    """
+    from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415
+
+    for mode in ("serial", "colored"):
+        positions = {}
+        for contracted in (True, False):
+            builder = newton.ModelBuilder()
+            rod = newton.Rod.create_straight(
+                start=(0.0, 0.0, 0.5), direction=(1.0, 0.0, 0.0), length=0.8, segment_count=32, radius=0.01
+            )
+            bodies, _joints = builder.add_rod(
+                rod=rod, bend_stiffness=0.5, twist_stiffness=0.5, wrap_in_articulation=True
+            )
+            builder.body_flags[int(bodies[0])] = int(newton.BodyFlags.KINEMATIC)
+            tip = int(bodies[-1])
+            builder.add_joint_fixed(-1, tip, parent_xform=builder.body_q[tip])
+            model = builder.finalize(device=device)
+            with kernel_overrides({"rod_chain_contracted": contracted}):
+                solver = newton.solvers.SolverSteel(
+                    model, iterations=16, articulation_constraint_max=64, solve_mode=mode, **_PROPAGATION
+                )
+            test.assertEqual(solver._rod_contracted, contracted)
+            a, b, control = model.state(), model.state(), model.control()
+            for _ in range(60):
+                solver.step(a, b, control, None, 1.0 / 600.0)
+                a, b = b, a
+            if contracted:
+                counts = solver._rod_ctr_count.numpy()
+                test.assertTrue(np.any((counts > 0) & (4 * counts <= 32)), f"{mode}: no chain contracted")
+            positions[contracted] = a.body_q.numpy()[:, :3]
+        test.assertTrue(np.all(np.isfinite(positions[True])))
+        np.testing.assert_allclose(positions[True], positions[False], atol=1.0e-5, err_msg=mode)
+
+
+add_function_test(
+    TestSteelRod,
+    "test_propagation_contracted_chain",
+    test_propagation_contracted_chain,
+    devices=get_cuda_test_devices(),
+)
+
+
 def test_propagation_tree_dynamics(test, device):
     """Rod trees take their unconstrained velocity from the propagation factorization, as the dense solve does."""
     from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415

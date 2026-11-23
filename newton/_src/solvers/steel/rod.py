@@ -134,6 +134,7 @@ def _linearize(
     history: DahlHistory,
     tau: wp.array[float],
     blocks: wp.array[wp.spatial_matrix],
+    joint_blocks: wp.array[wp.spatial_matrix],
 ):
     r = wp.tid()
     joint = joints[r]
@@ -143,6 +144,8 @@ def _linearize(
             tau[qd_start[joint] + i] = 0.0
     if not enabled[joint]:
         blocks[r] = block
+        if owners[joint] >= 0:
+            joint_blocks[joint] = block
         return
     iq = q_start[joint]
     iv = qd_start[joint]
@@ -188,6 +191,9 @@ def _linearize(
     for i in range(6):
         tau[iv + i] += load[i]
     blocks[r] = block
+    # The factor reads tree rods' blocks by joint index (scatter_joint_blocks).
+    if owners[joint] >= 0:
+        joint_blocks[joint] = block
 
 
 @wp.kernel
@@ -588,19 +594,6 @@ def build_propagation_rod_loop_rows(
             propagation_impulses[world, slot] = 0.0
 
 
-@wp.kernel
-def _scatter_blocks(
-    joints: wp.array[int],
-    owners: wp.array[int],
-    blocks: wp.array[wp.spatial_matrix],
-    joint_blocks: wp.array[wp.spatial_matrix],
-):
-    r = wp.tid()
-    joint = joints[r]
-    if owners[joint] >= 0:
-        joint_blocks[joint] = blocks[r]
-
-
 class RodMaterial:
     """Eliminate the six soft bilateral impulses of each tree rod into its local mass block."""
 
@@ -645,6 +638,7 @@ class RodMaterial:
         if self.world_twists:
             self.integrated = wp.array(spatial, dtype=bool, device=model.device)
             self.integrated_articulations = wp.array(np.flatnonzero(spatial), dtype=int, device=model.device)
+            self._integrated_np = np.flatnonzero(spatial)
             selected = tree & spatial[np.maximum(joint_art, 0)]
             self.tree_joints = wp.array(np.flatnonzero(selected), dtype=int, device=model.device)
             self.accumulated = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
@@ -738,7 +732,7 @@ class RodMaterial:
                 dt,
                 self.history,
             ],
-            outputs=[tau, self.blocks],
+            outputs=[tau, self.blocks, self.joint_blocks],
             device=model.device,
         )
 
@@ -764,14 +758,8 @@ class RodMaterial:
             )
 
     def scatter_joint_blocks(self, model):
-        """Write each tree rod's material block at its joint index; other joints keep zero."""
-        wp.launch(
-            _scatter_blocks,
-            dim=len(self.joints),
-            inputs=[self.joints, model.joint_articulation, self.blocks],
-            outputs=[self.joint_blocks],
-            device=model.device,
-        )
+        """Each tree rod's material block at its joint index (other joints zero), as the linearization wrote it."""
+        del model
         return self.joint_blocks
 
     def augment(self, size, H):
@@ -838,29 +826,33 @@ class RodMaterial:
                 block_dim=rod_tree.BLOCK_DIM,
                 device=m.device,
             )
-        wp.launch(
-            _world_twists,
-            dim=len(self.integrated_articulations),
-            inputs=[
-                self.integrated_articulations,
-                solver._rod_chain_flag if chain else self.no_skip,
-                solver._dynamics_art_active,
-                m._fk_joint_order,
-                m.articulation_start,
-                solver._articulation_joint_end,
-                m.joint_parent,
-                m.joint_child,
-                m.joint_qd_start,
-                m.body_com,
-                solver._articulation_origin,
-                augmented._joint_S_s,
-                velocity,
-                state.body_q,
-            ],
-            outputs=[self.accumulated, result.body_qd],
-            block_dim=solver._articulation_block_dim,
-            device=m.device,
-        )
+        # The walk skips chains; with only chains it is not launched (the chain flags are host-known at setup).
+        chain_np = getattr(solver, "_rod_chain_flag_np", None)
+        all_chains = chain and chain_np is not None and bool(np.all(chain_np[self._integrated_np] != 0))
+        if not all_chains:
+            wp.launch(
+                _world_twists,
+                dim=len(self.integrated_articulations),
+                inputs=[
+                    self.integrated_articulations,
+                    solver._rod_chain_flag if chain else self.no_skip,
+                    solver._dynamics_art_active,
+                    m._fk_joint_order,
+                    m.articulation_start,
+                    solver._articulation_joint_end,
+                    m.joint_parent,
+                    m.joint_child,
+                    m.joint_qd_start,
+                    m.body_com,
+                    solver._articulation_origin,
+                    augmented._joint_S_s,
+                    velocity,
+                    state.body_q,
+                ],
+                outputs=[self.accumulated, result.body_qd],
+                block_dim=solver._articulation_block_dim,
+                device=m.device,
+            )
         if self.all_spatial:
             wp.copy(result.joint_q, state.joint_q)
             wp.copy(result.joint_qd, state.joint_qd)

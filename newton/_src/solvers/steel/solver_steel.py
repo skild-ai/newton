@@ -28,6 +28,7 @@ from ..coupled.model_view import ModelView
 from ..solver import SolverBase
 from . import blocked_cholesky, latency_fused
 from . import contact_compliance as _contact_compliance
+from . import rod_chain_fk as _rod_chain_fk
 from . import rod_tree as _rod_tree
 from . import serial_units as _serial_units
 from ._testing import current_kernel_overrides
@@ -3119,6 +3120,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._tree_dynamics_sizes: set[int] = set()
         # Rod-tree groups whose factorization runs the six-lane walk.
         self._rod_tree_sizes: set[int] = set()
+        self._rod_chain_only_sizes: set[int] = set()
+        self._rod_contracted = False
         self._rod_tree_kernels = {
             name: bool(self._kernel_overrides.get(f"rod_tree_{name}", True))
             for name in ("factor", "response", "propagate")
@@ -3321,6 +3324,18 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_tree_FR = wp.zeros(
                 (max(model.joint_count, 1), 144), dtype=wp.float32, device=model.device
             )
+            self._propagation_tree_CR = wp.zeros(
+                max(model.joint_count, 1) * _rod_tree.CHAIN_REC, dtype=wp.float32, device=model.device
+            )
+            self._propagation_tree_CR2 = self._propagation_tree_CR.reshape(
+                (max(model.joint_count, 1), _rod_tree.CHAIN_REC)
+            )
+            # The factor prelude's per-slot terms (rod_tree._FACTOR_PRELUDE) and the walk slots it covers.
+            jc = max(model.joint_count, 1)
+            self._rod_factor_IW = wp.zeros(jc * 36, dtype=wp.float32, device=model.device)
+            self._rod_factor_KD = wp.zeros(jc * 6, dtype=wp.float32, device=model.device)
+            self._rod_factor_SINV = wp.zeros(jc * 36, dtype=wp.float32, device=model.device)
+            self._rod_prelude = bool(self._kernel_overrides.get("rod_factor_prelude", True))
 
             starts = model.articulation_start.numpy()
             ranges = [
@@ -3329,6 +3344,28 @@ class SolverSteel(SolverBase, CouplingInterface):
                 for art in self._propagation_tree_arts[size].numpy()
             ]
             meta_np = _rod_tree.joint_meta(model, ranges)
+            self._rod_walk_slots = {}
+            # Groups whose trees all walk one joint pattern can pack five trees per warp in the factor.
+            self._rod_factor_packed = {}
+            m4_all = meta_np.reshape(-1, 4)
+            for size in self._rod_tree_sizes:
+                patterns = set()
+                for art in self._propagation_tree_arts[size].numpy():
+                    start, end = int(starts[art]), int(self._model_plan.articulation_joint_end[art])
+                    patterns.add(tuple((m4_all[start:end, 3] & 0xFF).tolist()))
+                self._rod_factor_packed[int(size)] = len(patterns) == 1 and bool(
+                    self._kernel_overrides.get("rod_factor_packed", True)
+                )
+            for size in self._rod_tree_sizes:
+                slots, owners = [], []
+                for art in self._propagation_tree_arts[size].numpy():
+                    start, end = int(starts[art]), int(self._model_plan.articulation_joint_end[art])
+                    slots.extend(range(start, end))
+                    owners.extend([int(art)] * (end - start))
+                self._rod_walk_slots[int(size)] = (
+                    wp.array(np.asarray(slots, dtype=np.int32), dtype=wp.int32, device=model.device),
+                    wp.array(np.asarray(owners, dtype=np.int32), dtype=wp.int32, device=model.device),
+                )
             self._rod_tree_meta = wp.array(meta_np, dtype=wp.int32, device=model.device)
             # Chain-shaped trees propagate with a warp scan (see rod_tree.chain_propagate_kernel).
             art_ranges = [
@@ -3344,11 +3381,37 @@ class SolverSteel(SolverBase, CouplingInterface):
                 if chain[art]:
                     chain_pos[m4[start:end, 0]] = np.arange(start, end, dtype=np.int32)
             self._rod_chain_flag = wp.array(chain, dtype=wp.int32, device=model.device)
+            self._rod_chain_flag_np = chain.copy()
             self._rod_chain_any = bool(chain.any()) and bool(self._kernel_overrides.get("rod_chain_scan", True))
+            self._rod_contracted = (
+                self._rod_chain_any
+                and self._rod_tree_kernels["response"]
+                and bool(self._kernel_overrides.get("rod_chain_contracted", True))
+            )
             if not self._rod_chain_any:
                 self._rod_chain_flag.zero_()
+                self._rod_chain_flag_np[:] = 0
                 chain_pos[:] = -1
+            # Sizes whose rod trees are all chains: the walk kernels would skip every tree, so they are not launched.
+            self._rod_chain_only_sizes = (
+                {
+                    int(size)
+                    for size in self._rod_tree_sizes
+                    if all(chain[int(a)] for a in self._propagation_tree_arts[size].numpy())
+                }
+                if self._rod_chain_any
+                else set()
+            )
             self._rod_body_chain_pos = wp.array(chain_pos, dtype=wp.int32, device=model.device)
+            # Contracted chains (rod_tree._CONTRACT_PREP): each chain's active links, the maps between them and the
+            # snapshot twists, so iterations update only the active links.
+            jc = max(model.joint_count, 1)
+            self._rod_ctr_count = wp.zeros(max(model.articulation_count, 1), dtype=wp.int32, device=model.device)
+            self._rod_ctr_pos = wp.zeros(jc, dtype=wp.int32, device=model.device)
+            self._rod_ctr_body = wp.zeros(jc, dtype=wp.int32, device=model.device)
+            self._rod_ctr_P = wp.zeros(jc * 36, dtype=wp.float32, device=model.device)
+            self._rod_ctr_a = wp.zeros(jc * 6, dtype=wp.float32, device=model.device)
+            self._rod_ctr_qd0 = wp.zeros(jc * 6, dtype=wp.float32, device=model.device)
             self._rod_tree_branch = wp.zeros((max(model.body_count, 1), 36), dtype=wp.float32, device=model.device)
             self._rod_tree_branch_p = wp.zeros((max(model.body_count, 1), 6), dtype=wp.float32, device=model.device)
         # Fixed-signature stand-in for the compliant residual coefficients of solve kernels without compliance.
@@ -3503,6 +3566,17 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._fk_id_valid = wp.zeros(count, dtype=wp.int32, device=model.device)
         self._fk_id_none = wp.zeros(count, dtype=wp.int32, device=model.device)
         self._fk_id_scratch = wp.zeros(count, dtype=wp.int32, device=model.device)
+        # Rod chains take their forward kinematics from rod_chain_fk instead of the serial joint walk.
+        self._chain_fk = None
+        if (
+            model.device.is_cuda
+            and model.articulation_count
+            and getattr(model, "_has_rod_joints", False)
+            and self._tree_plan is None
+            and bool(self._kernel_overrides.get("rod_chain_fk", True))
+        ):
+            chain_fk = _rod_chain_fk.ChainFK(model, np.asarray(self._model_plan.articulation_joint_end))
+            self._chain_fk = chain_fk if chain_fk.count else None
         # The state the carried terms were published into, as a token the step compares on the device (0: none).
         self._fk_id_published_token = wp.zeros(1, dtype=wp.int32, device=model.device)
         self._fk_id_state_tokens = weakref.WeakKeyDictionary()
@@ -7567,7 +7641,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             or (self._enable_joint_limits and self._joint_limit_sizes)
             or self._joint_friction_warp_kernels
             or self._mimic_count
-            or self._connect_count
+            # The propagation response solves loop closures as propagation rows, not internal rows.
+            or (self._connect_count and self._articulated_contact_response == "immediate")
         )
         has_velocity_limits = bool(
             (
@@ -9412,7 +9487,25 @@ class SolverSteel(SolverBase, CouplingInterface):
                 )
             return stage3_qd
         # The serial per-articulation pass stops at the kinematics; the inertias, bias wrenches and the
-        # published COM velocities are formed one body per thread.
+        # published COM velocities are formed one body per thread. Rod chains skip the walk.
+        walk_skip = reuse if self._chain_fk is None else self._chain_fk.walk_skip(model, reuse, self._fk_id_none)
+        if self._chain_fk is not None:
+            self._chain_fk.launch(
+                model,
+                self._articulation_joint_end,
+                state_in.joint_q,
+                stage3_qd,
+                self._body_X_com,
+                self._dynamics_art_active,
+                reuse,
+                state_in.body_q,
+                state_aug._body_q_com,
+                self._articulation_origin,
+                state_aug._joint_S_s,
+                state_aug._body_v_s,
+                state_aug._body_a_s,
+                self._fk_id_scratch,
+            )
         wp.launch(
             eval_rigid_fk_kinematics,
             dim=model.articulation_count,
@@ -9433,7 +9526,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 model.joint_dof_dim,
                 model.body_com,
                 self._dynamics_art_active,
-                reuse,
+                walk_skip,
             ],
             outputs=[
                 state_in.body_q,
@@ -9554,6 +9647,19 @@ class SolverSteel(SolverBase, CouplingInterface):
                     device=model.device,
                 )
         elif self._drive_mode == "augmented" and self._articulation_max_dofs > 0:
+            # Rod chains sum their subtree wrenches without the serial walk (rod_chain_fk).
+            walk_active = self._dynamics_art_active
+            if self._chain_fk is not None:
+                walk_active = self._chain_fk.tau_walk_active(model, self._dynamics_art_active)
+                self._chain_fk.launch_tau(
+                    model,
+                    self._articulation_joint_end,
+                    self._dynamics_art_active,
+                    tau_inputs,
+                    state_aug._body_ft_s,
+                    self._aug_row_counts,
+                    state_aug._joint_tau,
+                )
             wp.launch(
                 eval_rigid_tau_and_augmented_drives,
                 dim=model.articulation_count,
@@ -9569,7 +9675,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     model.joint_effort_limit,
                     self._articulation_max_dofs,
                     dt,
-                    self._dynamics_art_active,
+                    walk_active,
                 ],
                 outputs=[
                     state_aug._body_ft_s,
@@ -9582,10 +9688,22 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
             )
         else:
+            walk_active = self._dynamics_art_active
+            if self._chain_fk is not None:
+                walk_active = self._chain_fk.tau_walk_active(model, self._dynamics_art_active)
+                self._chain_fk.launch_tau(
+                    model,
+                    self._articulation_joint_end,
+                    self._dynamics_art_active,
+                    tau_inputs,
+                    state_aug._body_ft_s,
+                    self._aug_row_counts,
+                    state_aug._joint_tau,
+                )
             wp.launch(
                 eval_rigid_tau,
                 dim=model.articulation_count,
-                inputs=[*common_inputs, *tau_inputs, self._dynamics_art_active],
+                inputs=[*common_inputs, *tau_inputs, walk_active],
                 outputs=[state_aug._body_ft_s, state_aug._joint_tau],
                 block_dim=self._articulation_block_dim,
                 device=model.device,
@@ -11757,6 +11875,25 @@ class SolverSteel(SolverBase, CouplingInterface):
         """
         model = self.model
         if self._reuse_kinematics_enabled:
+            walk_skip = self._fk_id_none
+            if self._chain_fk is not None:
+                walk_skip = self._chain_fk.flags
+                self._chain_fk.launch(
+                    model,
+                    self._articulation_joint_end,
+                    state_out.joint_q,
+                    state_out.joint_qd,
+                    self._body_X_com,
+                    self._dynamics_art_active,
+                    self._fk_id_none,
+                    state_out.body_q,
+                    self._body_q_com,
+                    self._articulation_origin,
+                    self._joint_S_s,
+                    self._body_v_s,
+                    self._body_a_s,
+                    self._fk_id_valid,
+                )
             wp.launch(
                 eval_rigid_fk_kinematics,
                 dim=model.articulation_count,
@@ -11777,7 +11914,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     model.joint_dof_dim,
                     model.body_com,
                     self._dynamics_art_active,
-                    self._fk_id_none,
+                    walk_skip,
                 ],
                 outputs=[
                     state_out.body_q,
@@ -12470,20 +12607,26 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
         # The coloring keeps a world's used-color masks in shared memory when its unit bodies
         # span few enough indices: the bodies of one world plus the global ones.
-        color_words = (PROPAGATION_COLOR_TAIL + 31) // 32
         span = int(model.body_count)
         if model.body_world_start is not None and self._world_count > 1:
             starts = model.body_world_start.numpy()
             per_world = int(np.max(starts[1 : self._world_count + 1] - starts[: self._world_count]))
             span = max(per_world, int(starts[-1] - starts[-2] + starts[0]))
+        prebuild_span = min(max(span, 1), 32768 // 4)
+        self._color_jp_scratch = wp.zeros(
+            max(self._world_count, 1) * color_prebuild_scratch_stride(rows, prebuild_span),
+            dtype=wp.int32,
+            device=model.device,
+        )
         self._color_prebuild_kernel = _get_color_propagation_prebuild_kernel(
             rows,
             entries,
             _COLOR_PREBUILD_BLOCK_DIM,
             self._color_order_stride,
             device_arch,
-            # Used-color masks of up to 512 bodies (32 KiB) stay in shared memory with the staged chunks.
-            max_body_span=min(max(span, 1), 32768 // (color_words * 4)),
+            # Used-color masks stay in shared memory (32 KiB) with the staged chunks: every color word for up to 512
+            # bodies, fewer words (at least the first 32 colors) for up to 8192.
+            max_body_span=prebuild_span,
             longest_first=self._propagation_color_order == "longest_first",
             rotating=self._propagation_color_order == "rotating",
         )
@@ -12491,7 +12634,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _refine_chain_inputs(self) -> list:
         """Chain flags, chain positions and the factor's backward records for the same-articulation refine."""
         if getattr(self, "_rod_chain_any", False):
-            return [self._rod_chain_flag, self._rod_body_chain_pos, self._propagation_tree_BR]
+            return [self._rod_chain_flag, self._rod_body_chain_pos, self._propagation_tree_CR2]
         return self._refine_chain_off
 
     def _propagation_clear_rows(self) -> None:
@@ -12627,6 +12770,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._color_world_row_order,
                     self._color_world_offsets,
                     self._color_unit_sorted,
+                    self._color_jp_scratch,
                 ],
                 block_dim=_COLOR_PREBUILD_BLOCK_DIM,
                 device=model.device,
@@ -12959,9 +13103,39 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_tree_D_inv,
             ]
             if size in self._rod_tree_sizes and self._rod_tree_kernels["factor"]:
+                if self._rod_prelude:
+                    walk_slots, slot_art = self._rod_walk_slots[size]
+                    wp.launch(
+                        _rod_tree.factor_prelude_kernel(),
+                        dim=len(walk_slots),
+                        inputs=[
+                            len(walk_slots),
+                            walk_slots,
+                            slot_art,
+                            self._propagation_tree_activity,
+                            self._rod_tree_meta,
+                            self._propagation_joint_S_flat,
+                            self._joint_armature_device,
+                            self._articulation_max_dofs,
+                            self._aug_row_counts,
+                            self._aug_row_dof_index,
+                            self._aug_row_K,
+                            self._body_I_m,
+                            state_aug._body_q_com,
+                        ],
+                        outputs=[self._rod_factor_IW, self._rod_factor_KD, self._rod_factor_SINV],
+                        device=model.device,
+                    )
+                # Packing five trees per warp pays once the trees alone fill the GPU; fewer trees keep a warp each.
+                packed = (
+                    self._rod_prelude
+                    and self._rod_factor_packed.get(size, False)
+                    and self._propagation_tree_activity is None
+                    and n_arts > 2 * max(int(model.device.sm_count), 1)
+                )
                 wp.launch(
-                    _rod_tree.factor_kernel(),
-                    dim=_rod_tree.launch_dim(n_arts),
+                    _rod_tree.factor_kernel(packed),
+                    dim=_rod_tree.packed_launch_dim(n_arts) if packed else _rod_tree.launch_dim(n_arts),
                     inputs=[
                         n_arts,
                         self._rod_tree_meta,
@@ -12984,10 +13158,36 @@ class SolverSteel(SolverBase, CouplingInterface):
                         state_aug._joint_qdd,
                         self._propagation_tree_BR,
                         self._propagation_tree_FR,
+                        self._propagation_tree_CR,
+                        int(self._rod_prelude),
+                        self._rod_factor_IW,
+                        self._rod_factor_KD,
+                        self._rod_factor_SINV,
                     ],
                     block_dim=_rod_tree.BLOCK_DIM,
                     device=model.device,
                 )
+                if self._rod_prelude:
+                    # With the prelude the factor keeps only the recursion; the records follow in parallel.
+                    wp.launch(
+                        _rod_tree.factor_epilogue_kernel(),
+                        dim=_rod_tree.epilogue_launch_dim(len(walk_slots)),
+                        inputs=[
+                            len(walk_slots),
+                            walk_slots,
+                            slot_art,
+                            self._propagation_tree_activity,
+                            self._rod_tree_meta,
+                            self._propagation_joint_S_flat,
+                            self._propagation_body_com_rel,
+                            self._propagation_tree_U,
+                            self._propagation_tree_D_inv,
+                            int(size not in self._rod_chain_only_sizes),
+                        ],
+                        outputs=[self._propagation_tree_BR, self._propagation_tree_FR, self._propagation_tree_CR],
+                        block_dim=_rod_tree.BLOCK_DIM,
+                        device=model.device,
+                    )
                 continue
             if self._propagation_native_tree[size]:
                 # The level kernels also take the parent slots and the level order.
@@ -13085,6 +13285,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._propagation_joint_range,
                             self._propagation_tree_BR,
                             self._propagation_tree_FR,
+                            self._propagation_tree_CR,
                             self._propagation_tree_D_inv,
                             self._propagation_joint_split,
                         ],
@@ -13092,26 +13293,46 @@ class SolverSteel(SolverBase, CouplingInterface):
                         block_dim=_rod_tree.BLOCK_DIM,
                         device=model.device,
                     )
-                wp.launch(
-                    _rod_tree.response_kernel(),
-                    dim=_rod_tree.launch_dim(n_arts),
-                    inputs=[
-                        n_arts,
-                        self._rod_tree_meta,
-                        arts,
-                        self._rod_chain_flag,
-                        self._propagation_tree_activity,
-                        *factor_inputs,
-                        self._propagation_joint_S_flat,
-                        self._propagation_body_com_rel,
-                        self._propagation_tree_U,
-                        self._propagation_tree_D_inv,
-                        self._propagation_joint_split,
-                    ],
-                    outputs=[self._propagation_body_response, self._propagation_body_response_split],
-                    block_dim=_rod_tree.BLOCK_DIM,
-                    device=model.device,
-                )
+                    if self._rod_contracted:
+                        wp.launch(
+                            _rod_tree.contract_prep_kernel(),
+                            dim=_rod_tree.chain_launch_dim(n_arts),
+                            inputs=[
+                                n_arts,
+                                self._rod_tree_meta,
+                                arts,
+                                self._rod_chain_flag,
+                                self._propagation_tree_activity,
+                                self._propagation_joint_range,
+                                self._propagation_body_seen,
+                                self._propagation_tree_BR,
+                                self._propagation_tree_CR,
+                            ],
+                            outputs=[self._rod_ctr_count, self._rod_ctr_pos, self._rod_ctr_body, self._rod_ctr_P],
+                            block_dim=_rod_tree.BLOCK_DIM,
+                            device=model.device,
+                        )
+                if size not in self._rod_chain_only_sizes:
+                    wp.launch(
+                        _rod_tree.response_kernel(),
+                        dim=_rod_tree.launch_dim(n_arts),
+                        inputs=[
+                            n_arts,
+                            self._rod_tree_meta,
+                            arts,
+                            self._rod_chain_flag,
+                            self._propagation_tree_activity,
+                            *factor_inputs,
+                            self._propagation_joint_S_flat,
+                            self._propagation_body_com_rel,
+                            self._propagation_tree_U,
+                            self._propagation_tree_D_inv,
+                            self._propagation_joint_split,
+                        ],
+                        outputs=[self._propagation_body_response, self._propagation_body_response_split],
+                        block_dim=_rod_tree.BLOCK_DIM,
+                        device=model.device,
+                    )
                 continue
             if self._propagation_native_tree[size]:
                 # The level kernels also take the parent slots and the level order.
@@ -13384,30 +13605,32 @@ class SolverSteel(SolverBase, CouplingInterface):
                                 self._propagation_tree_activity,
                                 self._propagation_joint_range,
                                 self._propagation_tree_FR,
+                                self._propagation_tree_CR,
                                 self._v_out,
                             ],
                             outputs=[self._propagation_body_qd],
                             block_dim=_rod_tree.BLOCK_DIM,
                             device=model.device,
                         )
-                    wp.launch(
-                        _rod_tree.refresh_kernel(),
-                        dim=_rod_tree.launch_dim(n_arts),
-                        inputs=[
-                            n_arts,
-                            self._rod_tree_meta,
-                            arts,
-                            self._rod_chain_flag,
-                            self._propagation_tree_activity,
-                            self._propagation_joint_range,
-                            self._propagation_joint_S_flat,
-                            self._propagation_body_com_rel,
-                            self._v_out,
-                        ],
-                        outputs=[self._propagation_body_qd],
-                        block_dim=_rod_tree.BLOCK_DIM,
-                        device=model.device,
-                    )
+                    if size not in self._rod_chain_only_sizes:
+                        wp.launch(
+                            _rod_tree.refresh_kernel(),
+                            dim=_rod_tree.launch_dim(n_arts),
+                            inputs=[
+                                n_arts,
+                                self._rod_tree_meta,
+                                arts,
+                                self._rod_chain_flag,
+                                self._propagation_tree_activity,
+                                self._propagation_joint_range,
+                                self._propagation_joint_S_flat,
+                                self._propagation_body_com_rel,
+                                self._v_out,
+                            ],
+                            outputs=[self._propagation_body_qd],
+                            block_dim=_rod_tree.BLOCK_DIM,
+                            device=model.device,
+                        )
                 continue
             if self._propagation_native_tree[size]:
                 wp.launch_tiled(
@@ -13468,10 +13691,40 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
             )
 
-    def _propagation_propagate_impulses(self) -> None:
+    def _propagation_contract_update(self, snapshot: bool) -> None:
+        """Contracted chains: snapshot the active links' twists, or set them from the impulses summed so far."""
+        model = self.model
+        for size in self._propagation_tree_sizes:
+            if size not in self._rod_tree_sizes or not self._rod_tree_kernels["propagate"]:
+                continue
+            n_arts = self._propagation_tree_art_count[size]
+            wp.launch(
+                _rod_tree.contract_update_kernel(),
+                dim=n_arts * 32,
+                inputs=[
+                    n_arts,
+                    self._propagation_tree_arts[size],
+                    self._rod_chain_flag,
+                    self._propagation_tree_activity,
+                    self._propagation_joint_range,
+                    self._rod_ctr_count,
+                    self._rod_ctr_body,
+                    self._rod_ctr_P,
+                    self._propagation_body_response,
+                    self._propagation_body_impulses,
+                    int(snapshot),
+                ],
+                outputs=[self._rod_ctr_qd0, self._rod_ctr_a, self._propagation_body_qd],
+                block_dim=32,
+                device=model.device,
+            )
+
+    def _propagation_propagate_impulses(self, contracted: bool = False) -> None:
         """Apply the impulses accumulated in a propagation sweep to the joint velocities.
 
-        Worlds on the cached path apply the cached responses; the tree walk skips them.
+        Worlds on the cached path apply the cached responses; the tree walk skips them. With ``contracted`` the
+        chains keep their impulses and only update their active links' twists (see rod_tree._CONTRACT_PREP);
+        the propagation after the iterations applies the sums.
         """
         model = self.model
         if self._propagation_cached_gemv_kernel is not None:
@@ -13512,9 +13765,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                     else self._propagation_cache_guard_off
                 )
                 if self._rod_chain_any:
+                    # Staging caps the chains per SM: once they fill the GPU without it, take the unstaged pass.
+                    staged = bool(
+                        self._kernel_overrides.get("rod_chain_staged", n_arts <= 4 * max(int(model.device.sm_count), 1))
+                    )
                     wp.launch(
-                        _rod_tree.chain_propagate_kernel(),
-                        dim=_rod_tree.chain_launch_dim(n_arts),
+                        _rod_tree.chain_propagate_kernel(staged),
+                        dim=n_arts * 32,
                         inputs=[
                             n_arts,
                             self._rod_tree_meta,
@@ -13526,34 +13783,42 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._propagation_joint_range,
                             self._propagation_tree_BR,
                             self._propagation_tree_FR,
+                            self._propagation_tree_CR,
+                            self._propagation_tree_u,
+                            self._rod_ctr_count if self._rod_contracted else self._rod_chain_flag,
+                            _rod_tree.CONTRACT_MAX if contracted else 0,
+                            self._rod_ctr_body,
+                            self._rod_ctr_P,
+                            self._propagation_body_response,
+                            self._rod_ctr_qd0,
+                        ],
+                        outputs=[self._propagation_body_impulses, self._propagation_body_qd, self._v_out],
+                        block_dim=_rod_tree.CHAIN_BLOCK_DIM,
+                        device=model.device,
+                    )
+                if size not in self._rod_chain_only_sizes:
+                    wp.launch(
+                        _rod_tree.propagate_kernel(),
+                        dim=_rod_tree.launch_dim(n_arts),
+                        inputs=[
+                            n_arts,
+                            self._rod_tree_meta,
+                            arts,
+                            self._rod_chain_flag,
+                            self._propagation_tree_activity,
+                            self._art_to_world,
+                            guard,
+                            *tree_inputs,
+                            self._propagation_tree_BR,
+                            self._propagation_tree_FR,
+                            self._rod_tree_branch_p,
+                            self._propagation_tree_body_delta,
                             self._propagation_tree_u,
                         ],
                         outputs=[self._propagation_body_impulses, self._propagation_body_qd, self._v_out],
                         block_dim=_rod_tree.BLOCK_DIM,
                         device=model.device,
                     )
-                wp.launch(
-                    _rod_tree.propagate_kernel(),
-                    dim=_rod_tree.launch_dim(n_arts),
-                    inputs=[
-                        n_arts,
-                        self._rod_tree_meta,
-                        arts,
-                        self._rod_chain_flag,
-                        self._propagation_tree_activity,
-                        self._art_to_world,
-                        guard,
-                        *tree_inputs,
-                        self._propagation_tree_BR,
-                        self._propagation_tree_FR,
-                        self._rod_tree_branch_p,
-                        self._propagation_tree_body_delta,
-                        self._propagation_tree_u,
-                    ],
-                    outputs=[self._propagation_body_impulses, self._propagation_body_qd, self._v_out],
-                    block_dim=_rod_tree.BLOCK_DIM,
-                    device=model.device,
-                )
             elif self._propagation_native_tree[size]:
                 guard = (
                     self._propagation_cache_world_flag
@@ -13862,11 +14127,15 @@ class SolverSteel(SolverBase, CouplingInterface):
             friction_start_iteration=friction_start_iteration,
         )
         wpb = _PROPAGATION_WORLDS_PER_BLOCK
+        # Contracted chains keep v_out until the iterations end, so nothing else may read it in between.
+        contracted = self._rod_contracted and not refresh_forced
         for iteration in range(iteration_offset, iteration_offset + iterations):
             if has_internal_rows and not contact_then_internal:
                 phase(3, iteration_offset=iteration)
             phase(4, iteration_offset=iteration)
             self._propagation_refresh_twists(force=refresh_forced, first=iteration == iteration_offset)
+            if contracted and iteration == iteration_offset:
+                self._propagation_contract_update(snapshot=True)
             self._snapshot_propagation_cache_twists()
             if self._propagation_colored:
                 self._launch_colored_sweep(
@@ -13981,9 +14250,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                     block_dim=32 * wpb,
                     device=model.device,
                 )
-            self._propagation_propagate_impulses()
+            self._propagation_propagate_impulses(contracted=contracted)
             if has_velocity_limits and not contact_then_internal:
                 phase(5, iteration_offset=iteration)
+        if contracted:
+            # The chains' summed impulses reach v_out and every link's twist.
+            self._propagation_propagate_impulses()
         if contact_then_internal and (has_internal_rows or has_velocity_limits):
             phase(2, iterations, iteration_offset=iteration_offset)
 
@@ -18698,6 +18970,162 @@ def advance_color_step(color_step: wp.array[wp.int32]):
     color_step[0] = color_step[0] + 1
 
 
+_COLOR_PREBUILD_PARALLEL = r"""
+    // Fast path, with the units in contact order and the masks in shared memory. Warp 0 runs the first-fit in
+    // batches of 32 staged units: each lane notes which earlier lanes share one of its bodies, and in each mini-round
+    // the lanes none of whose earlier sharers is still uncolored take the lowest color their bodies leave free. That
+    // is exactly the serial first-fit (a unit's color depends only on its lower-ranked sharers), while lanes of one
+    // mini-round share no body. Then the units sort by (color, rank) and a block scan gives their row slots.
+    const bool par_path = (n_pad <= @SC32@) && shared_masks;
+    // With fewer mask words than colors, a unit that finds none of its colors free would take the tail bucket, which
+    // the full masks would not: the world then recolors on the global masks below.
+    __shared__ int s_capped;
+    if (t == 0) s_capped = 0;
+    __syncthreads();
+    if (par_path) {
+        int* pcolor = jp_scratch.data + (long long)world * @JS@;
+        int* slen = pcolor + @M@;
+        __shared__ int s_part[@B@];
+        for (int base = 0; base < n_units; base += @CH@) {
+            const int cnt = min(@CH@, n_units - base);
+            for (int i = t; i < cnt; i += @B@) {
+                const int u = unit_order.data[order_base + base + i];
+                s_u[i] = u;
+                const int ba = unit_body_a.data[world_base + u];
+                const int bb = unit_body_b.data[world_base + u];
+                s_x[i] = (ba >= 0) ? ba - body_base : -1;
+                s_y[i] = (bb >= 0 && bb != ba) ? bb - body_base : -1;
+            }
+            __syncthreads();
+            if (t < 32) {
+                const unsigned FULL = 0xffffffffu;
+                for (int b0 = 0; b0 < cnt; b0 += 32) {
+                    const int i = b0 + t;
+                    const bool valid = i < cnt;
+                    const int la = valid ? s_x[i] : -1;
+                    const int lb = valid ? s_y[i] : -1;
+                    // Earlier lanes sharing a body: broadcast reads of the batch's bodies (the staged chunk itself).
+                    unsigned conf = 0u;
+                    #pragma unroll
+                    for (int j = 0; j < 32; ++j) {
+                        const int ja = (b0 + j < cnt) ? s_x[b0 + j] : -2;
+                        const int jb = (b0 + j < cnt) ? s_y[b0 + j] : -2;
+                        const bool share = (la >= 0 && (la == ja || la == jb)) || (lb >= 0 && (lb == ja || lb == jb));
+                        conf |= (j < t && share) ? (1u << j) : 0u;
+                    }
+                    bool done = !valid;
+                    while (true) {
+                        const unsigned pending = __ballot_sync(FULL, !done);
+                        if (pending == 0u) break;
+                        const bool go = !done && (conf & pending) == 0u;
+                        if (go) {
+                            int color = @CAP@;
+                            // Most units find a free color in the first word.
+                            const unsigned used0 = (la >= 0 ? (unsigned)s_mask[la] : 0u) | (lb >= 0 ? (unsigned)s_mask[lb] : 0u);
+                            if (~used0 != 0u && __ffs(~used0) - 1 < @CAPS@) {
+                                const int bit = __ffs(~used0) - 1;
+                                color = bit;
+                                if (la >= 0) s_mask[la] |= (int)(1u << bit);
+                                if (lb >= 0) s_mask[lb] |= (int)(1u << bit);
+                            } else for (int word = (~used0 != 0u) ? 0 : 1; word < @SW@; ++word) {
+                                unsigned used = 0u;
+                                if (la >= 0) used |= (unsigned)s_mask[word * @MBW@ + la];
+                                if (lb >= 0) used |= (unsigned)s_mask[word * @MBW@ + lb];
+                                const unsigned free_bits = ~used;
+                                if (free_bits != 0u) {
+                                    const int bit = __ffs(free_bits) - 1;
+                                    const int c = word * 32 + bit;
+                                    if (c < @CAPS@) {
+                                        color = c;
+                                        if (la >= 0) s_mask[word * @MBW@ + la] |= (int)(1u << bit);
+                                        if (lb >= 0) s_mask[word * @MBW@ + lb] |= (int)(1u << bit);
+                                    }
+                                    break;
+                                }
+                            }
+                            if (color == @CAP@ && @CAPS@ < @CAP@) s_capped = 1;
+                            s_z[i] = color;
+                            atomicAdd(&s_counts[color], 1);
+                            done = true;
+                        }
+                        __syncwarp(FULL);
+                    }
+                }
+            }
+            __syncthreads();
+            for (int i = t; i < cnt; i += @B@) {
+                unit_color.data[world_base + s_u[i]] = s_z[i];
+                pcolor[base + i] = s_z[i];
+            }
+            __syncthreads();
+        }
+        __syncthreads();
+        if (s_capped) goto recolor_on_global_masks;
+        if (t == 0) {
+            int acc = 0;
+            for (int c = 0; c < @NE@; ++c) {
+                world_color_offsets.data[world * @NE@ + c] = acc;
+                acc += s_counts[c];
+            }
+        }
+        // (color, rank) order: 32-bit keys in shared memory, where the masks were.
+        unsigned* s_k32 = reinterpret_cast<unsigned*>(s_raw);
+        for (int i = t; i < n_pad; i += @B@)
+            s_k32[i] = (i < n_units) ? (((unsigned)pcolor[i] << 13) | (unsigned)i) : 0xFFFFFFFFu;
+        __syncthreads();
+        bitonic32(s_k32, n_pad);
+        // Row slots: an inclusive block scan of the units' lengths in color order, one contiguous run per thread.
+        const int per = (n_units + @B@ - 1) / @B@;
+        const int lo = min(t * per, n_units), hi = min(lo + per, n_units);
+        int sum = 0;
+        for (int i = lo; i < hi; ++i) {
+            const int u = unit_order.data[order_base + (int)(s_k32[i] & 0x1FFFu)];
+            sum += unit_len.data[world_base + u];
+            slen[i] = sum;
+        }
+        s_part[t] = sum;
+        __syncthreads();
+        for (int d = 1; d < @B@; d <<= 1) {
+            const int v = (t >= d) ? s_part[t - d] : 0;
+            __syncthreads();
+            s_part[t] += v;
+            __syncthreads();
+        }
+        const int off = (t > 0) ? s_part[t - 1] : 0;
+        for (int i = lo; i < hi; ++i) {
+            const int u = unit_order.data[order_base + (int)(s_k32[i] & 0x1FFFu)];
+            const int c = unit_contact.data[world_base + u];
+            const int slot = slen[i] + off - unit_len.data[world_base + u];
+            world_row_order.data[world_base + i] = slot;
+            unit_sorted_contact.data[world_base + i] = c;
+            contact_slot.data[c] = slot;
+        }
+        return;
+    }
+recolor_on_global_masks:
+    if (s_capped) {
+        for (int c = t; c < @NE@; c += @B@) s_counts[c] = 0;
+        for (int u = t; u < n_units; u += @B@) {
+            const int ba = unit_body_a.data[world_base + u];
+            const int bb = unit_body_b.data[world_base + u];
+            for (int word = 0; word < @WORDS@; ++word) {
+                if (ba >= 0) body_used_mask.data[ba * @WORDS@ + word] = 0;
+                if (bb >= 0) body_used_mask.data[bb * @WORDS@ + word] = 0;
+            }
+        }
+        __syncthreads();
+    }
+    // The serial path keeps every color word: reduced shared masks only serve the fast path above.
+    const bool use_shared_masks = shared_masks && !s_capped && @FULLSW@;
+"""
+
+
+def color_prebuild_scratch_stride(propagation_max_constraints: int, max_body_span: int) -> int:
+    """Per-world ints of the fast coloring path's scratch: each unit's color by rank and the row-slot scan."""
+    del max_body_span
+    return 2 * int(propagation_max_constraints)
+
+
 @cache
 def _get_color_propagation_prebuild_kernel(
     propagation_max_constraints: int,
@@ -18728,12 +19156,18 @@ def _get_color_propagation_prebuild_kernel(
     # Span of body indices whose used-color masks fit in shared memory; a world whose
     # unit bodies span more keeps them in global memory. 0 always uses global memory.
     MBW = int(max_body_span)
+    # Used-color mask words per body in shared memory: all of them when MBW bodies fit 32 KiB, else as many as fit
+    # (at least one), and units that find no free color among those take the tail bucket.
+    SW = WORDS if MBW * WORDS * 4 <= 32768 else max(1, 32768 // (max(MBW, 1) * 4))
+    cap_s = min(cap, 32 * SW)
     # Shared buffers follow the per-world unit capacity: with many small worlds one
     # block runs per world, and a fixed large footprint would cut occupancy.
     CH = min(512, OS)  # units staged in shared memory per chunk of the serial passes
     SORT_CAP = min(4096, OS)  # units a world may have for the sort to run on packed keys in shared memory
+    # Without the length rank the sort key is the contact index alone: 32-bit keys, twice as many in the same buffer.
+    SORT_CAP32 = 0 if longest_first else min(2 * SORT_CAP, OS)
     # One raw buffer: the sort's keys first, then the masks and the staged chunks.
-    RAW_WORDS = max(2 * SORT_CAP, max(MBW, 1) * WORDS + 4 * CH)
+    RAW_WORDS = max(2 * SORT_CAP, max(MBW, 1) * SW + 4 * CH)
     # A color costs its longest unit, so longest_first sorts longer units first to share colors. The
     # rank takes 4 bits above the 31-bit contact index; packed keys keep the unit in the low 12 bits.
     assert SORT_CAP <= 1 << 12
@@ -18742,7 +19176,7 @@ def _get_color_propagation_prebuild_kernel(
         rank = f"(15 - min(unit_len.data[world_base + {u}], 15))" if longest_first else "0"
         return f"(((unsigned long long){rank} << 31) | (unsigned long long)unit_contact.data[world_base + {u}])"
 
-    def greedy(mask: str, index_a: str, index_b: str) -> str:
+    def greedy(mask: str, index_a: str, index_b: str, words: int = WORDS, ccap: int = cap) -> str:
         return f"""
                 for (int i = 0; i < cnt; ++i) {{{{
                     const int ba = s_x[i];
@@ -18750,7 +19184,7 @@ def _get_color_propagation_prebuild_kernel(
                     const int ia = {index_a};
                     const int ib = {index_b};
                     int color = {cap};
-                    for (int word = 0; word < {WORDS}; ++word) {{{{
+                    for (int word = 0; word < {words}; ++word) {{{{
                         unsigned used = 0u;
                         if (ba >= 0) used |= (unsigned){mask.format(x="ia")};
                         if (bb >= 0) used |= (unsigned){mask.format(x="ib")};
@@ -18758,7 +19192,7 @@ def _get_color_propagation_prebuild_kernel(
                         if (free_bits != 0u) {{{{
                             const int bit = __ffs(free_bits) - 1;
                             const int c = word * 32 + bit;
-                            if (c < {cap}) {{{{
+                            if (c < {ccap}) {{{{
                                 color = c;
                                 if (ba >= 0) {mask.format(x="ia")} |= (int)(1u << bit);
                                 if (bb >= 0) {mask.format(x="ib")} |= (int)(1u << bit);
@@ -18771,7 +19205,7 @@ def _get_color_propagation_prebuild_kernel(
                 }}}}"""
 
     greedy_global = greedy("body_used_mask.data[{x} * " + str(WORDS) + " + word]", "ba", "bb")
-    greedy_shared = greedy("s_mask[{x} * " + str(WORDS) + " + word]", "ba - body_base", "bb - body_base")
+    greedy_shared = greedy("s_mask[{x} * " + str(SW) + " + word]", "ba - body_base", "bb - body_base", SW, cap_s)
     if rotating:
         # Position p of the walk: a per-step permutation p -> (a * p + shift) mod n of the sorted order. a is a prime
         # above the per-world row capacity (checked at construction), so it is coprime with n and the map is a
@@ -18793,6 +19227,21 @@ def _get_color_propagation_prebuild_kernel(
         def walk(p: str) -> str:
             return p
 
+    JS = color_prebuild_scratch_stride(M, MBW)
+    par_block = (
+        _COLOR_PREBUILD_PARALLEL.replace("@SC32@", str(SORT_CAP32 if not rotating else 0))
+        .replace("@JS@", str(JS))
+        .replace("@M@", str(M))
+        .replace("@CH@", str(CH))
+        .replace("@MBW@", str(max(MBW, 1)))
+        .replace("@B@", str(B))
+        .replace("@CAPS@", str(cap_s))
+        .replace("@CAP@", str(cap))
+        .replace("@SW@", str(SW))
+        .replace("@NE@", str(NE))
+        .replace("@WORDS@", str(WORDS))
+        .replace("@FULLSW@", "true" if SW == WORDS else "false")
+    )
     mask_decl = """    __shared__ int s_body_lo, s_body_hi;
     if (t == 0) { s_body_lo = 0x7FFFFFFF; s_body_hi = -1; }
     __syncthreads();"""
@@ -18816,10 +19265,30 @@ def _get_color_propagation_prebuild_kernel(
 
     __shared__ int s_counts[{NE}];
     __shared__ int s_offsets[{NE}];
+    // Ascending bitonic sort of n (a power of two) 32-bit keys in shared memory, one comparator pair per thread
+    // and step.
+    auto bitonic32 = [&](unsigned* key, int n) {{
+        for (int k = 2; k <= n; k <<= 1) {{
+            for (int j = k >> 1; j > 0; j >>= 1) {{
+                const int lj = __ffs(j) - 1;
+                for (int q = t; q < (n >> 1); q += {B}) {{
+                    const int i = ((q >> lj) << (lj + 1)) | (q & (j - 1));
+                    const int partner = i + j;
+                    const unsigned ki = key[i];
+                    const unsigned kp = key[partner];
+                    if ((ki > kp) == ((i & k) == 0)) {{
+                        key[i] = kp;
+                        key[partner] = ki;
+                    }}
+                }}
+                __syncthreads();
+            }}
+        }}
+    }};
 
     __shared__ __align__(8) int s_raw[{RAW_WORDS}];
     int* s_mask = s_raw;
-    int* s_u = s_raw + {max(MBW, 1) * WORDS};
+    int* s_u = s_raw + {max(MBW, 1) * SW};
     int* s_x = s_u + {CH};
     int* s_y = s_u + 2 * {CH};
     int* s_z = s_u + 3 * {CH};
@@ -18828,17 +19297,39 @@ def _get_color_propagation_prebuild_kernel(
     // The used-color masks hold one {WORDS}-word bitmask per body: in shared memory,
     // indexed from the world's first body, when every unit body lies in this world.
     for (int i = t; i < n_pad; i += {B}) unit_order.data[order_base + i] = (i < n_units) ? i : -1;
-    for (int u = t; u < n_units; u += {B}) {{
-        const int ba = unit_body_a.data[world_base + u];
-        const int bb = unit_body_b.data[world_base + u];
-        if (ba >= 0) {{ atomicMin(&s_body_lo, ba); atomicMax(&s_body_hi, ba); }}
-        if (bb >= 0) {{ atomicMin(&s_body_lo, bb); atomicMax(&s_body_hi, bb); }}
+    {{
+        // Each thread folds its units first: one shared atomic per thread instead of per unit body.
+        int lo_b = 0x7FFFFFFF, hi_b = -1;
+        for (int u = t; u < n_units; u += {B}) {{
+            const int ba = unit_body_a.data[world_base + u];
+            const int bb = unit_body_b.data[world_base + u];
+            if (ba >= 0) {{ lo_b = min(lo_b, ba); hi_b = max(hi_b, ba); }}
+            if (bb >= 0) {{ lo_b = min(lo_b, bb); hi_b = max(hi_b, bb); }}
+        }}
+        if (hi_b >= 0) {{ atomicMin(&s_body_lo, lo_b); atomicMax(&s_body_hi, hi_b); }}
     }}
     for (int c = t; c < {NE}; c += {B}) s_counts[c] = 0;
     __syncthreads();
     // Bitonic sort of the permutation by (length rank, global contact index): the greedy
     // pass below is order-dependent, and this order is independent of the atomic list build.
-    if (n_pad <= {SORT_CAP}) {{
+    if (n_pad <= {SORT_CAP32}) {{
+        // Contact-index keys sort in shared memory; the units come back through contact_slot, which
+        // maps each unit's contact to its unit until the slot prefix below overwrites it.
+        unsigned* s_k32 = reinterpret_cast<unsigned*>(s_raw);
+        for (int i = t; i < n_pad; i += {B}) {{
+            unsigned key = 0xFFFFFFFFu;
+            if (i < n_units) {{
+                const int c = unit_contact.data[world_base + i];
+                key = (unsigned)c;
+                contact_slot.data[c] = i;
+            }}
+            s_k32[i] = key;
+        }}
+        __syncthreads();
+        bitonic32(s_k32, n_pad);
+        for (int i = t; i < n_units; i += {B}) unit_order.data[order_base + i] = contact_slot.data[(int)s_k32[i]];
+        __syncthreads();
+    }} else if (n_pad <= {SORT_CAP}) {{
         // Packed (rank, contact index, unit) keys sort in shared memory; contact indices are
         // unique per unit, so the order matches the permutation sort below.
         unsigned long long* s_key = reinterpret_cast<unsigned long long*>(s_raw);
@@ -18889,8 +19380,10 @@ def _get_color_propagation_prebuild_kernel(
     const int body_base = s_body_lo;
     const bool shared_masks = {MBW} > 0 && s_body_hi - s_body_lo < {MBW};
     if (shared_masks) {{
-        for (int i = t; i < {max(MBW, 1) * WORDS}; i += {B}) s_mask[i] = 0;
-    }} else {{
+        for (int i = t; i < {max(MBW, 1) * SW}; i += {B}) s_mask[i] = 0;
+    }}
+    // The serial path colors on the global masks unless the shared ones hold every color word.
+    if (!shared_masks || ({"false" if SW == WORDS else "true"} && n_pad > {SORT_CAP32 if not rotating else 0})) {{
         for (int u = t; u < n_units; u += {B}) {{
             const int ba = unit_body_a.data[world_base + u];
             const int bb = unit_body_b.data[world_base + u];
@@ -18902,6 +19395,7 @@ def _get_color_propagation_prebuild_kernel(
     }}
     __syncthreads();
 
+{par_block}
     // The serial passes below run on thread 0 over chunks of units that every thread
     // stages in shared memory first: thread 0 then touches no global memory, which on a
     // serial walk would put a dependent global round trip on every unit.
@@ -18917,7 +19411,7 @@ def _get_color_propagation_prebuild_kernel(
         if (t == 0) {{
             // First-fit greedy edge coloring: a unit takes the lowest color neither of its
             // bodies uses yet, so every color is a near-maximal matching.
-            if (shared_masks) {{
+            if (use_shared_masks) {{
 {greedy_shared}
             }} else {{
 {greedy_global}
@@ -19009,6 +19503,7 @@ def _get_color_propagation_prebuild_kernel(
             world_row_order: wp.array[int],
             world_color_offsets: wp.array[int],
             unit_sorted_contact: wp.array[int],
+            jp_scratch: wp.array[int],
         ): ...
 
         def color_propagation_prebuild_template(  # pragma: no cover - compiled by wp.kernel
@@ -19026,6 +19521,7 @@ def _get_color_propagation_prebuild_kernel(
             world_row_order: wp.array[int],
             world_color_offsets: wp.array[int],
             unit_sorted_contact: wp.array[int],
+            jp_scratch: wp.array[int],
         ):
             tile, _t = wp.tid()
             color_propagation_prebuild_native(
@@ -19044,6 +19540,7 @@ def _get_color_propagation_prebuild_kernel(
                 world_row_order,
                 world_color_offsets,
                 unit_sorted_contact,
+                jp_scratch,
             )
 
     else:
@@ -19064,6 +19561,7 @@ def _get_color_propagation_prebuild_kernel(
             world_row_order: wp.array[int],
             world_color_offsets: wp.array[int],
             unit_sorted_contact: wp.array[int],
+            jp_scratch: wp.array[int],
         ): ...
 
         def color_propagation_prebuild_template(  # pragma: no cover - compiled by wp.kernel
@@ -19080,6 +19578,7 @@ def _get_color_propagation_prebuild_kernel(
             world_row_order: wp.array[int],
             world_color_offsets: wp.array[int],
             unit_sorted_contact: wp.array[int],
+            jp_scratch: wp.array[int],
         ):
             tile, _t = wp.tid()
             color_propagation_prebuild_native(
@@ -19097,6 +19596,7 @@ def _get_color_propagation_prebuild_kernel(
                 world_row_order,
                 world_color_offsets,
                 unit_sorted_contact,
+                jp_scratch,
             )
 
     name = f"color_propagation_prebuild_{M}_{NE}_bd{B}_os{OS}_mbw{MBW}{'_lf' if longest_first else ''}{'_rot' if rotating else ''}"

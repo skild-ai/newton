@@ -26,10 +26,18 @@ from .friction_patches import WARP_DETERMINISM_OFF
 # Trees per warp and lanes per tree.
 TREES_PER_WARP = 1
 BLOCK_DIM = 64
+# Floats per link of the chain passes' compact record: B, W, S, Q (6x6 row-major each) and e (padded to 4).
+CHAIN_REC = 148
+# Longest chain whose records the chain propagation pass stages in shared memory (longer ones read them from
+# global memory in the same layout), and its block size: one warp per block.
+CHAIN_STAGE_MAX = 64
+CHAIN_BLOCK_DIM = 32
 
 _PRELUDE = (
     "\n    #define TREES_PER_WARP "
     + str(TREES_PER_WARP)
+    + "\n    #define CHAIN_REC "
+    + str(CHAIN_REC)
     + "\n"
     + r"""
     const int lane = threadIdx.x & 31;
@@ -64,11 +72,21 @@ _PRELUDE = (
 """
 )
 
+# The factor runs every lane of its warp: lanes past the sixth repeat lanes 0-5 (same tree, same values), so every
+# shuffle and warp sync takes the full mask. A partial mask compiles to a convergence check (MATCH.ANY and a
+# divergent branch) on every shuffle, which dominated the factor's serial walk. Only lanes 0-5 (``lead``) update
+# shared accumulators; identical stores from the repeating lanes are harmless.
+_PRELUDE_FULL = (
+    _PRELUDE.replace("const int grp = lane / 6;", "const int grp = 0;")
+    .replace("const int r = lane - grp * 6;", "const int r = lane % 6;\n    const bool lead = lane < 6;")
+    .replace("const unsigned GMASK = 0x3Fu << src0;", "const unsigned GMASK = 0xffffffffu;")
+)
+
 _FACTOR = (
     r"""
 #if defined(__CUDA_ARCH__)
 """
-    + _PRELUDE
+    + _PRELUDE_FULL
     + r"""
     if (grp >= TREES_PER_WARP || tree >= ntrees) return;
     float* X = shm[wib][grp][0];
@@ -88,7 +106,8 @@ _FACTOR = (
     const int rr = r - rb;
 
     // A joint's inputs as lane r needs them, loaded one joint ahead of their use.
-    struct In { int child, parent, gd, dc, flags, jid; wp::quat_t<wp::float32> q; float L[3][6]; float s[6]; float m[6]; float e[3]; float diag; };
+    struct In { int child, parent, gd, dc, flags, jid; wp::quat_t<wp::float32> q; float L[3][6]; float iw[6]; float s[6]; float m[6]; float e[3]; float diag; float sinv[6]; };
+    const bool pre = use_prelude != 0;
     auto load = [&](int k, In& o) {
         o.child = meta[4 * k + 0];
         o.parent = meta[4 * k + 1];
@@ -96,19 +115,24 @@ _FACTOR = (
         o.flags = meta[4 * k + 3];
         o.dc = o.flags & 7;
         o.jid = o.flags >> 8;
-        o.q = body_q_com.data[o.child].q;
-        const wp::mat_t<6, 6, wp::float32>& L = body_I_m.data[o.child];
-        #pragma unroll
-        for (int a = 0; a < 3; ++a)
+        if (pre) {
             #pragma unroll
-            for (int c = 0; c < 6; ++c) o.L[a][c] = L.data[rb + a][c];
+            for (int c = 0; c < 6; ++c) { o.iw[c] = IW.data[k * 36 + r * 6 + c]; o.sinv[c] = SINV.data[k * 36 + r * 6 + c]; }
+        } else {
+            o.q = body_q_com.data[o.child].q;
+            const wp::mat_t<6, 6, wp::float32>& L = body_I_m.data[o.child];
+            #pragma unroll
+            for (int a = 0; a < 3; ++a)
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) o.L[a][c] = L.data[rb + a][c];
+        }
         #pragma unroll
         for (int a = 0; a < 6; ++a) o.s[a] = (a < o.dc) ? SF[(o.gd + a) * 6 + r] : 0.0f;
         #pragma unroll
         for (int b = 0; b < 6; ++b) o.m[b] = (has_joint_material && r < o.dc && b < o.dc) ? joint_material.data[o.jid].data[r][b] : 0.0f;
         #pragma unroll
         for (int c = 0; c < 3; ++c) o.e[c] = (o.parent >= 0) ? CR[o.child * 3 + c] - CR[o.parent * 3 + c] : 0.0f;
-        o.diag = (r < o.dc) ? joint_armature.data[o.gd + r] : 0.0f;
+        o.diag = pre ? KD.data[k * 6 + r] : ((r < o.dc) ? joint_armature.data[o.gd + r] : 0.0f);
     };
 
     // Leaf to root.
@@ -122,7 +146,10 @@ _FACTOR = (
         // Row r of the child's articulated inertia: its own inertia in world axes, the chain carry and the
         // branch accumulator.
         float ia[6];
-        {
+        if (pre) {
+            #pragma unroll
+            for (int col = 0; col < 6; ++col) ia[col] = cur.iw[col] + ((cur.flags & 8) ? acc[col] : 0.0f);
+        } else {
             const wp::mat_t<3, 3, wp::float32> R = wp::quat_to_matrix(wp::quat_inverse(cur.q));
             // Column rr of R, selected without a runtime index (which would spill R to local memory).
             float rc[3];
@@ -144,12 +171,15 @@ _FACTOR = (
         float pa = (cur.flags & 8) ? acc_p : 0.0f;
         if (cur.flags & 32) {
             #pragma unroll
-            for (int col = 0; col < 6; ++col) {
-                ia[col] += branch.data[cur.child * 36 + r * 6 + col];
-                branch.data[cur.child * 36 + r * 6 + col] = 0.0f;
-            }
+            for (int col = 0; col < 6; ++col) ia[col] += branch.data[cur.child * 36 + r * 6 + col];
             pa += branch_p.data[cur.child * 6 + r];
-            branch_p.data[cur.child * 6 + r] = 0.0f;
+            // Every lane has read the accumulator (lanes past the sixth repeat lanes 0-5) before it is cleared.
+            __syncwarp(GMASK);
+            if (lead) {
+                #pragma unroll
+                for (int col = 0; col < 6; ++col) branch.data[cur.child * 36 + r * 6 + col] = 0.0f;
+                branch_p.data[cur.child * 6 + r] = 0.0f;
+            }
         }
 
         // U = I_a S (row r, column a), staged for D = S^T U.
@@ -179,7 +209,7 @@ _FACTOR = (
         }
         if (r < dc) {
             float diag = cur.diag;
-            for (int aug_i = 0; aug_i < aug_count; ++aug_i) {
+            for (int aug_i = 0; aug_i < (pre ? 0 : aug_count); ++aug_i) {
                 const int row_index = art * max_dofs + aug_i;
                 if (aug_row_dof_index.data[row_index] == cur.gd + r) {
                     const float K = aug_row_K.data[row_index];
@@ -221,6 +251,7 @@ _FACTOR = (
             for (int a = 0; a < 6; ++a) passed_p += u_row[a] * bcast(c, a);
         }
 
+        if (!pre)
         // The propagation pass's records. B = T (I - U D^-1 S^T) carries a child's wrench to its parent (T moves
         // it to the parent's center of mass); its transpose (I - S D^-1 U^T) X carries the parent's twist change
         // to the child. W = -D^-1 S^T gives the joint's w = D^-1 u from the wrench and Q = -D^-1 U^T X its
@@ -289,6 +320,17 @@ _FACTOR = (
             br[0] = make_float4(brow[0], brow[1], brow[2], brow[3]);
             br[1] = make_float4(brow[4], brow[5], wrow[0], wrow[1]);
             br[2] = make_float4(wrow[2], wrow[3], wrow[4], wrow[5]);
+            // The chain passes' compact record (see CHAIN_REC): B, W, S and Q row-major, then e.
+            float* cr = propagation_tree_CR.data + k * CHAIN_REC;
+            float2* c2 = reinterpret_cast<float2*>(cr + r * 6);
+            c2[0] = make_float2(brow[0], brow[1]); c2[1] = make_float2(brow[2], brow[3]); c2[2] = make_float2(brow[4], brow[5]);
+            c2 = reinterpret_cast<float2*>(cr + 36 + r * 6);
+            c2[0] = make_float2(wrow[0], wrow[1]); c2[1] = make_float2(wrow[2], wrow[3]); c2[2] = make_float2(wrow[4], wrow[5]);
+            c2 = reinterpret_cast<float2*>(cr + 72 + r * 6);
+            c2[0] = make_float2(cur.s[0], cur.s[1]); c2[1] = make_float2(cur.s[2], cur.s[3]); c2[2] = make_float2(cur.s[4], cur.s[5]);
+            c2 = reinterpret_cast<float2*>(cr + 108 + r * 6);
+            c2[0] = make_float2(qrow[0], qrow[1]); c2[1] = make_float2(qrow[2], qrow[3]); c2[2] = make_float2(qrow[4], qrow[5]);
+            if (r == 0) *reinterpret_cast<float4*>(cr + 144) = make_float4(ex, ey, ez, 0.0f);
             __syncwarp(GMASK);
         }
 
@@ -305,7 +347,7 @@ _FACTOR = (
                 for (int b = 0; b < 6; ++b) krow[b] = cur.m[b];
                 {
                     float diag = cur.diag;
-                    for (int aug_i = 0; aug_i < aug_count; ++aug_i) {
+                    for (int aug_i = 0; aug_i < (pre ? 0 : aug_count); ++aug_i) {
                         const int row_index = art * max_dofs + aug_i;
                         if (aug_row_dof_index.data[row_index] == cur.gd + r) {
                             const float K = aug_row_K.data[row_index];
@@ -315,8 +357,6 @@ _FACTOR = (
                     #pragma unroll
                     for (int b = 0; b < 6; ++b) if (b == r) krow[b] += diag;
                 }
-                float iinv[6];
-                gj(ihat, iinv);
                 // G = D^-1 K (DOF rows).
                 __syncwarp(GMASK);
                 #pragma unroll
@@ -330,6 +370,34 @@ _FACTOR = (
                     for (int b = 0; b < 6; ++b) v += Z[r * 6 + b] * X[b * 6 + c];
                     g[c] = v;
                 }
+                if (pre) {
+                    // Red = U (G S^-1): rows of G S^-1, then U times them.
+                    __syncwarp(GMASK);
+                    #pragma unroll
+                    for (int j = 0; j < 6; ++j) X[r * 6 + j] = cur.sinv[j];
+                    __syncwarp(GMASK);
+                    float mm[6];
+                    #pragma unroll
+                    for (int j = 0; j < 6; ++j) {
+                        float v = 0.0f;
+                        #pragma unroll
+                        for (int c = 0; c < 6; ++c) v += g[c] * X[c * 6 + j];
+                        mm[j] = v;
+                    }
+                    __syncwarp(GMASK);
+                    #pragma unroll
+                    for (int j = 0; j < 6; ++j) X[r * 6 + j] = mm[j];
+                    __syncwarp(GMASK);
+                    #pragma unroll
+                    for (int j = 0; j < 6; ++j) {
+                        float v = 0.0f;
+                        #pragma unroll
+                        for (int a = 0; a < 6; ++a) v += u_row[a] * X[a * 6 + j];
+                        red[j] = v;
+                    }
+                } else {
+                float iinv[6];
+                gj(ihat, iinv);
                 // M = G I^-1 (DOF rows).
                 __syncwarp(GMASK);
                 #pragma unroll
@@ -362,6 +430,7 @@ _FACTOR = (
                     #pragma unroll
                     for (int j = 0; j < 6; ++j) v += wrow[j] * Y[col * 6 + j];
                     red[col] = v;
+                }
                 }
                 __syncwarp(GMASK);
                 #pragma unroll
@@ -417,7 +486,7 @@ _FACTOR = (
                 #pragma unroll
                 for (int col = 0; col < 6; ++col) acc[col] = prow[col];
                 acc_p = pp;
-            } else {
+            } else if (lead) {
                 #pragma unroll
                 for (int col = 0; col < 6; ++col) branch.data[cur.parent * 36 + r * 6 + col] += prow[col];
                 branch_p.data[cur.parent * 6 + r] += pp;
@@ -484,11 +553,36 @@ _FACTOR = (
 )
 
 
+# Packed factor: five trees per warp when every tree of the group walks the same joint pattern (replicated worlds,
+# identical cables) and none is skipped, so all lanes stay convergent and keep full-mask shuffles. Lanes 30-31
+# repeat group 4; groups past the last tree repeat it. Only lanes of real trees (``lead``) touch accumulators.
+PACKED_TREES = 5
+_FACTOR_PACKED = (
+    _FACTOR.replace("const int grp = 0;", "const int grp = min(lane / 6, PACKED_TREES - 1);")
+    .replace(
+        "const int tree = warp_global * TREES_PER_WARP + grp;",
+        "const int tree_raw = warp_global * PACKED_TREES + grp;\n"
+        "    const int tree = (warp_global * PACKED_TREES < ntrees) ? min(tree_raw, ntrees - 1) : tree_raw;\n"
+        "    const bool lead = lane < 30 && tree_raw < ntrees;",
+    )
+    .replace("const bool lead = lane < 6;", "")
+    .replace("__shared__ float shm[2][TREES_PER_WARP][4][36];", "__shared__ float shm[2][PACKED_TREES][4][36];")
+    .replace("if (grp >= TREES_PER_WARP || tree >= ntrees) return;", "if (tree >= ntrees) return;", 1)
+    .replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n    #define PACKED_TREES " + str(PACKED_TREES), 1)
+)
+
+
+def packed_launch_dim(ntrees: int) -> int:
+    """Threads for ``ntrees`` trees of the packed factor: five per warp, rounded to whole blocks."""
+    warps = (ntrees + PACKED_TREES - 1) // PACKED_TREES
+    return ((warps * 32 + BLOCK_DIM - 1) // BLOCK_DIM) * BLOCK_DIM
+
+
 @functools.cache
-def factor_kernel():
+def factor_kernel(packed: bool = False):
     """Kernel factoring rod trees (and, with ``with_tau``, solving their unconstrained accelerations)."""
 
-    @wp.func_native(_FACTOR)
+    @wp.func_native(_FACTOR_PACKED if packed else _FACTOR)
     def rod_tree_factor_native(
         ntrees: int,
         joint_meta: wp.array[int],
@@ -520,6 +614,11 @@ def factor_kernel():
         joint_qdd: wp.array[float],
         propagation_tree_BR: wp.array2d[float],
         propagation_tree_FR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
+        use_prelude: int,
+        IW: wp.array[float],
+        KD: wp.array[float],
+        SINV: wp.array[float],
     ): ...
 
     def rod_tree_factor(  # pragma: no cover - compiled by wp.kernel
@@ -553,6 +652,11 @@ def factor_kernel():
         joint_qdd: wp.array[float],
         propagation_tree_BR: wp.array2d[float],
         propagation_tree_FR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
+        use_prelude: int,
+        IW: wp.array[float],
+        KD: wp.array[float],
+        SINV: wp.array[float],
     ):
         _tid = wp.tid()
         rod_tree_factor_native(
@@ -586,10 +690,15 @@ def factor_kernel():
             joint_qdd,
             propagation_tree_BR,
             propagation_tree_FR,
+            propagation_tree_CR,
+            use_prelude,
+            IW,
+            KD,
+            SINV,
         )
 
-    rod_tree_factor.__name__ = "rod_tree_factor"
-    rod_tree_factor.__qualname__ = "rod_tree_factor"
+    rod_tree_factor.__name__ = "rod_tree_factor" + ("_packed" if packed else "")
+    rod_tree_factor.__qualname__ = rod_tree_factor.__name__
     return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(rod_tree_factor)
 
 
@@ -604,7 +713,7 @@ _PROPAGATE = (
     r"""
 #if defined(__CUDA_ARCH__)
 """
-    + _PRELUDE
+    + _PRELUDE_FULL
     + r"""
     if (grp >= TREES_PER_WARP || tree >= ntrees) return;
     const int art = group_to_art.data[tree];
@@ -646,7 +755,8 @@ _PROPAGATE = (
         float pa = -cur.imp + ((cur.flags & 8) ? carry : 0.0f);
         if (cur.flags & 32) {
             pa += branch_p.data[cur.child * 6 + r];
-            branch_p.data[cur.child * 6 + r] = 0.0f;
+            __syncwarp(GMASK);
+            if (lead) branch_p.data[cur.child * 6 + r] = 0.0f;
         }
         float p[6];
         #pragma unroll
@@ -654,7 +764,7 @@ _PROPAGATE = (
         const float passed = cur.m0.x * p[0] + cur.m0.y * p[1] + cur.m0.z * p[2] + cur.m0.w * p[3] + cur.m1.x * p[4] + cur.m1.y * p[5];
         if (cur.parent >= 0) {
             if (cur.flags & 16) carry = passed;
-            else branch_p.data[cur.parent * 6 + r] += passed;
+            else if (lead) branch_p.data[cur.parent * 6 + r] += passed;
         }
         const float w = cur.m1.z * p[0] + cur.m1.w * p[1] + cur.m2.x * p[2] + cur.m2.y * p[3] + cur.m2.z * p[4] + cur.m2.w * p[5];
         if (r < cur.dc) propagation_tree_u.data[cur.gd + r] = w;
@@ -827,7 +937,7 @@ _RESPONSE = (
     r"""
 #if defined(__CUDA_ARCH__)
 """
-    + _PRELUDE.replace("__shared__ float shm[2][TREES_PER_WARP][4][36];", "__shared__ float shm[2][5][4][36];")
+    + _PRELUDE_FULL
     + r"""
     if (grp >= TREES_PER_WARP || tree >= ntrees) return;
     float* A = shm[wib][grp][0];
@@ -1120,7 +1230,7 @@ _REFRESH = (
     r"""
 #if defined(__CUDA_ARCH__)
 """
-    + _PRELUDE
+    + _PRELUDE_FULL
     + r"""
     if (grp >= TREES_PER_WARP || tree >= ntrees) return;
     const int art = group_to_art.data[tree];
@@ -1211,11 +1321,17 @@ def refresh_kernel():
     return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(rod_tree_refresh)
 
 
-_CHAIN_PROPAGATE = r"""
+_CHAIN_PROPAGATE = (
+    "\n    #define CHAIN_REC "
+    + str(CHAIN_REC)
+    + "\n    #define CONTRACT_KMAX 32"
+    + r"""
 #if defined(__CUDA_ARCH__)
     // One warp per chain. Lane s owns the chain's links [s*L, s*L + L): it composes its segment's maps in
     // registers, and the segments combine in a warp scan, so a pass costs about L + log2(32) map products
-    // instead of one dependent step per link.
+    // instead of one dependent step per link. The pass is bound by memory latency, not arithmetic, so a chain
+    // that fits stages its links' records, indices and impulses in shared memory first, with wide coalesced
+    // loads, and every pass reads them there.
     const int lane = threadIdx.x & 31;
     const int tree = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (tree >= ntrees) return;
@@ -1231,159 +1347,254 @@ _CHAIN_PROPAGATE = r"""
     const int lo = min(lane * L, n);
     const int hi = min(lo + L, n);
     const int* meta = joint_meta.data;
-    const float* BR = propagation_tree_BR.data;
-    const float* FR = propagation_tree_FR.data;
     const unsigned FULL = 0xffffffffu;
 
-    typedef float M6[36];
-    auto ident = [](M6 m) {
-        #pragma unroll
-        for (int e = 0; e < 36; ++e) m[e] = (e % 7 == 0) ? 1.0f : 0.0f;
+    #define CTR_SMEM (CONTRACT_KMAX * 90)
+    __shared__ __align__(16) float s_rec[(STAGE_MAX * CHAIN_REC > CTR_SMEM) ? STAGE_MAX * CHAIN_REC : CTR_SMEM];
+    __shared__ int s_link[(STAGE_MAX * 3 > CONTRACT_KMAX) ? STAGE_MAX * 3 : CONTRACT_KMAX];
+    __shared__ float s_imp[STAGE_MAX * 6];
+    __shared__ float s_u[STAGE_MAX * 6];
+    __shared__ float s_v[STAGE_MAX * 6];
+    const bool staged = n <= STAGE_MAX;
+    // Contracted iterations (contract_max > 0): a chain with few active links keeps its impulses and only sets its
+    // active links' twists from their sum (see _CONTRACT_PREP); the others propagate as usual.
+    const int Kc = contract_max ? n_active.data[art] : 0;
+    if (Kc > 0 && Kc <= contract_max && 4 * Kc <= n) {
+        const int K = Kc;
+        float* s_P = s_rec;
+        float* s_R = s_rec + CONTRACT_KMAX * 36;
+        float* s_f = s_rec + CONTRACT_KMAX * 72;
+        float* s_a = s_f + CONTRACT_KMAX * 6;
+        float* s_d = s_a + CONTRACT_KMAX * 6;
+        int* s_b = s_link;
+        float* QD = propagation_body_qd.data;
+        for (int i = lane; i < K; i += 32) s_b[i] = active_body.data[js + i];
+        __syncwarp(FULL);
+        for (int e = lane; e < K * 36; e += 32) {
+            s_P[e] = active_P.data[js * 36 + e];
+            s_R[e] = propagation_body_response.data[s_b[e / 36] * 36 + e % 36];
+        }
+        for (int e = lane; e < K * 6; e += 32) s_f[e] = propagation_body_impulses.data[s_b[e / 6] * 6 + e % 6];
+        __syncwarp(FULL);
+        if (lane == 0) {
+            float a[6];
+            #pragma unroll
+            for (int r = 0; r < 6; ++r) { a[r] = s_f[(K - 1) * 6 + r]; s_a[(K - 1) * 6 + r] = a[r]; }
+            for (int i = K - 2; i >= 0; --i) {
+                const float* P = s_P + i * 36;
+                float na[6];
+                #pragma unroll
+                for (int r = 0; r < 6; ++r) {
+                    float v = s_f[i * 6 + r];
+                    #pragma unroll
+                    for (int c = 0; c < 6; ++c) v += P[r * 6 + c] * a[c];
+                    na[r] = v;
+                }
+                #pragma unroll
+                for (int r = 0; r < 6; ++r) { a[r] = na[r]; s_a[i * 6 + r] = na[r]; }
+            }
+            float bv[6] = {0, 0, 0, 0, 0, 0};
+            for (int i = 0; i < K; ++i) {
+                const float* R = s_R + i * 36;
+                float t[6];
+                #pragma unroll
+                for (int r = 0; r < 6; ++r) {
+                    float d = bv[r], rf = bv[r];
+                    #pragma unroll
+                    for (int c = 0; c < 6; ++c) { d += R[r * 6 + c] * s_a[i * 6 + c]; rf += R[r * 6 + c] * s_f[i * 6 + c]; }
+                    s_d[i * 6 + r] = d;
+                    t[r] = rf;
+                }
+                if (i + 1 < K) {
+                    const float* P = s_P + i * 36;
+                    #pragma unroll
+                    for (int r = 0; r < 6; ++r) {
+                        float v = 0.0f;
+                        #pragma unroll
+                        for (int c = 0; c < 6; ++c) v += P[c * 6 + r] * t[c];
+                        bv[r] = v;
+                    }
+                }
+            }
+        }
+        __syncwarp(FULL);
+        for (int e = lane; e < K * 6; e += 32) QD[s_b[e / 6] * 6 + e % 6] = active_qd0.data[js * 6 + e] + s_d[e];
+        return;
+    }
+    const float* gcr = propagation_tree_CR.data + js * CHAIN_REC;
+    int any = 0;
+    if (staged) {
+        const float4* g4 = reinterpret_cast<const float4*>(gcr);
+        float4* d4 = reinterpret_cast<float4*>(s_rec);
+        for (int q = lane; q < n * (CHAIN_REC / 4); q += 32) d4[q] = g4[q];
+        for (int k = lane; k < n; k += 32) {
+            const int4 m = *reinterpret_cast<const int4*>(meta + 4 * (js + k));
+            s_link[3 * k] = m.x;
+            s_link[3 * k + 1] = m.z;
+            s_link[3 * k + 2] = m.w & 7;
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) {
+                const float v = propagation_body_impulses.data[m.x * 6 + c];
+                s_imp[6 * k + c] = v;
+                if (v != 0.0f) any = 1;
+            }
+        }
+        __syncwarp(FULL);
+    }
+    const float* rec = staged ? s_rec : gcr;
+    auto child_of = [&](int k) { return staged ? s_link[3 * k] : meta[4 * (js + k)]; };
+    auto gd_of = [&](int k) { return staged ? s_link[3 * k + 1] : meta[4 * (js + k) + 2]; };
+    auto dc_of = [&](int k) { return staged ? s_link[3 * k + 2] : (meta[4 * (js + k) + 3] & 7); };
+    auto imp_of = [&](int k, int c) {
+        return staged ? s_imp[6 * k + c] : propagation_body_impulses.data[meta[4 * (js + k)] * 6 + c];
     };
-    auto matmul = [](const M6 a, const M6 b, M6 out) {
+    // y = G x for G at offset off of link k's record (row-major), or its transpose.
+    auto mv = [&](int k, int off, const float* x, float* y) {
+        const float* g = rec + k * CHAIN_REC + off;
+        #pragma unroll
+        for (int r = 0; r < 6; ++r) {
+            float v = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) v += g[r * 6 + c] * x[c];
+            y[r] = v;
+        }
+    };
+    auto mtv = [&](int k, int off, const float* x, float* y) {
+        const float* g = rec + k * CHAIN_REC + off;
+        #pragma unroll
+        for (int r = 0; r < 6; ++r) {
+            float v = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) v += g[c * 6 + r] * x[c];
+            y[r] = v;
+        }
+    };
+    auto loadm = [&](int k, int off, float* m, bool transpose) {
+        const float* g = rec + k * CHAIN_REC + off;
+        #pragma unroll
+        for (int r = 0; r < 6; ++r)
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) m[r * 6 + c] = transpose ? g[c * 6 + r] : g[r * 6 + c];
+    };
+    auto matmul = [](const float* a, const float* b, float* out) {
         #pragma unroll
         for (int r = 0; r < 6; ++r)
             #pragma unroll
             for (int c = 0; c < 6; ++c) {
                 float v = 0.0f;
                 #pragma unroll
-                for (int t = 0; t < 6; ++t) v += a[r * 6 + t] * b[t * 6 + c];
+                for (int q = 0; q < 6; ++q) v += a[r * 6 + q] * b[q * 6 + c];
                 out[r * 6 + c] = v;
             }
     };
-    // B of chain link k (row-major) or its transpose, from the factor's backward records.
-    auto loadB = [&](int k, M6 m, bool transpose) {
-        const float* q = BR + (js + k) * 72;
+    // Warp scan of segment maps y = x + M y_in; on return x is the segment's inflow (backward: from the next
+    // segment, forward: from the previous one). M is consumed.
+    auto scan = [&](float* x, float* M, bool backward) {
         #pragma unroll
-        for (int r = 0; r < 6; ++r)
+        for (int d = 1; d < 32; d <<= 1) {
+            float xs[6], Ms[36], nm[36];
             #pragma unroll
-            for (int c = 0; c < 6; ++c) {
-                const float v = q[r * 12 + c];
-                if (transpose) m[c * 6 + r] = v; else m[r * 6 + c] = v;
+            for (int r = 0; r < 6; ++r) xs[r] = backward ? __shfl_down_sync(FULL, x[r], d) : __shfl_up_sync(FULL, x[r], d);
+            #pragma unroll
+            for (int e = 0; e < 36; ++e) Ms[e] = backward ? __shfl_down_sync(FULL, M[e], d) : __shfl_up_sync(FULL, M[e], d);
+            if (backward ? (lane + d < 32) : (lane >= d)) {
+                #pragma unroll
+                for (int r = 0; r < 6; ++r) {
+                    float v = x[r];
+                    #pragma unroll
+                    for (int c = 0; c < 6; ++c) v += M[r * 6 + c] * xs[c];
+                    x[r] = v;
+                }
+                matmul(M, Ms, nm);
+                #pragma unroll
+                for (int e = 0; e < 36; ++e) M[e] = nm[e];
             }
-    };
-    auto matvec_rows = [](const float* q, int stride, int off, const float* x, float* y) {
+        }
         #pragma unroll
         for (int r = 0; r < 6; ++r) {
-            float v = 0.0f;
-            #pragma unroll
-            for (int c = 0; c < 6; ++c) v += q[r * stride + off + c] * x[c];
-            y[r] = v;
+            const float v = backward ? __shfl_down_sync(FULL, x[r], 1) : __shfl_up_sync(FULL, x[r], 1);
+            x[r] = (backward ? lane < 31 : lane > 0) ? v : 0.0f;
         }
-    };
-    auto shfl_mat = [&](const M6 m, M6 out, int d, bool down) {
-        #pragma unroll
-        for (int e = 0; e < 36; ++e) out[e] = down ? __shfl_down_sync(FULL, m[e], d) : __shfl_up_sync(FULL, m[e], d);
     };
 
     // Backward: p_k = -imp_k + B_{k+1} p_{k+1}. The segment gives p_lo = a + C p_hi.
     float a[6] = {0, 0, 0, 0, 0, 0};
-    M6 C;
-    ident(C);
-    int any = 0;
+    float C[36];
+    #pragma unroll
+    for (int e = 0; e < 36; ++e) C[e] = (e % 7 == 0) ? 1.0f : 0.0f;
     for (int k = hi - 1; k >= lo; --k) {
-        const int child = meta[4 * (js + k)];
-        float imp[6];
-        #pragma unroll
-        for (int c = 0; c < 6; ++c) {
-            imp[c] = propagation_body_impulses.data[child * 6 + c];
-            if (imp[c] != 0.0f) any = 1;
-        }
         float na[6];
         if (k + 1 < n) {
-            M6 B, nc;
-            loadB(k + 1, B, false);
+            float B[36], nc[36];
+            loadm(k + 1, 0, B, false);
             #pragma unroll
             for (int r = 0; r < 6; ++r) {
                 float v = 0.0f;
                 #pragma unroll
                 for (int c = 0; c < 6; ++c) v += B[r * 6 + c] * a[c];
-                na[r] = v - imp[r];
+                na[r] = v;
             }
             matmul(B, C, nc);
             #pragma unroll
             for (int e = 0; e < 36; ++e) C[e] = nc[e];
         } else {
             #pragma unroll
-            for (int r = 0; r < 6; ++r) na[r] = -imp[r];
+            for (int r = 0; r < 6; ++r) na[r] = 0.0f;
             #pragma unroll
             for (int e = 0; e < 36; ++e) C[e] = 0.0f;
         }
         #pragma unroll
-        for (int r = 0; r < 6; ++r) a[r] = na[r];
+        for (int r = 0; r < 6; ++r) {
+            const float im = imp_of(k, r);
+            if (!staged && im != 0.0f) any = 1;
+            a[r] = na[r] - im;
+        }
     }
     if (__any_sync(FULL, any) == 0) return;
-    // Suffix scan over segments: Y_s = a_s + C_s Y_{s+1}.
-    {
-        float x[6];
-        #pragma unroll
-        for (int r = 0; r < 6; ++r) x[r] = a[r];
-        #pragma unroll
-        for (int d = 1; d < 32; d <<= 1) {
-            float xs[6];
-            M6 Cs, nc;
-            #pragma unroll
-            for (int r = 0; r < 6; ++r) xs[r] = __shfl_down_sync(FULL, x[r], d);
-            shfl_mat(C, Cs, d, true);
-            if (lane + d < 32) {
-                #pragma unroll
-                for (int r = 0; r < 6; ++r) {
-                    float v = x[r];
-                    #pragma unroll
-                    for (int c = 0; c < 6; ++c) v += C[r * 6 + c] * xs[c];
-                    x[r] = v;
-                }
-                matmul(C, Cs, nc);
-                #pragma unroll
-                for (int e = 0; e < 36; ++e) C[e] = nc[e];
-            }
-        }
-        // The segment's inflow is the next segment's p_lo.
-        #pragma unroll
-        for (int r = 0; r < 6; ++r) {
-            const float v = __shfl_down_sync(FULL, x[r], 1);
-            a[r] = (lane < 31) ? v : 0.0f;
-        }
-    }
+    scan(a, C, true);
     // Fix-up: each link's wrench with the true inflow, and w = W p.
     for (int k = hi - 1; k >= lo; --k) {
-        const int child = meta[4 * (js + k)];
-        const int gd = meta[4 * (js + k) + 2];
-        const int dc = meta[4 * (js + k) + 3] & 7;
         float p[6];
         if (k + 1 < n) {
-            const float* q = BR + (js + k + 1) * 72;
-            matvec_rows(q, 12, 0, a, p);
+            mv(k + 1, 0, a, p);
         } else {
             #pragma unroll
             for (int r = 0; r < 6; ++r) p[r] = 0.0f;
         }
         #pragma unroll
-        for (int r = 0; r < 6; ++r) p[r] -= propagation_body_impulses.data[child * 6 + r];
+        for (int r = 0; r < 6; ++r) p[r] -= imp_of(k, r);
         float w[6];
-        matvec_rows(BR + (js + k) * 72, 12, 6, p, w);
+        mv(k, 36, p, w);
+        const int gd = gd_of(k);
+        const int dc = dc_of(k);
         for (int r = 0; r < dc; ++r) propagation_tree_u.data[gd + r] = w[r];
+        if (staged) {
+            #pragma unroll
+            for (int r = 0; r < 6; ++r) s_u[6 * k + r] = (r < dc) ? w[r] : 0.0f;
+        }
         #pragma unroll
         for (int r = 0; r < 6; ++r) a[r] = p[r];
     }
     __syncwarp(FULL);
+    auto u_of = [&](int k, float* w) {
+        const int gd = gd_of(k);
+        const int dc = dc_of(k);
+        #pragma unroll
+        for (int r = 0; r < 6; ++r) w[r] = staged ? s_u[6 * k + r] : ((r < dc) ? propagation_tree_u.data[gd + r] : 0.0f);
+    };
 
     // Forward: d_k = A_k d_{k-1} + S_k w_k with A_k = B_k^T; the segment gives d_{hi-1} = b + H d_{lo-1}.
     float b[6] = {0, 0, 0, 0, 0, 0};
-    M6 H;
-    ident(H);
+    float H[36];
+    #pragma unroll
+    for (int e = 0; e < 36; ++e) H[e] = (e % 7 == 0) ? 1.0f : 0.0f;
     for (int k = lo; k < hi; ++k) {
-        const int gd = meta[4 * (js + k) + 2];
-        const int dc = meta[4 * (js + k) + 3] & 7;
-        float w[6];
-        #pragma unroll
-        for (int r = 0; r < 6; ++r) w[r] = (r < dc) ? propagation_tree_u.data[gd + r] : 0.0f;
-        float sw[6];
-        matvec_rows(FR + (js + k) * 144, 24, 12, w, sw);
+        float w[6], sw[6];
+        u_of(k, w);
+        mv(k, 72, w, sw);
         if (k > 0) {
-            M6 A, nh;
-            loadB(k, A, true);
-            float nb[6];
+            float A[36], nh[36], nb[6];
+            loadm(k, 0, A, true);
             #pragma unroll
             for (int r = 0; r < 6; ++r) {
                 float v = sw[r];
@@ -1403,61 +1614,32 @@ _CHAIN_PROPAGATE = r"""
             for (int e = 0; e < 36; ++e) H[e] = 0.0f;
         }
     }
-    // Prefix scan over segments: Z_s = b_s + H_s Z_{s-1}.
-    {
-        float x[6];
-        #pragma unroll
-        for (int r = 0; r < 6; ++r) x[r] = b[r];
-        #pragma unroll
-        for (int d = 1; d < 32; d <<= 1) {
-            float xs[6];
-            M6 Hs, nh;
-            #pragma unroll
-            for (int r = 0; r < 6; ++r) xs[r] = __shfl_up_sync(FULL, x[r], d);
-            shfl_mat(H, Hs, d, false);
-            if (lane >= d) {
-                #pragma unroll
-                for (int r = 0; r < 6; ++r) {
-                    float v = x[r];
-                    #pragma unroll
-                    for (int c = 0; c < 6; ++c) v += H[r * 6 + c] * xs[c];
-                    x[r] = v;
-                }
-                matmul(H, Hs, nh);
-                #pragma unroll
-                for (int e = 0; e < 36; ++e) H[e] = nh[e];
-            }
-        }
-        #pragma unroll
-        for (int r = 0; r < 6; ++r) {
-            const float v = __shfl_up_sync(FULL, x[r], 1);
-            b[r] = (lane > 0) ? v : 0.0f;
-        }
-    }
+    scan(b, H, false);
     // Fix-up: each link's twist change carries to the next link and its joint acceleration goes to v_out.
     for (int k = lo; k < hi; ++k) {
-        const int p4 = 4 * (js + k);
-        const int child = meta[p4];
-        const int gd = meta[p4 + 2];
-        const int dc = meta[p4 + 3] & 7;
-        const float* fr = FR + (js + k) * 144;
-        float w[6];
-        #pragma unroll
-        for (int r = 0; r < 6; ++r) w[r] = (r < dc) ? propagation_tree_u.data[gd + r] : 0.0f;
-        float d[6], qdd[6];
-        matvec_rows(fr, 24, 12, w, d);
-        matvec_rows(fr, 24, 6, b, qdd);
+        float w[6], d[6], qdd[6];
+        u_of(k, w);
+        mv(k, 72, w, d);
+        mv(k, 108, b, qdd);
         if (k > 0) {
-            const float* q = BR + (js + k) * 72;
+            float t[6];
+            mtv(k, 0, b, t);
             #pragma unroll
-            for (int r = 0; r < 6; ++r) {
-                float v = d[r];
-                #pragma unroll
-                for (int c = 0; c < 6; ++c) v += q[c * 12 + r] * b[c];
-                d[r] = v;
+            for (int r = 0; r < 6; ++r) d[r] += t[r];
+        }
+        const int child = child_of(k);
+        const int gd = gd_of(k);
+        const int dc = dc_of(k);
+        #pragma unroll
+        for (int r = 0; r < 6; ++r) {
+            if (r < dc) {
+                const float nv = v_out.data[gd + r] + qdd[r] + w[r];
+                v_out.data[gd + r] = nv;
+                if (staged) s_v[6 * k + r] = nv;
+            } else if (staged) {
+                s_v[6 * k + r] = 0.0f;
             }
         }
-        for (int r = 0; r < dc; ++r) v_out.data[gd + r] += qdd[r] + w[r];
         #pragma unroll
         for (int r = 0; r < 6; ++r) {
             propagation_body_impulses.data[child * 6 + r] = 0.0f;
@@ -1476,16 +1658,20 @@ _CHAIN_PROPAGATE = r"""
         o[2] += w0 * e[1] - w1 * e[0];
     };
     auto link_twist = [&](int k, float* sv, float* e) {
-        const int p4 = 4 * (js + k);
-        const int gd = meta[p4 + 2];
-        const int dc = meta[p4 + 3] & 7;
-        const float* fr = FR + (js + k) * 144;
         float v[6];
+        if (staged) {
+            #pragma unroll
+            for (int r = 0; r < 6; ++r) v[r] = s_v[6 * k + r];
+        } else {
+            const int gd = gd_of(k);
+            const int dc = dc_of(k);
+            #pragma unroll
+            for (int r = 0; r < 6; ++r) v[r] = (r < dc) ? v_out.data[gd + r] : 0.0f;
+        }
+        mv(k, 72, v, sv);
+        const float* er = rec + k * CHAIN_REC + 144;
         #pragma unroll
-        for (int r = 0; r < 6; ++r) v[r] = (r < dc) ? v_out.data[gd + r] : 0.0f;
-        matvec_rows(fr, 24, 12, v, sv);
-        #pragma unroll
-        for (int c = 0; c < 3; ++c) e[c] = (k > 0) ? fr[18 + c] : 0.0f;
+        for (int c = 0; c < 3; ++c) e[c] = (k > 0) ? er[c] : 0.0f;
     };
     float t[6] = {0, 0, 0, 0, 0, 0};
     float E[3] = {0, 0, 0};
@@ -1525,19 +1711,25 @@ _CHAIN_PROPAGATE = r"""
         shift(o, e);
         #pragma unroll
         for (int r = 0; r < 6; ++r) o[r] += sv[r];
-        const int child = meta[4 * (js + k)];
+        const int child = child_of(k);
         #pragma unroll
         for (int r = 0; r < 6; ++r) propagation_body_qd.data[child * 6 + r] = o[r];
     }
 #endif
 """
+)
 
 
 @functools.cache
-def chain_propagate_kernel():
-    """Kernel propagating each chain-shaped rod tree's link impulses with a warp scan (see ``_CHAIN_PROPAGATE``)."""
+def chain_propagate_kernel(staged: bool = True):
+    """Kernel propagating each chain-shaped rod tree's link impulses with a warp scan (see ``_CHAIN_PROPAGATE``).
 
-    @wp.func_native(_CHAIN_PROPAGATE)
+    ``staged`` reserves shared memory for chains of up to CHAIN_STAGE_MAX links: the faster pass for a lone chain,
+    and a cap on how many chains share an SM, so a launch whose chains fill the GPU on their own takes the
+    unstaged variant.
+    """
+
+    @wp.func_native("\n    #define STAGE_MAX " + str(CHAIN_STAGE_MAX if staged else 1) + "\n" + _CHAIN_PROPAGATE)
     def rod_chain_propagate_native(
         ntrees: int,
         joint_meta: wp.array[int],
@@ -1549,7 +1741,14 @@ def chain_propagate_kernel():
         articulation_joint_range: wp.array[int],
         propagation_tree_BR: wp.array2d[float],
         propagation_tree_FR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
         propagation_tree_u: wp.array[float],
+        n_active: wp.array[int],
+        contract_max: int,
+        active_body: wp.array[int],
+        active_P: wp.array[float],
+        propagation_body_response: wp.array3d[float],
+        active_qd0: wp.array[float],
         propagation_body_impulses: wp.array2d[float],
         propagation_body_qd: wp.array2d[float],
         v_out: wp.array[float],
@@ -1566,7 +1765,14 @@ def chain_propagate_kernel():
         articulation_joint_range: wp.array[int],
         propagation_tree_BR: wp.array2d[float],
         propagation_tree_FR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
         propagation_tree_u: wp.array[float],
+        n_active: wp.array[int],
+        contract_max: int,
+        active_body: wp.array[int],
+        active_P: wp.array[float],
+        propagation_body_response: wp.array3d[float],
+        active_qd0: wp.array[float],
         propagation_body_impulses: wp.array2d[float],
         propagation_body_qd: wp.array2d[float],
         v_out: wp.array[float],
@@ -1583,14 +1789,21 @@ def chain_propagate_kernel():
             articulation_joint_range,
             propagation_tree_BR,
             propagation_tree_FR,
+            propagation_tree_CR,
             propagation_tree_u,
+            n_active,
+            contract_max,
+            active_body,
+            active_P,
+            propagation_body_response,
+            active_qd0,
             propagation_body_impulses,
             propagation_body_qd,
             v_out,
         )
 
-    rod_chain_propagate.__name__ = "rod_chain_propagate"
-    rod_chain_propagate.__qualname__ = "rod_chain_propagate"
+    rod_chain_propagate.__name__ = "rod_chain_propagate" + ("" if staged else "_unstaged")
+    rod_chain_propagate.__qualname__ = rod_chain_propagate.__name__
     return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(rod_chain_propagate)
 
 
@@ -1633,8 +1846,7 @@ _CHAIN_RESPONSE = r"""
     const int lo = min(lane * L, n);
     const int hi = min(lo + L, n);
     const int* meta = joint_meta.data;
-    const float* BR = propagation_tree_BR.data;
-    const float* FR = propagation_tree_FR.data;
+    const float* CRR = propagation_tree_CR.data;
     const float* DI = propagation_tree_D_inv.data;
     const unsigned FULL = 0xffffffffu;
 
@@ -1669,12 +1881,12 @@ _CHAIN_RESPONSE = r"""
         const int flags = meta[p4 + 3];
         const int dc = flags & 7;
         const int jid = flags >> 8;
-        const float* br = BR + (js + k) * 72;
-        const float* fr = FR + (js + k) * 144;
+        const float* br = CRR + (js + k) * 148;
+        const float* fr = br;
         #pragma unroll
         for (int r = 0; r < 6; ++r)
             #pragma unroll
-            for (int c = 0; c < 6; ++c) Mk[r * 6 + c] = (k > 0) ? br[c * 12 + r] : 0.0f;
+            for (int c = 0; c < 6; ++c) Mk[r * 6 + c] = (k > 0) ? br[c * 6 + r] : 0.0f;
         float SD[36];
         #pragma unroll
         for (int r = 0; r < 6; ++r)
@@ -1683,7 +1895,7 @@ _CHAIN_RESPONSE = r"""
                 float v = 0.0f;
                 #pragma unroll
                 for (int a = 0; a < 6; ++a)
-                    if (a < dc && b < dc) v += fr[r * 24 + 12 + a] * DI[jid * 36 + a * 6 + b];
+                    if (a < dc && b < dc) v += fr[72 + r * 6 + a] * DI[jid * 36 + a * 6 + b];
                 SD[r * 6 + b] = v;
             }
         #pragma unroll
@@ -1692,11 +1904,16 @@ _CHAIN_RESPONSE = r"""
             for (int c = 0; c < 6; ++c) {
                 float v = 0.0f;
                 #pragma unroll
-                for (int b = 0; b < 6; ++b) v += SD[r * 6 + b] * fr[c * 24 + 12 + b];
+                for (int b = 0; b < 6; ++b) v += SD[r * 6 + b] * fr[72 + c * 6 + b];
                 Kk[r * 6 + c] = v;
             }
         weight = (float)max(propagation_joint_split.data[jid], 1);
     };
+    // Without joints shared by several rows (every split weight 1) the split response is the exact one: skip it.
+    int local_split = 0;
+    for (int k = lo; k < hi; ++k)
+        if (propagation_joint_split.data[meta[4 * (js + k) + 3] >> 8] > 1) local_split = 1;
+    const bool split = __any_sync(FULL, local_split) != 0;
     // Segment map: R_{hi-1} = M R_{lo-1} M^T + N (exact) and + Ns (split).
     float M[36], N[36], Ns[36];
     #pragma unroll
@@ -1708,7 +1925,7 @@ _CHAIN_RESPONSE = r"""
         #pragma unroll
         for (int e = 0; e < 36; ++e) { nn[e] = Kk[e]; ns[e] = weight * Kk[e]; }
         congruence_add(Mk, N, nn);
-        congruence_add(Mk, Ns, ns);
+        if (split) congruence_add(Mk, Ns, ns);
         matmul(Mk, M, nm);
         #pragma unroll
         for (int e = 0; e < 36; ++e) { N[e] = nn[e]; Ns[e] = ns[e]; M[e] = nm[e]; }
@@ -1720,11 +1937,11 @@ _CHAIN_RESPONSE = r"""
         for (int e = 0; e < 36; ++e) {
             Mp[e] = __shfl_up_sync(FULL, M[e], d);
             Np[e] = __shfl_up_sync(FULL, N[e], d);
-            Nsp[e] = __shfl_up_sync(FULL, Ns[e], d);
+            Nsp[e] = split ? __shfl_up_sync(FULL, Ns[e], d) : 0.0f;
         }
         if (lane >= d) {
             congruence_add(M, Np, N);
-            congruence_add(M, Nsp, Ns);
+            if (split) congruence_add(M, Nsp, Ns);
             float nm[36];
             matmul(M, Mp, nm);
             #pragma unroll
@@ -1736,7 +1953,7 @@ _CHAIN_RESPONSE = r"""
     #pragma unroll
     for (int e = 0; e < 36; ++e) {
         const float a = __shfl_up_sync(FULL, N[e], 1);
-        const float b = __shfl_up_sync(FULL, Ns[e], 1);
+        const float b = split ? __shfl_up_sync(FULL, Ns[e], 1) : 0.0f;
         R[e] = (lane > 0) ? a : 0.0f;
         Rs[e] = (lane > 0) ? b : 0.0f;
     }
@@ -1747,14 +1964,14 @@ _CHAIN_RESPONSE = r"""
         #pragma unroll
         for (int e = 0; e < 36; ++e) { nr[e] = Kk[e]; ns[e] = weight * Kk[e]; }
         congruence_add(Mk, R, nr);
-        congruence_add(Mk, Rs, ns);
+        if (split) congruence_add(Mk, Rs, ns);
         const int child = meta[4 * (js + k)];
         #pragma unroll
         for (int e = 0; e < 36; ++e) {
             R[e] = nr[e];
             Rs[e] = ns[e];
             propagation_body_response.data[child * 36 + e] = nr[e];
-            propagation_body_response_split.data[child * 36 + e] = ns[e];
+            propagation_body_response_split.data[child * 36 + e] = split ? ns[e] : nr[e];
         }
     }
 #endif
@@ -1775,6 +1992,7 @@ def chain_response_kernel():
         articulation_joint_range: wp.array[int],
         propagation_tree_BR: wp.array2d[float],
         propagation_tree_FR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
         propagation_tree_D_inv: wp.array3d[float],
         propagation_joint_split: wp.array[int],
         propagation_body_response: wp.array3d[float],
@@ -1790,6 +2008,7 @@ def chain_response_kernel():
         articulation_joint_range: wp.array[int],
         propagation_tree_BR: wp.array2d[float],
         propagation_tree_FR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
         propagation_tree_D_inv: wp.array3d[float],
         propagation_joint_split: wp.array[int],
         propagation_body_response: wp.array3d[float],
@@ -1805,6 +2024,7 @@ def chain_response_kernel():
             articulation_joint_range,
             propagation_tree_BR,
             propagation_tree_FR,
+            propagation_tree_CR,
             propagation_tree_D_inv,
             propagation_joint_split,
             propagation_body_response,
@@ -1818,6 +2038,7 @@ def chain_response_kernel():
 
 _CHAIN_REFRESH = r"""
 #if defined(__CUDA_ARCH__)
+    #define CHAIN_REC_N 148
     const int lane = threadIdx.x & 31;
     const int tree = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (tree >= ntrees) return;
@@ -1831,7 +2052,7 @@ _CHAIN_REFRESH = r"""
     const int lo = min(lane * L, n);
     const int hi = min(lo + L, n);
     const int* meta = joint_meta.data;
-    const float* FR = propagation_tree_FR.data;
+    const float* CRR = propagation_tree_CR.data;
     const unsigned FULL = 0xffffffffu;
     auto matvec_rows = [](const float* q, int stride, int off, const float* x, float* y) {
         #pragma unroll
@@ -1855,13 +2076,13 @@ _CHAIN_REFRESH = r"""
         const int p4 = 4 * (js + k);
         const int gd = meta[p4 + 2];
         const int dc = meta[p4 + 3] & 7;
-        const float* fr = FR + (js + k) * 144;
+        const float* fr = CRR + (js + k) * CHAIN_REC_N;
         float v[6];
         #pragma unroll
         for (int r = 0; r < 6; ++r) v[r] = (r < dc) ? v_out.data[gd + r] : 0.0f;
-        matvec_rows(fr, 24, 12, v, sv);
+        matvec_rows(fr, 6, 72, v, sv);
         #pragma unroll
-        for (int c = 0; c < 3; ++c) e[c] = (k > 0) ? fr[18 + c] : 0.0f;
+        for (int c = 0; c < 3; ++c) e[c] = (k > 0) ? fr[144 + c] : 0.0f;
     };
     float t[6] = {0, 0, 0, 0, 0, 0};
     float E[3] = {0, 0, 0};
@@ -1922,6 +2143,7 @@ def chain_refresh_kernel():
         articulation_active: wp.array[int],
         articulation_joint_range: wp.array[int],
         propagation_tree_FR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
         v_out: wp.array[float],
         propagation_body_qd: wp.array2d[float],
     ): ...
@@ -1934,6 +2156,7 @@ def chain_refresh_kernel():
         articulation_active: wp.array[int],
         articulation_joint_range: wp.array[int],
         propagation_tree_FR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
         v_out: wp.array[float],
         propagation_body_qd: wp.array2d[float],
     ):
@@ -1946,6 +2169,7 @@ def chain_refresh_kernel():
             articulation_active,
             articulation_joint_range,
             propagation_tree_FR,
+            propagation_tree_CR,
             v_out,
             propagation_body_qd,
         )
@@ -2074,3 +2298,712 @@ def chain_world_twists_kernel():
     return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(
         rod_chain_world_twists
     )
+
+
+# Contracted chains: within one propagation solve a chain's factorization is fixed, so the twists of its
+# contact-active links are an exact linear function of the impulses on those links alone. With the active links
+# p_1 < ... < p_K in walk order, R_i the body response at p_i and P_i = B_{p_i + 1} ... B_{p_{i+1}} the product of
+# the factor's backward maps between consecutive active links, the twist change at p_i is R_i a_i + b_i with
+# a_i = f_i + P_i a_{i+1} (from the tip) and b_{i+1} = P_i^T (b_i + R_i f_i) (from the root); this is the
+# same-articulation chain response of the refine pass extended to every pair. An iteration then costs O(K) small
+# matrix-vector products per chain instead of a pass over all its links, and the full propagation of the summed
+# impulses runs once after the iterations.
+
+# Most active links a contracted chain may have; chains with more keep the full propagation every iteration.
+CONTRACT_MAX = 32
+
+_CONTRACT_PREP = r"""
+#if defined(__CUDA_ARCH__)
+    #define LONG_SPAN 8
+    // One warp per chain: list the active links in walk order (ballot compaction) and compose P_i.
+    const int lane = threadIdx.x & 31;
+    const int tree = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (tree >= ntrees) return;
+    const int art = group_to_art.data[tree];
+    if (chain_flag.data[art] == 0) return;
+    const int js = articulation_joint_range.data[2 * art];
+    const int n = articulation_joint_range.data[2 * art + 1] - js;
+    const unsigned FULL = 0xffffffffu;
+    int count = 0;
+    if (articulation_active.data && articulation_active.data[art] == 0) {
+        n_active.data[art] = 0;
+        return;
+    }
+    for (int base = 0; base < n; base += 32) {
+        const int k = base + lane;
+        int child = -1;
+        bool act = false;
+        if (k < n) {
+            child = joint_meta.data[4 * (js + k)];
+            act = body_seen.data[child] != 0;
+        }
+        const unsigned m = __ballot_sync(FULL, act);
+        if (act) {
+            const int i = count + __popc(m & ((1u << lane) - 1u));
+            active_pos.data[js + i] = k;
+            active_body.data[js + i] = child;
+        }
+        count += __popc(m);
+    }
+    if (lane == 0) n_active.data[art] = count;
+    __syncwarp(FULL);
+    const float* BR = propagation_tree_CR.data;
+    auto matmul_b = [&](float* M, int k) {
+        const float* br = BR + (js + k) * 148;
+        float nm[36];
+        #pragma unroll
+        for (int r = 0; r < 6; ++r)
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) {
+                float v = 0.0f;
+                #pragma unroll
+                for (int t = 0; t < 6; ++t) v += M[r * 6 + t] * br[t * 6 + c];
+                nm[r * 6 + c] = v;
+            }
+        #pragma unroll
+        for (int e = 0; e < 36; ++e) M[e] = nm[e];
+    };
+    // Long spans: the whole warp composes each, lane chunks first, then an ordered tree reduction.
+    for (int i = 0; i + 1 < count; ++i) {
+        const int p = active_pos.data[js + i];
+        const int q = active_pos.data[js + i + 1];
+        if (q - p <= LONG_SPAN) continue;
+        const int m = q - p;
+        const int per = (m + 31) / 32;
+        float M[36];
+        #pragma unroll
+        for (int e = 0; e < 36; ++e) M[e] = (e % 7 == 0) ? 1.0f : 0.0f;
+        for (int k = p + 1 + lane * per; k <= q && k < p + 1 + (lane + 1) * per; ++k) matmul_b(M, k);
+        #pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            float Ms[36], nm[36];
+            #pragma unroll
+            for (int e = 0; e < 36; ++e) Ms[e] = __shfl_down_sync(FULL, M[e], d);
+            if ((lane & (2 * d - 1)) == 0) {
+                #pragma unroll
+                for (int r = 0; r < 6; ++r)
+                    #pragma unroll
+                    for (int c = 0; c < 6; ++c) {
+                        float v = 0.0f;
+                        #pragma unroll
+                        for (int t = 0; t < 6; ++t) v += M[r * 6 + t] * Ms[t * 6 + c];
+                        nm[r * 6 + c] = v;
+                    }
+                #pragma unroll
+                for (int e = 0; e < 36; ++e) M[e] = nm[e];
+            }
+        }
+        if (lane == 0) {
+            float4* out = reinterpret_cast<float4*>(active_P.data + (js + i) * 36);
+            #pragma unroll
+            for (int q4 = 0; q4 < 9; ++q4) out[q4] = make_float4(M[4 * q4], M[4 * q4 + 1], M[4 * q4 + 2], M[4 * q4 + 3]);
+        }
+    }
+    // Short spans: one lane each.
+    for (int i = lane; i + 1 < count; i += 32) {
+        const int p = active_pos.data[js + i];
+        const int q = active_pos.data[js + i + 1];
+        if (q - p > LONG_SPAN) continue;
+        float M[36];
+        #pragma unroll
+        for (int e = 0; e < 36; ++e) M[e] = (e % 7 == 0) ? 1.0f : 0.0f;
+        for (int k = p + 1; k <= q; ++k) {
+            const float* br = BR + (js + k) * 148;
+            float nm[36];
+            #pragma unroll
+            for (int r = 0; r < 6; ++r)
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) {
+                    float v = 0.0f;
+                    #pragma unroll
+                    for (int t = 0; t < 6; ++t) v += M[r * 6 + t] * br[t * 6 + c];
+                    nm[r * 6 + c] = v;
+                }
+            #pragma unroll
+            for (int e = 0; e < 36; ++e) M[e] = nm[e];
+        }
+        float4* out = reinterpret_cast<float4*>(active_P.data + (js + i) * 36);
+        #pragma unroll
+        for (int q4 = 0; q4 < 9; ++q4) out[q4] = make_float4(M[4 * q4], M[4 * q4 + 1], M[4 * q4 + 2], M[4 * q4 + 3]);
+    }
+#endif
+"""
+
+_CONTRACT_UPDATE = (
+    "\n    #define KMAX "
+    + str(CONTRACT_MAX)
+    + r"""
+#if defined(__CUDA_ARCH__)
+    // One warp per chain with 1..KMAX active links (chains with more keep the full propagation every iteration).
+    // snapshot != 0 keeps the active twists before the first sweep; otherwise the active twists become the
+    // snapshot plus the exact response to the impulses summed so far, on lane 0 over values staged in shared memory.
+    const int lane = threadIdx.x & 31;
+    const int tree = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (tree >= ntrees) return;
+    const int art = group_to_art.data[tree];
+    if (chain_flag.data[art] == 0) return;
+    if (articulation_active.data && articulation_active.data[art] == 0) return;
+    const int K = n_active.data[art];
+    const int js = articulation_joint_range.data[2 * art];
+    const int nlinks = articulation_joint_range.data[2 * art + 1] - js;
+    if (K <= 0 || K > KMAX || 4 * K > nlinks) return;
+    const unsigned FULL = 0xffffffffu;
+    float* QD = propagation_body_qd.data;
+    if (snapshot) {
+        for (int e = lane; e < K * 6; e += 32) {
+            const int b = active_body.data[js + e / 6];
+            active_qd0.data[js * 6 + e] = QD[b * 6 + e % 6];
+        }
+        return;
+    }
+    __shared__ __align__(16) float s_P[KMAX * 36];
+    __shared__ __align__(16) float s_R[KMAX * 36];
+    __shared__ float s_f[KMAX * 6];
+    __shared__ float s_a[KMAX * 6];
+    __shared__ float s_d[KMAX * 6];
+    __shared__ int s_b[KMAX];
+    for (int i = lane; i < K; i += 32) s_b[i] = active_body.data[js + i];
+    __syncwarp(FULL);
+    for (int e = lane; e < K * 36; e += 32) {
+        s_P[e] = active_P.data[js * 36 + e];
+        s_R[e] = propagation_body_response.data[s_b[e / 36] * 36 + e % 36];
+    }
+    for (int e = lane; e < K * 6; e += 32) s_f[e] = propagation_body_impulses.data[s_b[e / 6] * 6 + e % 6];
+    __syncwarp(FULL);
+    if (lane == 0) {
+        // a_i = f_i + P_i a_{i+1}, from the tip.
+        float a[6];
+        #pragma unroll
+        for (int r = 0; r < 6; ++r) { a[r] = s_f[(K - 1) * 6 + r]; s_a[(K - 1) * 6 + r] = a[r]; }
+        for (int i = K - 2; i >= 0; --i) {
+            const float* P = s_P + i * 36;
+            float na[6];
+            #pragma unroll
+            for (int r = 0; r < 6; ++r) {
+                float v = s_f[i * 6 + r];
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) v += P[r * 6 + c] * a[c];
+                na[r] = v;
+            }
+            #pragma unroll
+            for (int r = 0; r < 6; ++r) { a[r] = na[r]; s_a[i * 6 + r] = na[r]; }
+        }
+        // Twist changes: R_i a_i + b_i with b_{i+1} = P_i^T (b_i + R_i f_i), from the root.
+        float bv[6] = {0, 0, 0, 0, 0, 0};
+        for (int i = 0; i < K; ++i) {
+            const float* R = s_R + i * 36;
+            float t[6];
+            #pragma unroll
+            for (int r = 0; r < 6; ++r) {
+                float d = bv[r], rf = bv[r];
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) { d += R[r * 6 + c] * s_a[i * 6 + c]; rf += R[r * 6 + c] * s_f[i * 6 + c]; }
+                s_d[i * 6 + r] = d;
+                t[r] = rf;
+            }
+            if (i + 1 < K) {
+                const float* P = s_P + i * 36;
+                #pragma unroll
+                for (int r = 0; r < 6; ++r) {
+                    float v = 0.0f;
+                    #pragma unroll
+                    for (int c = 0; c < 6; ++c) v += P[c * 6 + r] * t[c];
+                    bv[r] = v;
+                }
+            }
+        }
+    }
+    __syncwarp(FULL);
+    for (int e = lane; e < K * 6; e += 32) QD[s_b[e / 6] * 6 + e % 6] = active_qd0.data[js * 6 + e] + s_d[e];
+#endif
+"""
+)
+
+
+@functools.cache
+def contract_prep_kernel():
+    """Kernel listing each chain's active links and composing the maps between them (see ``_CONTRACT_PREP``)."""
+
+    @wp.func_native(_CONTRACT_PREP)
+    def rod_contract_prep_native(
+        ntrees: int,
+        joint_meta: wp.array[int],
+        group_to_art: wp.array[int],
+        chain_flag: wp.array[int],
+        articulation_active: wp.array[int],
+        articulation_joint_range: wp.array[int],
+        body_seen: wp.array[int],
+        propagation_tree_BR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
+        n_active: wp.array[int],
+        active_pos: wp.array[int],
+        active_body: wp.array[int],
+        active_P: wp.array[float],
+    ): ...
+
+    def rod_contract_prep(  # pragma: no cover - compiled by wp.kernel
+        ntrees: int,
+        joint_meta: wp.array[int],
+        group_to_art: wp.array[int],
+        chain_flag: wp.array[int],
+        articulation_active: wp.array[int],
+        articulation_joint_range: wp.array[int],
+        body_seen: wp.array[int],
+        propagation_tree_BR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
+        n_active: wp.array[int],
+        active_pos: wp.array[int],
+        active_body: wp.array[int],
+        active_P: wp.array[float],
+    ):
+        _tid = wp.tid()
+        rod_contract_prep_native(
+            ntrees,
+            joint_meta,
+            group_to_art,
+            chain_flag,
+            articulation_active,
+            articulation_joint_range,
+            body_seen,
+            propagation_tree_BR,
+            propagation_tree_CR,
+            n_active,
+            active_pos,
+            active_body,
+            active_P,
+        )
+
+    return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(rod_contract_prep)
+
+
+@functools.cache
+def contract_update_kernel():
+    """Kernel applying each chain's contracted response to its active links (see ``_CONTRACT_UPDATE``)."""
+
+    @wp.func_native(_CONTRACT_UPDATE)
+    def rod_contract_update_native(
+        ntrees: int,
+        group_to_art: wp.array[int],
+        chain_flag: wp.array[int],
+        articulation_active: wp.array[int],
+        articulation_joint_range: wp.array[int],
+        n_active: wp.array[int],
+        active_body: wp.array[int],
+        active_P: wp.array[float],
+        propagation_body_response: wp.array3d[float],
+        propagation_body_impulses: wp.array2d[float],
+        snapshot: int,
+        active_qd0: wp.array[float],
+        active_a: wp.array[float],
+        propagation_body_qd: wp.array2d[float],
+    ): ...
+
+    def rod_contract_update(  # pragma: no cover - compiled by wp.kernel
+        ntrees: int,
+        group_to_art: wp.array[int],
+        chain_flag: wp.array[int],
+        articulation_active: wp.array[int],
+        articulation_joint_range: wp.array[int],
+        n_active: wp.array[int],
+        active_body: wp.array[int],
+        active_P: wp.array[float],
+        propagation_body_response: wp.array3d[float],
+        propagation_body_impulses: wp.array2d[float],
+        snapshot: int,
+        active_qd0: wp.array[float],
+        active_a: wp.array[float],
+        propagation_body_qd: wp.array2d[float],
+    ):
+        _tid = wp.tid()
+        rod_contract_update_native(
+            ntrees,
+            group_to_art,
+            chain_flag,
+            articulation_active,
+            articulation_joint_range,
+            n_active,
+            active_body,
+            active_P,
+            propagation_body_response,
+            propagation_body_impulses,
+            snapshot,
+            active_qd0,
+            active_a,
+            propagation_body_qd,
+        )
+
+    return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(rod_contract_update)
+
+
+# Factor epilogue: the propagation records (BR, FR, CR) of every rod joint, six lanes per joint, from the U and D^-1
+# the factor stored; the factor itself then keeps only the recursion. Same arithmetic as the factor's own records.
+_FACTOR_EPILOGUE = (
+    "\n#if defined(__CUDA_ARCH__)\n"
+    + _PRELUDE.replace(
+        "const int tree = warp_global * TREES_PER_WARP + grp;", "const int tree = warp_global * 5 + grp;"
+    )
+    + r"""
+    if (grp >= 5) return;
+    const int slot = tree;
+    if (slot >= nslots) return;
+    const int k = walk_slots.data[slot];
+    const int art = slot_art.data[slot];
+    if (articulation_active.data && articulation_active.data[art] == 0) return;
+    __shared__ float eshm[2][5][4][36];
+    float* X = eshm[wib][grp][0];
+    float* Y = eshm[wib][grp][1];
+    float* Z = eshm[wib][grp][2];
+    float* V = eshm[wib][grp][3];
+    const int child = joint_meta.data[4 * k + 0];
+    const int parent = joint_meta.data[4 * k + 1];
+    const int gd = joint_meta.data[4 * k + 2];
+    const int flags = joint_meta.data[4 * k + 3];
+    const int dc = flags & 7;
+    const int jid = flags >> 8;
+    const float* SF = propagation_joint_S_flat.data;
+    const float* CR = propagation_body_com_rel.data;
+    float s_row[6], u_row[6];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a) {
+        s_row[a] = (a < dc) ? SF[(gd + a) * 6 + r] : 0.0f;
+        u_row[a] = (a < dc) ? propagation_tree_U.data[(gd + a) * 6 + r] : 0.0f;
+    }
+    const float e0 = (parent >= 0) ? CR[child * 3 + 0] - CR[parent * 3 + 0] : 0.0f;
+    const float e1 = (parent >= 0) ? CR[child * 3 + 1] - CR[parent * 3 + 1] : 0.0f;
+    const float e2 = (parent >= 0) ? CR[child * 3 + 2] - CR[parent * 3 + 2] : 0.0f;
+    #pragma unroll
+    for (int a = 0; a < 6; ++a) X[r * 6 + a] = s_row[a];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a) Y[r * 6 + a] = u_row[a];
+    #pragma unroll
+    for (int b = 0; b < 6; ++b)
+        Z[r * 6 + b] = (r < dc && b < dc) ? propagation_tree_D_inv.data[jid * 36 + r * 6 + b] : 0.0f;
+    __syncwarp(GMASK);
+"""
+    + r"""
+        // The propagation pass's records. B = T (I - U D^-1 S^T) carries a child's wrench to its parent (T moves
+        // it to the parent's center of mass); its transpose (I - S D^-1 U^T) X carries the parent's twist change
+        // to the child. W = -D^-1 S^T gives the joint's w = D^-1 u from the wrench and Q = -D^-1 U^T X its
+        // acceleration from the parent's twist change. Lane r's backward record is [B row r, W row r]; its
+        // forward record is [B column r, Q row r, S row r, e, 0]: contiguous, so the walk loads them as float4s.
+        {
+            float wv[6];
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                float v = 0.0f;
+                #pragma unroll
+                for (int a = 0; a < 6; ++a) v += u_row[a] * Z[a * 6 + b];
+                wv[b] = v;
+            }
+            const float ex = e0, ey = e1, ez = e2;
+            float brow[6];
+            #pragma unroll
+            for (int col = 0; col < 6; ++col) {
+                float p = 0.0f;
+                #pragma unroll
+                for (int b = 0; b < 6; ++b) p += wv[b] * X[col * 6 + b];
+                const float bv = ((col == r) ? 1.0f : 0.0f) - p;
+                const float b0 = bcast(bv, 0), b1 = bcast(bv, 1), b2 = bcast(bv, 2);
+                float v = bv;
+                if (r == 3) v += ey * b2 - ez * b1;
+                if (r == 4) v += ez * b0 - ex * b2;
+                if (r == 5) v += ex * b1 - ey * b0;
+                brow[col] = v;
+            }
+            float wrow[6], qrow[6];
+            {
+                float g[6];
+                #pragma unroll
+                for (int j = 0; j < 6; ++j) {
+                    float v = 0.0f, t = 0.0f;
+                    #pragma unroll
+                    for (int b = 0; b < 6; ++b) {
+                        v += Z[r * 6 + b] * Y[j * 6 + b];
+                        t += Z[r * 6 + b] * X[j * 6 + b];
+                    }
+                    g[j] = v;
+                    wrow[j] = -t;
+                }
+                qrow[0] = -g[0];
+                qrow[1] = -g[1];
+                qrow[2] = -g[2];
+                qrow[3] = -(g[3] - ez * g[1] + ey * g[2]);
+                qrow[4] = -(g[4] + ez * g[0] - ex * g[2]);
+                qrow[5] = -(g[5] - ey * g[0] + ex * g[1]);
+            }
+            #pragma unroll
+            for (int col = 0; col < 6; ++col) V[r * 6 + col] = brow[col];
+            __syncwarp(GMASK);
+            float rec[24];
+            #pragma unroll
+            for (int j = 0; j < 6; ++j) {
+                rec[j] = V[j * 6 + r];
+                rec[6 + j] = qrow[j];
+                rec[12 + j] = s_row[j];
+            }
+            rec[18] = ex; rec[19] = ey; rec[20] = ez; rec[21] = 0.0f; rec[22] = 0.0f; rec[23] = 0.0f;
+            // The walk kernels' records; chain-only groups read the compact record alone.
+            if (write_walk_records) {
+            float4* fr = reinterpret_cast<float4*>(propagation_tree_FR.data + k * 144 + r * 24);
+            #pragma unroll
+            for (int q = 0; q < 6; ++q) fr[q] = make_float4(rec[4 * q], rec[4 * q + 1], rec[4 * q + 2], rec[4 * q + 3]);
+            float4* br = reinterpret_cast<float4*>(propagation_tree_BR.data + k * 72 + r * 12);
+            br[0] = make_float4(brow[0], brow[1], brow[2], brow[3]);
+            br[1] = make_float4(brow[4], brow[5], wrow[0], wrow[1]);
+            br[2] = make_float4(wrow[2], wrow[3], wrow[4], wrow[5]);
+            }
+            // The chain passes' compact record (see CHAIN_REC): B, W, S and Q row-major, then e.
+            float* cr = propagation_tree_CR.data + k * CHAIN_REC;
+            float2* c2 = reinterpret_cast<float2*>(cr + r * 6);
+            c2[0] = make_float2(brow[0], brow[1]); c2[1] = make_float2(brow[2], brow[3]); c2[2] = make_float2(brow[4], brow[5]);
+            c2 = reinterpret_cast<float2*>(cr + 36 + r * 6);
+            c2[0] = make_float2(wrow[0], wrow[1]); c2[1] = make_float2(wrow[2], wrow[3]); c2[2] = make_float2(wrow[4], wrow[5]);
+            c2 = reinterpret_cast<float2*>(cr + 72 + r * 6);
+            c2[0] = make_float2(s_row[0], s_row[1]); c2[1] = make_float2(s_row[2], s_row[3]); c2[2] = make_float2(s_row[4], s_row[5]);
+            c2 = reinterpret_cast<float2*>(cr + 108 + r * 6);
+            c2[0] = make_float2(qrow[0], qrow[1]); c2[1] = make_float2(qrow[2], qrow[3]); c2[2] = make_float2(qrow[4], qrow[5]);
+            if (r == 0) *reinterpret_cast<float4*>(cr + 144) = make_float4(ex, ey, ez, 0.0f);
+            __syncwarp(GMASK);
+        }
+
+"""
+    + r"""
+#endif
+"""
+)
+
+
+# Factor prelude: everything a rod joint's step of the factorization needs that does not depend on its children,
+# one thread per joint, so the serial walk keeps only the recursion. Per walk slot k: the child's inertia in world
+# axes (IW, 36), the joint's diagonal terms (armature and implicit drive stiffness, KD, 6) and, for a full-rank
+# joint, S^-1 (SINV, 36): with S invertible, I_hat^-1 U^T = S^-1, so the reduced inertia U D^-1 K I_hat^-1 U^T is
+# U D^-1 K S^-1 and needs no second inversion.
+_FACTOR_PRELUDE = r"""
+#if defined(__CUDA_ARCH__)
+    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= nslots) return;
+    const int k = walk_slots.data[slot];
+    const int art = slot_art.data[slot];
+    if (articulation_active.data && articulation_active.data[art] == 0) return;
+    const int child = joint_meta.data[4 * k + 0];
+    const int gd = joint_meta.data[4 * k + 2];
+    const int flags = joint_meta.data[4 * k + 3];
+    const int dc = flags & 7;
+    const float* SF = propagation_joint_S_flat.data;
+    const wp::mat_t<3, 3, wp::float32> R = wp::quat_to_matrix(wp::quat_inverse(body_q_com.data[child].q));
+    const wp::mat_t<6, 6, wp::float32>& L = body_I_m.data[child];
+    float* iw = IW.data + k * 36;
+    #pragma unroll
+    for (int r = 0; r < 6; ++r) {
+        const int rb = r >= 3 ? 3 : 0;
+        const int rr = r - rb;
+        #pragma unroll
+        for (int col = 0; col < 6; ++col) {
+            const int cb = col >= 3 ? 3 : 0;
+            const int cc = col - cb;
+            float v = 0.0f;
+            #pragma unroll
+            for (int a = 0; a < 3; ++a)
+                #pragma unroll
+                for (int b = 0; b < 3; ++b)
+                    v += R.data[a][rr] * L.data[rb + a][cb + b] * R.data[b][cc];
+            iw[r * 6 + col] = v;
+        }
+    }
+    const int aug_count = aug_row_counts.data[art];
+    for (int r = 0; r < 6; ++r) {
+        float diag = 0.0f;
+        if (r < dc) {
+            diag = joint_armature.data[gd + r];
+            for (int aug_i = 0; aug_i < aug_count; ++aug_i) {
+                const int row_index = art * max_dofs + aug_i;
+                if (aug_row_dof_index.data[row_index] == gd + r) {
+                    const float Kd = aug_row_K.data[row_index];
+                    if (Kd > 0.0f) diag += Kd;
+                }
+            }
+        }
+        KD.data[k * 6 + r] = diag;
+    }
+    float* sinv = SINV.data + k * 36;
+    bool done = false;
+    if (dc == 6) {
+        // A rod (or free) joint's S is [[A, C], [0, A]] with A its axes in world (a rotation) and C the lever arms of
+        // the angular columns: S^-1 = [[A^-1, -A^-1 C A^-1], [0, A^-1]].
+        float lower = 0.0f;
+        wp::mat_t<3, 3, wp::float32> A, C;
+        for (int r = 0; r < 3; ++r)
+            for (int a = 0; a < 3; ++a) {
+                A.data[r][a] = SF[(gd + a) * 6 + r];
+                C.data[r][a] = SF[(gd + 3 + a) * 6 + r];
+                lower = fmaxf(lower, fabsf(SF[(gd + a) * 6 + 3 + r]));
+                lower = fmaxf(lower, fabsf(SF[(gd + 3 + a) * 6 + 3 + r] - SF[(gd + a) * 6 + r]));
+            }
+        if (lower <= 1e-6f) {
+            const wp::mat_t<3, 3, wp::float32> Ai = wp::inverse(A);
+            const wp::mat_t<3, 3, wp::float32> T = wp::mul(wp::mul(Ai, C), Ai);
+            for (int r = 0; r < 3; ++r)
+                for (int a = 0; a < 3; ++a) {
+                    sinv[r * 6 + a] = Ai.data[r][a];
+                    sinv[r * 6 + 3 + a] = -T.data[r][a];
+                    sinv[(3 + r) * 6 + a] = 0.0f;
+                    sinv[(3 + r) * 6 + 3 + a] = Ai.data[r][a];
+                }
+            done = true;
+        }
+    }
+    if (dc == 6 && !done) {
+        // Any other full-rank S: Gauss-Jordan with static indices (registers, no pivot swaps).
+        float m[36], inv[36];
+        #pragma unroll
+        for (int r = 0; r < 6; ++r)
+            #pragma unroll
+            for (int a = 0; a < 6; ++a) {
+                m[r * 6 + a] = SF[(gd + a) * 6 + r];
+                inv[r * 6 + a] = (r == a) ? 1.0f : 0.0f;
+            }
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) {
+            const float sc = 1.0f / m[c * 6 + c];
+            #pragma unroll
+            for (int e = 0; e < 6; ++e) { m[c * 6 + e] *= sc; inv[c * 6 + e] *= sc; }
+            #pragma unroll
+            for (int r = 0; r < 6; ++r) {
+                if (r == c) continue;
+                const float f = m[r * 6 + c];
+                #pragma unroll
+                for (int e = 0; e < 6; ++e) { m[r * 6 + e] -= f * m[c * 6 + e]; inv[r * 6 + e] -= f * inv[c * 6 + e]; }
+            }
+        }
+        #pragma unroll
+        for (int e = 0; e < 36; ++e) sinv[e] = inv[e];
+    }
+#endif
+"""
+
+
+@functools.cache
+def factor_prelude_kernel():
+    """Kernel forming each rod joint's child-independent factor terms (see ``_FACTOR_PRELUDE``)."""
+
+    @wp.func_native(_FACTOR_PRELUDE)
+    def rod_factor_prelude_native(
+        nslots: int,
+        walk_slots: wp.array[int],
+        slot_art: wp.array[int],
+        articulation_active: wp.array[int],
+        joint_meta: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        joint_armature: wp.array[float],
+        max_dofs: int,
+        aug_row_counts: wp.array[int],
+        aug_row_dof_index: wp.array[int],
+        aug_row_K: wp.array[float],
+        body_I_m: wp.array[wp.spatial_matrix],
+        body_q_com: wp.array[wp.transform],
+        IW: wp.array[float],
+        KD: wp.array[float],
+        SINV: wp.array[float],
+    ): ...
+
+    def rod_factor_prelude(  # pragma: no cover - compiled by wp.kernel
+        nslots: int,
+        walk_slots: wp.array[int],
+        slot_art: wp.array[int],
+        articulation_active: wp.array[int],
+        joint_meta: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        joint_armature: wp.array[float],
+        max_dofs: int,
+        aug_row_counts: wp.array[int],
+        aug_row_dof_index: wp.array[int],
+        aug_row_K: wp.array[float],
+        body_I_m: wp.array[wp.spatial_matrix],
+        body_q_com: wp.array[wp.transform],
+        IW: wp.array[float],
+        KD: wp.array[float],
+        SINV: wp.array[float],
+    ):
+        _tid = wp.tid()
+        rod_factor_prelude_native(
+            nslots,
+            walk_slots,
+            slot_art,
+            articulation_active,
+            joint_meta,
+            propagation_joint_S_flat,
+            joint_armature,
+            max_dofs,
+            aug_row_counts,
+            aug_row_dof_index,
+            aug_row_K,
+            body_I_m,
+            body_q_com,
+            IW,
+            KD,
+            SINV,
+        )
+
+    return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(rod_factor_prelude)
+
+
+@functools.cache
+def factor_epilogue_kernel():
+    """Kernel writing every rod joint's propagation records from the factor's U and D^-1 (see ``_FACTOR_EPILOGUE``)."""
+
+    @wp.func_native(_FACTOR_EPILOGUE)
+    def rod_factor_epilogue_native(
+        nslots: int,
+        walk_slots: wp.array[int],
+        slot_art: wp.array[int],
+        articulation_active: wp.array[int],
+        joint_meta: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        propagation_tree_U: wp.array2d[float],
+        propagation_tree_D_inv: wp.array3d[float],
+        write_walk_records: int,
+        propagation_tree_BR: wp.array2d[float],
+        propagation_tree_FR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
+    ): ...
+
+    def rod_factor_epilogue(  # pragma: no cover - compiled by wp.kernel
+        nslots: int,
+        walk_slots: wp.array[int],
+        slot_art: wp.array[int],
+        articulation_active: wp.array[int],
+        joint_meta: wp.array[int],
+        propagation_joint_S_flat: wp.array2d[float],
+        propagation_body_com_rel: wp.array2d[float],
+        propagation_tree_U: wp.array2d[float],
+        propagation_tree_D_inv: wp.array3d[float],
+        write_walk_records: int,
+        propagation_tree_BR: wp.array2d[float],
+        propagation_tree_FR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
+    ):
+        _tid = wp.tid()
+        rod_factor_epilogue_native(
+            nslots,
+            walk_slots,
+            slot_art,
+            articulation_active,
+            joint_meta,
+            propagation_joint_S_flat,
+            propagation_body_com_rel,
+            propagation_tree_U,
+            propagation_tree_D_inv,
+            write_walk_records,
+            propagation_tree_BR,
+            propagation_tree_FR,
+            propagation_tree_CR,
+        )
+
+    return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(rod_factor_epilogue)
+
+
+def epilogue_launch_dim(nslots: int) -> int:
+    """Threads for ``nslots`` joints: five six-lane groups per warp, rounded to whole blocks."""
+    warps = (nslots + 4) // 5
+    return ((warps * 32 + BLOCK_DIM - 1) // BLOCK_DIM) * BLOCK_DIM

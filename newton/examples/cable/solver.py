@@ -92,6 +92,9 @@ def make_solver(
             propagation_constraint_max=contact_rows if propagation else None,
             articulation_constraint_max=dense_rows,
             row_watermark=True,
+            # Each step publishes its body state through the solver's own kinematics and the next step starts from
+            # them instead of re-deriving them from the joint coordinates.
+            reuse_kinematics=True,
             parallel_tree=parallel_tree,
             enable_joint_limits=enable_joint_limits,
             coupled_contact_passes=coupled_contact_passes,

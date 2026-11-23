@@ -30,6 +30,7 @@ from newton._src.solvers.steel.solver_steel import (
     _colored_staging_supported,
     _get_color_propagation_prebuild_kernel,
     _SteelTreePlan,
+    color_prebuild_scratch_stride,
 )
 from newton.solvers import SolverSteel
 from newton.tests.steel._fixtures import (
@@ -2219,6 +2220,9 @@ def _run_prebuild(device, worlds, max_constraints, max_body_span, longest_first)
             row_order,
             offsets,
             sorted_contact,
+            wp.zeros(
+                count * color_prebuild_scratch_stride(max_constraints, max_body_span), dtype=wp.int32, device=device
+            ),
         ],
         block_dim=256,
         device=device,
@@ -2426,6 +2430,35 @@ def test_prebuild_matches_the_reference_on_both_sort_paths(test, device):
                 )
 
 
+def test_prebuild_recolors_a_wide_world_past_its_shared_colors(test, device):
+    """Match the reference when a world spans so many bodies that its shared masks hold fewer colors than it needs.
+
+    A world over 5000 bodies keeps one 32-color mask word per body in shared memory; a hub of 40 units needs 40
+    colors, so the world recolors on the global masks, and a sparse world of the same span stays on the fast path.
+    """
+    rng = np.random.default_rng(2)
+    worlds = []
+    for hub_units in (40, 0):
+        n_bodies, n_random = 5000, 300
+        body_a = rng.integers(1, n_bodies, n_random).astype(np.int32)
+        body_b = rng.integers(1, n_bodies, n_random).astype(np.int32)
+        body_b[body_b == body_a] = -1
+        body_a = np.concatenate([body_a, np.zeros(hub_units, dtype=np.int32), np.array([n_bodies - 1], np.int32)])
+        body_b = np.concatenate(
+            [body_b, rng.choice(np.arange(1, n_bodies - 1), hub_units, replace=False).astype(np.int32), [-1]]
+        )
+        n = len(body_a)
+        contact = (rng.permutation(4 * n)[:n] + len(worlds) * 4 * n).astype(np.int32)
+        length = rng.choice(np.array([1, 3, 6], dtype=np.int32), n)
+        worlds.append((contact, body_a, body_b, length))
+    results = _run_prebuild(device, worlds, 4096, 8192, False)
+    for w, (units, result) in enumerate(zip(worlds, results, strict=True)):
+        expected = _first_fit_coloring(*units, False)
+        test.assertEqual(int(expected[0].max()) >= 32, w == 0, "the hub does not exceed one mask word")
+        for name, got, want in zip(("color", "offsets", "row start", "contact"), result, expected, strict=False):
+            np.testing.assert_array_equal(got, want, err_msg=f"world {w} {name}")
+
+
 def test_color_order_option_is_validated(test, device):
     """Reject an unknown propagation_color_order and keep the option read-only."""
     model = _heap(device, nx=2, ny=2, nz=1)
@@ -2472,6 +2505,7 @@ for _fn in (
     test_prebuild_matches_the_first_fit_reference,
     test_longest_first_reaches_the_hub_lower_bound,
     test_prebuild_matches_the_reference_on_both_sort_paths,
+    test_prebuild_recolors_a_wide_world_past_its_shared_colors,
     test_color_order_option_is_validated,
     test_colored_accepts_a_large_row_budget,
     test_rotating_walk_is_a_permutation_up_to_its_bound,
