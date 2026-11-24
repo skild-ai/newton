@@ -175,7 +175,7 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 5, propagation=(2, 4))
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 5, propagation=(2, 20))
         self.update_step_interval = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
 
@@ -305,6 +305,8 @@ class Example:
             args,
             contact_rows=3 * self.collision_pipeline.rigid_contact_max + 6 * len(self.clamps.bodies),
             iterations=self.sim_iterations,
+            # The obstacles push the bundle sideways: every sweep's impulses must reach the whole cable.
+            propagation_interval=1,
         )
 
         # Initialize states and contacts

@@ -217,6 +217,12 @@ from .kernels import (
     prepare_world_impulses,
     prescale_joint_velocity_limits,
     propagate_tree_impulses_for_size,
+    propagation_momentum_apply,
+    propagation_momentum_dot,
+    propagation_momentum_dot_ordered,
+    propagation_momentum_rows,
+    propagation_momentum_step,
+    propagation_momentum_world,
     publish_fk_id_source,
     refine_same_articulation_propagation_rows,
     refine_same_articulation_propagation_rows_paths,
@@ -1797,6 +1803,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     propagation_cached_response_body_max = _ConstructionOption()
     propagation_color_order = _ConstructionOption()
     propagation_interval = _ConstructionOption()
+    propagation_momentum = _ConstructionOption()
     friction_combine = _ConstructionOption()
     restitution_combine = _ConstructionOption()
     free_rigid_torsional_friction = _ConstructionOption()
@@ -2098,6 +2105,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         propagation_cached_response_body_max: int = 8,
         propagation_color_order: Literal["contact", "longest_first", "rotating"] = "contact",
         propagation_interval: int = 1,
+        propagation_momentum: bool | None = None,
         friction_combine: Literal["average", "min", "multiply", "max"] = "average",
         restitution_combine: Literal["average", "min", "multiply", "max"] = "average",
         free_rigid_torsional_friction: float | None = None,
@@ -2633,6 +2641,15 @@ class SolverSteel(SolverBase, CouplingInterface):
                 between, the sweep's own body estimates carry the impulses it keeps summing, so the exact joint
                 velocities arrive less often in exchange for fewer tree passes. 1 (default) propagates every
                 iteration. At least 1.
+            propagation_momentum: With ``articulated_contact_response="propagation"``, accelerate the sweeps
+                with Nesterov momentum: at each tree propagation but the last, the row impulses move on by a
+                growing share of their change since the previous one, and that propagation installs the velocity
+                of the move with the sweeps'. The momentum restarts whenever the sweeps move the impulses against
+                it. A sweep moves only the bodies its rows touch, so the rows of one articulation share each
+                joint's mobility (mass splitting), which keeps every sweep stable but slows long trees that carry
+                rows on most links (a cable lying on a surface, pushed or held); momentum recovers much of that
+                convergence without loosening the split. It keeps rod chains off their contracted iterations.
+                ``None`` (default) turns it on when the model has rod material.
             propagation_color_order: Order in which ``solve_mode="colored"`` colors a world's
                 contacts and runs those left without a batch: ``"contact"`` (default) by contact
                 index, or ``"longest_first"`` by row count, longest first, then contact index. A batch takes as long as its longest
@@ -2956,6 +2973,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_interval = int(propagation_interval)
         if self._propagation_interval < 1:
             raise ValueError("propagation_interval must be at least 1")
+        self._propagation_momentum_option = propagation_momentum
         if self._propagation_cached_response_body_max < 1:
             raise ValueError("propagation_cached_response_body_max must be at least 1")
         if propagation_color_order not in ("contact", "longest_first", "rotating"):
@@ -12319,6 +12337,19 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_body_split_seen = wp.zeros((bodies,), dtype=wp.int32, device=device)
         self._propagation_joint_split = wp.zeros((joints,), dtype=wp.int32, device=device)
         self._propagation_split_max_depth = max(int(np.diff(model.articulation_start.numpy()).max(initial=1)), 1)
+        # Momentum of the sweeps: the previous sweep's impulses, a sweep's starting impulses, the move to install,
+        # and each world's Nesterov sequence.
+        momentum = self._propagation_momentum_option
+        if momentum is None:
+            momentum = self._rod_material is not None
+        self._propagation_momentum = bool(momentum)
+        momentum_shape = (worlds, rows) if self._propagation_momentum else (1, 1)
+        self._momentum_prev = wp.zeros(momentum_shape, dtype=wp.float32, device=device)
+        self._momentum_start = wp.zeros(momentum_shape, dtype=wp.float32, device=device)
+        self._momentum_delta = wp.zeros(momentum_shape, dtype=wp.float32, device=device)
+        self._momentum_t = wp.ones(worlds if self._propagation_momentum else 1, dtype=wp.float32, device=device)
+        self._momentum_beta = wp.zeros(worlds if self._propagation_momentum else 1, dtype=wp.float32, device=device)
+        self._momentum_dot = wp.zeros(worlds if self._propagation_momentum else 1, dtype=wp.float32, device=device)
         # Articulated-body factorization and scratch of the tree passes.
         self._propagation_joint_S_flat = wp.zeros((dofs, 6), dtype=wp.float32, device=device)
         self._propagation_tree_Ia = wp.zeros((bodies, 6, 6), dtype=wp.float32, device=device)
@@ -14181,7 +14212,11 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         wpb = _PROPAGATION_WORLDS_PER_BLOCK
         # Contracted chains keep v_out until the iterations end, so nothing else may read it in between.
-        contracted = self._rod_contracted and not refresh_forced
+        momentum = self._propagation_momentum
+        contracted = self._rod_contracted and not refresh_forced and not momentum
+        if momentum:
+            self._momentum_t.fill_(1.0)
+            wp.copy(self._momentum_prev, self._propagation_impulses)
         for iteration in range(iteration_offset, iteration_offset + iterations):
             if has_internal_rows and not contact_then_internal:
                 phase(3, iteration_offset=iteration)
@@ -14190,6 +14225,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             if contracted and iteration == iteration_offset:
                 self._propagation_contract_update(snapshot=True)
             self._snapshot_propagation_cache_twists()
+            every = self._propagation_interval
+            if momentum and (every == 1 or (iteration - iteration_offset) % every == 0):
+                # The impulses a propagation block of sweeps starts from: the momentum's restart test reads them.
+                wp.copy(self._momentum_start, self._propagation_impulses)
             if self._propagation_colored:
                 self._launch_colored_sweep(
                     *colored_rows,
@@ -14305,9 +14344,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 )
             # With propagation_interval k > 1 the tree propagation runs every k-th iteration and after the last; in
             # between, the sweep's own body estimates carry the impulses it keeps summing.
-            every = self._propagation_interval
             last = iteration == iteration_offset + iterations - 1
-            if every == 1 or last or (iteration - iteration_offset) % every == every - 1:
+            propagates = every == 1 or last or (iteration - iteration_offset) % every == every - 1
+            if momentum and propagates and not last:
+                # The momentum's move joins the sweep's pending impulses, so one propagation installs both.
+                self._apply_propagation_momentum()
+            if propagates:
                 self._propagation_propagate_impulses(contracted=contracted)
             if has_velocity_limits and not contact_then_internal:
                 phase(5, iteration_offset=iteration)
@@ -14316,6 +14358,115 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_propagate_impulses()
         if contact_then_internal and (has_internal_rows or has_velocity_limits):
             phase(2, iterations, iteration_offset=iteration_offset)
+
+    def _apply_propagation_momentum(self) -> None:
+        """Move the row impulses on by each world's momentum and add the move to the pending body impulses.
+
+        The iteration's tree propagation that follows installs the move's velocity with the sweep's.
+        """
+        device = self.model.device
+        rows = self._world_count * self._propagation_max_constraints
+        if not self._ordered_rows and device.is_cuda:
+            wp.launch(
+                propagation_momentum_step,
+                dim=self._world_count * 256,
+                inputs=[
+                    self._world_count,
+                    self._propagation_constraint_count,
+                    self._momentum_start,
+                    self._propagation_impulses,
+                    self._momentum_prev,
+                ],
+                outputs=[self._momentum_t, self._momentum_beta],
+                block_dim=256,
+                device=device,
+            )
+            wp.launch(
+                propagation_momentum_apply,
+                dim=rows,
+                inputs=[
+                    self._propagation_constraint_count,
+                    self._propagation_max_constraints,
+                    self._momentum_beta,
+                    self._propagation_body_a,
+                    self._propagation_body_b,
+                    self._propagation_J_a,
+                    self._propagation_J_b,
+                    self._propagation_MiJt_a,
+                    self._propagation_MiJt_b,
+                ],
+                outputs=[
+                    self._propagation_impulses,
+                    self._momentum_prev,
+                    self._propagation_body_qd,
+                    self._propagation_body_impulses,
+                ],
+                device=device,
+            )
+            return
+        if self._ordered_rows:
+            wp.launch(
+                propagation_momentum_dot_ordered,
+                dim=self._world_count,
+                inputs=[
+                    self._propagation_constraint_count,
+                    self._propagation_impulses,
+                    self._momentum_prev,
+                    self._momentum_start,
+                ],
+                outputs=[self._momentum_dot],
+                device=device,
+            )
+        else:
+            self._momentum_dot.zero_()
+            wp.launch(
+                propagation_momentum_dot,
+                dim=rows,
+                inputs=[
+                    self._propagation_constraint_count,
+                    self._propagation_max_constraints,
+                    self._propagation_impulses,
+                    self._momentum_prev,
+                    self._momentum_start,
+                ],
+                outputs=[self._momentum_dot],
+                device=device,
+            )
+        wp.launch(
+            propagation_momentum_world,
+            dim=self._world_count,
+            inputs=[self._momentum_dot],
+            outputs=[self._momentum_t, self._momentum_beta],
+            device=device,
+        )
+        wp.launch(
+            propagation_momentum_rows,
+            dim=rows,
+            inputs=[self._propagation_constraint_count, self._propagation_max_constraints, self._momentum_beta],
+            outputs=[self._propagation_impulses, self._momentum_prev, self._momentum_delta],
+            device=device,
+        )
+        if self._ordered_rows:
+            kernel, dim = accumulate_propagation_warmstart_body_impulses_ordered, (self._world_count, 6)
+        else:
+            kernel, dim = accumulate_propagation_warmstart_body_impulses, rows
+        wp.launch(
+            kernel,
+            dim=dim,
+            inputs=[
+                self._propagation_constraint_count,
+                self._propagation_body_a,
+                self._propagation_body_b,
+                self._propagation_J_a,
+                self._propagation_J_b,
+                self._propagation_MiJt_a,
+                self._propagation_MiJt_b,
+                self._momentum_delta,
+                self._propagation_max_constraints,
+            ],
+            outputs=[self._propagation_body_qd, self._propagation_body_impulses],
+            device=device,
+        )
 
     def _prepare_colored_sweep(self, propagation_rhs: wp.array) -> tuple[wp.array, wp.array, wp.array]:
         """Fold the prescribed sides out of the rows and gather the step's unit records; once per pass.

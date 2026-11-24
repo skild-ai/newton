@@ -67,6 +67,7 @@ def make_solver(
     parallel_tree=False,
     enable_joint_limits=False,
     coupled_contact_passes=0,
+    propagation_interval=3,
     **vbd_options,
 ):
     if getattr(args, "solver", "vbd") == "steel":
@@ -95,8 +96,9 @@ def make_solver(
             # Each step publishes its body state through the solver's own kinematics and the next step starts from
             # them instead of re-deriving them from the joint coordinates.
             reuse_kinematics=True,
-            # Rod trees propagate every third iteration; the sweep's body estimates carry the ones between.
-            propagation_interval=3 if propagation else 1,
+            # Rod trees propagate every third iteration, where the sweeps' momentum steps too; the sweeps' body
+            # estimates carry the impulses between. Scenes that push long cables sideways propagate every one.
+            propagation_interval=propagation_interval if propagation else 1,
             parallel_tree=parallel_tree,
             enable_joint_limits=enable_joint_limits,
             coupled_contact_passes=coupled_contact_passes,

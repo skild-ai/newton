@@ -3,6 +3,8 @@
 
 """CUDA contact sweeps colored by immediate articulated response."""
 
+import functools
+
 import warp as wp
 
 from .friction import friction_pair_candidate
@@ -249,7 +251,7 @@ def _barrier():
     """Publish disjoint generalized-velocity writes before the next color."""
 
 
-_THREADS = 128
+_THREADS = 256
 
 
 @wp.kernel(enable_backward=False)
@@ -316,6 +318,242 @@ def _sweep(
             _barrier()
 
 
+_SHARED_DOFS = 11776  # 46 KB of float velocities per block, within the 48 KB static limit with the kernel's own scratch
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    __shared__ float s_v[11776];
+    if (op == 0) return s_v[i];
+    if (op == 1) { s_v[i] = x; return x; }
+    s_v[i] += x;
+    return s_v[i];
+#else
+    return 0.0f;
+#endif
+""")
+def _shared_v(op: int, i: int, x: float) -> float:
+    """The block's world velocities in shared memory: 0 reads, 1 writes, 2 adds."""
+
+
+@functools.cache
+def sweep_kernel(lane_steps: int):
+    """The sweep with the world's velocities in shared memory and each lane's DOF loop unrolled to ``lane_steps``.
+
+    Same arithmetic and order as :func:`_sweep`; the velocities stay in the block's shared memory between
+    units instead of global memory, and each lane issues all its coefficient loads of a row at once.
+    """
+
+    coeffs = wp.types.vector(length=lane_steps, dtype=float)
+
+    @wp.func
+    def load_side(rows: _Rows, free: bool, w: int, row: int, end: int, base: int, size: int, lane: int):
+        """One lane's coefficients of a row on one side: all loads issued before any is used."""
+        j = coeffs()
+        y = coeffs()
+        for step in range(wp.static(lane_steps)):
+            k = lane + 32 * step
+            if k < size:
+                jk, yk = _coeff(rows, free, w, row, end, base, k)
+                j[step] = jk
+                y[step] = yk
+        return j, y
+
+    @wp.func
+    def dot_v(j: coeffs, base: int, size: int, lane: int):
+        acc = float(0.0)
+        for step in range(wp.static(lane_steps)):
+            k = lane + 32 * step
+            if k < size:
+                acc += j[step] * _shared_v(0, base + k, 0.0)
+        return acc
+
+    @wp.func
+    def dot_c(j: coeffs, y: coeffs, size: int, lane: int):
+        acc = float(0.0)
+        for step in range(wp.static(lane_steps)):
+            if lane + 32 * step < size:
+                acc += j[step] * y[step]
+        return acc
+
+    @wp.func
+    def add_v(y0: coeffs, y1: coeffs, d0: float, d1: float, base: int, size: int, lane: int):
+        for step in range(wp.static(lane_steps)):
+            k = lane + 32 * step
+            if k < size:
+                _shared_v(2, base + k, y0[step] * d0 + y1[step] * d1)
+
+    @wp.func
+    def solve(
+        rows: _Rows,
+        free: bool,
+        world: int,
+        normal: int,
+        size: int,
+        ab: wp.vec2i,
+        offsets: wp.array[int],
+        sizes: wp.array[int],
+        omega: float,
+        regularize: bool,
+        friction: bool,
+        lane: int,
+    ):
+        # Everything the unit reads before it changes anything: scalars and both sides' coefficients.
+        t = normal + 1
+        pair = size >= 3 and friction
+        diagonal = rows.diag[world, normal]
+        rhs_n = rows.rhs[world, normal]
+        old = rows.impulse[world, normal]
+        weight = float(1.0)
+        if regularize:
+            weight = rows.weight[world, normal]
+        rhs_t = float(0.0)
+        rhs_u = float(0.0)
+        old_pair = wp.vec2()
+        mu = float(0.0)
+        a_t = float(0.0)
+        b_t = float(0.0)
+        parent = int(-1)
+        if pair:
+            rhs_t = rows.rhs[world, t]
+            rhs_u = rows.rhs[world, t + 1]
+            old_pair = wp.vec2(rows.impulse[world, t], rows.impulse[world, t + 1])
+            mu = rows.mu[world, t]
+            a_t = rows.diag[world, t]
+            b_t = rows.diag[world, t + 1]
+            parent = rows.parent[world, normal]
+        a0 = ab[0]
+        a1 = ab[1]
+        on0 = a0 >= 0
+        on1 = a1 >= 0 and a1 != a0
+        base0 = int(0)
+        size0 = int(0)
+        base1 = int(0)
+        size1 = int(0)
+        if on0:
+            base0 = offsets[a0]
+            size0 = sizes[a0]
+        if on1:
+            base1 = offsets[a1]
+            size1 = sizes[a1]
+        jn0, yn0 = load_side(rows, free, world, normal, 0, base0, size0, lane)
+        jn1, yn1 = load_side(rows, free, world, normal, 1, base1, size1, lane)
+        jt0 = coeffs()
+        yt0 = coeffs()
+        ju0 = coeffs()
+        yu0 = coeffs()
+        jt1 = coeffs()
+        yt1 = coeffs()
+        ju1 = coeffs()
+        yu1 = coeffs()
+        if pair:
+            jt0, yt0 = load_side(rows, free, world, t, 0, base0, size0, lane)
+            ju0, yu0 = load_side(rows, free, world, t + 1, 0, base0, size0, lane)
+            jt1, yt1 = load_side(rows, free, world, t, 1, base1, size1, lane)
+            ju1, yu1 = load_side(rows, free, world, t + 1, 1, base1, size1, lane)
+        updated = old
+        if diagonal > 0.0:
+            if not free:
+                diagonal = 1.0 / diagonal
+            jv = float(0.0)
+            if on0:
+                jv += dot_v(jn0, base0, size0, lane)
+            if on1:
+                jv += dot_v(jn1, base1, size1, lane)
+            jv = _warp_sum(jv)
+            step = -diagonal * (jv + rhs_n) * weight - (1.0 - weight) * old
+            updated = wp.max(0.0, old + omega * step)
+            _warp_sync()
+            if lane == 0:
+                rows.impulse[world, normal] = updated
+            dn = updated - old
+            if on0:
+                add_v(yn0, yn0, dn, 0.0, base0, size0, lane)
+            if on1:
+                add_v(yn1, yn1, dn, 0.0, base1, size1, lane)
+            _warp_sync()
+        if pair:
+            m0 = float(0.0)
+            m1 = float(0.0)
+            m2 = float(0.0)
+            if on0:
+                m0 += dot_v(jt0, base0, size0, lane)
+                m1 += dot_v(ju0, base0, size0, lane)
+                m2 += dot_c(jt0, yu0, size0, lane)
+            if on1:
+                m0 += dot_v(jt1, base1, size1, lane)
+                m1 += dot_v(ju1, base1, size1, lane)
+                m2 += dot_c(jt1, yu1, size1, lane)
+            measure = wp.vec3(_warp_sum(m0), _warp_sum(m1), _warp_sum(m2))
+            residual = wp.vec2(measure[0] + rhs_t, measure[1] + rhs_u)
+            load = updated
+            if parent >= 0:
+                load = patch_normal_load(rows.parent, rows.impulse, world, normal)
+            radius = wp.max(0.0, mu * load)
+            if free:
+                a_t = 1.0 / a_t if a_t > 0.0 else 0.0
+                b_t = 1.0 / b_t if b_t > 0.0 else 0.0
+            updated_pair = friction_pair_candidate(a_t, measure[2], b_t, residual, old_pair, radius, omega)
+            mag = wp.length(updated_pair)
+            if mag > radius:
+                updated_pair *= radius / mag
+            _warp_sync()
+            if lane == 0:
+                rows.impulse[world, t] = updated_pair[0]
+                rows.impulse[world, t + 1] = updated_pair[1]
+            dp = updated_pair - old_pair
+            if on0:
+                add_v(yt0, yu0, dp[0], dp[1], base0, size0, lane)
+            if on1:
+                add_v(yt1, yu1, dp[0], dp[1], base1, size1, lane)
+            _warp_sync()
+
+    def sweep_shared(
+        dense: _Rows,
+        free: _Rows,
+        units: wp.array2d[int],
+        sides: wp.array2d[wp.vec2i],
+        order: wp.array2d[int],
+        offsets: wp.array2d[int],
+        counts: wp.array[int],
+        art_offset: wp.array[int],
+        response: wp.array[int],
+        world_dofs: wp.array[int],
+        world_dof_indices: wp.array2d[int],
+        dense_capacity: int,
+        omega: float,
+        regularize: bool,
+        friction_start: int,
+        iterations: int,
+        v: wp.array[float],
+    ):
+        w, thread = wp.tid()
+        lane = thread % 32
+        n = world_dofs[w]
+        for i in range(thread, n, _THREADS):
+            _shared_v(1, i, v[world_dof_indices[w, i]])
+        _barrier()
+        for iteration in range(iterations):
+            for color in range(counts[w]):
+                u = offsets[w, color] + thread // 32
+                while u < offsets[w, color + 1]:
+                    i = order[w, u]
+                    if i < dense_capacity:
+                        solve(dense, False, w, i, units[w, i], sides[w, i], art_offset, response, omega, regularize,
+                              iteration >= friction_start, lane)  # fmt: skip
+                    else:
+                        solve(free, True, w, i - dense_capacity, units[w, i], sides[w, i], art_offset, response,
+                              omega, regularize, iteration >= friction_start, lane)  # fmt: skip
+                    u += _THREADS // 32
+                _barrier()
+        for i in range(thread, n, _THREADS):
+            v[world_dof_indices[w, i]] = _shared_v(0, i, 0.0)
+
+    sweep_shared.__name__ = f"immediate_sweep_shared_{lane_steps}"
+    sweep_shared.__qualname__ = sweep_shared.__name__
+    return wp.kernel(enable_backward=False, module="unique")(sweep_shared)
+
+
 class ImmediateColoring:
     def __init__(self, solver):
         self.device = solver.device
@@ -331,6 +569,14 @@ class ImmediateColoring:
         self.offsets = wp.empty((self.worlds, capacity + 1), dtype=int, device=self.device)
         self.last = wp.empty(solver.model.articulation_count, dtype=int, device=self.device)
         self.count = wp.empty(self.worlds, dtype=int, device=self.device)
+        # Worlds whose velocities fit shared memory sweep there, each lane unrolling its share of the widest row.
+        widest = int(solver._articulation_response_dof_count.numpy().max(initial=0))
+        self.lane_steps = max((widest + 31) // 32, 1)
+        self.shared = (
+            0 < solver._max_world_dofs <= _SHARED_DOFS
+            and getattr(solver, "_world_dof_indices", None) is not None
+            and bool(solver._kernel_overrides.get("immediate_shared_sweep", True))
+        )
 
     def prepare(self, solver, contacts):
         self.units.zero_()
@@ -391,6 +637,34 @@ class ImmediateColoring:
         free.rhs, free.diag = solver._immediate_mf_rhs, solver._mf_eff_mass_inv
         free.mu, free.weight = solver._mf_row_mu, solver._mf_row_w
         free.parent, free.impulse = solver._mf_row_parent, solver._mf_impulses
+        if self.shared:
+            # The world's velocities fit the block's shared memory: the units read and write them there.
+            wp.launch(
+                sweep_kernel(self.lane_steps),
+                dim=(self.worlds, _THREADS),
+                block_dim=_THREADS,
+                inputs=[
+                    dense,
+                    free,
+                    self.units,
+                    self.sides,
+                    self.order,
+                    self.offsets,
+                    self.count,
+                    solver._articulation_world_dof_offset,
+                    solver._articulation_response_dof_count,
+                    solver._world_dof_count,
+                    solver._world_dof_indices,
+                    self.dense_capacity,
+                    solver.relaxation,
+                    regularize,
+                    friction_start,
+                    iterations,
+                    solver._v_out,
+                ],
+                device=self.device,
+            )
+            return
         wp.launch(
             _sweep,
             dim=(self.worlds, _THREADS),

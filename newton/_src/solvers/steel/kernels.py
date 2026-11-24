@@ -9082,6 +9082,203 @@ def count_propagation_joint_split(
                 joint = body_to_joint[parent]
 
 
+@wp.kernel
+def propagation_momentum_dot(
+    propagation_constraint_count: wp.array[int],
+    propagation_max_constraints: int,
+    propagation_impulses: wp.array2d[float],
+    momentum_prev: wp.array2d[float],
+    momentum_start: wp.array2d[float],
+    # outputs
+    momentum_dot: wp.array[float],
+):
+    """Each row's share of its world's restart test: (this sweep's move) . (the move since the last sweep)."""
+    tid = wp.tid()
+    world = tid // propagation_max_constraints
+    i = tid - world * propagation_max_constraints
+    if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
+        return
+    lam = propagation_impulses[world, i]
+    value = (lam - momentum_start[world, i]) * (lam - momentum_prev[world, i])
+    if value != 0.0:
+        wp.atomic_add(momentum_dot, world, value)
+
+
+@wp.kernel
+def propagation_momentum_dot_ordered(
+    propagation_constraint_count: wp.array[int],
+    propagation_impulses: wp.array2d[float],
+    momentum_prev: wp.array2d[float],
+    momentum_start: wp.array2d[float],
+    # outputs
+    momentum_dot: wp.array[float],
+):
+    """``propagation_momentum_dot`` summed in row order, one thread per world (deterministic runs)."""
+    world = wp.tid()
+    m = wp.min(propagation_constraint_count[world], propagation_impulses.shape[1])
+    dot = float(0.0)
+    for i in range(m):
+        lam = propagation_impulses[world, i]
+        dot += (lam - momentum_start[world, i]) * (lam - momentum_prev[world, i])
+    momentum_dot[world] = dot
+
+
+@wp.kernel
+def propagation_momentum_world(
+    momentum_dot: wp.array[float],
+    # in/out
+    momentum_t: wp.array[float],
+    # outputs
+    momentum_beta: wp.array[float],
+):
+    """Nesterov momentum of one world's propagation sweep (``SolverSteel(propagation_momentum=True)``).
+
+    ``momentum_dot`` is the restart test: the sweep's move against the momentum's. The momentum restarts when the
+    sweep moved the impulses against it (gradient restart), otherwise it advances the Nesterov sequence.
+    """
+    world = wp.tid()
+    t = momentum_t[world]
+    if momentum_dot[world] < 0.0:
+        momentum_t[world] = 1.0
+        momentum_beta[world] = 0.0
+    else:
+        t_next = 0.5 * (1.0 + wp.sqrt(1.0 + 4.0 * t * t))
+        momentum_t[world] = t_next
+        momentum_beta[world] = (t - 1.0) / t_next
+
+
+_MOMENTUM_STEP_THREADS = 256
+
+_MOMENTUM_STEP = """
+#if defined(__CUDA_ARCH__)
+    __shared__ float s_red[256];
+    __shared__ float s_beta;
+    const int t = threadIdx.x;
+    const int world = blockIdx.x;
+    if (world >= world_count) return;
+    const int mc = impulses.shape[1];
+    int m = count.data[world];
+    if (m > mc) m = mc;
+    const size_t base = (size_t)world * mc;
+    float dot = 0.0f;
+    for (int i = t; i < m; i += 256) {
+        const float lam = impulses.data[base + i];
+        dot += (lam - start.data[base + i]) * (lam - prev.data[base + i]);
+    }
+    s_red[t] = dot;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) {
+        if (t < o) s_red[t] += s_red[t + o];
+        __syncthreads();
+    }
+    if (t == 0) {
+        const float tk = momentum_t.data[world];
+        if (s_red[0] < 0.0f) {
+            momentum_t.data[world] = 1.0f;
+            s_beta = 0.0f;
+        } else {
+            const float tn = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * tk * tk));
+            momentum_t.data[world] = tn;
+            s_beta = (tk - 1.0f) / tn;
+        }
+    }
+    __syncthreads();
+    if (t == 0) momentum_beta.data[world] = s_beta;
+#endif
+"""
+
+
+@wp.func_native(_MOMENTUM_STEP)
+def _propagation_momentum_step_native(
+    world_count: int,
+    count: wp.array[int],
+    start: wp.array2d[float],
+    impulses: wp.array2d[float],
+    prev: wp.array2d[float],
+    momentum_t: wp.array[float],
+    momentum_beta: wp.array[float],
+): ...
+
+
+@wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)
+def propagation_momentum_step(
+    world_count: int,
+    count: wp.array[int],
+    start: wp.array2d[float],
+    impulses: wp.array2d[float],
+    prev: wp.array2d[float],
+    momentum_t: wp.array[float],
+    momentum_beta: wp.array[float],
+):
+    """One world per block: the restart test, summed in shared memory, and the world's Nesterov step."""
+    _tid = wp.tid()
+    _propagation_momentum_step_native(world_count, count, start, impulses, prev, momentum_t, momentum_beta)
+
+
+@wp.kernel
+def propagation_momentum_apply(
+    propagation_constraint_count: wp.array[int],
+    propagation_max_constraints: int,
+    momentum_beta: wp.array[float],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_MiJt_a: wp.array3d[float],
+    propagation_MiJt_b: wp.array3d[float],
+    # in/out
+    propagation_impulses: wp.array2d[float],
+    momentum_prev: wp.array2d[float],
+    propagation_body_qd: wp.array2d[float],
+    propagation_body_impulses: wp.array2d[float],
+):
+    """Move each row's impulse on by its world's momentum and add the move to its bodies' twists and impulses."""
+    tid = wp.tid()
+    world = tid // propagation_max_constraints
+    i = tid - world * propagation_max_constraints
+    if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
+        return
+    lam = propagation_impulses[world, i]
+    delta = momentum_beta[world] * (lam - momentum_prev[world, i])
+    momentum_prev[world, i] = lam
+    if delta == 0.0:
+        return
+    propagation_impulses[world, i] = lam + delta
+    ba = propagation_body_a[world, i]
+    bb = propagation_body_b[world, i]
+    for k in range(6):
+        if ba >= 0:
+            wp.atomic_add(propagation_body_qd, ba, k, propagation_MiJt_a[world, i, k] * delta)
+            wp.atomic_add(propagation_body_impulses, ba, k, propagation_J_a[world, i, k] * delta)
+        if bb >= 0:
+            wp.atomic_add(propagation_body_qd, bb, k, propagation_MiJt_b[world, i, k] * delta)
+            wp.atomic_add(propagation_body_impulses, bb, k, propagation_J_b[world, i, k] * delta)
+
+
+@wp.kernel
+def propagation_momentum_rows(
+    propagation_constraint_count: wp.array[int],
+    propagation_max_constraints: int,
+    momentum_beta: wp.array[float],
+    # in/out
+    propagation_impulses: wp.array2d[float],
+    momentum_prev: wp.array2d[float],
+    # outputs
+    momentum_delta: wp.array2d[float],
+):
+    """Extrapolate each row's impulse by its world's momentum; ``momentum_delta`` is the change to install."""
+    tid = wp.tid()
+    world = tid // propagation_max_constraints
+    i = tid - world * propagation_max_constraints
+    if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
+        return
+    lam = propagation_impulses[world, i]
+    delta = momentum_beta[world] * (lam - momentum_prev[world, i])
+    momentum_prev[world, i] = lam
+    propagation_impulses[world, i] = lam + delta
+    momentum_delta[world, i] = delta
+
+
 # ---------------------------------------------------------------------------
 # Loop-closing joints as propagation rows
 #

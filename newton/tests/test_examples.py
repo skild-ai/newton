@@ -721,6 +721,11 @@ add_example_batch(
             "test_options": {"num-frames": 150, "no-dahl": True},
             "test_suffix": "no_dahl_recovery",
         },
+        {
+            "devices": cuda_test_devices,
+            "test_options": {"num-frames": 150, "solver": "steel", "solve-mode": "colored"},
+            "test_suffix": "native_steel_dahl_retention",
+        },
     ],
 )
 add_example_test(

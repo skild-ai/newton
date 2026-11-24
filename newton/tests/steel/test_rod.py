@@ -389,10 +389,17 @@ def test_propagation_matches_immediate(test, device):
     model.shape_material_mu.fill_(0.0)
     _, rest, contacts = _settle(model, 40, iterations=64)
     test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
-    gaps = []
+    # The split sweep alone approaches the immediate step as the iterations grow; momentum reaches it at least as
+    # fast (it may already sit at the rounding floor at 256 iterations).
+    gaps = {False: [], True: []}
     for iterations in (256, 2048):
         qd = {}
-        for name, options in (("immediate", {}), ("propagation", _PROPAGATION)):
+        variants = (
+            ("immediate", {}),
+            ("split", {**_PROPAGATION, "propagation_momentum": False}),
+            ("momentum", {**_PROPAGATION, "propagation_momentum": True}),
+        )
+        for name, options in variants:
             solver = newton.solvers.SolverSteel(
                 model,
                 articulation_constraint_max=640,
@@ -401,9 +408,12 @@ def test_propagation_matches_immediate(test, device):
                 **options,
             )
             qd[name] = _step_from(model, rest, solver).joint_qd.numpy()
-        gaps.append(float(np.abs(qd["immediate"] - qd["propagation"]).max()))
-    test.assertLess(gaps[1], 0.5 * gaps[0])
-    test.assertLess(gaps[1], 2.0e-3)
+        gaps[False].append(float(np.abs(qd["immediate"] - qd["split"]).max()))
+        gaps[True].append(float(np.abs(qd["immediate"] - qd["momentum"]).max()))
+    test.assertLess(gaps[False][1], 0.5 * gaps[False][0])
+    test.assertLess(gaps[False][1], 2.0e-3)
+    test.assertLess(gaps[True][1], 2.0e-3)
+    test.assertLessEqual(gaps[True][0], gaps[False][0] + 1.0e-5)
     free = {}
     for name, options in (("immediate", {}), ("propagation", _PROPAGATION)):
         solver = newton.solvers.SolverSteel(model, articulation_constraint_max=640, iterations=8, **options)
@@ -532,6 +542,73 @@ def test_propagation_interval(test, device):
 
 
 add_function_test(TestSteelRod, "test_propagation_interval", test_propagation_interval, devices=get_cuda_test_devices())
+
+
+def _pushed_cable_penetration(device, momentum, iterations=8, steps=60, dt=1.0 / 120.0, speed=0.6):
+    """Deepest penetration of a kinematic capsule driven sideways through a 40-link cable lying on the ground."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    builder.rigid_gap = 0.05
+    rod = newton.Rod.create_straight(
+        start=(-1.5, 0.0, 0.021), direction=(1.0, 0.0, 0.0), length=4.0, segment_count=40, radius=0.02
+    )
+    builder.add_rod(rod=rod, bend_stiffness=1.0e2, bend_damping=5.0)
+    pusher = builder.add_body(xform=wp.transform(wp.vec3(0.0, -0.08, 0.3), wp.quat_identity()))
+    builder.add_shape_capsule(body=pusher, radius=0.05, half_height=0.25, cfg=newton.ModelBuilder.ShapeConfig(mu=0.0))
+    builder.body_flags[pusher] = int(newton.BodyFlags.KINEMATIC)
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    model.rigid_contact_max = contacts.rigid_contact_max
+    solver = newton.solvers.SolverSteel(
+        model,
+        iterations=iterations,
+        articulation_constraint_max=64,
+        propagation_constraint_max=512,
+        propagation_momentum=momentum,
+        **_PROPAGATION,
+    )
+    a, b, control = model.state(), model.state(), model.control()
+    joint = int(np.flatnonzero(model.joint_child.numpy() == pusher)[0])
+    q0, v0 = int(model.joint_q_start.numpy()[joint]), int(model.joint_qd_start.numpy()[joint])
+    links = [i for i in range(model.body_count) if i != pusher]
+    deepest = 0.0
+    for step in range(steps):
+        for state, ahead in ((a, 0), (b, 1)):
+            q, qd = state.joint_q.numpy(), state.joint_qd.numpy()
+            q[q0 + 1] = -0.08 + speed * dt * (step + ahead)
+            qd[v0 : v0 + 6] = 0.0
+            qd[v0 + 1] = speed
+            state.joint_q.assign(q)
+            state.joint_qd.assign(qd)
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        pipeline.collide(a, contacts)
+        solver.step(a, b, control, contacts, dt)
+        a, b = b, a
+        body_q = a.body_q.numpy()
+        gap = np.hypot(body_q[links, 0] - body_q[pusher, 0], body_q[links, 1] - body_q[pusher, 1])
+        deepest = max(deepest, float((0.07 - gap).max()))
+    test_finite = np.all(np.isfinite(a.body_q.numpy()))
+    return deepest, bool(test_finite), solver
+
+
+def test_propagation_momentum(test, device):
+    """Momentum lets a cable lying on the ground follow a pusher that the split sweep alone lets through.
+
+    Every link carries ground rows, so the split sweep gives each row a sliver of the cable's mobility and the
+    sideways push converges slowly; momentum recovers that convergence at the same iterations.
+    """
+    plain, finite, solver = _pushed_cable_penetration(device, False)
+    test.assertFalse(solver.propagation_momentum)
+    test.assertTrue(finite)
+    accelerated, finite, solver = _pushed_cable_penetration(device, True)
+    test.assertTrue(solver.propagation_momentum)
+    test.assertTrue(finite)
+    test.assertGreater(plain, 6.0e-3)
+    test.assertLess(accelerated, 0.6 * plain)
+
+
+add_function_test(TestSteelRod, "test_propagation_momentum", test_propagation_momentum, devices=get_cuda_test_devices())
 
 
 def test_propagation_tree_dynamics(test, device):
