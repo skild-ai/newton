@@ -551,8 +551,9 @@ class Contacts:
     def body_pair_reduction_fallback(self) -> wp.array:
         """Device flag, nonzero when the pass that filled this buffer skipped body-pair reduction.
 
-        A pass falls back when the body-pair group table saturates: it then keeps every
-        primitive and convex contact, so no contact is lost but none is reduced. Raise
+        A pass falls back when the body-pair group table saturates: it then writes the
+        primitive and convex contacts it staged within the contact gap, unreduced, so the
+        staging and ``rigid_contact_max`` capacities still bound what it keeps. Raise
         :attr:`newton.CollisionPipeline.BodyPairReductionConfig.hashtable_size_factor`
         when it is set. Reset at the start of every collision pass.
 

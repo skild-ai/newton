@@ -1787,8 +1787,8 @@ class CollisionPipeline:
         """
         hashtable_size_factor: float = 1.0
         """Multiplier on the group-table capacity, which is derived from the model's contact-pair topology
-        rather than from ``max_triangle_pairs``.  If the table is too small, the affected frames keep every
-        primitive and convex contact, so ``rigid_contact_count`` stays near its unreduced value; such a
+        rather than from ``max_triangle_pairs``.  If the table is too small, the affected frames write their
+        primitive and convex contacts unreduced, so ``rigid_contact_count`` stays near its unreduced value; such a
         frame sets :attr:`newton.Contacts.body_pair_reduction_fallback` and prints a warning once."""
         material_attributes: tuple[str, ...] | None = None
         """Per-shape custom attributes, by full name such as ``"steel:min_torsional_patch_radius"``, that

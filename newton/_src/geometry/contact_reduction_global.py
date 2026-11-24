@@ -2814,8 +2814,8 @@ def finish_group_frame_kernel(
     if fell_back != 0 and group_data.fallback[1] == 0:
         group_data.fallback[1] = 1
         wp.printf(
-            "Warning: body-pair contact reduction table saturated (%d of %d entries); the frame keeps every "
-            "contact. Increase BodyPairReductionConfig.hashtable_size_factor.\n",
+            "Warning: body-pair contact reduction table saturated (%d of %d entries); the frame writes its "
+            "staged contacts unreduced. Increase BodyPairReductionConfig.hashtable_size_factor.\n",
             ht_active_slots[ht_capacity],
             ht_capacity,
         )
