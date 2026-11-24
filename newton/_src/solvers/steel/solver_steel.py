@@ -1501,10 +1501,11 @@ class SolverSteel(SolverBase, CouplingInterface):
       ``min_distance`` and non-negative ``max_distance`` of a DISTANCE joint that roots its articulation (the
       limits of its first DOF) on the distance between the joint's two anchors, along the anchors' predicted
       relative velocity while they coincide; a zero ``max_distance`` holds the anchors together on all three
-      axes. The row is linear in the step's velocity, so when the child anchor is offset from the child's
-      center of mass and the body turns quickly, the anchor can pass a positive bound by an amount that shrinks
-      with ``dt``; more iterations do not reduce it. Any other DISTANCE joint raises :class:`NotImplementedError` when limits are enabled. Joint limits
-      are not enforced by default. Joint velocity limits (:attr:`~newton.Model.joint_velocity_limit`) are
+      axes. The row bounds the anchor's velocity along one direction, not the next anchor distance: when the
+      child anchor is offset from the child's center of mass, its impulse can also change the anchor's transverse
+      velocity, and rotation adds integration error, so the anchor can pass a positive bound. More iterations of
+      the same row do not remove this. Any other DISTANCE joint raises :class:`NotImplementedError` when limits
+      are enabled. Joint limits are not enforced by default. Joint velocity limits (:attr:`~newton.Model.joint_velocity_limit`) are
       enforced as rows when ``enable_joint_velocity_limits`` is set.
     - Experimental dry joint friction: with ``enable_joint_friction=True``,
       :attr:`~newton.Model.joint_friction` of PRISMATIC, REVOLUTE, BALL and D6 DOFs bounds one
