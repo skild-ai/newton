@@ -1845,7 +1845,7 @@ class TestFreeRigidAngularFrictionImport(unittest.TestCase):
         self.assertEqual(int(solver._free_rigid_unrouted_warned.numpy()[0]), 1)
 
     def test_global_condim_with_a_partner_in_another_solve_world_adds_no_angular_rows(self):
-        """Leave the rows off when a global body's only partner solves in world 1; on in world 0 or explicitly paired."""
+        """Leave the rows off when a global body's only partner solves in world 1, paired or not; on in solve world 0."""
         for partner_world, explicit in ((1, False), (1, True), (0, False)):
             with self.subTest(partner_world=partner_world, explicit=explicit):
                 builder = newton.ModelBuilder()
