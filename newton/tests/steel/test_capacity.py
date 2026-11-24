@@ -13,6 +13,7 @@ import warp as wp
 import newton
 from newton._src.solvers.steel.friction_patches import FrictionPatches
 from newton._src.solvers.steel.kernels import allocate_world_contact_slots, finalize_mf_constraint_counts
+from newton._src.solvers.steel.solver_steel import _STATIC_SHARED_MEMORY_BYTES, _mfgs_block_shared_bytes
 from newton.solvers import SolverSteel
 from newton.tests.steel._fixtures import printf_capture_is_reliable, steel_mode_options
 from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_cuda_test_devices, get_test_devices
@@ -1082,6 +1083,96 @@ add_function_test(
     TestSteelRowAllocation,
     "test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget",
     test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget,
+    devices=get_cuda_test_devices(),
+)
+
+
+def _stacked_boxes(device):
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    for i in range(4):
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1 + 0.2 * i), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+    return builder.finalize(device=device)
+
+
+def _rollout(model, steps=30, **options):
+    solver = SolverSteel(model, deterministic=wp.DeterministicMode.RUN_TO_RUN, **options)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    return solver, state_0.body_q.numpy(), state_0.body_qd.numpy()
+
+
+def _sweep_block_bytes(solver):
+    mf_rows = solver._mf_meta_packed.shape[1] // 4
+    return _mfgs_block_shared_bytes(
+        solver._articulation_constraint_max,
+        mf_rows,
+        solver._max_world_dofs,
+        shared_metadata=solver._mfgs_shared_metadata,
+        has_drive_rows=solver._has_drive_rows,
+        fuse_vel_limits=solver._velocity_limits_fused,
+        pair_cache=solver._mfgs_pair_cache,
+        torsion_links=solver._mfgs_torsion_links,
+        velocity_limit_units=solver._enable_joint_velocity_limits,
+        stream_mf_lambda=solver._mfgs_stream_mf_lambda,
+    )
+
+
+def test_free_body_capacity_past_sweep_shared_memory(test, device):
+    """Step with a free-body capacity whose impulses do not fit the sweep's shared memory, as a small capacity does."""
+    model = _stacked_boxes(device)
+    small, small_q, small_qd = _rollout(model, free_body_constraint_max=1024)
+    large, large_q, large_qd = _rollout(model, free_body_constraint_max=16384)
+    test.assertFalse(small._mfgs_stream_mf_lambda)
+    test.assertTrue(large._mfgs_stream_mf_lambda)
+    test.assertTrue(np.isfinite(large_q).all())
+    np.testing.assert_array_equal(large_q, small_q)
+    np.testing.assert_array_equal(large_qd, small_qd)
+
+
+def test_sweep_shared_memory_fits_static_limit(test, device):
+    """Keep the selected sweep layout within static shared memory on both sides of the free-body boundary."""
+    model = _stacked_boxes(device)
+    probe = SolverSteel(model)
+    dims = (probe._articulation_constraint_max, probe._max_world_dofs)
+    rows = {"has_drive_rows": probe._has_drive_rows, "fuse_vel_limits": probe._velocity_limits_fused}
+
+    def fits(mf_rows):
+        return _mfgs_block_shared_bytes(dims[0], mf_rows, dims[1], shared_metadata=False, **rows) <= (
+            _STATIC_SHARED_MEMORY_BYTES
+        )
+
+    boundary = next(n for n in range(_STATIC_SHARED_MEMORY_BYTES // 4, 0, -1) if fits(n))
+    for capacity, streamed in ((boundary, False), (boundary + 1, True)):
+        with test.subTest(free_body_constraint_max=capacity):
+            solver, body_q, _ = _rollout(model, steps=2, free_body_constraint_max=capacity)
+            test.assertEqual(solver._mfgs_stream_mf_lambda, streamed)
+            test.assertLessEqual(_sweep_block_bytes(solver), _STATIC_SHARED_MEMORY_BYTES)
+            test.assertTrue(np.isfinite(body_q).all())
+    with test.assertRaisesRegex(ValueError, "articulation_constraint_max=16384"):
+        SolverSteel(model, articulation_constraint_max=16384)
+
+
+class TestSteelSweepSharedMemory(unittest.TestCase):
+    pass
+
+
+add_function_test(
+    TestSteelSweepSharedMemory,
+    "test_free_body_capacity_past_sweep_shared_memory",
+    test_free_body_capacity_past_sweep_shared_memory,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelSweepSharedMemory,
+    "test_sweep_shared_memory_fits_static_limit",
+    test_sweep_shared_memory_fits_static_limit,
     devices=get_cuda_test_devices(),
 )
 

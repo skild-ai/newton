@@ -1101,6 +1101,7 @@ def _use_resident_mfgs_metadata(
     has_drive_rows: bool = False,
     fuse_vel_limits: bool = False,
     velocity_limit_units: bool = False,
+    stream_mf_lambda: bool = False,
 ) -> bool:
     """Select resident dense-row metadata for compact solver shapes.
 
@@ -1117,8 +1118,11 @@ def _use_resident_mfgs_metadata(
         has_drive_rows=has_drive_rows,
         fuse_vel_limits=fuse_vel_limits,
         velocity_limit_units=velocity_limit_units,
+        stream_mf_lambda=stream_mf_lambda,
     )
-    return metadata_bytes <= _MFGS_RESIDENT_METADATA_MAX_BYTES and total_shared_bytes <= max_shared_memory
+    return metadata_bytes <= _MFGS_RESIDENT_METADATA_MAX_BYTES and total_shared_bytes <= min(
+        max_shared_memory, _STATIC_SHARED_MEMORY_BYTES
+    )
 
 
 def _use_mfgs_pair_cache(
@@ -1134,6 +1138,7 @@ def _use_mfgs_pair_cache(
     sm_count: int,
     torsion_links: bool = False,
     velocity_limit_units: bool = False,
+    stream_mf_lambda: bool = False,
 ) -> bool:
     """Select the MF-GS friction-pair cache when a shared-memory estimate keeps every world resident.
 
@@ -1150,6 +1155,7 @@ def _use_mfgs_pair_cache(
         pair_cache=True,
         torsion_links=torsion_links,
         velocity_limit_units=velocity_limit_units,
+        stream_mf_lambda=stream_mf_lambda,
     )
     resident_worlds = sm_count * (max_shared_memory // block_bytes)
     # Row parents are cached as short, and the kernel's arrays are static shared memory.
@@ -1171,6 +1177,7 @@ def _use_mfgs_torsion_links(
     fuse_vel_limits: bool,
     pair_cache: bool,
     velocity_limit_units: bool = False,
+    stream_mf_lambda: bool = False,
 ) -> bool:
     """Select the linked contact-torsion sweep when its row lists fit the static shared-memory bound.
 
@@ -1186,6 +1193,7 @@ def _use_mfgs_torsion_links(
         pair_cache=pair_cache,
         torsion_links=True,
         velocity_limit_units=velocity_limit_units,
+        stream_mf_lambda=stream_mf_lambda,
     )
     return block_bytes <= min(max_shared_memory, _STATIC_SHARED_MEMORY_BYTES)
 
@@ -1201,12 +1209,14 @@ def _mfgs_block_shared_bytes(
     pair_cache: bool = False,
     torsion_links: bool = False,
     velocity_limit_units: bool = False,
+    stream_mf_lambda: bool = False,
 ) -> int:
     """Return the static shared memory [B] of one matrix-free Gauss-Seidel kernel block, up to 4-byte alignment.
 
     Every ``__shared__`` array of :func:`_get_pgs_solve_mf_gs_kernel` is counted here.
     """
-    total = _MFGS_TILE_SHARED_STORAGE_BYTES + 4 * (max_world_dofs + max_constraints + free_body_constraint_max)
+    resident_mf_rows = 0 if stream_mf_lambda else free_body_constraint_max
+    total = _MFGS_TILE_SHARED_STORAGE_BYTES + 4 * (max_world_dofs + max_constraints + resident_mf_rows)
     if shared_metadata:
         total += _mfgs_metadata_bytes(max_constraints, has_drive_rows, fuse_vel_limits)
     if pair_cache:
@@ -2195,12 +2205,16 @@ class SolverSteel(SolverBase, CouplingInterface):
             articulation_constraint_max: Capacity of rows involving articulated bodies (mimic and
                 connect rows, contacts, enabled joint limits, joint velocity limits, joint friction
                 and, with ``drive_mode="rows"``, joint drives) per world. Rows beyond it are
-                dropped and reported, see :attr:`constraint_overflow`.
+                dropped and reported, see :attr:`constraint_overflow`. On CUDA the matrix-free
+                sweep keeps these rows and the world's DOFs in 48 KiB of shared memory, about
+                12,000 together; a larger shape raises :class:`ValueError`.
             free_body_constraint_max: Capacity of free-body rows per world: free-body contact rows
                 and free-body velocity-limit rows. Under the ``"propagation"`` response free-body
                 contacts use the propagation rows, so
                 it sizes only the velocity-limit rows. Rows beyond it are dropped and reported, see
-                :attr:`constraint_overflow`.
+                :attr:`constraint_overflow`. On CUDA, once these rows no longer fit the sweep's
+                shared memory beside the dense rows (about 12,000 rows), the sweep keeps their
+                impulses in global memory, with the same results.
             propagation_constraint_max: Capacity of the propagation row family per world in the
                 ``"propagation"`` response, which holds every contact
                 row except those between two links of one articulation; these stay dense unless
@@ -6705,27 +6719,32 @@ class SolverSteel(SolverBase, CouplingInterface):
             and not self._sparse_diagonal_contact_solve
         ):
             mf_rows = self._mf_meta_packed.shape[1] // 4
-            shared_metadata = _use_resident_mfgs_metadata(
-                self._articulation_constraint_max,
-                mf_rows,
-                self._max_world_dofs,
-                int(getattr(model.device, "max_shared_memory_per_block", 0)),
-                has_drive_rows=self._has_drive_rows,
-                fuse_vel_limits=self._velocity_limits_fused,
-                velocity_limit_units=self._enable_joint_velocity_limits,
-            )
-            row_phases = self._propagation_active or self._row_schedule != "interleaved"
-            mfgs_shape = (
-                self._articulation_constraint_max,
-                mf_rows,
-                self._max_world_dofs,
-                int(getattr(model.device, "max_shared_memory_per_block", 0)),
-            )
-            mfgs_metadata = {
-                "shared_metadata": shared_metadata,
+            mfgs_dims = (self._articulation_constraint_max, mf_rows, self._max_world_dofs)
+            mfgs_shape = (*mfgs_dims, int(getattr(model.device, "max_shared_memory_per_block", 0)))
+            mfgs_rows = {
                 "has_drive_rows": self._has_drive_rows,
                 "fuse_vel_limits": self._velocity_limits_fused,
                 "velocity_limit_units": self._enable_joint_velocity_limits,
+            }
+            # Free-body impulses stay in global memory once one float per free-body row no longer fits the block.
+            self._mfgs_stream_mf_lambda = (
+                _mfgs_block_shared_bytes(*mfgs_dims, shared_metadata=False, **mfgs_rows) > _STATIC_SHARED_MEMORY_BYTES
+            )
+            min_bytes = _mfgs_block_shared_bytes(*mfgs_dims, shared_metadata=False, stream_mf_lambda=True, **mfgs_rows)
+            if model.device.is_cuda and min_bytes > _STATIC_SHARED_MEMORY_BYTES:
+                raise ValueError(
+                    f"articulation_constraint_max={mfgs_dims[0]} with {mfgs_dims[2]} DOFs per world needs {min_bytes} B "
+                    f"of sweep shared memory, over the {_STATIC_SHARED_MEMORY_BYTES} B limit."
+                )
+            shared_metadata = _use_resident_mfgs_metadata(
+                *mfgs_shape, stream_mf_lambda=self._mfgs_stream_mf_lambda, **mfgs_rows
+            )
+            self._mfgs_shared_metadata = shared_metadata
+            row_phases = self._propagation_active or self._row_schedule != "interleaved"
+            mfgs_metadata = {
+                "shared_metadata": shared_metadata,
+                "stream_mf_lambda": self._mfgs_stream_mf_lambda,
+                **mfgs_rows,
             }
             mfgs_residency = {"world_count": self._world_count, "sm_count": int(getattr(model.device, "sm_count", 0))}
             # The lists come first: without them each torsion row rescans every dense row, a cost that grows with
@@ -6762,6 +6781,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 contact_compliance=self._contact_compliance,
                 pair_cache=self._mfgs_pair_cache,
                 free_rigid_angular_friction=self._free_rigid_angular_rows,
+                stream_mf_lambda=self._mfgs_stream_mf_lambda,
                 torsion_links=self._mfgs_torsion_links,
                 nesterov_momentum=self._nesterov_momentum,
             )

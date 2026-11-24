@@ -1,0 +1,1 @@
+Fix `SolverSteel` failing to compile its matrix-free sweep on CUDA when `free_body_constraint_max` exceeds about 12,000 rows per world ("uses too much shared data"); past that size the sweep keeps the free-body impulses in global memory. A shape whose dense rows and DOFs alone exceed the sweep's shared memory raises `ValueError` at construction.
