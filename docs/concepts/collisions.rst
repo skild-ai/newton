@@ -1415,8 +1415,10 @@ Body-pair reduction doesn't support ``contact_matching="sticky"`` or
 hydroelastic contacts. Keep it off when it doesn't reduce the end-to-end step time.
 To check, compare the step time and :attr:`~Contacts.rigid_contact_count` with it
 on and off: a count that stays near its unreduced value means little was reduced,
-or the group table was too small and frames kept every contact (raise
-``BodyPairReductionConfig.hashtable_size_factor``).
+or the group table was too small and frames kept every contact. Such a pass sets
+:attr:`~Contacts.body_pair_reduction_fallback` and prints a warning once; raise
+``BodyPairReductionConfig.hashtable_size_factor`` to fit the table, and read
+:meth:`~CollisionPipeline.body_pair_reduction_stats` for how close it runs to full.
 
 This body-pair reduction API is experimental and may change without prior notice.
 

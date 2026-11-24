@@ -1123,6 +1123,7 @@ class GlobalContactReducer:
             self.group_contact_pos2d = wp.zeros(buffer_size, dtype=wp.vec2, device=device)
             self.group_frame_state = wp.zeros(GROUP_FRAME_STATE_COUNT, dtype=wp.int32, device=device)
             self.group_stats = wp.zeros(GROUP_STAT_COUNT, dtype=wp.int64, device=device)
+            self.group_fallback = wp.zeros(2, dtype=wp.int32, device=device)
             # Re-checks every discarded contact against its slots; for tests and debugging.
             self.verify = False
 
@@ -1251,6 +1252,7 @@ class GlobalContactReducer:
         data.contact_pos2d = self.group_contact_pos2d
         data.frame_state = self.group_frame_state
         data.stats = self.group_stats
+        data.fallback = self.group_fallback
         data.verify = 1 if self.verify else 0
         return data
 
@@ -2351,6 +2353,8 @@ class GroupReductionData:
     contact_pos2d: wp.array[wp.vec2]
     frame_state: wp.array[wp.int32]
     stats: wp.array[wp.int64]
+    # [0] this pass kept every contact; [1] the saturation warning was printed.
+    fallback: wp.array[wp.int32]
     verify: int
 
 
@@ -2805,6 +2809,16 @@ def finish_group_frame_kernel(
         stats[wp.static(GROUP_STAT_INPUT_OVERFLOW_FRAMES)] = stats[
             wp.static(GROUP_STAT_INPUT_OVERFLOW_FRAMES)
         ] + wp.int64(1)
+    fell_back = frame[wp.static(GROUP_FRAME_FALLBACK)]
+    group_data.fallback[0] = fell_back
+    if fell_back != 0 and group_data.fallback[1] == 0:
+        group_data.fallback[1] = 1
+        wp.printf(
+            "Warning: body-pair contact reduction table saturated (%d of %d entries); the frame keeps every "
+            "contact. Increase BodyPairReductionConfig.hashtable_size_factor.\n",
+            ht_active_slots[ht_capacity],
+            ht_capacity,
+        )
     for i in range(wp.static(GROUP_FRAME_STATE_COUNT)):
         frame[i] = 0
 

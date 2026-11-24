@@ -40,7 +40,7 @@ from newton._src.geometry.contact_reduction_global import (
 from newton._src.sim.contacts import Contacts
 from newton.geometry import HydroelasticSDF
 from newton.solvers.experimental.coupled import SolverCoupled
-from newton.tests.unittest_utils import MUJOCO_MODULES, requires
+from newton.tests.unittest_utils import MUJOCO_MODULES, StdOutCapture, requires
 
 DT = 1.0 / 240.0
 
@@ -156,6 +156,43 @@ def _same_articulation_scissor(builder):
         )
     builder.add_articulation(joints)
     return base
+
+
+def _plate_stack_model(worlds, plates, grid=4, half_thickness=0.01, tile=0.02):
+    """Replicated flush stacks of plates on a ground plane; each plate is one body of ``grid x grid`` boxes."""
+    template = newton.ModelBuilder()
+    offset = (grid - 1) * tile
+    for k in range(plates):
+        body = template.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, half_thickness * (2 * k + 1)), wp.quat_identity()), mass=1.0
+        )
+        for i in range(grid):
+            for j in range(grid):
+                template.add_shape_box(
+                    body,
+                    xform=wp.transform(wp.vec3(2 * tile * i - offset, 2 * tile * j - offset, 0.0), wp.quat_identity()),
+                    hx=tile,
+                    hy=tile,
+                    hz=half_thickness,
+                )
+    builder = newton.ModelBuilder()
+    builder.replicate(template, worlds, spacing=(2.0, 2.0, 0.0))
+    builder.add_ground_plane()
+    return builder.finalize(device=wp.get_device())
+
+
+def _collide_capturing_output(pipeline, state, contacts, passes=1):
+    """Run collision passes and return the device printf output they produce."""
+    wp.synchronize()
+    capture = StdOutCapture()
+    capture.begin()
+    try:
+        for _ in range(passes):
+            pipeline.collide(state, contacts)
+        wp.synchronize()
+    finally:
+        output = capture.end()
+    return output
 
 
 def _sphere_grid_body(builder, pos, n=5, spacing=0.05, radius=0.01, mass=1.0, center_dz=0.0):
@@ -1146,6 +1183,19 @@ class TestBodyPairReductionTableSizing(unittest.TestCase):
         self.assertEqual(stats["probe_failures"], 0)
         self.assertLess(stats["max_contacts_kept"], stats["max_contacts_in"])
 
+    def test_automatic_coverage_sizes_for_bin_and_cell_fan_out(self):
+        """Fit flush multi-box stacks at the default factor: a pair spans several bins, voxels and layers."""
+        model = _plate_stack_model(worlds=2, plates=8)
+        state = model.state()
+        pipeline = _make_pipeline(model, True, rigid_contact_max=65536)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        stats = pipeline.body_pair_reduction_stats()
+        self.assertEqual(stats["input_overflow_frames"], 0)
+        self.assertEqual(stats["fallback_frames"], 0)
+        self.assertEqual(int(contacts.body_pair_reduction_fallback.numpy()[0]), 0)
+        self.assertLess(stats["sum_contacts_kept"], stats["sum_contacts_in"])
+
     def _scene(self, n_bodies):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         for k in range(n_bodies):
@@ -1613,7 +1663,8 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         # a size factor small enough to hit the 1024-entry floor: 1200 groups cannot fit
         pipeline = _make_pipeline(model, True, body_pair_hashtable_size_factor=1e-6)
         contacts = pipeline.contacts()
-        pipeline.collide(state, contacts)
+        output = _collide_capturing_output(pipeline, state, contacts)
+        self.assertIn("hashtable_size_factor", output)
         n_red = int(contacts.rigid_contact_count.numpy()[0])
         stats = pipeline._body_pair_reducer.stats()
         self.assertEqual(n_red, n_base, "saturated frame must keep the whole unreduced set")
@@ -1627,6 +1678,26 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         self.assertEqual(stats["total_frames"], 1)
         self.assertEqual(stats["sum_contacts_in"], n_base)
         self.assertEqual(stats["sum_contacts_kept"], n_base)
+
+    def test_saturation_is_flagged_and_warned_once(self):
+        """Flag every saturated pass on the contact stream and warn once; a large factor clears both."""
+        model = _plate_stack_model(worlds=2, plates=8)
+        state = model.state()
+        small = _make_pipeline(model, True, rigid_contact_max=65536, body_pair_hashtable_size_factor=1e-6)
+        contacts = small.contacts()
+        output = _collide_capturing_output(small, state, contacts, passes=2)
+        stats = small.body_pair_reduction_stats()
+        self.assertEqual(stats["fallback_frames"], 2)
+        self.assertEqual(int(contacts.body_pair_reduction_fallback.numpy()[0]), 1)
+        self.assertEqual(int(contacts._reduction_overflow.numpy()[0]), 0, "a fallback pass loses no contact")
+        self.assertEqual(output.count("Increase BodyPairReductionConfig.hashtable_size_factor"), 1, output)
+
+        large = _make_pipeline(model, True, rigid_contact_max=65536, body_pair_hashtable_size_factor=8.0)
+        large_contacts = large.contacts()
+        output = _collide_capturing_output(large, state, large_contacts)
+        self.assertEqual(large.body_pair_reduction_stats()["fallback_frames"], 0)
+        self.assertEqual(int(large_contacts.body_pair_reduction_fallback.numpy()[0]), 0)
+        self.assertNotIn("hashtable_size_factor", output)
 
     def test_buffer_stamp_must_match_pipeline(self):
         """Pair stamped buffers with reducing pipelines only, at the reducer's own capacity.
