@@ -75,6 +75,7 @@ class TestConvexDecompositionCache(unittest.TestCase):
         builder.approximate_meshes(method=method, shape_indices=[shape], raise_on_failure=raise_on_failure, **kwargs)
         return builder
 
+    @requires("scipy")
     def test_split_hull_budget_ignores_per_component_cache_entries(self):
         """Keep a merged CoACD hull budget, split across components, apart from per-component cache entries."""
         mesh = newton.Mesh(self.vertices, self.faces, maxhullvert=64)

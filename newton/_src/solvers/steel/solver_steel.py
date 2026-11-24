@@ -1964,6 +1964,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="condim",
+                update_flags=ModelFlags.SHAPE_PROPERTIES,
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.SHAPE,
                 assignment=Model.AttributeAssignment.MODEL,
@@ -1977,6 +1978,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="adhesion",
+                update_flags=ModelFlags.SHAPE_PROPERTIES,
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.SHAPE,
                 assignment=Model.AttributeAssignment.MODEL,

@@ -36,7 +36,7 @@ from newton._src.solvers.steel.solver_steel import (
 )
 from newton.solvers import SolverBase, SolverSteel
 from newton.tests.steel._fixtures import COLORED_VARIANTS, select_colored_variant, set_torsion_radius
-from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_test_devices, requires
 
 _DT = 1.0 / 480.0
 _RUN_TO_RUN = wp.DeterministicMode.RUN_TO_RUN
@@ -538,6 +538,19 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
 
         _simulate("sphere", 0.0, steps=1, condim=6, on_solver=on_solver, observe=observe)
         np.testing.assert_array_equal(seen["mu"], [(mu[0] + mu[1]) / np.float32(2.0), rolling.max(), torsional.max()])
+
+    def test_condim_edit_notified_with_its_declared_flags_refreshes_coefficients(self):
+        """Refresh the rows' coefficients after a condim edit notified with the attribute's declared flags."""
+        model, _ = _scene("sphere")
+        model.steel.condim.fill_(6)
+        model.shape_material_mu_rolling.fill_(0.003)
+        solver = SolverSteel(model)
+        np.testing.assert_allclose(solver._free_rigid_mu_rolling.numpy()[: model.shape_count], 0.003)
+        flags = model.get_attribute_update_flags("steel:condim")
+        self.assertEqual(flags, newton.ModelFlags.SHAPE_PROPERTIES)
+        model.steel.condim.fill_(4)
+        solver.notify_model_changed(flags)
+        np.testing.assert_array_equal(solver._free_rigid_mu_rolling.numpy()[: model.shape_count], 0.0)
 
     def test_shape_notify_inside_graph_capture_refreshes_coefficients(self):
         """Capture a shape-property notify that changes mu_rolling, and replay it into the rows' bound."""
@@ -1749,6 +1762,7 @@ class TestFreeRigidAngularFrictionImport(unittest.TestCase):
                 model = builder.finalize(device="cpu")
                 np.testing.assert_array_equal(model.steel.condim.numpy(), 3)
 
+    @requires("pxr.Usd")
     def test_usd_reads_the_authored_steel_condim(self):
         """Read ``newton:steel:condim`` from a USD shape and leave unauthored shapes at 3."""
         from pxr import Sdf, Usd, UsdGeom, UsdPhysics
