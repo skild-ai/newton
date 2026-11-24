@@ -2214,8 +2214,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 it sizes only the velocity-limit rows. Rows beyond it are dropped and reported, see
                 :attr:`constraint_overflow`. On CUDA, once these rows no longer fit the sweep's
                 shared memory beside ``articulation_constraint_max`` and the world's response DOFs
-                (about 12,000 in total), the sweep keeps their impulses in global memory, with the
-                same results.
+                (about 12,000 in total), the sweep keeps their impulses in global memory: the
+                results are the same, each sweep is slower, and ``solve_mode="colored"`` with the
+                ``"propagation"`` response is usually faster for such large worlds.
             propagation_constraint_max: Capacity of the propagation row family per world in the
                 ``"propagation"`` response, which holds every contact
                 row except those between two links of one articulation; these stay dense unless
