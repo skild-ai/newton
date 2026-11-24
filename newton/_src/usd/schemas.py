@@ -413,10 +413,7 @@ class SchemaResolverPhysx(SchemaResolver):
             "kd": SchemaAttribute("physxMaterial:compliantContactDamping", None),
         },
         PrimType.BODY: {
-            # Rigid body damping
             "disable_gravity": SchemaAttribute("physxRigidBody:disableGravity", False),
-            "rigid_body_linear_damping": SchemaAttribute("physxRigidBody:linearDamping", 0.0),
-            "rigid_body_angular_damping": SchemaAttribute("physxRigidBody:angularDamping", 0.05),
         },
         PrimType.ARTICULATION: {
             "self_collision_enabled": SchemaAttribute("physxArticulation:enabledSelfCollisions", True),

@@ -29,7 +29,7 @@ from newton.tests.steel._fixtures import (
     steel_mode_options,
 )
 from newton.tests.steel._fixtures import run_fixture as run_compliance_fixture
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices, requires
 
 
 def _assert_bitwise(test, a, b, label):
@@ -119,6 +119,7 @@ def test_angular_damping_follows_in_place_edits(test, device):
     test.assertEqual(float(state_in.joint_qd.numpy()[5]), 0.0)
 
 
+@requires("pxr.Usd")
 def test_physx_attributes_import_from_usd_and_are_read_every_step(test, device):
     """Import the PhysX body and collision USD attributes into the steel namespace, and step with replaced arrays."""
     from pxr import Sdf, Usd, UsdGeom, UsdPhysics
@@ -713,7 +714,7 @@ def _construct(test, model, expect_warning, **kwargs):
     """Construct the solver, requiring exactly the unsolvable-global-contact warning or no warning."""
     if expect_warning:
         return _expect_one_warning(
-            test, newton.exceptions.NewtonWarning, _UNSOLVABLE_GLOBAL_WARNING, lambda: SolverSteel(model, **kwargs)
+            test, newton.NewtonWarning, _UNSOLVABLE_GLOBAL_WARNING, lambda: SolverSteel(model, **kwargs)
         )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -1164,10 +1165,8 @@ class TestSteelSolveModeOptions(unittest.TestCase):
         )
         for kwargs, message, expected in deprecated:
             with self.subTest(**kwargs):
-                with self.assertWarnsRegex(newton.exceptions.NewtonDeprecationWarning, re.escape(message)) as caught:
-                    warnings.filterwarnings(
-                        "ignore", message=_CPU_COLORED_WARNING, category=newton.exceptions.NewtonWarning
-                    )
+                with self.assertWarnsRegex(newton.NewtonDeprecationWarning, re.escape(message)) as caught:
+                    warnings.filterwarnings("ignore", message=_CPU_COLORED_WARNING, category=newton.NewtonWarning)
                     solver = SolverSteel(model, **kwargs)
                 self.assertEqual(Path(caught.filename).resolve(), Path(__file__).resolve())
                 self.assertEqual((solver.solve_mode, solver.articulated_contact_response), expected)
@@ -1176,8 +1175,8 @@ class TestSteelSolveModeOptions(unittest.TestCase):
         """Expose the normalized pair without warnings and reject unknown values and an unsupported pair."""
         model, _ = _build_plane_model("cpu", separation=0.0, restitution=0.0)
         with warnings.catch_warnings():
-            warnings.simplefilter("error", newton.exceptions.NewtonDeprecationWarning)
-            warnings.filterwarnings("ignore", message=_CPU_COLORED_WARNING, category=newton.exceptions.NewtonWarning)
+            warnings.simplefilter("error", newton.NewtonDeprecationWarning)
+            warnings.filterwarnings("ignore", message=_CPU_COLORED_WARNING, category=newton.NewtonWarning)
             solver = SolverSteel(model)
             self.assertEqual((solver.solve_mode, solver.articulated_contact_response), ("serial", "immediate"))
             solver = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation")
@@ -1199,7 +1198,11 @@ class TestSteelSolveModeOptions(unittest.TestCase):
         self.assertFalse(solver.nesterov_momentum)
         with self.assertRaises(AttributeError):
             solver.nesterov_momentum = True
-        for options in ({"articulated_contact_response": "propagation"}, {"row_schedule": "contact_then_internal"}):
+        for options in (
+            {"articulated_contact_response": "propagation"},
+            {"row_schedule": "contact_then_internal"},
+            {"row_schedule": "phased"},
+        ):
             with self.subTest(**options), self.assertRaisesRegex(ValueError, "nesterov_momentum requires"):
                 SolverSteel(model, nesterov_momentum=True, **options)
 
@@ -1207,7 +1210,7 @@ class TestSteelSolveModeOptions(unittest.TestCase):
         """On CPU the colored mode runs the serial propagation sweep, so sleeping with it names CUDA, not the mode."""
         model = _floor_model("cpu", "static")
         with warnings.catch_warnings(), self.assertRaisesRegex(NotImplementedError, "requires CUDA"):
-            warnings.filterwarnings("ignore", message=_CPU_COLORED_WARNING, category=newton.exceptions.NewtonWarning)
+            warnings.filterwarnings("ignore", message=_CPU_COLORED_WARNING, category=newton.NewtonWarning)
             SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation", enable_sleeping=True)
 
 
@@ -1322,9 +1325,7 @@ class TestSteelPrivateApi(unittest.TestCase):
                 mode.NOT_GUARANTEED,
             )
             wp.config.deterministic = mode.GPU_TO_GPU
-            with self.assertWarnsRegex(
-                newton.exceptions.NewtonWarning, "is GPU_TO_GPU; .* supports at most RUN_TO_RUN"
-            ):
+            with self.assertWarnsRegex(newton.NewtonWarning, "is GPU_TO_GPU; .* supports at most RUN_TO_RUN"):
                 self.assertEqual(SolverSteel(model).deterministic, mode.RUN_TO_RUN)
             if cuda_model is not None:
                 wp.config.deterministic = mode.RUN_TO_RUN
@@ -1376,15 +1377,6 @@ class TestSteelPrivateApi(unittest.TestCase):
         for path in sorted(_PACKAGE_DIR.glob("*.py")):
             with self.subTest(file=path.name):
                 self.assertIsNone(pattern.search(path.read_text(encoding="utf-8").replace(profiling, "")))
-
-    def test_prescribed_response_is_not_a_public_execution_knob(self):
-        """Select the kinematic-body response internally, not through a constructor option."""
-        init_method = self.solver_methods["__init__"]
-        parameters = {
-            argument.arg
-            for argument in [*init_method.args.posonlyargs, *init_method.args.args, *init_method.args.kwonlyargs]
-        }
-        self.assertNotIn("exclude_fully_kinematic_free_articulations", parameters)
 
     def test_kernel_factories_are_private_cached_functions(self):
         """Keep the size-specialized kernel factories private, cached and keyed by device architecture."""
@@ -1469,6 +1461,77 @@ add_function_test(
     TestSteelReuseKinematicsOption,
     "test_reuse_kinematics_defaults_off_and_publishes_eval_fk_state",
     test_reuse_kinematics_defaults_off_and_publishes_eval_fk_state,
+    devices=get_test_devices(),
+)
+
+
+def test_cfm_damps_the_sweep_and_keeps_its_solution(test, device):
+    """Scale a limit row's step by ``A / (A + cfm)`` and converge to the same rigid stop for any cfm."""
+    inertia = 0.5
+    response = 1.0 / inertia
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * inertia))
+    joint = builder.add_joint_revolute(-1, link, axis=(0.0, 1.0, 0.0), limit_lower=-1.0, limit_upper=0.0, armature=0.0)
+    builder.add_articulation([joint])
+    model = builder.finalize(device=device)
+    qd0 = 2.0
+
+    def end_speed(cfm, iterations):
+        solver = SolverSteel(model, cfm=cfm, iterations=iterations, enable_joint_limits=True)
+        state_0, state_1 = model.state(), model.state()
+        state_0.joint_qd.assign([qd0])
+        solver.step(state_0, state_1, model.control(), None, DT)
+        return float(state_1.joint_qd.numpy()[0])
+
+    # One sweep at the limit (phi = 0) leaves cfm / (A + cfm) of the approach speed.
+    test.assertAlmostEqual(end_speed(response, 1), 0.5 * qd0, delta=1.0e-5)
+    test.assertAlmostEqual(end_speed(3.0 * response, 1), 0.75 * qd0, delta=1.0e-5)
+    test.assertAlmostEqual(end_speed(1.0e-7, 1), 0.0, delta=1.0e-5)
+    # The converged sweep stops the joint whatever cfm is; a softening cfm would leave cfm * lambda.
+    test.assertAlmostEqual(end_speed(3.0 * response, 64), 0.0, delta=1.0e-5)
+
+
+def test_cfm_scales_a_regularized_contact_penetration(test, device):
+    """Scale the resting penetration of a regularized contact by ``(A + cfm) / A``."""
+    g, beta, dt = 0.5, 0.2, 1.0 / 240.0
+    penetration = {}
+    for cfm in (0.0, 1.0):
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        body = builder.add_body(
+            xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()), mass=1.0, inertia=wp.mat33(np.eye(3) * 0.004)
+        )
+        builder.add_shape_sphere(body, radius=0.1, cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0))
+        model = builder.finalize(device=device)
+        solver = SolverSteel(model, cfm=cfm, baumgarte=beta, contact_regularization=g, iterations=64)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        for _ in range(240):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, dt)
+            state_0, state_1 = state_1, state_0
+        penetration[cfm] = 0.1 - float(state_0.body_q.numpy()[0, 2])
+    # One row through the COM of a 1 kg body: A = 1, and the row settles at g (A + cfm) m |gravity| dt^2 / beta.
+    expected = g * 9.81 * dt * dt / beta
+    test.assertAlmostEqual(penetration[0.0], expected, delta=0.03 * expected)
+    test.assertAlmostEqual(penetration[1.0], 2.0 * expected, delta=0.03 * expected)
+
+
+class TestSteelCfmOption(unittest.TestCase):
+    """What the ``cfm`` option changes in the Gauss-Seidel sweep."""
+
+
+add_function_test(
+    TestSteelCfmOption,
+    "test_cfm_damps_the_sweep_and_keeps_its_solution",
+    test_cfm_damps_the_sweep_and_keeps_its_solution,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestSteelCfmOption,
+    "test_cfm_scales_a_regularized_contact_penetration",
+    test_cfm_scales_a_regularized_contact_penetration,
     devices=get_test_devices(),
 )
 

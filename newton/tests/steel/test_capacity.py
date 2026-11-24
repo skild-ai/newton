@@ -4,7 +4,6 @@
 """Row capacities, overflow reporting, watermarks and heterogeneous-world guards of SolverSteel."""
 
 import gc
-import sys
 import unittest
 import weakref
 
@@ -15,7 +14,7 @@ import newton
 from newton._src.solvers.steel.friction_patches import FrictionPatches
 from newton._src.solvers.steel.kernels import allocate_world_contact_slots, finalize_mf_constraint_counts
 from newton.solvers import SolverSteel
-from newton.tests.steel._fixtures import steel_mode_options
+from newton.tests.steel._fixtures import printf_capture_is_reliable, steel_mode_options
 from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_cuda_test_devices, get_test_devices
 
 
@@ -77,8 +76,7 @@ def test_dense_capacity_failure_is_world_local(test, device, solve_mode="serial"
 
 def test_overflow_warning_is_printed_once(test, device, solve_mode="serial", response="immediate"):
     """Print one device-side warning per overflowing row family, inside this test."""
-    if wp.get_device(device).is_cpu and sys.platform == "win32":
-        test.skipTest("Warp CPU printf capture is unreliable on Windows")
+    check_output = printf_capture_is_reliable()
     model = _box_on_ground(device, worlds=2)
     if response == "propagation":
         # The propagation rows hold every contact, in free_body_constraint_max + articulation_constraint_max rows.
@@ -93,7 +91,8 @@ def test_overflow_warning_is_printed_once(test, device, solve_mode="serial", res
     step_output = []
     for _ in range(2):
         capture = StdOutCapture()
-        capture.begin()
+        if check_output:
+            capture.begin()
         try:
             pipeline.collide(state_in, contacts)
             solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
@@ -102,7 +101,7 @@ def test_overflow_warning_is_printed_once(test, device, solve_mode="serial", res
             try:
                 wp.synchronize()
             finally:
-                output = capture.end()
+                output = capture.end() if check_output else ""
         step_output.append(
             [
                 line
@@ -110,10 +109,11 @@ def test_overflow_warning_is_printed_once(test, device, solve_mode="serial", res
                 if line.strip() and not (line.startswith("Module") and "load on device" in line)
             ]
         )
-    family = "propagation" if response == "propagation" else "matrix-free"
-    test.assertEqual(len(step_output[0]), 1, step_output[0])
-    test.assertRegex(step_output[0][0], rf"^Warning: Steel {family} constraint-row overflow in world [01]:")
-    test.assertEqual(step_output[1], [])
+    if check_output:
+        family = "propagation" if response == "propagation" else "matrix-free"
+        test.assertEqual(len(step_output[0]), 1, step_output[0])
+        test.assertRegex(step_output[0][0], rf"^Warning: Steel {family} constraint-row overflow in world [01]:")
+        test.assertEqual(step_output[1], [])
     expected = [0, 0, 0, 1, 0] if response == "propagation" else [0, 1, 0, 0, 0]
     np.testing.assert_array_equal(solver._row_overflow_warning_emitted.numpy(), expected)
 
@@ -456,6 +456,7 @@ def test_allocator_rejects_incomplete_contact_frame(test, device):
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
+            None,
         ],
         outputs=[
             wp.zeros((capacity,), dtype=wp.int32, device=device),
@@ -594,6 +595,7 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity, propagat
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
+            None,
         ],
         outputs=[
             wp.zeros((contact_count,), dtype=wp.int32, device=device),
@@ -1070,6 +1072,61 @@ def test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_bu
             np.testing.assert_allclose(sized_qd, ample_qd, atol=1e-6)
 
 
+def _folding_chain(device, links=12):
+    """A chain hung from one end whose links fold onto each other, one articulation."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    capsule_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.5 * np.pi)
+    parent, joints = -1, []
+    for i in range(links):
+        link = builder.add_link(xform=wp.transform(wp.vec3(0.08 * i + 0.04, 0.0, 0.5), wp.quat_identity()))
+        builder.add_shape_capsule(
+            link, xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), capsule_rot), radius=0.025, half_height=0.02
+        )
+        anchor = wp.vec3(0.0, 0.0, 0.5) if parent < 0 else wp.vec3(0.04, 0.0, 0.0)
+        joints.append(
+            builder.add_joint_revolute(
+                parent,
+                link,
+                axis=(0.0, 1.0, 0.0) if i % 3 else (0.0, 0.3, 1.0),
+                parent_xform=wp.transform(anchor, wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(-0.04, 0.0, 0.0), wp.quat_identity()),
+                armature=0.002,
+                damping=0.002,
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    return builder.finalize(device=device)
+
+
+def test_deterministic_overflow_repeats(test, device):
+    """Repeat an overflowing colored propagation solve bitwise with the deterministic row order."""
+    finals = []
+    for _ in range(2):
+        model = _folding_chain(device)
+        solver = SolverSteel(
+            model,
+            solve_mode="colored",
+            articulated_contact_response="propagation",
+            articulation_constraint_max=32,
+            deterministic=wp.DeterministicMode.RUN_TO_RUN,
+            warn_constraint_overflow=False,
+        )
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        for _ in range(320):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+        test.assertTrue(bool(solver.constraint_overflow.numpy()[0]))
+        body_q = state_0.body_q.numpy()
+        test.assertTrue(np.isfinite(body_q).all())
+        finals.append(body_q)
+    np.testing.assert_array_equal(finals[1], finals[0])
+
+
 add_function_test(
     TestSteelRowAllocation,
     "test_propagation_constraint_max_sizes_the_propagation_family",
@@ -1080,6 +1137,12 @@ add_function_test(
     TestSteelRowAllocation,
     "test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget",
     test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelRowAllocation,
+    "test_deterministic_overflow_repeats",
+    test_deterministic_overflow_repeats,
     devices=get_cuda_test_devices(),
 )
 

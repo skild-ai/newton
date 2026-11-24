@@ -19,7 +19,7 @@ import numpy as np
 import newton
 from newton import config
 from newton._src.geometry import _convex_cache
-from newton.tests.unittest_utils import USD_AVAILABLE, patch_sys_module
+from newton.tests.unittest_utils import patch_sys_module, requires
 
 
 class TestConvexDecompositionCache(unittest.TestCase):
@@ -75,6 +75,7 @@ class TestConvexDecompositionCache(unittest.TestCase):
         builder.approximate_meshes(method=method, shape_indices=[shape], raise_on_failure=raise_on_failure, **kwargs)
         return builder
 
+    @requires("scipy")
     def test_split_hull_budget_ignores_per_component_cache_entries(self):
         """Keep a merged CoACD hull budget, split across components, apart from per-component cache entries."""
         mesh = newton.Mesh(self.vertices, self.faces, maxhullvert=64)
@@ -88,7 +89,7 @@ class TestConvexDecompositionCache(unittest.TestCase):
         }
         per_component_key = _convex_cache.hash_inputs(mesh, "coacd", settings)
         _convex_cache.write(self.cache_dir, per_component_key, [(self.vertices + 5, self.faces.copy())])
-        with self.assertWarnsRegex(newton.exceptions.NewtonWarning, "more disconnected components"):
+        with self.assertWarnsRegex(newton.NewtonWarning, "more disconnected components"):
             self._build(merge=True, max_convex_hull=1)
         self.assertEqual(self.coacd.call_count, 1)
 
@@ -138,7 +139,7 @@ class TestConvexDecompositionCache(unittest.TestCase):
         self._build(cache_dir=self.cache_dir)
         self.assertEqual(self.coacd.call_count, 3)
 
-    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    @requires("pxr.Usd")
     def test_usd_import_uses_global_cache(self):
         """Reuse or disable cached decomposition through automatic USD import."""
         from pxr import Usd, UsdGeom, UsdPhysics
@@ -228,6 +229,7 @@ class TestConvexDecompositionCache(unittest.TestCase):
                     self._build(cache_dir=self.cache_dir)
                 self.assertEqual(list(self.cache_dir.glob("*.npz")), [])
 
+    @requires("scipy")
     def test_cache_does_not_store_fallback_hulls(self):
         """Retry decomposition after an earlier call fell back to a convex hull."""
         self.coacd.side_effect = RuntimeError("decomposition failed")

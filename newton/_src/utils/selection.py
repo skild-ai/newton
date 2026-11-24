@@ -426,7 +426,7 @@ class FrequencyLayout:
 
     A regular layout addresses row ``offset + world * stride_between_worlds + articulation *
     stride_within_worlds + index`` for each selected ``index``. When the articulations' start rows
-    are not regularly spaced across worlds, ``model_starts`` gives the absolute start row of each
+    are not regularly spaced within or between worlds, ``model_starts`` gives the absolute start row of each
     ``(world, articulation)`` instead, and attributes are gathered and scattered through
     :meth:`get_model_indices`. When the selected values are not at the same offsets in every
     articulation, ``model_indices`` gives the absolute row of each selected value of each
@@ -927,13 +927,6 @@ def _validate_layouts(
     return results
 
 
-def get_world_offset(world_ids):
-    for i in range(len(world_ids)):
-        if world_ids[i] > -1:
-            return i
-    return None
-
-
 def is_contiguous_slice(indices):
     n = len(indices)
     if n > 1:
@@ -988,9 +981,9 @@ class ArticulationView:
     articulations, in model order, so worlds holding other articulations are skipped
     (``is_sparse``). ``world_ids`` maps each view world to its model world, and
     masks and returned arrays use the view's world axis. When the selected articulations'
-    rows are not regularly spaced between worlds, for example when worlds hold different
-    articulations, the affected attributes are addressed through explicit absolute model
-    indices (``uses_explicit_model_indices``).
+    rows are not regularly spaced within or between worlds, for example when other
+    articulations sit between them, the affected attributes are addressed through explicit
+    absolute model indices (``uses_explicit_model_indices``).
 
     Getters may return a copy instead of a view of the source array, for example when a joint or link filter leaves
     gaps in the selection or rows are addressed through explicit model indices. Write changes back with the matching
@@ -2578,8 +2571,9 @@ class ArticulationView:
                 view DOFs are considered actuated.
             component: The component that owns the parameter — a
                 :class:`~newton.actuators.DriveBase`,
-                :class:`~newton.actuators.ClampingBase`, or
-                :class:`~newton.actuators.Delay` instance.
+                :class:`~newton.actuators.ClampingBase`,
+                :class:`~newton.actuators.MotorDC`, or
+                :class:`~newton.actuators.InputProcessorDelay` instance.
             name: Attribute name on *component* (e.g. ``"kp"``, ``"max_effort"``,
                 ``"delay_steps"``).
 
@@ -2630,8 +2624,9 @@ class ArticulationView:
                 view DOFs are considered actuated.
             component: The component that owns the parameter — a
                 :class:`~newton.actuators.DriveBase`,
-                :class:`~newton.actuators.ClampingBase`, or
-                :class:`~newton.actuators.Delay` instance.
+                :class:`~newton.actuators.ClampingBase`,
+                :class:`~newton.actuators.MotorDC`, or
+                :class:`~newton.actuators.InputProcessorDelay` instance.
             name: Attribute name on *component* (e.g. ``"kp"``, ``"max_effort"``,
                 ``"delay_steps"``).
             values: New parameter values shaped ``(world_count, dofs_per_world)``
