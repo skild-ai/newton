@@ -1220,6 +1220,24 @@ def test_bisection_keeps_a_jammed_contact_near_the_frictionless_load(test, devic
                     test.assertLessEqual(float(np.linalg.norm(tangent)), block[9] * normal * (1.0 + 1.0e-6))
 
 
+# A rank-one block slipping off its axis whose Schur complement, 9e-5 G_nn, is small but not rounding: its root
+# lies near 1e4 times the frictionless load. Values as in _JAMMED_BLOCKS.
+_FAR_ROOT_BLOCK = (-1.0, 0.0, 0.1, 1.00009, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0)
+
+
+def test_bisection_reaches_the_far_root_of_a_nearly_jammed_block(test, device):
+    """Search past the flat start of a nearly jammed residual to its root instead of stopping as if it had none."""
+    block = np.array(_FAR_ROOT_BLOCK, dtype=np.float32)
+    g_nn, g_nt1, g_nt2 = (float(v) for v in block[3:6])
+    for mode in ("bisection", "bisection_desaxce"):
+        with test.subTest(mode=mode):
+            normal, tangent1, tangent2 = (float(v) for v in _mf_block(device, block, mode))
+            bias = float(block[9] * np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
+            residual = float(block[0]) + g_nn * normal + g_nt1 * tangent1 + g_nt2 * tangent2 - bias
+            test.assertGreater(normal, 1.0e3)
+            test.assertLessEqual(abs(residual), 1.0e-5 * g_nn * normal)
+
+
 # A block whose second tangent direction barely responds but slips at 1 m/s: friction must still oppose that slip.
 # Values: u_n, u_t1, u_t2, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2, G_t2t2, mu.
 _STIFF_SLIPPING_BLOCK = (-1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0e-7, 0.5)
@@ -1343,6 +1361,7 @@ for _fn in (
     test_bisection_leaves_an_ill_conditioned_sticking_contact_at_rest,
     test_bisection_keeps_a_jammed_contact_near_the_frictionless_load,
     test_bisection_keeps_friction_on_a_stiff_slipping_direction,
+    test_bisection_reaches_the_far_root_of_a_nearly_jammed_block,
     test_bisection_bounds_the_normal_force_on_a_hinged_rod,
     test_bisection_reports_no_friction_without_tangential_mobility,
 ):

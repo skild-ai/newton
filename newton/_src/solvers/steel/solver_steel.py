@@ -24733,6 +24733,9 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                                             && G_nn * axis_tt - axis_nt * axis_nt <= 1.0e-4f * G_nn * axis_tt
                                         : minor_nn > 0.0f && det_block <= 1.0e-6f * G_nn * minor_nn
                                             && minor_n1 * minor_n1 + minor_n2 * minor_n2 <= mu * mu * minor_nn * minor_nn * (1.0f + 2.0e-5f));
+                                    // A jammed block whose Schur complement is at rounding level gains no load response at large loads, so a residual
+                                    // that stops rising has no root; a larger complement keeps a root, however far.
+                                    const bool rootless = jammed && (!rank_one || G_nn * axis_tt - axis_nt * axis_nt <= 1.0e-6f * G_nn * axis_tt);
                                     for (int _it = 0; _it < 64; _it++) {
                                         const float f_x = probe(x, new_lambda_t1, new_lambda_t2);
                                         new_lambda_n = x;
@@ -24753,10 +24756,10 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                                                 }
                                                 if (stick_t1 * stick_t1 + stick_t2 * stick_t2 <= mu * mu * x * x * (1.0f + 2.0e-5f)) break;
                                             }
-                                            // Whatever the probe, an unbracketed residual that rose by less than 1% of its remaining gap since the last
-                                            // approaching probe has no root within reach: keep that probe's load.
-                                            if (!bracketed && f_x - f_lo <= 1.0e-2f * -f_x) {
-                                                if (lo <= 0.0f) break;
+                                            // Whatever the probe, on a rootless block an unbracketed residual that rose by less than 1% of its remaining
+                                            // gap since the last approaching probe has stopped: keep that probe's load.
+                                            if (rootless && !bracketed && f_x - f_lo <= 1.0e-2f * -f_x) {
+                                                if (lo <= 0.0f || _it >= 63) break;
                                                 x = lo;
                                                 last_probe = true;
                                                 continue;
@@ -25007,6 +25010,9 @@ _MF_BISECTION_FRICTION_SOURCE = """
                                             && G_nn * axis_tt - axis_nt * axis_nt <= 1.0e-4f * G_nn * axis_tt
                                         : minor_nn > 0.0f && det_block <= 1.0e-6f * G_nn * minor_nn
                                             && minor_n1 * minor_n1 + minor_n2 * minor_n2 <= mu * mu * minor_nn * minor_nn * (1.0f + 2.0e-5f));
+                                    // A jammed block whose Schur complement is at rounding level gains no load response at large loads, so a residual
+                                    // that stops rising has no root; a larger complement keeps a root, however far.
+                                    const bool rootless = jammed && (!rank_one || G_nn * axis_tt - axis_nt * axis_nt <= 1.0e-6f * G_nn * axis_tt);
                                     for (int _it = 0; _it < 64; _it++) {
                                         const float f_x = probe(x, new_lambda_t1, new_lambda_t2);
                                         new_lambda_n = x;
@@ -25027,10 +25033,10 @@ _MF_BISECTION_FRICTION_SOURCE = """
                                                 }
                                                 if (stick_t1 * stick_t1 + stick_t2 * stick_t2 <= mu * mu * x * x * (1.0f + 2.0e-5f)) break;
                                             }
-                                            // Whatever the probe, an unbracketed residual that rose by less than 1% of its remaining gap since the last
-                                            // approaching probe has no root within reach: keep that probe's load.
-                                            if (!bracketed && f_x - f_lo <= 1.0e-2f * -f_x) {
-                                                if (lo <= 0.0f) break;
+                                            // Whatever the probe, on a rootless block an unbracketed residual that rose by less than 1% of its remaining
+                                            // gap since the last approaching probe has stopped: keep that probe's load.
+                                            if (rootless && !bracketed && f_x - f_lo <= 1.0e-2f * -f_x) {
+                                                if (lo <= 0.0f || _it >= 63) break;
                                                 x = lo;
                                                 last_probe = true;
                                                 continue;
