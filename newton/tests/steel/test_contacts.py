@@ -1513,11 +1513,12 @@ class _SleepingContactForces:
         self.control = self.model.control()
         self.weight = np.linalg.norm(self.model.gravity.numpy()[0])
 
-    def step(self, body_f=None, observables=True):
+    def step(self, body_f=None, observables=True, collide=True):
         self.states[0].clear_forces()
         if body_f is not None:
             self.states[0].body_f.assign(body_f)
-        self.pipeline.collide(self.states[0], self.contacts)
+        if collide:
+            self.pipeline.collide(self.states[0], self.contacts)
         if observables:
             self.observables.contact_f.fill_(wp.spatial_vector(FILL, FILL, FILL, FILL, FILL, FILL))
         self.solver.step(
@@ -1605,14 +1606,20 @@ def test_sleeping_contact_f_across_reset(test, device):
     scene.assert_resting(scene.net())
 
 
-def test_sleeping_contact_f_needs_every_step(test, device):
+def test_sleeping_contact_f_needs_every_step(test, device, collide=True):
     """Report zero for skipped contacts after a step that did not request the force, until the island wakes."""
     scene = _SleepingContactForces(device)
     for _ in range(150):
         scene.step()
     np.testing.assert_array_equal(scene.awake(), [0, 0])
-    scene.assert_resting(scene.net())
-    scene.step(observables=False)
+    carried = scene.net()
+    scene.assert_resting(carried)
+    # A step on the unchanged contact set carries the force without a match.
+    scene.step(collide=False)
+    np.testing.assert_array_equal(scene.net(), carried)
+    scene.step(observables=False, collide=collide)
+    scene.step(collide=collide)
+    np.testing.assert_array_equal(scene.net(), 0.0)
     scene.step()
     np.testing.assert_array_equal(scene.net(), 0.0)
 
@@ -1858,6 +1865,16 @@ for _name in (
     "test_sleeping_contact_f_needs_every_step",
 ):
     add_function_test(TestSteelContactObservable, _name, globals()[_name], devices=all_devices)
+
+
+# Without a collision pass the contact generation stays the same, so only the step count can break the chain.
+add_function_test(
+    TestSteelContactObservable,
+    "test_sleeping_contact_f_needs_every_step_on_a_reused_contact_set",
+    test_sleeping_contact_f_needs_every_step,
+    devices=all_devices,
+    collide=False,
+)
 
 
 add_function_test(

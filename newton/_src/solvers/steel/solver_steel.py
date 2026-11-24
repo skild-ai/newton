@@ -1664,15 +1664,15 @@ class SolverSteel(SolverBase, CouplingInterface):
         report zero, as do rows beyond the contact count or the rigid capacity and the
         soft-contact rows.
 
-        A contact of a sleeping island whose rows are skipped (``sleep_skip_constraints``) reports
-        the force it reported on the previous step, so a resting body keeps its last solved
-        support force while it sleeps. The force carries from step to step through
-        :attr:`~newton.Contacts.rigid_contact_match_index`, so it needs a collision pipeline
-        with contact matching (``contact_matching="latest"`` or ``"sticky"``) and ``CONTACT_F``
-        requested on every step; otherwise such a contact reports zero until its island wakes. A
-        step that reuses the previous contact set without a collision pass keeps the force
-        without matching. ``sleep_skip_constraints=False`` solves the rows of sleeping islands and
-        reports their forces directly.
+        With ``sleep_skip_constraints=True``, a contact of a sleeping island gets no rows and reports
+        the force it reported on the previous solver step, so a resting body keeps its last solved
+        support force while it sleeps. Across a collision pass the force follows
+        :attr:`~newton.Contacts.rigid_contact_match_index`, so it needs contact matching
+        (``contact_matching="latest"`` or ``"sticky"``); a step on the unchanged contact set carries
+        it without matching. Every solver step must request ``CONTACT_F``. Otherwise, or without
+        matching across a collision pass, such a contact reports zero until its island wakes. With
+        ``sleep_skip_constraints=False`` the rows of sleeping islands are solved and their forces
+        are reported directly, with or without matching.
 
         With ``enable_sleeping``, :attr:`SolverSteel.Observables.body_awake` reports per-body sleep
         flags; see :ref:`steel_sleep_observable`.

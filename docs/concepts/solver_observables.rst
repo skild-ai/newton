@@ -383,14 +383,15 @@ Without sleeping the kind is unsupported and requesting it raises.
 
 With ``sleep_skip_constraints=True`` (the default), a sleeping island gets no contact
 rows. In :attr:`~newton.solvers.SolverBase.Observables.contact_f`, each of its contacts
-reports the force it reported on the previous step, so a resting body keeps its last
-solved support force while it sleeps. The force carries from step to step through
-:attr:`~newton.Contacts.rigid_contact_match_index`: create the
-:class:`~newton.CollisionPipeline` with ``contact_matching="latest"`` (or ``"sticky"``)
-and request ``CONTACT_F`` on every step. Without matching, or after a step that did not
-request ``CONTACT_F``, these contacts report zero until their island wakes. With
-``sleep_skip_constraints=False`` the rows of sleeping islands are solved and their
-forces are reported directly.
+reports the force it reported on the previous solver step, so a resting body keeps its
+last solved support force while it sleeps. Across a collision pass the force follows
+:attr:`~newton.Contacts.rigid_contact_match_index`, so create the
+:class:`~newton.CollisionPipeline` with ``contact_matching="latest"`` (or ``"sticky"``);
+a step on the unchanged contact set carries it without matching. Every solver step must
+request ``CONTACT_F``. Otherwise, or without matching across a collision pass, these
+contacts report zero until their island wakes. With ``sleep_skip_constraints=False``
+the rows of sleeping islands are solved and their forces are reported directly, with or
+without matching.
 
 .. _mujoco_overflow_observable:
 

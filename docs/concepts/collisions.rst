@@ -2035,9 +2035,12 @@ and is consumed by the solver :meth:`~solvers.SolverBase.step` method for contac
 
    :class:`~solvers.SolverSteel` with sleeping and ``sleep_skip_constraints=True`` skips
    the rows of sleeping islands and reports each of their contacts' force from the
-   previous step, carried through contact matching. Use ``contact_matching="latest"``
-   and request ``CONTACT_F`` on every step; otherwise those contacts report zero while
-   their island sleeps. See :ref:`steel_sleep_observable`.
+   previous solver step. Across a collision pass the force follows contact matching
+   (``contact_matching="latest"``); a step on the unchanged contact set carries it
+   without matching. Every solver step must request ``CONTACT_F``; otherwise those
+   contacts report zero until their island wakes. With ``sleep_skip_constraints=False``
+   the rows are solved and the forces are reported directly. See
+   :ref:`steel_sleep_observable`.
 
 .. note::
 

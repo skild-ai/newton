@@ -46,10 +46,13 @@ class _SleepState:
         self.body_nodes = wp.array(body_nodes, dtype=int, device=device)
         self.body_prescribed = wp.array(prescribed.astype(np.int32), dtype=int, device=device)
         self.contact_response_mask = wp.clone(solver._body_has_response_dofs)
-        # Last reported linear force [N] of each contact, and the contact set it was reported for.
+        # Solver steps finished, on the device so captured steps count during replay.
+        self.step_stamp = wp.zeros(1, dtype=int, device=device)
+        # Last reported linear force [N] of each contact, and the step and contact set it was reported for.
         self.contact_force_history = None
         if skip_constraints:
             self.contact_force_history = wp.zeros(solver._max_contacts_alloc, dtype=wp.vec3, device=device)
+            self.contact_force_history_step = wp.full(1, -1, dtype=int, device=device)
             self.contact_force_history_generation = wp.full(1, CONTACT_GENERATION_NONE, dtype=wp.int32, device=device)
             self.contact_force_history_stream = wp.zeros(1, dtype=wp.int32, device=device)
             self._no_match_index = wp.zeros(0, dtype=wp.int32, device=device)
@@ -487,7 +490,8 @@ class _SleepState:
     def latch_contact_forces(self, contacts, contact_f, contact_stream):
         """Report the last force of contacts whose rows sleeping skipped, then record this step's forces.
 
-        A force carries only between consecutive ``CONTACT_F`` steps on one buffer, through contact matching.
+        A force carries only between consecutive solver steps that both request ``CONTACT_F``, on one buffer,
+        through contact matching or an unchanged contact set.
         """
         device = self.model.device
         match_index = contacts.rigid_contact_match_index
@@ -512,6 +516,8 @@ class _SleepState:
                 contacts.contact_generation,
                 contact_stream,
                 *history,
+                self.step_stamp,
+                self.contact_force_history_step,
                 self.contact_force_history,
             ],
             outputs=[contact_f],
@@ -526,8 +532,9 @@ class _SleepState:
                 contact_f,
                 contacts.contact_generation,
                 contact_stream,
+                self.step_stamp,
             ],
-            outputs=[self.contact_force_history, *history],
+            outputs=[self.contact_force_history, *history, self.contact_force_history_step],
             device=device,
         )
 
@@ -599,7 +606,7 @@ class _SleepState:
         wp.launch(
             _publish_components,
             self.parent.size,
-            [self.parent, self.root_ready, self.art_awake, self.previous_root, self.asleep_steps],
+            [self.parent, self.root_ready, self.art_awake, self.previous_root, self.asleep_steps, self.step_stamp],
             device=device,
         )
         wp.launch(
@@ -1177,9 +1184,16 @@ def _quiet_components(
 
 @wp.kernel(enable_backward=False)
 def _publish_components(
-    parent: wp.array[int], ready: wp.array[int], awake: wp.array[int], previous: wp.array[int], asleep: wp.array[int]
+    parent: wp.array[int],
+    ready: wp.array[int],
+    awake: wp.array[int],
+    previous: wp.array[int],
+    asleep: wp.array[int],
+    step_stamp: wp.array[int],
 ):
     i = wp.tid()
+    if i == 0:
+        step_stamp[0] += 1
     awake[i] = 1 - ready[parent[i]]
     previous[i] = parent[i]
     if awake[i] == 0:
@@ -1317,6 +1331,8 @@ def _latch_contact_forces(
     contact_stream: int,
     history_generation: wp.array[wp.int32],
     history_stream: wp.array[wp.int32],
+    step_stamp: wp.array[int],
+    history_step: wp.array[int],
     history: wp.array[wp.vec3],
     contact_f: wp.array[wp.spatial_vector],
 ):
@@ -1338,6 +1354,9 @@ def _latch_contact_forces(
         contact_generation, match_generation, contact_stream, history_generation, history_stream
     )
     source = int(-1)
+    # The history must come from the step just before this one; an unrequested step in between breaks it.
+    if history_step[0] != step_stamp[0] - 1:
+        relation = 0
     if relation == 1:
         source = c
     elif relation == 2 and c < match_index.shape[0]:
@@ -1355,15 +1374,18 @@ def _record_contact_forces(
     contact_f: wp.array[wp.spatial_vector],
     contact_generation: wp.array[wp.int32],
     contact_stream: int,
+    step_stamp: wp.array[int],
     history: wp.array[wp.vec3],
     history_generation: wp.array[wp.int32],
     history_stream: wp.array[wp.int32],
+    history_step: wp.array[int],
 ):
     """Record each live contact's reported linear force and the contact set it belongs to."""
     c = wp.tid()
     if c == 0:
         history_generation[0] = contact_generation[0]
         history_stream[0] = contact_stream
+        history_step[0] = step_stamp[0]
     if c < wp.min(contact_count[0], rigid_contact_max):
         history[c] = wp.spatial_top(contact_f[c])
 
