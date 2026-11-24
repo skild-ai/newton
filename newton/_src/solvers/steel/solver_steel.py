@@ -45,6 +45,7 @@ from .contact_angular_friction import (
     launch_propagation_free_rigid_angular_friction_rows,
     refresh_free_rigid_angular_friction,
     validate_free_rigid_angular_friction,
+    warn_unrouted_condim_contacts,
 )
 from .contact_torsion import (
     configure_contact_torsion,
@@ -1818,6 +1819,9 @@ class SolverSteel(SolverBase, CouplingInterface):
           between free bodies, and free bodies on static or kinematic geometry, read it, so a condim
           above 3 adds no rows on other shapes, on shapes without shape collision or in collision
           group 0, or on shapes that no dynamic free body in their world or the global world can touch.
+          A user-assigned :attr:`~newton.Model.shape_contact_pairs` counts its pairs whatever their flags,
+          groups and worlds; pairs given only to a :class:`~newton.CollisionPipeline` are not visible here,
+          and the first free-body contact on such a gated-off shape prints a warning.
           The MJCF importer reads the geom's ``condim`` and USD reads ``mjc:condim``, the inputs of
           :class:`~newton.solvers.SolverMuJoCo`'s ``mujoco:condim``; an authored USD
           ``newton:steel:condim`` takes precedence. Condim 1 imports as 3, since this attribute only adds
@@ -10093,6 +10097,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._mf_target_velocity.zero_()
 
         self._cross_world_contacts.zero_()
+        warn_unrouted_condim_contacts(self, contacts)
         if mf_active:
             self._mf_slot_counter.zero_()
             self._mf_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)

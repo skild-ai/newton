@@ -15,7 +15,7 @@ against free bodies or static and kinematic geometry) receive them.
 import numpy as np
 import warp as wp
 
-from ...geometry.flags import ShapeFlags
+from ...sim.collide import _shape_collide_mask
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
@@ -45,8 +45,18 @@ def configure_free_rigid_angular_friction(solver, model, torsional: float | None
     # Kernel argument for a model without steel:condim; the gate kernel ignores it.
     solver._free_rigid_condim_placeholder = wp.zeros(1, dtype=wp.int32, device=model.device)
     routed = False
+    solver._free_rigid_unrouted_condim = None
     if values is not None and solver._has_free_rigid_bodies:
-        routed = bool(np.any(values[_free_route_contact_shapes(solver)] >= 4))
+        reachable, on_route_body = _free_route_contact_shapes(solver)
+        routed = bool(np.any(values[reachable] >= 4))
+        unrouted = (values >= 4) & on_route_body & ~reachable
+        if not (overridden or routed) and np.any(unrouted):
+            # Pairs given only to a CollisionPipeline can still bring these shapes into contact; warn if one does.
+            solver._free_rigid_unrouted_condim = wp.array(unrouted.astype(np.int32), dtype=wp.int32, device=model.device)
+            route_body = _free_route_body_mask(solver)
+            route_body[solver._model_plan.response_free_rigid_body_indices] = 2
+            solver._free_rigid_unrouted_route_body = wp.array(route_body, dtype=wp.int32, device=model.device)
+            solver._free_rigid_unrouted_warned = wp.zeros(1, dtype=wp.int32, device=model.device)
     solver._free_rigid_angular_rows = bool(overridden or routed)
     if not solver._free_rigid_angular_rows:
         return
@@ -106,6 +116,26 @@ def free_rigid_route_bodies(solver) -> wp.array | None:
     if not solver._free_rigid_angular_rows:
         return None
     return wp.array(_free_route_body_mask(solver), dtype=wp.int32, device=solver.model.device)
+
+
+def warn_unrouted_condim_contacts(solver, contacts) -> None:
+    """Warn once from the device if a free-body contact touches a condim 4 or 6 shape the construction gate left out."""
+    if solver._free_rigid_unrouted_condim is None or contacts is None or contacts.rigid_contact_max == 0:
+        return
+    wp.launch(
+        _warn_unrouted_condim_contact,
+        dim=contacts.rigid_contact_max,
+        inputs=[
+            contacts.rigid_contact_count,
+            contacts.rigid_contact_shape0,
+            contacts.rigid_contact_shape1,
+            solver.model.shape_body,
+            solver._free_rigid_unrouted_condim,
+            solver._free_rigid_unrouted_route_body,
+        ],
+        outputs=[solver._free_rigid_unrouted_warned],
+        device=solver.model.device,
+    )
 
 
 def launch_free_rigid_angular_friction_rows(solver, state_aug, contacts, threads: int) -> None:
@@ -325,21 +355,23 @@ def _free_route_body_mask(solver) -> np.ndarray:
     return route
 
 
-def _free_route_contact_shapes(solver) -> np.ndarray:
-    """Mark the colliding shapes that can meet a free-body-route partner across a responding free body.
+def _free_route_contact_shapes(solver) -> tuple[np.ndarray, np.ndarray]:
+    """Mark the shapes that can meet a free-body-route partner across a responding free body.
 
+    Returns that mask and the mask of shapes whose body takes the free-body route. A user-assigned
+    :attr:`~newton.Model.shape_contact_pairs` counts its pairs whatever their collision flags, groups and worlds.
     Collision groups other than 0 and filter pairs are ignored, so this may include shapes that never touch.
     """
     model = solver.model
     shape_body, shape_world = model.shape_body.numpy(), model.shape_world.numpy()
     body = np.maximum(shape_body, 0)
-    colliding = ((model.shape_flags.numpy() & int(ShapeFlags.COLLIDE_SHAPES)) != 0) & (
-        model.shape_collision_group.numpy() != 0
-    )
-    on_route = colliding & ((shape_body < 0) | (_free_route_body_mask(solver)[body] != 0))
+    on_route_body = (shape_body < 0) | (_free_route_body_mask(solver)[body] != 0)
+    colliding = _shape_collide_mask(model) & (model.shape_collision_group.numpy() != 0)
+    on_route = colliding & on_route_body
     responding = np.zeros(max(model.body_count, 1), dtype=bool)
     responding[solver._model_plan.response_free_rigid_body_indices] = True
-    on_free = on_route & (shape_body >= 0) & responding[body]
+    on_free_body = on_route_body & (shape_body >= 0) & responding[body]
+    on_free = on_route & on_free_body
     # Per-world shape counts with the global (-1) world in slot 0; a global shape meets every world.
     slot = shape_world + 1
 
@@ -349,4 +381,50 @@ def _free_route_contact_shapes(solver) -> np.ndarray:
 
     same_body = np.bincount(body[on_route & (shape_body >= 0)], minlength=len(responding))[body]
     partners = np.where(on_free, reachable_count(on_route) - same_body, reachable_count(on_free))
-    return on_route & (partners > 0)
+    reachable = on_route & (partners > 0)
+    if model._shape_contact_pair_data is None and model._shape_contact_pairs is not None:
+        pairs = model._shape_contact_pairs.numpy().reshape(-1, 2)
+        pairs = pairs[(pairs >= 0).all(axis=1) & (pairs < model.shape_count).all(axis=1)]
+        a, b = pairs[:, 0], pairs[:, 1]
+        routed = on_route_body[a] & on_route_body[b] & (on_free_body[a] | on_free_body[b])
+        reachable[a[routed]] = True
+        reachable[b[routed]] = True
+    return reachable, on_route_body
+
+
+@wp.kernel
+def _warn_unrouted_condim_contact(
+    contact_count: wp.array[wp.int32],
+    shape0: wp.array[wp.int32],
+    shape1: wp.array[wp.int32],
+    shape_body: wp.array[wp.int32],
+    unrouted: wp.array[wp.int32],
+    route_body: wp.array[wp.int32],
+    warned: wp.array[wp.int32],
+):
+    """Print one warning for a free-body contact on a shape whose condim was gated off; ``route_body`` is 2 on free bodies."""
+    tid = wp.tid()
+    if tid >= contact_count[0]:
+        return
+    a = shape0[tid]
+    b = shape1[tid]
+    if a < 0 or b < 0 or (unrouted[a] == 0 and unrouted[b] == 0):
+        return
+    route_a = 1
+    route_b = 1
+    if shape_body[a] >= 0:
+        route_a = route_body[shape_body[a]]
+    if shape_body[b] >= 0:
+        route_b = route_body[shape_body[b]]
+    if route_a == 0 or route_b == 0 or (route_a != 2 and route_b != 2):
+        return
+    shape = b
+    if unrouted[a] != 0:
+        shape = a
+    if wp.atomic_exch(warned, 0, 1) == 0:
+        wp.printf(
+            "Warning: SolverSteel: a free-body contact touches shape %d, whose steel:condim above 3 adds no rows "
+            "because no default contact pair reaches it. Assign explicit pairs to model.shape_contact_pairs "
+            "before constructing the solver.\n",
+            shape,
+        )

@@ -1787,6 +1787,34 @@ class TestFreeRigidAngularFrictionImport(unittest.TestCase):
         np.testing.assert_array_equal(np.sort(model.steel.condim.numpy()), [3, 3, 6])
         self.assertFalse(SolverSteel(model)._free_rigid_angular_rows)
 
+    def test_explicit_pairs_reach_a_noncolliding_condim(self):
+        """Enable the rows for a noncolliding condim 6 geom paired explicitly on the model; warn for pipeline-only pairs."""
+        mjcf = (
+            "<mujoco><worldbody>"
+            '<geom type="plane" size="1 1 0.1"/>'
+            f'<body pos="0 0 {_RADIUS}"><freejoint/>'
+            f'<geom type="sphere" size="{_RADIUS}" condim="6" contype="0" conaffinity="0"/></body>'
+            "</worldbody></mujoco>"
+        )
+        model = _import_mjcf(mjcf)
+        ball = int(np.flatnonzero(model.steel.condim.numpy() == 6)[0])
+        pairs = wp.array(np.array([[ball, 1 - ball]], dtype=np.int32), dtype=wp.vec2i, device="cpu")
+        model.shape_contact_pairs = pairs
+        # The rows are CUDA-only, so enabling them on CPU raises.
+        with self.assertRaisesRegex(NotImplementedError, "steel:condim"):
+            SolverSteel(model)
+
+        model = _import_mjcf(mjcf)
+        pipeline = newton.CollisionPipeline(model, broad_phase="explicit", shape_pairs_filtered=pairs)
+        solver = SolverSteel(model)
+        self.assertFalse(solver._free_rigid_angular_rows)
+        contacts = pipeline.contacts()
+        state_0, state_1 = model.state(), model.state()
+        pipeline.collide(state_0, contacts)
+        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+        solver.step(state_0, state_1, model.control(), contacts, _DT)
+        self.assertEqual(int(solver._free_rigid_unrouted_warned.numpy()[0]), 1)
+
     def test_condim_in_a_world_without_free_bodies_adds_no_angular_rows(self):
         """Leave the rows off for a condim 6 ground in a world without free bodies; on in the free body's world."""
         for ground_world in (1, 0, -1):
