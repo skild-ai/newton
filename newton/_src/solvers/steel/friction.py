@@ -375,9 +375,15 @@ _COUPLED_CONTACT_BISECTION = """
                     && G_nn * axis_tt - axis_nt * axis_nt <= 1.0e-4f * G_nn * axis_tt
                 : minor_nn > 0.0f && det_block <= 1.0e-6f * G_nn * minor_nn
                     && minor_n1 * minor_n1 + minor_n2 * minor_n2 <= mu * mu * minor_nn * minor_nn * (1.0f + 2.0e-5f));
-            // A jammed block whose Schur complement is at most 1e-6 G_nn is treated as numerically singular: its search bounds
-            // the load rather than pursue an ill-conditioned root, even a finite one that a small positive complement keeps.
-            const bool singular_jam = jammed && (!rank_one || G_nn * axis_tt - axis_nt * axis_nt <= 1.0e-6f * G_nn * axis_tt);
+            // A numerically singular rank-one jam (complement at most 1e-6 G_nn) whose probes slip off the axis tends, at large
+            // loads, to its sticking residual plus k^2 |off-axis slip| / sqrt(mu^2 - k^2), k = axis_nt / axis_tt. A negative
+            // limit means no root; the search then keeps the first approaching load. A small positive complement is ignored.
+            const float axis_ratio = axis_nt / axis_tt;
+            const float cone_left = mu * mu - axis_ratio * axis_ratio;
+            const float sticking_residual = u_n - target_vel_n - axis_ratio * (pair_vx * u_t1 + pair_vy * u_t2);
+            const bool no_root = jammed && rank_one && !clamp_axis
+                && G_nn * axis_tt - axis_nt * axis_nt <= 1.0e-6f * G_nn * axis_tt && cone_left > 0.0f
+                && axis_ratio * axis_ratio * fabsf(pair_vx * u_t2 - pair_vy * u_t1) < -sticking_residual * sqrtf(cone_left);
             for (int _it = 0; _it < 64; _it++) {
                 const float f_x = probe(x, new_lambda_t1, new_lambda_t2);
                 new_lambda_n = x;
@@ -398,14 +404,7 @@ _COUPLED_CONTACT_BISECTION = """
                         }
                         if (stick_t1 * stick_t1 + stick_t2 * stick_t2 <= mu * mu * x * x * (1.0f + 2.0e-5f)) break;
                     }
-                    // Whatever the probe, on a numerically singular jam an unbracketed residual that rose by less than 1% of its
-                    // remaining gap since the last approaching probe is treated as rootless: keep that probe's load.
-                    if (singular_jam && !bracketed && f_x - f_lo <= 1.0e-2f * -f_x) {
-                        if (lo <= 0.0f || _it >= 63) break;
-                        x = lo;
-                        last_probe = true;
-                        continue;
-                    }
+                    if (no_root) break;
                 }
                 if (f_x < 0.0f) {
                     lo = x;

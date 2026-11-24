@@ -1205,6 +1205,8 @@ _JAMMED_BLOCKS = {
     "rank_one_on_the_cone": (-1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0),
     # A rank-one jam that also slips off its axis: the disk solve has no root at any load.
     "rank_one_slipping_off_axis": (-1.0, 0.0, 0.1, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+    # The same jam slipping just slower than its limit: the residual tends to -1.85e-5 and never reaches zero.
+    "rank_one_slipping_under_its_limit": (-0.001, 0.0, 0.0017, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
 }
 
 
@@ -1251,6 +1253,20 @@ def test_bisection_bounds_the_load_below_the_singular_cutoff(test, device):
             normal, *_ = _mf_block(device, block, mode)
             bias = float(block[9] * np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
             test.assertLessEqual(float(normal), (bias - float(block[0])) / float(block[3]) * (1.0 + 1.0e-5))
+
+
+# A singular rank-one jam whose sliding direction turns with the load: its residual starts flat but has a root near
+# 0.232005 (from tan(theta) = 1.74378288 and mu = 2).
+_TURNING_SLIP_BLOCK = (-0.001, 1.0, 1.74378288, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0)
+
+
+def test_bisection_finds_the_root_of_a_jam_whose_slip_turns(test, device):
+    """Reach the root of a singular jam whose residual is flat at the first probe but rises as the slip turns."""
+    block = np.array(_TURNING_SLIP_BLOCK, dtype=np.float32)
+    normal, tangent1, tangent2 = (float(v) for v in _mf_block(device, block, "bisection"))
+    residual = float(block[0]) + normal + tangent1
+    test.assertAlmostEqual(normal, 0.232005, delta=1.0e-4)
+    test.assertLessEqual(abs(residual), 1.0e-5 * normal)
 
 
 # A block whose second tangent direction barely responds but slips at 1 m/s: friction must still oppose that slip.
@@ -1378,6 +1394,7 @@ for _fn in (
     test_bisection_keeps_friction_on_a_stiff_slipping_direction,
     test_bisection_reaches_the_far_root_of_a_nearly_jammed_block,
     test_bisection_bounds_the_load_below_the_singular_cutoff,
+    test_bisection_finds_the_root_of_a_jam_whose_slip_turns,
     test_bisection_bounds_the_normal_force_on_a_hinged_rod,
     test_bisection_reports_no_friction_without_tangential_mobility,
 ):
