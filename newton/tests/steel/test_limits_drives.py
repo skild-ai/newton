@@ -3254,6 +3254,20 @@ def test_zero_max_distance_holds_the_anchors_together(test, device):
             test.assertLess(distances.max(), 1.0e-5)
 
 
+def test_positive_max_distance_caps_any_push_from_coincident_anchors(test, device):
+    """Stop a weight pushed from coincident anchors at a 5 mm ``max_distance`` along every axis and a diagonal."""
+    cap, speed = 0.005, 4.0
+    directions = [np.eye(3)[axis] * sign for axis in range(3) for sign in (1.0, -1.0)]
+    directions.append(np.ones(3) / np.sqrt(3.0))
+    for direction in directions:
+        with test.subTest(direction=direction.tolist()):
+            model, body = _build_tether(
+                device, start=tuple(_TETHER_ANCHOR), upper=cap, velocity=tuple(speed * direction), gravity=False
+            )
+            distances = _tether_distances(model, body, 10, enable_joint_limits=True)
+            test.assertLess(distances.max(), cap + 1.0e-5)
+
+
 def test_distance_rows_count_toward_the_capacity_warning(test, device):
     """Warn at construction when a bounded DISTANCE joint's rows alone exceed ``articulation_constraint_max``."""
     model, _ = _build_tether(device, start=(0.3, 0.0, 1.0), lower=0.1, upper=0.5)
@@ -3308,6 +3322,10 @@ for _name, _func in (
     ("test_distance_row_is_the_anchor_distance_rate", test_distance_row_is_the_anchor_distance_rate),
     ("test_zero_min_distance_is_no_bound", test_zero_min_distance_is_no_bound),
     ("test_zero_max_distance_holds_the_anchors_together", test_zero_max_distance_holds_the_anchors_together),
+    (
+        "test_positive_max_distance_caps_any_push_from_coincident_anchors",
+        test_positive_max_distance_caps_any_push_from_coincident_anchors,
+    ),
     ("test_distance_rows_count_toward_the_capacity_warning", test_distance_rows_count_toward_the_capacity_warning),
     ("test_multi_world_distance_limits_match_single_worlds", test_multi_world_distance_limits_match_single_worlds),
 ):

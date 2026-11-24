@@ -8525,8 +8525,9 @@ def build_distance_limit_rows(
     :class:`~newton.solvers.SolverXPBD`; a zero minimum distance is no bound. The distance is
     ``|p|``, the child anchor's position in the parent anchor frame (the joint's linear coordinates). With the
     joint velocity ``(v, w)`` of the child COM in that frame, its rate is ``n . v + (r x n) . w`` for ``n = p / |p|``
-    and ``r = p - p_com``, so each row spans only the joint's own six DOFs. A zero maximum distance holds ``p`` at
-    zero with two opposing rows per axis, which are always active.
+    and ``r = p - p_com``, so each row spans only the joint's own six DOFs. At coincident anchors ``n`` follows the
+    anchor's predicted velocity. A zero maximum distance holds ``p`` at zero with two opposing rows per axis, which
+    are always active.
     """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
@@ -8569,11 +8570,18 @@ def build_distance_limit_rows(
                 world_target_velocity[world, slot] = 0.0
             continue
         distance = wp.length(p)
-        # Coincident anchors take the parent anchor frame's x axis.
+        r = p - com
         n = wp.vec3(1.0, 0.0, 0.0)
         if distance > 1.0e-9:
             n = p / distance
-        n_w = wp.cross(p - com, n)
+        else:
+            # Coincident anchors separate along the anchor's predicted velocity, so bound that direction.
+            v = wp.vec3(joint_qd[dof], joint_qd[dof + 1], joint_qd[dof + 2])
+            w = wp.vec3(joint_qd[dof + 3], joint_qd[dof + 4], joint_qd[dof + 5])
+            u = v + wp.cross(w, r)
+            if wp.length(u) > 1.0e-9:
+                n = wp.normalize(u)
+        n_w = wp.cross(r, n)
         rate = float(0.0)
         for i in range(3):
             rate += n[i] * joint_qd[dof + i] + n_w[i] * joint_qd[dof + 3 + i]

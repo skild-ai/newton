@@ -1496,9 +1496,10 @@ class SolverSteel(SolverBase, CouplingInterface):
       :attr:`~newton.Model.joint_limit_lower` / :attr:`~newton.Model.joint_limit_upper` of a
       PRISMATIC, REVOLUTE or D6 DOF is a unilateral row, and so is each positive
       ``min_distance`` and non-negative ``max_distance`` of a DISTANCE joint that roots its articulation (the
-      limits of its first DOF) on the distance between the joint's two anchors; a zero ``max_distance`` holds
-      the anchors together on all three axes. Any other DISTANCE joint raises :class:`NotImplementedError`
-      when limits are enabled. Joint limits are not enforced by default. Joint velocity limits (:attr:`~newton.Model.joint_velocity_limit`) are
+      limits of its first DOF) on the distance between the joint's two anchors, along the anchors' predicted
+      relative velocity while they coincide; a zero ``max_distance`` holds the anchors together on all three
+      axes. Any other DISTANCE joint raises :class:`NotImplementedError` when limits are enabled. Joint limits
+      are not enforced by default. Joint velocity limits (:attr:`~newton.Model.joint_velocity_limit`) are
       enforced as rows when ``enable_joint_velocity_limits`` is set.
     - Experimental dry joint friction: with ``enable_joint_friction=True``,
       :attr:`~newton.Model.joint_friction` of PRISMATIC, REVOLUTE, BALL and D6 DOFs bounds one
