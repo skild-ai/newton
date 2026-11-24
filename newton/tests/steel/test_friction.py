@@ -894,7 +894,7 @@ def test_unsupported_combinations_raise(test, device):
     for mode in MODES[1:]:
         with test.subTest(mode=mode):
             # An omitted friction_anchor_beta selects point friction, with a warning.
-            with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "point friction"):
+            with test.assertWarnsRegex(newton.NewtonWarning, "point friction"):
                 solver = SolverSteel(model, friction_mode=mode)
             test.assertEqual(solver.friction_anchor_beta, 0.0)
             with test.assertRaisesRegex(ValueError, "friction_mode='fixed_normal'"):
@@ -2464,7 +2464,10 @@ class TestSteelFrictionGraspHistory(unittest.TestCase):
 
         contacts.rigid_contact_shape0.assign(boxes[::-1].copy())
         contacts.rigid_contact_shape1.assign(grounds[::-1].copy())
-        contacts.rigid_contact_point0.assign([[0, 0, 0.002]] * 2)
+        lifted = s1.joint_q.numpy().reshape(2, 7)
+        lifted[:, 2] += 0.002
+        s1.joint_q.assign(lifted.ravel())
+        newton.eval_fk(model, s1.joint_q, s1.joint_qd, s1)
         solver.step(s1, s0, model.control(), contacts, 0.005)
         self.assertTrue((solver._contact_slot.numpy()[:2] == -1).all())
         bodies = patches.previous.body_a.numpy()[:2]
@@ -2541,6 +2544,44 @@ class TestSteelFrictionAnchorSelection(unittest.TestCase):
                 rows = solver._mf_row_type.numpy()[0, : solver._mf_constraint_count.numpy()[0]]
                 self.assertEqual(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_FRICTION), 2)
                 np.testing.assert_allclose(solver._friction_patches.view.weight.numpy()[:3], [0, 1, 0])
+
+    def test_separated_contacts_of_a_touching_pair_hold_no_anchors(self):
+        """Place friction only on the touching contact when its neighbours are separated inside the gap limit."""
+        with wp.ScopedDevice(_DEVICE):
+            builder = newton.ModelBuilder()
+            ground = builder.add_ground_plane()
+            body = builder.add_body()
+            box = builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+            model = builder.finalize()
+            solver = newton.solvers.SolverSteel(model, friction_anchor_beta=0.2, contact_friction_gap_max=0.005)
+            contacts = newton.CollisionPipeline(model, rigid_contact_max=3).contacts()
+            contacts.rigid_contact_count.assign([3])
+            contacts.rigid_contact_shape0.assign([box] * 3)
+            contacts.rigid_contact_shape1.assign([ground] * 3)
+            contacts.rigid_contact_point0.assign([[-0.08, 0, 0.004], [0, 0, 0], [0.08, 0, 0.004]])
+            contacts.rigid_contact_point1.assign([[-0.08, 0, 0], [0, 0, 0], [0.08, 0, 0]])
+            contacts.rigid_contact_normal.assign([[0, 0, -1]] * 3)
+            solver.step(model.state(), model.state(), model.control(), contacts, 0.005)
+            np.testing.assert_allclose(solver._friction_patches.view.weight.numpy()[:3], [0, 1, 0])
+
+    def test_separated_contacts_without_touch_keep_nearest_anchors(self):
+        """Keep friction on the nearest contacts of a pair that is only speculatively in contact."""
+        with wp.ScopedDevice(_DEVICE):
+            builder = newton.ModelBuilder()
+            ground = builder.add_ground_plane()
+            body = builder.add_body()
+            box = builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+            model = builder.finalize()
+            solver = newton.solvers.SolverSteel(model, friction_anchor_beta=0.2, contact_friction_gap_max=0.005)
+            contacts = newton.CollisionPipeline(model, rigid_contact_max=3).contacts()
+            contacts.rigid_contact_count.assign([3])
+            contacts.rigid_contact_shape0.assign([box] * 3)
+            contacts.rigid_contact_shape1.assign([ground] * 3)
+            contacts.rigid_contact_point0.assign([[-0.08, 0, 0.0003], [0, 0, 0.004], [0.08, 0, 0.0003]])
+            contacts.rigid_contact_point1.assign([[-0.08, 0, 0], [0, 0, 0], [0.08, 0, 0]])
+            contacts.rigid_contact_normal.assign([[0, 0, -1]] * 3)
+            solver.step(model.state(), model.state(), model.control(), contacts, 0.005)
+            np.testing.assert_allclose(solver._friction_patches.view.weight.numpy()[:3], [0.5, 0, 0.5])
 
     def test_cuda_planar_patch_reduces_friction_rows(self):
         """Retain a box face's four normals while using only two friction anchors."""
@@ -2922,7 +2963,7 @@ def test_colored_modes_keep_the_coupled_restrictions(test, device):
     for mode in _COUPLED_MODES:
         with test.subTest(mode=mode):
             colored = {**_response_options("colored"), "friction_mode": mode}
-            with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "point friction"):
+            with test.assertWarnsRegex(newton.NewtonWarning, "point friction"):
                 solver = SolverSteel(model, **colored)
             test.assertEqual(solver.friction_anchor_beta, 0.0)
             test.assertIn(f"_{mode}", solver._pgs_solve_propagation_colored_warp_kernel.key)

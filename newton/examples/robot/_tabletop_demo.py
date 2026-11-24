@@ -64,20 +64,8 @@ class TabletopDemo:
         b.default_shape_cfg.gap = 0.001
         b.default_shape_cfg.restitution = 0.02
         b.default_shape_cfg.density = 600
-        assets = {
-            "franka_emika_panda": str(
-                newton.utils.download_asset("franka_emika_panda", ref="f8fb7abcbeba2318814a74f3eeb02780ad7925d6")
-            )
-        }
         robot = "franka" if self.task == "plates" else "ur10"
-        if robot == "ur10":
-            assets["ur10_menagerie"] = str(
-                newton.examples.download_external_git_folder(
-                    "https://github.com/google-deepmind/mujoco_menagerie.git",
-                    "universal_robots_ur10e",
-                    ref="f054586a8e90465d49ee5be15335c4a0c7f57caf",
-                )
-            )
+        assets = download_robot_assets(robot)
         ee, down, fingers = make_arm(
             b,
             assets,
@@ -245,3 +233,21 @@ class TabletopDemo:
         """Reject solver rows lost to insufficient contact capacity."""
         stats = self.solver.constraint_row_watermarks()
         assert all(v == 0 for k, v in stats.items() if "overflow" in k or "dropped" in k), stats
+
+
+def download_robot_assets(robot: str) -> dict[str, str]:
+    """Download the robot description folders a tabletop demo loads, and return their paths by name."""
+    assets = {
+        "franka_emika_panda": str(
+            newton.utils.download_asset("franka_emika_panda", ref="f8fb7abcbeba2318814a74f3eeb02780ad7925d6")
+        )
+    }
+    if robot == "ur10":
+        assets["ur10_menagerie"] = str(
+            newton.examples.download_external_git_folder(
+                "https://github.com/google-deepmind/mujoco_menagerie.git",
+                "universal_robots_ur10e",
+                ref="f054586a8e90465d49ee5be15335c4a0c7f57caf",
+            )
+        )
+    return assets
