@@ -1616,6 +1616,7 @@ def test_linear_row_builder_leaves_the_angular_rows(test, device):
         floats(sentinel, (1, 6)),
         floats(sentinel, (1, 6)),
         floats(sentinel, (1, 6)),
+        floats(sentinel, (1, 6)),
     ]
     wp.launch(
         build_mf_contact_rows,
@@ -1654,6 +1655,7 @@ def test_linear_row_builder_leaves_the_angular_rows(test, device):
             0,  # friction_combine
             0,  # restitution_combine
             None,  # recovery_phi
+            floats(float("inf")),  # rigid_body_max_depenetration_velocity
         ],
         outputs=outputs,
         device=device,
