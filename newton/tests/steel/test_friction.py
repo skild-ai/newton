@@ -1200,6 +1200,9 @@ def test_bisection_leaves_an_ill_conditioned_sticking_contact_at_rest(test, devi
 _JAMMED_BLOCKS = {
     "singular": (-0.5, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.2),
     "near_singular": (-0.5, 0.0, 0.0, 1.0000005, 1.0, 0.0, 1.0, 0.0, 1.0, 1.2),
+    # Sticking pairs exactly on the cone, with a regular and a rank-one tangent block.
+    "on_the_cone": (-1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0),
+    "rank_one_on_the_cone": (-1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0),
 }
 
 
@@ -1212,6 +1215,20 @@ def test_bisection_keeps_a_jammed_contact_near_the_frictionless_load(test, devic
                     normal, *tangent = solve(device, np.array(block, dtype=np.float32), mode)
                     test.assertLessEqual(normal, 1.0)
                     test.assertLessEqual(float(np.linalg.norm(tangent)), block[9] * normal * (1.0 + 1.0e-6))
+
+
+# A block whose second tangent direction barely responds but slips at 1 m/s: friction must still oppose that slip.
+# Values: u_n, u_t1, u_t2, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2, G_t2t2, mu.
+_STIFF_SLIPPING_BLOCK = (-1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0e-7, 0.5)
+
+
+def test_bisection_keeps_friction_on_a_stiff_slipping_direction(test, device):
+    """Oppose real slip along a tangent direction with a rounding-level response, as the disk minimizer does."""
+    block = np.array(_STIFF_SLIPPING_BLOCK, dtype=np.float32)
+    for mode in ("bisection", "bisection_desaxce"):
+        with test.subTest(mode=mode):
+            expected = _bisection_reference(_STIFF_SLIPPING_BLOCK, mode == "bisection_desaxce")
+            np.testing.assert_allclose(_mf_block(device, block, mode), expected, rtol=1.0e-4, atol=1.0e-5)
 
 
 def _one_dof_contact_force(model, mode, joint_f=None, steps=120, **solver_kwargs):
@@ -1322,6 +1339,7 @@ for _fn in (
     test_bisection_solves_the_tangent_pair_on_the_disk,
     test_bisection_leaves_an_ill_conditioned_sticking_contact_at_rest,
     test_bisection_keeps_a_jammed_contact_near_the_frictionless_load,
+    test_bisection_keeps_friction_on_a_stiff_slipping_direction,
     test_bisection_bounds_the_normal_force_on_a_hinged_rod,
     test_bisection_reports_no_friction_without_tangential_mobility,
 ):

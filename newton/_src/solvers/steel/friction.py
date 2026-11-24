@@ -326,17 +326,23 @@ _COUPLED_CONTACT_BISECTION = """
             float pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy;
             friction_pair_setup(
                 G_t1t1, G_t1t2, G_t2t2, pair_scale, pair_largest, pair_smallest, pair_vx, pair_vy);
-            // A rank-one tangent block (a one-DoF link) moves only along its axis; the pair is the clamped axis
-            // impulse, since the disk solve would spend the budget on its rounding-level other direction.
+            // A rank-one tangent block (a one-DoF link) moves only along its axis. While its slip off the axis stays at
+            // rounding level at every load, the pair is the clamped axis impulse, since the disk solve would spend the
+            // budget on that slip.
             const bool rank_one = !tangent_free && pair_smallest <= 1.0e-6f * pair_largest;
             const float axis_nt = pair_vx * G_nt1 + pair_vy * G_nt2;
             const float axis_tt = pair_scale * pair_largest;
+            const float load_scale = fmaxf(old_lambda_n, (target_vel_n - u_n_at_zero) / G_nn);
+            const bool clamp_axis = rank_one
+                && fabsf(pair_vx * G_nt2 - pair_vy * G_nt1) <= 1.0e-4f * (fabsf(axis_nt) + mu * axis_tt)
+                && fabsf(pair_vx * u_t2 - pair_vy * u_t1)
+                    <= 1.0e-4f * (fabsf(pair_vx * u_t1 + pair_vy * u_t2) + mu * axis_tt * load_scale);
             const auto probe = [&](float lambda_n, float& tangent1, float& tangent2) {
                 const float d_n = lambda_n - old_lambda_n;
                 const float radius = tangent_free ? 0.0f : fmaxf(mu * lambda_n, 0.0f);
                 const float r_t1 = u_t1 + G_nt1 * d_n, r_t2 = u_t2 + G_nt2 * d_n;
                 float2 pair;
-                if (rank_one) {
+                if (clamp_axis) {
                     const float axis = pair_vx * (old_lambda_t1 - r_t1 / axis_tt)
                         + pair_vy * (old_lambda_t2 - r_t2 / axis_tt);
                     const float clamped = fminf(fmaxf(axis, -radius), radius);
@@ -363,19 +369,31 @@ _COUPLED_CONTACT_BISECTION = """
             int last_side = 0;
             float x = fmaxf(old_lambda_n, -f_lo / G_nn);
             // A singular block that sticks at every large load has no root above a probe that sticks and leaves
-            // the contact approaching. A rank-one tangent block is tested on its axis.
+            // the contact approaching. A rank-one tangent block is tested on its axis. The cone's boundary counts as inside.
             const bool jammed = !tangent_free && (rank_one
-                ? fabsf(axis_nt) <= mu * axis_tt && G_nn * axis_tt - axis_nt * axis_nt <= 1.0e-4f * G_nn * axis_tt
+                ? fabsf(axis_nt) <= mu * axis_tt * (1.0f + 1.0e-5f)
+                    && G_nn * axis_tt - axis_nt * axis_nt <= 1.0e-4f * G_nn * axis_tt
                 : minor_nn > 0.0f && det_block <= 1.0e-6f * G_nn * minor_nn
-                    && minor_n1 * minor_n1 + minor_n2 * minor_n2 <= mu * mu * minor_nn * minor_nn);
+                    && minor_n1 * minor_n1 + minor_n2 * minor_n2 <= mu * mu * minor_nn * minor_nn * (1.0f + 2.0e-5f));
             for (int _it = 0; _it < 64; _it++) {
                 const float f_x = probe(x, new_lambda_t1, new_lambda_t2);
                 new_lambda_n = x;
                 // Within what a 1e-5 relative error in the load would leave.
                 if (last_probe || fabsf(f_x) <= 1.0e-5f * G_nn * x) break;
-                if (jammed && f_x < 0.0f
-                    && new_lambda_t1 * new_lambda_t1 + new_lambda_t2 * new_lambda_t2 < 0.999f * mu * mu * x * x)
-                    break;
+                if (jammed && f_x < 0.0f && (clamp_axis || !rank_one)) {
+                    // The probe sticks if its unconstrained tangent pair lies in the cone, within rounding.
+                    const float r_t1 = u_t1 + G_nt1 * (x - old_lambda_n), r_t2 = u_t2 + G_nt2 * (x - old_lambda_n);
+                    float stick_t1, stick_t2;
+                    if (clamp_axis) {
+                        const float axis = pair_vx * (old_lambda_t1 - r_t1 / axis_tt) + pair_vy * (old_lambda_t2 - r_t2 / axis_tt);
+                        stick_t1 = pair_vx * axis;
+                        stick_t2 = pair_vy * axis;
+                    } else {
+                        stick_t1 = old_lambda_t1 - (G_t2t2 * r_t1 - G_t1t2 * r_t2) / minor_nn;
+                        stick_t2 = old_lambda_t2 - (G_t1t1 * r_t2 - G_t1t2 * r_t1) / minor_nn;
+                    }
+                    if (stick_t1 * stick_t1 + stick_t2 * stick_t2 <= mu * mu * x * x * (1.0f + 2.0e-5f)) break;
+                }
                 if (f_x < 0.0f) {
                     lo = x;
                     f_lo = f_x;
