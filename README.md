@@ -1,3 +1,13 @@
+> [!NOTE]
+> This is [skild-ai/newton](https://github.com/skild-ai/newton), a development fork of
+> [newton-physics/newton](https://github.com/newton-physics/newton) for work on Steel, a rigid-body solver
+> developed by Skild AI in collaboration with NVIDIA. Fork changes are recorded in this repository's git
+> history, and we send them upstream as pull requests. Apart from the added example rows, the rest of this
+> README and the status badges below describe upstream Newton. As in upstream Newton, a Linux Foundation
+> project, the code is licensed under Apache-2.0, the documentation under CC-BY-4.0, and third-party
+> components under their own licenses (see below). The original copyright and license notices are kept.
+> Skild and Skild AI are trademarks of Skild AI and are not licensed under any of these licenses.
+
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/newton-physics/newton/main)
 [![Downloads](https://api.pepy.tech/badge/newton/month)](https://pepy.tech/projects/newton)
