@@ -190,6 +190,10 @@ Solver Observables
 ``SensorIMU`` requires ``SolverBase.ObservableKind.BODY_QDD`` and ``SensorContact``
 requires ``SolverBase.ObservableKind.CONTACT_F``. ``SensorContact`` uses only the
 linear part of each ``CONTACT_F`` wrench (force [N]); the torque part is ignored.
+With :class:`~newton.solvers.SolverSteel` sleeping, ``SensorContact`` keeps reading
+the support force of a sleeping body only when the collision pipeline matches contacts
+(``contact_matching="latest"``) and ``CONTACT_F`` is requested on every step; otherwise
+the force drops to zero while the body sleeps (see :ref:`steel_sleep_observable`).
 Each sensor's ``solver_observable_kinds`` property provides its requirements
 without mutating the model. Union the sets when both sensors are present.
 Pass a contacts buffer to the factory when requesting contact-indexed

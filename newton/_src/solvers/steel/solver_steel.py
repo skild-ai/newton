@@ -1660,14 +1660,19 @@ class SolverSteel(SolverBase, CouplingInterface):
         :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F` is requested. Each live rigid
         contact row holds the force [N] on shape 0's body, in world frame, from the solved
         normal and friction impulses of the step divided by ``dt``; the torque part is zero
-        (torsional friction is not reported). Contacts whose rows were dropped for capacity,
-        and contacts of sleeping islands whose rows are skipped (``sleep_skip_constraints``),
+        (torsional friction is not reported). Contacts whose rows were dropped for capacity
         report zero, as do rows beyond the contact count or the rigid capacity and the
-        soft-contact rows. A zero force
-        under a sleeping body does not mean the contact was lost: force-threshold logic and
-        :class:`~newton.sensors.SensorContact` see an apparent unloading while the island
-        sleeps; pass ``sleep_skip_constraints=False`` (or leave sleeping off) to keep the
-        solved forces.
+        soft-contact rows.
+
+        A contact of a sleeping island whose rows are skipped (``sleep_skip_constraints``) reports
+        the force it reported on the previous step, so a resting body keeps its last solved
+        support force while it sleeps. The force carries from step to step through
+        :attr:`~newton.Contacts.rigid_contact_match_index`, so it needs a collision pipeline
+        with contact matching (``contact_matching="latest"`` or ``"sticky"``) and ``CONTACT_F``
+        requested on every step; otherwise such a contact reports zero until its island wakes. A
+        step that reuses the previous contact set without a collision pass keeps the force
+        without matching. ``sleep_skip_constraints=False`` solves the rows of sleeping islands and
+        reports their forces directly.
 
         With ``enable_sleeping``, :attr:`SolverSteel.Observables.body_awake` reports per-body sleep
         flags; see :ref:`steel_sleep_observable`.
@@ -7442,6 +7447,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[observables.contact_f],
                 device=self.model.device,
             )
+            if self._sleeping is not None and self._sleeping.contact_force_history is not None:
+                self._sleeping.latch_contact_forces(contacts, observables.contact_f, self._contact_stream(contacts))
         if observables is not None and observables.is_requested(self.ObservableKind.BODY_AWAKE):
             self._copy_body_awake(observables)
         return state_out

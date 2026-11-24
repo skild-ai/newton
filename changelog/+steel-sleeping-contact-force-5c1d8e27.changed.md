@@ -1,0 +1,1 @@
+Report the last solved force for contacts of sleeping `SolverSteel` islands whose rows are skipped (`sleep_skip_constraints=True`) in `CONTACT_F`, instead of zero. The force carries across steps through contact matching, so it needs a collision pipeline with `contact_matching` enabled and `CONTACT_F` requested on every step; without matching these contacts still report zero.
