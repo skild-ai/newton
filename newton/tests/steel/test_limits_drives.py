@@ -3434,7 +3434,7 @@ def test_positive_max_distance_caps_any_push_from_coincident_anchors(test, devic
 def test_distance_rows_count_toward_the_capacity_warning(test, device):
     """Warn at construction when a bounded DISTANCE joint's rows alone exceed ``articulation_constraint_max``."""
     model, _ = _build_tether(device, start=(0.3, 0.0, 1.0), lower=0.1, upper=0.5)
-    with test.assertWarnsRegex(newton.exceptions.NewtonWarning, r"need at least 2 dense rows"):
+    with test.assertWarnsRegex(newton.NewtonWarning, r"need at least 2 dense rows"):
         SolverSteel(
             model, enable_joint_limits=True, joint_limit_activation_gap=float("inf"), articulation_constraint_max=1
         )
