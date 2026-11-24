@@ -21,7 +21,12 @@ from newton._src.solvers.steel.friction_patches import _FLOOD_MIN_CONTACTS
 from newton._src.solvers.steel.sleeping import _SleepState
 from newton.solvers import SolverBase, SolverSteel
 from newton.tests.steel._fixtures import PROFILE, _advance, _articulations, _parent_wrench_scene
-from newton.tests.unittest_utils import add_function_test, capture_with_cuda_driver, get_cuda_test_devices
+from newton.tests.unittest_utils import (
+    add_function_test,
+    capture_with_cuda_driver,
+    get_cuda_test_devices,
+    get_test_devices,
+)
 
 
 def _response(name: str) -> dict:
@@ -906,13 +911,14 @@ def test_anchored_articulations_sleep_and_wake(test, device):
 
     # Pushing the first articulation restores its rows and leaves the second asleep.
     force = np.zeros((model.body_count, 6), dtype=np.float32)
-    force[0, 0] = 20.0
+    # Exceed the fixture's static friction limit (approximately 235 N).
+    force[0, 0] = 500.0
     for _ in range(5):
         states[0].body_f.assign(force)
         _advance(pipeline, solver, states, control, 1, clear=False)
     np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 1, 0, 0])
     test.assertEqual(int(solver._constraint_count.numpy()[0]), awake_rows // 2)
-    test.assertGreater(states[0].body_q.numpy()[0, 0], frozen[0, 0])
+    test.assertGreater(states[0].body_q.numpy()[0, 0] - frozen[0, 0], 1.0e-3)
     np.testing.assert_array_equal(states[0].body_q.numpy()[2:], frozen[2:])
 
     _advance(pipeline, solver, states, control, 600)
@@ -1092,6 +1098,17 @@ def test_property_notification_wakes_only_changed_islands(test, device):
     solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
     _advance(pipeline, solver, states, model.control(), 1)
     np.testing.assert_array_equal(solver._sleeping.art_awake.numpy(), [1, 0])
+
+
+def test_gravity_exclusion_edit_wakes_sleeping_bodies(test, device):
+    """Wake sleeping bodies whose gravity exclusion changed, notified with the attribute's declared flags."""
+    model, pipeline, solver, states, control = _scene(device)
+    _advance_boxes(pipeline, solver, states, control, 120)
+    np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [0, 0])
+    model.body_disable_gravity.fill_(True)
+    solver.notify_model_changed(model.get_attribute_update_flags("body_disable_gravity"))
+    _advance_boxes(pipeline, solver, states, control, 1)
+    np.testing.assert_array_equal(solver._sleeping.body_awake.numpy(), [1, 1])
 
 
 def test_frozen_patch_carry_matches_rebuild(test, device):
@@ -1413,7 +1430,7 @@ def test_mimic_articulation_stays_awake(test, device):
             if legacy:
                 _expect_one_warning(
                     test,
-                    newton.exceptions.NewtonDeprecationWarning,
+                    newton.NewtonDeprecationWarning,
                     r"add_constraint_mimic\(\) is deprecated",
                     functools.partial(builder.add_constraint_mimic, joint0=joints[2], joint1=joints[1]),
                 )
@@ -1463,7 +1480,7 @@ def test_stiffness_without_a_spring_lets_articulations_sleep(test, device):
         pipeline = newton.CollisionPipeline(model, rigid_contact_max=512, deterministic=True)
         if stiffness:
             # Steel warns about stiffness on DOFs it applies no spring to.
-            with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "springs on 18 DOF"):
+            with test.assertWarnsRegex(newton.NewtonWarning, "springs on 18 DOF"):
                 solver = newton.solvers.SolverSteel(model, **PROFILE)
         else:
             solver = newton.solvers.SolverSteel(model, **PROFILE)
@@ -1613,6 +1630,13 @@ for _name in (
     "test_default_threshold_keeps_a_slow_spin_awake",
 ):
     add_function_test(TestSteelSleepingProduction, _name, globals()[_name], devices=devices)
+
+add_function_test(
+    TestSteelSleepingProduction,
+    "test_gravity_exclusion_edit_wakes_sleeping_bodies",
+    test_gravity_exclusion_edit_wakes_sleeping_bodies,
+    devices=get_test_devices(),
+)
 
 
 def test_fixed_table_does_not_merge_dynamic_islands(test, device):

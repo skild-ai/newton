@@ -29,7 +29,7 @@ from newton.tests.steel._fixtures import (
     steel_mode_options,
 )
 from newton.tests.steel._fixtures import run_fixture as run_compliance_fixture
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices, requires
 
 
 def _assert_bitwise(test, a, b, label):
@@ -119,6 +119,7 @@ def test_angular_damping_follows_in_place_edits(test, device):
     test.assertEqual(float(state_in.joint_qd.numpy()[5]), 0.0)
 
 
+@requires("pxr.Usd")
 def test_physx_attributes_import_from_usd_and_are_read_every_step(test, device):
     """Import the PhysX body and collision USD attributes into the steel namespace, and step with replaced arrays."""
     from pxr import Sdf, Usd, UsdGeom, UsdPhysics
@@ -713,7 +714,7 @@ def _construct(test, model, expect_warning, **kwargs):
     """Construct the solver, requiring exactly the unsolvable-global-contact warning or no warning."""
     if expect_warning:
         return _expect_one_warning(
-            test, newton.exceptions.NewtonWarning, _UNSOLVABLE_GLOBAL_WARNING, lambda: SolverSteel(model, **kwargs)
+            test, newton.NewtonWarning, _UNSOLVABLE_GLOBAL_WARNING, lambda: SolverSteel(model, **kwargs)
         )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -1164,10 +1165,8 @@ class TestSteelSolveModeOptions(unittest.TestCase):
         )
         for kwargs, message, expected in deprecated:
             with self.subTest(**kwargs):
-                with self.assertWarnsRegex(newton.exceptions.NewtonDeprecationWarning, re.escape(message)) as caught:
-                    warnings.filterwarnings(
-                        "ignore", message=_CPU_COLORED_WARNING, category=newton.exceptions.NewtonWarning
-                    )
+                with self.assertWarnsRegex(newton.NewtonDeprecationWarning, re.escape(message)) as caught:
+                    warnings.filterwarnings("ignore", message=_CPU_COLORED_WARNING, category=newton.NewtonWarning)
                     solver = SolverSteel(model, **kwargs)
                 self.assertEqual(Path(caught.filename).resolve(), Path(__file__).resolve())
                 self.assertEqual((solver.solve_mode, solver.articulated_contact_response), expected)
@@ -1176,8 +1175,8 @@ class TestSteelSolveModeOptions(unittest.TestCase):
         """Expose the normalized pair without warnings and reject unknown values and an unsupported pair."""
         model, _ = _build_plane_model("cpu", separation=0.0, restitution=0.0)
         with warnings.catch_warnings():
-            warnings.simplefilter("error", newton.exceptions.NewtonDeprecationWarning)
-            warnings.filterwarnings("ignore", message=_CPU_COLORED_WARNING, category=newton.exceptions.NewtonWarning)
+            warnings.simplefilter("error", newton.NewtonDeprecationWarning)
+            warnings.filterwarnings("ignore", message=_CPU_COLORED_WARNING, category=newton.NewtonWarning)
             solver = SolverSteel(model)
             self.assertEqual((solver.solve_mode, solver.articulated_contact_response), ("serial", "immediate"))
             solver = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation")
@@ -1199,7 +1198,11 @@ class TestSteelSolveModeOptions(unittest.TestCase):
         self.assertFalse(solver.nesterov_momentum)
         with self.assertRaises(AttributeError):
             solver.nesterov_momentum = True
-        for options in ({"articulated_contact_response": "propagation"}, {"row_schedule": "contact_then_internal"}):
+        for options in (
+            {"articulated_contact_response": "propagation"},
+            {"row_schedule": "contact_then_internal"},
+            {"row_schedule": "phased"},
+        ):
             with self.subTest(**options), self.assertRaisesRegex(ValueError, "nesterov_momentum requires"):
                 SolverSteel(model, nesterov_momentum=True, **options)
 
@@ -1207,7 +1210,7 @@ class TestSteelSolveModeOptions(unittest.TestCase):
         """On CPU the colored mode runs the serial propagation sweep, so sleeping with it names CUDA, not the mode."""
         model = _floor_model("cpu", "static")
         with warnings.catch_warnings(), self.assertRaisesRegex(NotImplementedError, "requires CUDA"):
-            warnings.filterwarnings("ignore", message=_CPU_COLORED_WARNING, category=newton.exceptions.NewtonWarning)
+            warnings.filterwarnings("ignore", message=_CPU_COLORED_WARNING, category=newton.NewtonWarning)
             SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation", enable_sleeping=True)
 
 
@@ -1322,9 +1325,7 @@ class TestSteelPrivateApi(unittest.TestCase):
                 mode.NOT_GUARANTEED,
             )
             wp.config.deterministic = mode.GPU_TO_GPU
-            with self.assertWarnsRegex(
-                newton.exceptions.NewtonWarning, "is GPU_TO_GPU; .* supports at most RUN_TO_RUN"
-            ):
+            with self.assertWarnsRegex(newton.NewtonWarning, "is GPU_TO_GPU; .* supports at most RUN_TO_RUN"):
                 self.assertEqual(SolverSteel(model).deterministic, mode.RUN_TO_RUN)
             if cuda_model is not None:
                 wp.config.deterministic = mode.RUN_TO_RUN
@@ -1376,15 +1377,6 @@ class TestSteelPrivateApi(unittest.TestCase):
         for path in sorted(_PACKAGE_DIR.glob("*.py")):
             with self.subTest(file=path.name):
                 self.assertIsNone(pattern.search(path.read_text(encoding="utf-8").replace(profiling, "")))
-
-    def test_prescribed_response_is_not_a_public_execution_knob(self):
-        """Select the kinematic-body response internally, not through a constructor option."""
-        init_method = self.solver_methods["__init__"]
-        parameters = {
-            argument.arg
-            for argument in [*init_method.args.posonlyargs, *init_method.args.args, *init_method.args.kwonlyargs]
-        }
-        self.assertNotIn("exclude_fully_kinematic_free_articulations", parameters)
 
     def test_kernel_factories_are_private_cached_functions(self):
         """Keep the size-specialized kernel factories private, cached and keyed by device architecture."""

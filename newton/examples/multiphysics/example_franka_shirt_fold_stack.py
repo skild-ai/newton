@@ -24,7 +24,6 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy
-from pxr import Usd
 
 import newton
 import newton.examples
@@ -244,6 +243,8 @@ class Example:
                 builder.shape_material_kd[shape] = CLOTH_KD
                 builder.shape_material_mu[shape] = CLOTH_MU
 
+        from pxr import Usd  # noqa: PLC0415
+
         stage = Usd.Stage.Open(newton.examples.get_asset("unisex_shirt.usd"))
         shirt = newton.usd.get_mesh(stage.GetPrimAtPath("/root/shirt"))
         self.particle_start = builder.particle_count
@@ -357,7 +358,6 @@ class Example:
                     solver=lambda view: SolverVBD(
                         model=view,
                         iterations=vbd_iterations,
-                        rigid_compliant_alm=True,
                         # Low slip threshold keeps the stack from creeping on the cloth.
                         friction_epsilon=1.0e-3,
                         particle_enable_self_contact=True,

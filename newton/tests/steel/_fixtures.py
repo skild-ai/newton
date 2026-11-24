@@ -3,6 +3,7 @@
 
 """Scenes, solver settings and helpers shared by the SolverSteel test modules."""
 
+import sys
 import warnings
 from types import SimpleNamespace
 
@@ -28,6 +29,16 @@ def steel_mode_options(mode: str) -> dict[str, str]:
     if mode == "colored":
         return {"solve_mode": "colored", "articulated_contact_response": "propagation"}
     return {"articulated_contact_response": mode}
+
+
+def printf_capture_is_reliable() -> bool:
+    """Whether a test may assert on stdout captured around a kernel's ``wp.printf``.
+
+    On Windows the printf output of a kernel cannot be reliably captured by a ``StdOutCapture`` that
+    redirected stdout inside the process, on CUDA as on the CPU, so Warp's own print tests skip the
+    platform. The row-overflow tests check the device-side flags there and leave the text unread.
+    """
+    return sys.platform != "win32"
 
 
 def _heap(device, nx=6, ny=6, nz=3, pitch=0.042, half=0.02, kinematic_tray=False):

@@ -3577,7 +3577,7 @@ def test_colored_rows_fold_only_with_kinematic_roots(test, device):
     flags = model.body_flags.numpy()
     flags[table] &= ~int(newton.BodyFlags.KINEMATIC)
     model.body_flags.assign(flags)
-    with test.assertWarnsRegex(newton.exceptions.NewtonWarning, "recapture graphs of colored steps"):
+    with test.assertWarnsRegex(newton.NewtonWarning, "recapture graphs of colored steps"):
         solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
     test.assertFalse(solver._has_body_prescribed)
     test.assertFalse(np.any(solver._body_prescribed.numpy()))
