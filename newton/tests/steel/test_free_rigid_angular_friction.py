@@ -1830,6 +1830,36 @@ class TestFreeRigidAngularFrictionImport(unittest.TestCase):
         self.assertNotIn("steel:condim", outputs[1])
         self.assertEqual(int(solver._free_rigid_unrouted_warned.numpy()[0]), 1)
 
+    def test_global_condim_with_a_partner_in_another_solve_world_adds_no_angular_rows(self):
+        """Leave the rows off when a global body's only partner solves in world 1; on in world 0 or explicitly paired."""
+        for partner_world, explicit in ((1, False), (1, True), (0, False)):
+            with self.subTest(partner_world=partner_world, explicit=explicit):
+                builder = newton.ModelBuilder()
+                SolverSteel.register_custom_attributes(builder)
+                ball = builder.add_body(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
+                ball_shape = builder.add_shape_sphere(ball, radius=_RADIUS, custom_attributes={"steel:condim": 6})
+                box_shape = -1
+                for world in (0, 1):
+                    builder.begin_world()
+                    if world == partner_world:
+                        box = builder.add_body(xform=wp.transform((0.0, 0.0, 1.0 - 1.5 * _RADIUS), wp.quat_identity()))
+                        box_shape = builder.add_shape_box(box, hx=_RADIUS, hy=_RADIUS, hz=_RADIUS)
+                    else:
+                        # A far hinged link keeps the world populated without adding a free-body-route partner.
+                        link = builder.add_link(xform=wp.transform((5.0, 0.0, 1.0), wp.quat_identity()))
+                        builder.add_shape_sphere(link, radius=_RADIUS)
+                        builder.add_articulation([builder.add_joint_revolute(-1, link)])
+                    builder.end_world()
+                model = builder.finalize(device="cpu")
+                if explicit:
+                    pairs = np.array([[ball_shape, box_shape]], dtype=np.int32)
+                    model.shape_contact_pairs = wp.array(pairs, dtype=wp.vec2i, device="cpu")
+                if partner_world == 1:
+                    self.assertFalse(SolverSteel(model)._free_rigid_angular_rows)
+                else:
+                    with self.assertRaisesRegex(NotImplementedError, "steel:condim"):
+                        SolverSteel(model)
+
     def test_condim_in_a_world_without_free_bodies_adds_no_angular_rows(self):
         """Leave the rows off for a condim 6 ground in a world without free bodies; on in the free body's world."""
         for ground_world in (1, 0, -1):

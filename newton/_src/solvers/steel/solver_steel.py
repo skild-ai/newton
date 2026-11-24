@@ -1819,8 +1819,9 @@ class SolverSteel(SolverBase, CouplingInterface):
           between free bodies, and free bodies on static or kinematic geometry, read it, so a condim
           above 3 adds no rows on other shapes, on shapes without shape collision or in collision
           group 0, or on shapes that no dynamic free body in their world or the global world can touch.
-          A user-assigned :attr:`~newton.Model.shape_contact_pairs` counts its pairs whatever their flags,
-          groups and worlds; pairs given only to a :class:`~newton.CollisionPipeline` are not visible here,
+          Partners must also share a solve world, in which a global body counts as world 0, since the solve
+          drops contacts between solve worlds. A user-assigned :attr:`~newton.Model.shape_contact_pairs`
+          counts its pairs whatever their flags, groups and collision worlds; pairs given only to a :class:`~newton.CollisionPipeline` are not visible here,
           and the first free-body contact on such a gated-off shape prints a warning.
           The MJCF importer reads the geom's ``condim`` and USD reads ``mjc:condim``, the inputs of
           :class:`~newton.solvers.SolverMuJoCo`'s ``mujoco:condim``; an authored USD

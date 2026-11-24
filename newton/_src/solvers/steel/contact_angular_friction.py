@@ -50,7 +50,7 @@ def configure_free_rigid_angular_friction(solver, model, torsional: float | None
     routed = False
     solver._free_rigid_unrouted_condim = None
     if values is not None and solver._has_free_rigid_bodies:
-        reachable, on_route_body = _free_route_contact_shapes(solver)
+        reachable, on_route_body, solve_world = _free_route_contact_shapes(solver)
         routed = bool(np.any(values[reachable] >= 4))
         unrouted = (values >= 4) & on_route_body & ~reachable
         if not (overridden or routed) and np.any(unrouted):
@@ -61,6 +61,7 @@ def configure_free_rigid_angular_friction(solver, model, torsional: float | None
             route_body = _free_route_body_mask(solver)
             route_body[solver._model_plan.response_free_rigid_body_indices] = 2
             solver._free_rigid_unrouted_route_body = wp.array(route_body, dtype=wp.int32, device=model.device)
+            solver._free_rigid_unrouted_solve_world = wp.array(solve_world, dtype=wp.int32, device=model.device)
             solver._free_rigid_unrouted_warned = wp.zeros(1, dtype=wp.int32, device=model.device)
     solver._free_rigid_angular_rows = bool(overridden or routed)
     if not solver._free_rigid_angular_rows:
@@ -137,6 +138,7 @@ def warn_unrouted_condim_contacts(solver, contacts) -> None:
             solver.model.shape_body,
             solver._free_rigid_unrouted_condim,
             solver._free_rigid_unrouted_route_body,
+            solver._free_rigid_unrouted_solve_world,
         ],
         outputs=[solver._free_rigid_unrouted_warned],
         device=solver.model.device,
@@ -360,12 +362,15 @@ def _free_route_body_mask(solver) -> np.ndarray:
     return route
 
 
-def _free_route_contact_shapes(solver) -> tuple[np.ndarray, np.ndarray]:
+def _free_route_contact_shapes(solver) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Mark the shapes that can meet a free-body-route partner across a responding free body.
 
-    Returns that mask and the mask of shapes whose body takes the free-body route. A user-assigned
-    :attr:`~newton.Model.shape_contact_pairs` counts its pairs whatever their collision flags, groups and worlds.
-    Collision groups other than 0 and filter pairs are ignored, so this may include shapes that never touch.
+    Returns that mask, the mask of shapes whose body takes the free-body route and each shape's solve world (-1
+    for a body without response DOFs). Partners must share a world for
+    collision and, like the solve, a solve world for the bodies with response DOFs; a global body solves in world 0.
+    A user-assigned :attr:`~newton.Model.shape_contact_pairs` counts its pairs whatever their collision flags, groups
+    and collision worlds. Collision groups other than 0 and filter pairs are ignored, so this may include shapes that
+    never touch.
     """
     model = solver.model
     shape_body, shape_world = model.shape_body.numpy(), model.shape_world.numpy()
@@ -377,24 +382,58 @@ def _free_route_contact_shapes(solver) -> tuple[np.ndarray, np.ndarray]:
     responding[solver._model_plan.response_free_rigid_body_indices] = True
     on_free_body = on_route_body & (shape_body >= 0) & responding[body]
     on_free = on_route & on_free_body
-    # Per-world shape counts with the global (-1) world in slot 0; a global shape meets every world.
-    slot = shape_world + 1
+    # The solve world of a shape whose body has response DOFs, as the contact allocator assigns it; -1 otherwise.
+    solve_world = np.full(len(shape_body), -1, dtype=np.int64)
+    if model.body_count:
+        body_art = solver._body_to_articulation.numpy()[body]
+        art = np.maximum(body_art, 0)
+        has_dofs = (shape_body >= 0) & (body_art >= 0) & (solver._articulation_response_dof_count.numpy()[art] > 0)
+        solve_world = np.where(has_dofs, solver._art_to_world.numpy()[art], -1).astype(np.int64)
+    # Collision slots: the global (-1) world in slot 0; a global shape meets every slot, others slot 0 and their own.
+    slot = shape_world.astype(np.int64) + 1
+    slots = model.world_count + 1
+    is_global = shape_world < 0
 
-    def reachable_count(mask):
-        counts = np.bincount(slot[mask], minlength=model.world_count + 1)
-        return np.where(shape_world < 0, counts.sum(), counts[slot] + counts[0])
+    def partner_count(mask, world):
+        """Count ``mask`` shapes in a compatible collision slot, in solve world ``world`` per shape, or any if None."""
+        if world is None:
+            counts = np.bincount(slot[mask], minlength=slots)
+            return np.where(is_global, counts.sum(), counts[slot] + counts[0])
+        keys = slot[mask] * (slots + 1) + solve_world[mask] + 1
+        unique, counts = np.unique(keys, return_counts=True)
 
-    same_body = np.bincount(body[on_route & (shape_body >= 0)], minlength=len(responding))[body]
-    partners = np.where(on_free, reachable_count(on_route) - same_body, reachable_count(on_free))
+        def lookup(query):
+            if not len(unique):
+                return np.zeros(len(query), dtype=np.int64)
+            index = np.minimum(np.searchsorted(unique, query), len(unique) - 1)
+            return np.where(unique[index] == query, counts[index], 0)
+
+        totals = np.bincount(solve_world[mask] + 1, minlength=slots + 1)
+        local = lookup(slot * (slots + 1) + world + 1) + lookup(world + 1)
+        return np.where(is_global, totals[np.clip(world + 1, 0, slots)], local)
+
+    wildcard = on_route & (solve_world < 0)
+    held = on_route & ~on_free & (solve_world >= 0)
+    same_body = np.bincount(body[on_free], minlength=len(responding))[body]
+    free_partners = (
+        partner_count(wildcard, None)
+        + partner_count(on_free, solve_world)
+        + partner_count(held, solve_world)
+        - same_body
+    )
+    other_partners = np.where(solve_world >= 0, partner_count(on_free, solve_world), partner_count(on_free, None))
+    partners = np.where(on_free, free_partners, other_partners)
     reachable = on_route & (partners > 0)
     if model._shape_contact_pair_data is None and model._shape_contact_pairs is not None:
         pairs = model._shape_contact_pairs.numpy().reshape(-1, 2)
         pairs = pairs[(pairs >= 0).all(axis=1) & (pairs < model.shape_count).all(axis=1)]
         a, b = pairs[:, 0], pairs[:, 1]
-        routed = on_route_body[a] & on_route_body[b] & (on_free_body[a] | on_free_body[b])
+        world_a, world_b = solve_world[a], solve_world[b]
+        same_solve_world = (world_a < 0) | (world_b < 0) | (world_a == world_b)
+        routed = on_route_body[a] & on_route_body[b] & (on_free_body[a] | on_free_body[b]) & same_solve_world
         reachable[a[routed]] = True
         reachable[b[routed]] = True
-    return reachable, on_route_body
+    return reachable, on_route_body, solve_world
 
 
 @wp.kernel
@@ -405,6 +444,7 @@ def _warn_unrouted_condim_contact(
     shape_body: wp.array[wp.int32],
     unrouted: wp.array[wp.int32],
     route_body: wp.array[wp.int32],
+    solve_world: wp.array[wp.int32],
     warned: wp.array[wp.int32],
 ):
     """Print one warning for a free-body contact on a shape whose condim was gated off; ``route_body`` is 2 on free bodies."""
@@ -422,6 +462,9 @@ def _warn_unrouted_condim_contact(
     if shape_body[b] >= 0:
         route_b = route_body[shape_body[b]]
     if route_a == 0 or route_b == 0 or (route_a != 2 and route_b != 2):
+        return
+    # The solve drops a contact between two solve worlds, so the gate is right to leave it out.
+    if solve_world[a] >= 0 and solve_world[b] >= 0 and solve_world[a] != solve_world[b]:
         return
     shape = b
     if unrouted[a] != 0:
