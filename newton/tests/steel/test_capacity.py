@@ -1070,6 +1070,61 @@ def test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_bu
             np.testing.assert_allclose(sized_qd, ample_qd, atol=1e-6)
 
 
+def _folding_chain(device, links=12):
+    """A chain hung from one end whose links fold onto each other, one articulation."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    capsule_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.5 * np.pi)
+    parent, joints = -1, []
+    for i in range(links):
+        link = builder.add_link(xform=wp.transform(wp.vec3(0.08 * i + 0.04, 0.0, 0.5), wp.quat_identity()))
+        builder.add_shape_capsule(
+            link, xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), capsule_rot), radius=0.025, half_height=0.02
+        )
+        anchor = wp.vec3(0.0, 0.0, 0.5) if parent < 0 else wp.vec3(0.04, 0.0, 0.0)
+        joints.append(
+            builder.add_joint_revolute(
+                parent,
+                link,
+                axis=(0.0, 1.0, 0.0) if i % 3 else (0.0, 0.3, 1.0),
+                parent_xform=wp.transform(anchor, wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(-0.04, 0.0, 0.0), wp.quat_identity()),
+                armature=0.002,
+                damping=0.002,
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    return builder.finalize(device=device)
+
+
+def test_deterministic_overflow_repeats(test, device):
+    """Repeat an overflowing colored propagation solve bitwise with the deterministic row order."""
+    finals = []
+    for _ in range(2):
+        model = _folding_chain(device)
+        solver = SolverSteel(
+            model,
+            solve_mode="colored",
+            articulated_contact_response="propagation",
+            articulation_constraint_max=32,
+            deterministic=wp.DeterministicMode.RUN_TO_RUN,
+            warn_constraint_overflow=False,
+        )
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        for _ in range(320):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+        test.assertTrue(bool(solver.constraint_overflow.numpy()[0]))
+        body_q = state_0.body_q.numpy()
+        test.assertTrue(np.isfinite(body_q).all())
+        finals.append(body_q)
+    np.testing.assert_array_equal(finals[1], finals[0])
+
+
 add_function_test(
     TestSteelRowAllocation,
     "test_propagation_constraint_max_sizes_the_propagation_family",
@@ -1080,6 +1135,12 @@ add_function_test(
     TestSteelRowAllocation,
     "test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget",
     test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelRowAllocation,
+    "test_deterministic_overflow_repeats",
+    test_deterministic_overflow_repeats,
     devices=get_cuda_test_devices(),
 )
 
