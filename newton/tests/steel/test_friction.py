@@ -1263,7 +1263,7 @@ _TURNING_SLIP_BLOCK = (-0.001, 1.0, 1.74378288, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.
 def test_bisection_finds_the_root_of_a_jam_whose_slip_turns(test, device):
     """Reach the root of a singular jam whose residual is flat at the first probe but rises as the slip turns."""
     block = np.array(_TURNING_SLIP_BLOCK, dtype=np.float32)
-    normal, tangent1, tangent2 = (float(v) for v in _mf_block(device, block, "bisection"))
+    normal, tangent1, _ = (float(v) for v in _mf_block(device, block, "bisection"))
     residual = float(block[0]) + normal + tangent1
     test.assertAlmostEqual(normal, 0.232005, delta=1.0e-4)
     test.assertLessEqual(abs(residual), 1.0e-5 * normal)
