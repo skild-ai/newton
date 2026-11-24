@@ -1238,6 +1238,21 @@ def test_bisection_reaches_the_far_root_of_a_nearly_jammed_block(test, device):
             test.assertLessEqual(abs(residual), 1.0e-5 * g_nn * normal)
 
 
+# The same block with a complement of 2^-20 G_nn, under the 1e-6 G_nn cutoff: it is treated as numerically singular,
+# and its load stays at the frictionless one although a root exists near 1e6 times it.
+_SINGULAR_CUTOFF_BLOCK = (-1.0, 0.0, 0.1, 1.0 + 2.0**-20, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0)
+
+
+def test_bisection_bounds_the_load_below_the_singular_cutoff(test, device):
+    """Keep the frictionless load on a slipping jam whose Schur complement is under the numerical-singularity cutoff."""
+    block = np.array(_SINGULAR_CUTOFF_BLOCK, dtype=np.float32)
+    for mode in ("bisection", "bisection_desaxce"):
+        with test.subTest(mode=mode):
+            normal, *_ = _mf_block(device, block, mode)
+            bias = float(block[9] * np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
+            test.assertLessEqual(float(normal), (bias - float(block[0])) / float(block[3]) * (1.0 + 1.0e-5))
+
+
 # A block whose second tangent direction barely responds but slips at 1 m/s: friction must still oppose that slip.
 # Values: u_n, u_t1, u_t2, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2, G_t2t2, mu.
 _STIFF_SLIPPING_BLOCK = (-1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0e-7, 0.5)
@@ -1362,6 +1377,7 @@ for _fn in (
     test_bisection_keeps_a_jammed_contact_near_the_frictionless_load,
     test_bisection_keeps_friction_on_a_stiff_slipping_direction,
     test_bisection_reaches_the_far_root_of_a_nearly_jammed_block,
+    test_bisection_bounds_the_load_below_the_singular_cutoff,
     test_bisection_bounds_the_normal_force_on_a_hinged_rod,
     test_bisection_reports_no_friction_without_tangential_mobility,
 ):
