@@ -1275,8 +1275,9 @@ class TestBodyPairReductionTableSizing(unittest.TestCase):
     def test_size_factor_scales_the_derived_capacity(self):
         """Scale the derived capacity by ``hashtable_size_factor``."""
         model = self._scene(24)
-        small = _make_pipeline(model, True, body_pair_hashtable_size_factor=1.0)
-        large = _make_pipeline(model, True, body_pair_hashtable_size_factor=8.0)
+        # A wide stage keeps both requests below the staging cap.
+        small = _make_pipeline(model, True, rigid_contact_max=1 << 17, body_pair_hashtable_size_factor=1.0)
+        large = _make_pipeline(model, True, rigid_contact_max=1 << 17, body_pair_hashtable_size_factor=8.0)
         self.assertGreater(
             large._body_pair_reducer.describe()["hashtable_capacity_request"],
             small._body_pair_reducer.describe()["hashtable_capacity_request"],
