@@ -1802,8 +1802,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         - ``steel:rigid_body_max_depenetration_velocity`` [m/s] bounds the Baumgarte correction
           velocity of penetrating contacts on free bodies and articulation links
           (``physxRigidBody:maxDepenetrationVelocity``, default unbounded). A contact takes the
-          smaller positive bound of its two bodies. As in PhysX, joint limits and compliant
-          contacts are not bounded.
+          smaller positive bound of its two bodies, kinematic and zero-DOF bodies included. As in
+          PhysX, joint limits and compliant contacts are not bounded.
 
         One per-shape attribute enables contact torsion, see ``contact_torsion_device``:
 
@@ -6539,6 +6539,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         #   .z = rhs bits, .w = row_type | (row_parent << 16)
         self._mf_meta_packed = wp.zeros((worlds, rows * 4), dtype=wp.int32, device=device)
         self._mf_row_rebound_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
+        self._mf_row_max_depenetration_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._mf_row_w = wp.ones(
             (worlds, rows) if self._regularization_enabled else (1, 1), dtype=wp.float32, device=device
         )
@@ -10754,6 +10755,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._friction_combine_id,
                         self._restitution_combine_id,
                         recovery_phi,
+                        self._rigid_body_max_depenetration_velocity,
                     ],
                     outputs=[
                         self._mf_body_a,
@@ -10766,6 +10768,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._mf_phi,
                         self._mf_target_velocity,
                         self._mf_row_rebound_velocity,
+                        self._mf_row_max_depenetration_velocity,
                     ],
                     device=model.device,
                 )
@@ -11268,7 +11271,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._body_to_articulation,
                 self._articulation_dof_start,
                 self._v_hat,
-                self._rigid_body_max_depenetration_velocity,
+                self._mf_row_max_depenetration_velocity,
                 self._cfm,
                 self._baumgarte,
                 self._contact_w,
@@ -11626,6 +11629,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_phi = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._propagation_target_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._propagation_row_rebound_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
+        self._propagation_row_max_depenetration_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         # Rebound bias of each row, kept for the velocity-only iterations.
         self._propagation_restitution_bias = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._propagation_row_w = wp.ones(
@@ -12049,6 +12053,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._friction_combine_id,
                 self._restitution_combine_id,
                 recovery_phi,
+                self._rigid_body_max_depenetration_velocity,
             ],
             outputs=[
                 self._propagation_body_a,
@@ -12061,6 +12066,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_phi,
                 self._propagation_target_velocity,
                 self._propagation_row_rebound_velocity,
+                self._propagation_row_max_depenetration_velocity,
             ],
             device=model.device,
         )
@@ -12388,7 +12394,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_target_velocity,
                 self._propagation_row_rebound_velocity,
                 self._propagation_body_qd,
-                self._rigid_body_max_depenetration_velocity,
+                self._propagation_row_max_depenetration_velocity,
                 self._cfm,
                 self._baumgarte,
                 self._contact_w,
