@@ -16,6 +16,7 @@ import numpy as np
 import warp as wp
 
 from ...sim.collide import _shape_collide_mask
+from .friction_patches import WARP_DETERMINISM_OFF
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
@@ -24,6 +25,8 @@ from .kernels import (
     build_propagation_free_rigid_angular_rows,
     gate_free_rigid_angular_coefficients,
 )
+
+wp.set_module_options({"enable_backward": False, **WARP_DETERMINISM_OFF})
 
 
 def configure_free_rigid_angular_friction(solver, model, torsional: float | None, rolling: float | None) -> None:
@@ -52,7 +55,9 @@ def configure_free_rigid_angular_friction(solver, model, torsional: float | None
         unrouted = (values >= 4) & on_route_body & ~reachable
         if not (overridden or routed) and np.any(unrouted):
             # Pairs given only to a CollisionPipeline can still bring these shapes into contact; warn if one does.
-            solver._free_rigid_unrouted_condim = wp.array(unrouted.astype(np.int32), dtype=wp.int32, device=model.device)
+            solver._free_rigid_unrouted_condim = wp.array(
+                unrouted.astype(np.int32), dtype=wp.int32, device=model.device
+            )
             route_body = _free_route_body_mask(solver)
             route_body[solver._model_plan.response_free_rigid_body_indices] = 2
             solver._free_rigid_unrouted_route_body = wp.array(route_body, dtype=wp.int32, device=model.device)
