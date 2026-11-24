@@ -398,7 +398,18 @@ def _position_rhs(family: str, *, phi, baumgarte, friction_anchor_beta, dt, devi
         wp.launch(
             compute_world_contact_bias,
             dim=1,
-            inputs=[count, phi_arr, row_type, zeros3(), baumgarte, friction_anchor_beta, 1.0, 1.0, dt],
+            inputs=[
+                count,
+                phi_arr,
+                row_type,
+                zeros3(),
+                wp.full((1, 3), wp.inf, dtype=wp.float32, device=device),
+                baumgarte,
+                friction_anchor_beta,
+                1.0,
+                1.0,
+                dt,
+            ],
             outputs=[rhs, zeros3()],
             device=device,
         )

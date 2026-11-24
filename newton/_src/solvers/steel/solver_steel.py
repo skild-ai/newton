@@ -1798,8 +1798,11 @@ class SolverSteel(SolverBase, CouplingInterface):
         - ``steel:rigid_body_max_linear_velocity`` [m/s] and ``steel:rigid_body_max_angular_velocity`` [rad/s]
           bound the velocity of free bodies (``physxRigidBody:maxLinearVelocity`` and
           ``physxRigidBody:maxAngularVelocity``, default unbounded).
-        - ``steel:rigid_body_max_depenetration_velocity`` [m/s] bounds the contact correction velocity
-          of free bodies (``physxRigidBody:maxDepenetrationVelocity``, default unbounded).
+        - ``steel:rigid_body_max_depenetration_velocity`` [m/s] bounds the Baumgarte correction
+          velocity of penetrating contacts on free bodies and articulation links
+          (``physxRigidBody:maxDepenetrationVelocity``, default unbounded). A contact takes the
+          smaller positive bound of its two bodies. As in PhysX, joint limits and compliant
+          contacts are not bounded.
 
         One per-shape attribute enables contact torsion, see ``contact_torsion_device``:
 
@@ -6463,6 +6466,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._phi = wp.zeros(shape, dtype=wp.float32, device=device)
         self._target_velocity = wp.zeros(shape, dtype=wp.float32, device=device)
         self._row_rebound_velocity = wp.zeros(shape, dtype=wp.float32, device=device)
+        self._row_max_depenetration_velocity = wp.zeros(shape, dtype=wp.float32, device=device)
         # Regularization weight per row, read by the solve only when regularization is on.
         self._row_w = wp.ones(shape if self._regularization_enabled else (1, 1), dtype=wp.float32, device=device)
         # Right-hand side of the velocity-only iterations.
@@ -8368,6 +8372,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._phi,
                 self._row_type,
                 self._target_velocity,
+                self._row_max_depenetration_velocity,
                 self._baumgarte,
                 self._friction_anchor_beta,
                 self._contact_speculative_scale,
@@ -10573,6 +10578,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._friction_combine_id,
                     self._restitution_combine_id,
                     recovery_phi,
+                    self._rigid_body_max_depenetration_velocity,
                 ],
                 outputs=[
                     self._row_type,
@@ -10581,6 +10587,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._phi,
                     self._target_velocity,
                     self._row_rebound_velocity,
+                    self._row_max_depenetration_velocity,
                 ],
                 device=model.device,
             )
