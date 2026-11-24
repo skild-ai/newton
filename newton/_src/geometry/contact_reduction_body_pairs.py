@@ -130,7 +130,7 @@ from .types import GeoType
 
 # Automatic coverage splits a pair's contacts into a touching and a speculative layer.
 GROUP_DEPTH_LAYERS = 2
-# Normal bins budgeted per group pair when sizing the automatic-coverage table.
+# Normal bins budgeted per group pair: a sizing heuristic, not an occupancy bound.
 GROUP_AUTO_BINS_PER_PAIR = 3
 
 # Solver-visible contact material fields. Shapes on one body may only share a

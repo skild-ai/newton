@@ -1022,6 +1022,45 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         self.assertFalse(coupled.entry_contacts("all", plain).rigid_contact_body_pair_reduced)
         self.assertTrue(coupled.entry_contacts("all", reduced).rigid_contact_body_pair_reduced)
 
+    def test_coupled_entry_contacts_keep_the_fallback_flag(self):
+        """Mirror the source pass's fallback flag into a coupled entry's filtered contacts, cached or refreshed."""
+        model = _plate_stack_model(worlds=2, plates=8)
+        state = model.state()
+        separated = model.state()
+        body_q = separated.body_q.numpy()
+        body_q[:, 2] += 1.0 + 0.5 * np.arange(len(body_q))
+        separated.body_q.assign(body_q)
+        coupled = SolverCoupled(
+            model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="all", solver=newton.solvers.SolverSemiImplicit, bodies=list(range(model.body_count))
+                )
+            ],
+        )
+        pipeline = _make_pipeline(model, True, rigid_contact_max=65536, body_pair_hashtable_size_factor=1e-6)
+        contacts = pipeline.contacts()
+
+        def filtered_flag(source):
+            filtered = coupled.entry_contacts("all", source)
+            self.assertIsNot(filtered, source)
+            return int(filtered.body_pair_reduction_fallback.numpy()[0])
+
+        # A fallback pass, a cached reuse of it, a pass that fits, then a fallback pass again.
+        _collide_capturing_output(pipeline, state, contacts)
+        self.assertEqual(int(contacts.body_pair_reduction_fallback.numpy()[0]), 1)
+        self.assertEqual(filtered_flag(contacts), 1)
+        self.assertEqual(filtered_flag(contacts), 1)
+        pipeline.collide(separated, contacts)
+        self.assertEqual(int(contacts.body_pair_reduction_fallback.numpy()[0]), 0)
+        self.assertEqual(filtered_flag(contacts), 0)
+        pipeline.collide(state, contacts)
+        self.assertEqual(filtered_flag(contacts), 1)
+        # A different source buffer refreshes the cached entry buffer and its flag.
+        other = pipeline.contacts()
+        pipeline.collide(separated, other)
+        self.assertEqual(filtered_flag(other), 0)
+
     @requires(*MUJOCO_MODULES)
     def test_mujoco_consumes_reduced_newton_contacts(self):
         """Resolve a penetrating compound patch through MuJoCo Warp's Newton contact adapter."""

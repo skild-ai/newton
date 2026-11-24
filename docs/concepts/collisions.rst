@@ -1419,6 +1419,10 @@ or the group table was too small and frames kept every contact. Such a pass sets
 :attr:`~Contacts.body_pair_reduction_fallback` and prints a warning once; raise
 ``BodyPairReductionConfig.hashtable_size_factor`` to fit the table, and read
 :meth:`~CollisionPipeline.body_pair_reduction_stats` for how close it runs to full.
+With automatic coverage the table reserves several entries per body pair (one
+per budgeted normal bin, voxel and depth layer); lower ``hashtable_size_factor``
+when :meth:`~CollisionPipeline.body_pair_reduction_stats` shows a table far
+larger than ``max_hashtable_entries``.
 
 This body-pair reduction API is experimental and may change without prior notice.
 
