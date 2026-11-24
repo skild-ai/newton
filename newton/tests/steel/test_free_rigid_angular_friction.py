@@ -35,7 +35,12 @@ from newton._src.solvers.steel.solver_steel import (
     _get_pgs_solve_propagation_contact_kernel,
 )
 from newton.solvers import SolverBase, SolverSteel
-from newton.tests.steel._fixtures import COLORED_VARIANTS, select_colored_variant, set_torsion_radius
+from newton.tests.steel._fixtures import (
+    COLORED_VARIANTS,
+    printf_capture_is_reliable,
+    select_colored_variant,
+    set_torsion_radius,
+)
 from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_test_devices, requires
 
 _DT = 1.0 / 480.0
@@ -1824,10 +1829,12 @@ class TestFreeRigidAngularFrictionImport(unittest.TestCase):
         self.assertFalse(solver._free_rigid_angular_rows)
         contacts = pipeline.contacts()
         states = [model.state(), model.state()]
+        check_output = printf_capture_is_reliable()
         outputs = []
         for _ in range(2):
             capture = StdOutCapture()
-            capture.begin()
+            if check_output:
+                capture.begin()
             try:
                 pipeline.collide(states[0], contacts)
                 solver.step(states[0], states[1], model.control(), contacts, _DT)
@@ -1836,12 +1843,13 @@ class TestFreeRigidAngularFrictionImport(unittest.TestCase):
                 try:
                     wp.synchronize()
                 finally:
-                    outputs.append(capture.end())
+                    outputs.append(capture.end() if check_output else "")
             states.reverse()
             self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
-        self.assertIn(f"touches shape {ball}, whose steel:condim above 3 adds no rows", outputs[0])
-        self.assertIn("Assign explicit pairs to model.shape_contact_pairs", outputs[0])
-        self.assertNotIn("steel:condim", outputs[1])
+        if check_output:
+            self.assertIn(f"touches shape {ball}, whose steel:condim above 3 adds no rows", outputs[0])
+            self.assertIn("Assign explicit pairs to model.shape_contact_pairs", outputs[0])
+            self.assertNotIn("steel:condim", outputs[1])
         self.assertEqual(int(solver._free_rigid_unrouted_warned.numpy()[0]), 1)
 
     def test_global_condim_with_a_partner_in_another_solve_world_adds_no_angular_rows(self):
