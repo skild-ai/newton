@@ -2206,15 +2206,16 @@ class SolverSteel(SolverBase, CouplingInterface):
                 connect rows, contacts, enabled joint limits, joint velocity limits, joint friction
                 and, with ``drive_mode="rows"``, joint drives) per world. Rows beyond it are
                 dropped and reported, see :attr:`constraint_overflow`. On CUDA the matrix-free
-                sweep keeps these rows and the world's DOFs in 48 KiB of shared memory, about
-                12,000 together; a larger shape raises :class:`ValueError`.
+                sweep keeps these rows and the world's response DOFs (six per free body) in 48 KiB
+                of shared memory, about 12,000 together; a larger shape raises :class:`ValueError`.
             free_body_constraint_max: Capacity of free-body rows per world: free-body contact rows
                 and free-body velocity-limit rows. Under the ``"propagation"`` response free-body
                 contacts use the propagation rows, so
                 it sizes only the velocity-limit rows. Rows beyond it are dropped and reported, see
                 :attr:`constraint_overflow`. On CUDA, once these rows no longer fit the sweep's
-                shared memory beside the dense rows (about 12,000 rows), the sweep keeps their
-                impulses in global memory, with the same results.
+                shared memory beside ``articulation_constraint_max`` and the world's response DOFs
+                (about 12,000 in total), the sweep keeps their impulses in global memory, with the
+                same results.
             propagation_constraint_max: Capacity of the propagation row family per world in the
                 ``"propagation"`` response, which holds every contact
                 row except those between two links of one articulation; these stay dense unless
