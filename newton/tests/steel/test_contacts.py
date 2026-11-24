@@ -257,7 +257,6 @@ def _dense_speculative_rhs(device, scale: float) -> float:
             wp.array([[1.0]], dtype=wp.float32, device=device),
             wp.array([[PGS_CONSTRAINT_TYPE_CONTACT]], dtype=wp.int32, device=device),
             wp.zeros((1, 1), dtype=wp.float32, device=device),
-            wp.full((1, 1), wp.inf, dtype=wp.float32, device=device),
             0.2,
             0.2,
             scale,
@@ -325,18 +324,7 @@ def _dense_restitution_rhs(device, scale: float) -> float:
     wp.launch(
         compute_world_contact_bias,
         dim=1,
-        inputs=[
-            wp.array([1], dtype=wp.int32, device=device),
-            phi,
-            row_type,
-            target,
-            wp.full((1, 1), wp.inf, dtype=wp.float32, device=device),
-            0.2,
-            0.2,
-            scale,
-            1.0,
-            0.5,
-        ],
+        inputs=[wp.array([1], dtype=wp.int32, device=device), phi, row_type, target, 0.2, 0.2, scale, 1.0, 0.5],
         outputs=[rhs, row_w],
         device=device,
     )

@@ -6209,7 +6209,6 @@ def compute_world_contact_bias(
     world_phi: wp.array2d[float],
     world_row_type: wp.array2d[int],
     world_target_velocity: wp.array2d[float],
-    world_row_max_depenetration_velocity: wp.array2d[float],
     pgs_beta: float,
     friction_anchor_beta: float,
     contact_speculative_scale: float,
@@ -6222,8 +6221,7 @@ def compute_world_contact_bias(
     """Compute the bias of each dense row; the solve adds ``J v`` every iteration.
 
     ``rhs = -target_velocity + bias``. Penetrating contacts and violated joint limits
-    get the Baumgarte term ``beta * phi / dt``, bounded for contacts by the row's maximum
-    depenetration velocity; separated contacts may close
+    get the Baumgarte term ``beta * phi / dt``; separated contacts may close
     ``contact_speculative_scale`` times their gap during the step, and limits within
     their activation gap the remaining gap. Mimic and connect rows get the Baumgarte
     term for either sign of ``phi``. Friction rows of persistent patches get
@@ -6243,11 +6241,7 @@ def compute_world_contact_bias(
         row_w = float(1.0)
         if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
             if phi <= 0.0:
-                bias = pgs_beta * phi * inv_dt
-                bound = world_row_max_depenetration_velocity[world, i]
-                if wp.isfinite(bound):
-                    bias = wp.max(bias, -bound)
-                rhs += bias
+                rhs += pgs_beta * phi * inv_dt
                 row_w = contact_w
             else:
                 rhs += contact_speculative_scale * phi * inv_dt
@@ -6264,6 +6258,34 @@ def compute_world_contact_bias(
         world_rhs[world, i] = rhs
         if contact_w < 1.0:
             world_row_w[world, i] = row_w
+
+
+@wp.kernel
+def bound_world_contact_depenetration_bias(
+    world_constraint_count: wp.array[int],
+    max_constraints: int,
+    world_phi: wp.array2d[float],
+    world_row_type: wp.array2d[int],
+    world_target_velocity: wp.array2d[float],
+    world_row_max_depenetration_velocity: wp.array2d[float],
+    pgs_beta: float,
+    dt: float,
+    # in/out
+    world_rhs: wp.array2d[float],
+):
+    """Bound the Baumgarte term of each penetrating dense contact by the row's maximum depenetration velocity.
+
+    Must run right after :func:`compute_world_contact_bias`.
+    """
+    tid = wp.tid()
+    world = tid // max_constraints
+    i = tid - world * max_constraints
+    if i >= world_constraint_count[world] or world_row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
+        return
+    phi = world_phi[world, i]
+    bound = world_row_max_depenetration_velocity[world, i]
+    if phi <= 0.0 and pgs_beta * phi * (1.0 / dt) < -bound:
+        world_rhs[world, i] = -world_target_velocity[world, i] - bound
 
 
 @wp.kernel

@@ -115,6 +115,7 @@ from .kernels import (
     apply_world_contact_restitution,
     apply_world_impulses_to_velocity,
     assign_world_contact_slots,
+    bound_world_contact_depenetration_bias,
     build_joint_limit_rows,
     build_mass_update_mask,
     build_mf_body_map,
@@ -8372,7 +8373,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._phi,
                 self._row_type,
                 self._target_velocity,
-                self._row_max_depenetration_velocity,
                 self._baumgarte,
                 self._friction_anchor_beta,
                 self._contact_speculative_scale,
@@ -8380,6 +8380,22 @@ class SolverSteel(SolverBase, CouplingInterface):
                 dt,
             ],
             outputs=[self._rhs, self._row_w],
+            device=model.device,
+        )
+        wp.launch(
+            bound_world_contact_depenetration_bias,
+            dim=self._world_count * self._articulation_constraint_max,
+            inputs=[
+                self._constraint_count,
+                self._articulation_constraint_max,
+                self._phi,
+                self._row_type,
+                self._target_velocity,
+                self._row_max_depenetration_velocity,
+                self._baumgarte,
+                dt,
+            ],
+            outputs=[self._rhs],
             device=model.device,
         )
         if self._has_free_rigid_bodies:
