@@ -8526,7 +8526,8 @@ def build_distance_limit_rows(
     ``|p|``, the child anchor's position in the parent anchor frame (the joint's linear coordinates). With the
     joint velocity ``(v, w)`` of the child COM in that frame, its rate is ``n . v + (r x n) . w`` for ``n = p / |p|``
     and ``r = p - p_com``, so each row spans only the joint's own six DOFs. At coincident anchors ``n`` follows the
-    anchor's predicted velocity. A zero maximum distance holds ``p`` at zero with two opposing rows per axis, which
+    anchor's predicted velocity. The row bounds the linearized rate, so rotation about an offset COM within the step
+    can carry the anchor past a positive bound. A zero maximum distance holds ``p`` at zero with two opposing rows per axis, which
     are always active.
     """
     group_idx = wp.tid()
