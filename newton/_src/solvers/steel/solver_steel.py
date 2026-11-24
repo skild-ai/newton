@@ -24738,13 +24738,29 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                                         new_lambda_n = x;
                                         // Within what a 1e-5 relative error in the load would leave.
                                         if (last_probe || fabsf(f_x) <= 1.0e-5f * G_nn * x) break;
-                                        // Unbracketed, a jammed residual that rose by less than 1% of its remaining gap since the last approaching
-                                        // probe has no root within reach: keep that probe's load.
-                                        if (jammed && f_x < 0.0f && !bracketed && f_x - f_lo <= 1.0e-2f * -f_x) {
-                                            if (lo <= 0.0f) break;
-                                            x = lo;
-                                            last_probe = true;
-                                            continue;
+                                        if (jammed && f_x < 0.0f) {
+                                            if (clamp_axis || !rank_one) {
+                                                // The probe sticks if its unconstrained tangent pair lies in the cone, within rounding.
+                                                const float r_t1 = u_t1 + G_nt1 * (x - old_lambda_n), r_t2 = u_t2 + G_nt2 * (x - old_lambda_n);
+                                                float stick_t1, stick_t2;
+                                                if (clamp_axis) {
+                                                    const float axis = pair_vx * (old_lambda_t1 - r_t1 / axis_tt) + pair_vy * (old_lambda_t2 - r_t2 / axis_tt);
+                                                    stick_t1 = pair_vx * axis;
+                                                    stick_t2 = pair_vy * axis;
+                                                } else {
+                                                    stick_t1 = old_lambda_t1 - (G_t2t2 * r_t1 - G_t1t2 * r_t2) / minor_nn;
+                                                    stick_t2 = old_lambda_t2 - (G_t1t1 * r_t2 - G_t1t2 * r_t1) / minor_nn;
+                                                }
+                                                if (stick_t1 * stick_t1 + stick_t2 * stick_t2 <= mu * mu * x * x * (1.0f + 2.0e-5f)) break;
+                                            }
+                                            // Whatever the probe, an unbracketed residual that rose by less than 1% of its remaining gap since the last
+                                            // approaching probe has no root within reach: keep that probe's load.
+                                            if (!bracketed && f_x - f_lo <= 1.0e-2f * -f_x) {
+                                                if (lo <= 0.0f) break;
+                                                x = lo;
+                                                last_probe = true;
+                                                continue;
+                                            }
                                         }
                                         if (f_x < 0.0f) {
                                             lo = x;
@@ -24996,13 +25012,29 @@ _MF_BISECTION_FRICTION_SOURCE = """
                                         new_lambda_n = x;
                                         // Within what a 1e-5 relative error in the load would leave.
                                         if (last_probe || fabsf(f_x) <= 1.0e-5f * G_nn * x) break;
-                                        // Unbracketed, a jammed residual that rose by less than 1% of its remaining gap since the last approaching
-                                        // probe has no root within reach: keep that probe's load.
-                                        if (jammed && f_x < 0.0f && !bracketed && f_x - f_lo <= 1.0e-2f * -f_x) {
-                                            if (lo <= 0.0f) break;
-                                            x = lo;
-                                            last_probe = true;
-                                            continue;
+                                        if (jammed && f_x < 0.0f) {
+                                            if (clamp_axis || !rank_one) {
+                                                // The probe sticks if its unconstrained tangent pair lies in the cone, within rounding.
+                                                const float r_t1 = u_t1 + G_nt1 * (x - old_lambda_n), r_t2 = u_t2 + G_nt2 * (x - old_lambda_n);
+                                                float stick_t1, stick_t2;
+                                                if (clamp_axis) {
+                                                    const float axis = pair_vx * (old_lambda_t1 - r_t1 / axis_tt) + pair_vy * (old_lambda_t2 - r_t2 / axis_tt);
+                                                    stick_t1 = pair_vx * axis;
+                                                    stick_t2 = pair_vy * axis;
+                                                } else {
+                                                    stick_t1 = old_lambda_t1 - (G_t2t2 * r_t1 - G_t1t2 * r_t2) / minor_nn;
+                                                    stick_t2 = old_lambda_t2 - (G_t1t1 * r_t2 - G_t1t2 * r_t1) / minor_nn;
+                                                }
+                                                if (stick_t1 * stick_t1 + stick_t2 * stick_t2 <= mu * mu * x * x * (1.0f + 2.0e-5f)) break;
+                                            }
+                                            // Whatever the probe, an unbracketed residual that rose by less than 1% of its remaining gap since the last
+                                            // approaching probe has no root within reach: keep that probe's load.
+                                            if (!bracketed && f_x - f_lo <= 1.0e-2f * -f_x) {
+                                                if (lo <= 0.0f) break;
+                                                x = lo;
+                                                last_probe = true;
+                                                continue;
+                                            }
                                         }
                                         if (f_x < 0.0f) {
                                             lo = x;
