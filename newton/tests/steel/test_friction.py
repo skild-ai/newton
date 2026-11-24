@@ -1203,17 +1203,20 @@ _JAMMED_BLOCKS = {
     # Sticking pairs exactly on the cone, with a regular and a rank-one tangent block.
     "on_the_cone": (-1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0),
     "rank_one_on_the_cone": (-1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0),
+    # A rank-one jam that also slips off its axis: the disk solve has no root at any load.
+    "rank_one_slipping_off_axis": (-1.0, 0.0, 0.1, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
 }
 
 
 def test_bisection_keeps_a_jammed_contact_near_the_frictionless_load(test, device):
-    """Stop the bisection search near the frictionless load on a block that has no root."""
+    """Stop the bisection search at most at the frictionless load on a block that has no root."""
     for mode in ("bisection", "bisection_desaxce"):
         for name, block in _JAMMED_BLOCKS.items():
             for route, solve in (("colored", _colored_block), ("serial", _mf_block)):
                 with test.subTest(mode=mode, block=name, route=route):
                     normal, *tangent = solve(device, np.array(block, dtype=np.float32), mode)
-                    test.assertLessEqual(normal, 1.0)
+                    bias = block[9] * float(np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
+                    test.assertLessEqual(normal, (bias - block[0]) / block[3] * (1.0 + 1.0e-5))
                     test.assertLessEqual(float(np.linalg.norm(tangent)), block[9] * normal * (1.0 + 1.0e-6))
 
 
