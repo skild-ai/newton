@@ -1855,7 +1855,9 @@ class TestFreeRigidAngularFrictionImport(unittest.TestCase):
                     pairs = np.array([[ball_shape, box_shape]], dtype=np.int32)
                     model.shape_contact_pairs = wp.array(pairs, dtype=wp.vec2i, device="cpu")
                 if partner_world == 1:
-                    self.assertFalse(SolverSteel(model)._free_rigid_angular_rows)
+                    with self.assertWarnsRegex(newton.exceptions.NewtonWarning, "solved in world 0"):
+                        solver = SolverSteel(model)
+                    self.assertFalse(solver._free_rigid_angular_rows)
                 else:
                     with self.assertRaisesRegex(NotImplementedError, "steel:condim"):
                         SolverSteel(model)
