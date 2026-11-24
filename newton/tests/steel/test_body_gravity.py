@@ -13,7 +13,7 @@ import warp as wp
 import newton
 from newton.solvers import SolverFeatherstone, SolverSteel
 from newton.solvers.experimental.coupled import SolverCoupled
-from newton.tests.unittest_utils import USD_AVAILABLE
+from newton.tests.unittest_utils import requires
 from newton.usd import SchemaResolverNewton, SchemaResolverPhysx
 
 
@@ -24,7 +24,7 @@ class TestSteelBodyGravity(unittest.TestCase):
         for solver_type in (newton.solvers.SolverXPBD, newton.solvers.SolverSemiImplicit):
             with (
                 self.subTest(solver=solver_type.__name__),
-                self.assertWarnsRegex(newton.exceptions.NewtonWarning, "ignores Model.body_disable_gravity"),
+                self.assertWarnsRegex(newton.NewtonWarning, "ignores Model.body_disable_gravity"),
             ):
                 solver_type(model)
         coupled = SolverCoupled
@@ -152,7 +152,7 @@ class TestSteelBodyGravity(unittest.TestCase):
                     getattr(states[1], name).numpy(), getattr(states[0], name).numpy(), atol=3.0e-6
                 )
 
-    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    @requires("pxr.Usd")
     def test_usd_selective_gravity(self):
         """Keep a gravity-disabled body stationary while its neighbor falls."""
         # USD is an optional importer dependency.

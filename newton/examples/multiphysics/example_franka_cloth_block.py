@@ -292,9 +292,7 @@ class Example:
                 ),
                 SolverCoupled.Entry(
                     name="vbd",
-                    solver=lambda view: SolverVBD(
-                        model=view, iterations=int(args.vbd_iterations), rigid_compliant_alm=True
-                    ),
+                    solver=lambda view: SolverVBD(model=view, iterations=int(args.vbd_iterations)),
                     particles=list(range(self.model.particle_count)),
                 ),
             ],

@@ -12,7 +12,7 @@ import warp as wp
 
 import newton
 from newton._src.geometry.utils import remesh_convex_hull
-from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices, requires
 
 SHAPE_GAP = 0.0015
 
@@ -385,6 +385,7 @@ def test_rounded_hull_settles(test, device):
         test.assertLess(speed, 0.15, f"{euler}: face-clipped hull still rotates at {speed:.3f} rad/s")
 
 
+@requires("scipy")
 class TestConvexFaceClip(unittest.TestCase):
     pass
 
