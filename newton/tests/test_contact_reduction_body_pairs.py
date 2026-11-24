@@ -40,6 +40,7 @@ from newton._src.geometry.contact_reduction_global import (
 from newton._src.sim.contacts import Contacts
 from newton.geometry import HydroelasticSDF
 from newton.solvers.experimental.coupled import SolverCoupled
+from newton.tests.steel._fixtures import printf_capture_is_reliable
 from newton.tests.unittest_utils import MUJOCO_MODULES, StdOutCapture, requires
 
 DT = 1.0 / 240.0
@@ -182,16 +183,18 @@ def _plate_stack_model(worlds, plates, grid=4, half_thickness=0.01, tile=0.02):
 
 
 def _collide_capturing_output(pipeline, state, contacts, passes=1):
-    """Run collision passes and return the device printf output they produce."""
+    """Run collision passes and return the device printf output they produce, or ``None`` where it is not captured."""
+    check_output = printf_capture_is_reliable()
     wp.synchronize()
     capture = StdOutCapture()
-    capture.begin()
+    if check_output:
+        capture.begin()
     try:
         for _ in range(passes):
             pipeline.collide(state, contacts)
         wp.synchronize()
     finally:
-        output = capture.end()
+        output = capture.end() if check_output else None
     return output
 
 
@@ -1677,8 +1680,8 @@ class TestBodyPairReductionSafety(unittest.TestCase):
 
         Per-contact fail-open would let CUDA scheduling decide which groups get
         the last table entries -- a scheduling-dependent kept set. Exceeding
-        the budget must instead fall back for the whole frame: every contact
-        kept, which is deterministic, and counted in telemetry.
+        the budget must instead fall back for the whole frame: every staged
+        contact written unreduced, which is deterministic, and counted in telemetry.
         """
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         rng = np.random.default_rng(9)
@@ -1704,7 +1707,9 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         pipeline = _make_pipeline(model, True, body_pair_hashtable_size_factor=1e-6)
         contacts = pipeline.contacts()
         output = _collide_capturing_output(pipeline, state, contacts)
-        self.assertIn("hashtable_size_factor", output)
+        if output is not None:
+            self.assertIn("hashtable_size_factor", output)
+        self.assertEqual(int(contacts.body_pair_reduction_fallback.numpy()[0]), 1)
         n_red = int(contacts.rigid_contact_count.numpy()[0])
         stats = pipeline._body_pair_reducer.stats()
         self.assertEqual(n_red, n_base, "saturated frame must keep the whole unreduced set")
@@ -1730,14 +1735,24 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         self.assertEqual(stats["fallback_frames"], 2)
         self.assertEqual(int(contacts.body_pair_reduction_fallback.numpy()[0]), 1)
         self.assertEqual(int(contacts._reduction_overflow.numpy()[0]), 0, "a fallback pass loses no contact")
-        self.assertEqual(output.count("Increase BodyPairReductionConfig.hashtable_size_factor"), 1, output)
+        self.assertEqual(int(small.narrow_phase.group_contact_reducer.group_fallback.numpy()[1]), 1, "warned flag")
+        if output is not None:
+            self.assertEqual(output.count("Increase BodyPairReductionConfig.hashtable_size_factor"), 1, output)
+
+        # The fallback writes the staged contacts unreduced, so a small buffer still overflows.
+        tight = _make_pipeline(model, True, rigid_contact_max=32, body_pair_hashtable_size_factor=1e-6)
+        tight_contacts = tight.contacts()
+        _collide_capturing_output(tight, state, tight_contacts)
+        self.assertEqual(int(tight_contacts.body_pair_reduction_fallback.numpy()[0]), 1)
+        self.assertEqual(int(tight_contacts._reduction_overflow.numpy()[0]), 1)
 
         large = _make_pipeline(model, True, rigid_contact_max=65536, body_pair_hashtable_size_factor=8.0)
         large_contacts = large.contacts()
         output = _collide_capturing_output(large, state, large_contacts)
         self.assertEqual(large.body_pair_reduction_stats()["fallback_frames"], 0)
         self.assertEqual(int(large_contacts.body_pair_reduction_fallback.numpy()[0]), 0)
-        self.assertNotIn("hashtable_size_factor", output)
+        if output is not None:
+            self.assertNotIn("hashtable_size_factor", output)
 
     def test_buffer_stamp_must_match_pipeline(self):
         """Pair stamped buffers with reducing pipelines only, at the reducer's own capacity.
