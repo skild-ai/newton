@@ -59,6 +59,9 @@ PGS_CONSTRAINT_TYPE_JOINT_FRICTION = 8
 # the normal, each present only for a positive pair coefficient [m] and bounded by that coefficient times the normal load.
 PGS_CONSTRAINT_TYPE_CONTACT_ROLLING = 9
 PGS_CONSTRAINT_TYPE_CONTACT_SPIN = 10
+# The free-body sweep's packed row metadata keeps the row type in the low bits of ``.w`` and the signed parent row above.
+MF_META_ROW_TYPE_BITS = 8
+MF_META_ROW_TYPE_MASK = (1 << MF_META_ROW_TYPE_BITS) - 1
 
 # Positive gaps below this slop [m] count as touching: it absorbs float32 residuals of
 # rows that land exactly at contact.

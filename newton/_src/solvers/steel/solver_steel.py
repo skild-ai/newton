@@ -65,6 +65,8 @@ from .kernels import (
     MATERIAL_COMBINE_MAX,
     MATERIAL_COMBINE_MIN,
     MATERIAL_COMBINE_MULTIPLY,
+    MF_META_ROW_TYPE_BITS,
+    MF_META_ROW_TYPE_MASK,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
@@ -2778,6 +2780,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._free_body_constraint_max = int(free_body_constraint_max)
         if self._free_body_constraint_max < 1:
             raise ValueError("free_body_constraint_max must be >= 1")
+        max_free_parent = (2**31 - 1) >> MF_META_ROW_TYPE_BITS
+        if self._free_body_constraint_max - 1 > max_free_parent:
+            raise ValueError(f"free_body_constraint_max must be at most {max_free_parent + 1}")
         self.warn_constraint_overflow = warn_constraint_overflow
         self._row_watermark = bool(row_watermark)
         self._row_watermarks = (
@@ -6547,7 +6552,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._mf_phi = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         # Packed metadata of the fused solve (int4 per row):
         #   .x = (dof_a << 16) | (dof_b & 0xFFFF), .y = eff_mass_inv bits,
-        #   .z = rhs bits, .w = row_type | (row_parent << 16)
+        #   .z = rhs bits, .w = row_type | (row_parent << MF_META_ROW_TYPE_BITS)
         self._mf_meta_packed = wp.zeros((worlds, rows * 4), dtype=wp.int32, device=device)
         self._mf_row_rebound_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._mf_row_w = wp.ones(
@@ -15051,7 +15056,7 @@ def _get_pack_mf_meta_kernel(free_body_constraint_max: int, device_arch: str) ->
         packed.x = (da << 16) | (db & 0xFFFF);
         packed.y = __float_as_int(diag);
         packed.z = __float_as_int(rhs_val);
-        packed.w = rt | (par << 16);
+        packed.w = rt | (par << {MF_META_ROW_TYPE_BITS});
         *reinterpret_cast<int4*>(&mf_meta.data[off_meta + i * 4]) = packed;
     }}
 #endif
@@ -15771,7 +15776,7 @@ def _get_pgs_solve_local_owned_kernel(
             const int dof_b = (packed_dofs << 16) >> 16;
             const float inverse_diagonal = __int_as_float(meta.y);
             const int packed_type_parent = meta.w;
-            const int mf_row_type = packed_type_parent & 0xFFFF;
+            const int mf_row_type = packed_type_parent & {MF_META_ROW_TYPE_MASK};
             if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
                 && global_iteration < friction_start_iteration) {{
                 s_mf_lambda[mf_row] = 0.0f;
@@ -15793,16 +15798,16 @@ def _get_pgs_solve_local_owned_kernel(
             if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}) {{
                 if (new_impulse_mf < 0.0f) new_impulse_mf = 0.0f;
             }} else if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
-                const int parent_mf = packed_type_parent >> 16;
+                const int parent_mf = packed_type_parent >> {MF_META_ROW_TYPE_BITS};
                 if (mf_row != parent_mf + 1) {{
                     new_impulse_mf = old_impulse_mf;
                 }} else {{
                     float lambda_n_mf = s_mf_lambda[parent_mf];
                     for (int patch_row =
-                             (mf_meta.data[mf_meta_offset + parent_mf * 4 + 3] >> 16);
+                             (mf_meta.data[mf_meta_offset + parent_mf * 4 + 3] >> {MF_META_ROW_TYPE_BITS});
                          patch_row >= 0 && patch_row != parent_mf;
                          patch_row =
-                             (mf_meta.data[mf_meta_offset + patch_row * 4 + 3] >> 16))
+                             (mf_meta.data[mf_meta_offset + patch_row * 4 + 3] >> {MF_META_ROW_TYPE_BITS}))
                         lambda_n_mf += s_mf_lambda[patch_row];
                     const float radius_mf = fmaxf(
                         mf_row_mu.data[mf_offset + mf_row] * lambda_n_mf, 0.0f);
@@ -16717,9 +16722,9 @@ def _get_pgs_solve_mf_gs_kernel(
         mf_friction_radius = f"""            float radius = 0.0f;
             if (mf_rt == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
                 float lambda_n = s_lam_mf[mf_par];
-                for (int patch_row = (mf_meta.data[off_meta + mf_par * 4 + 3] >> 16);
+                for (int patch_row = (mf_meta.data[off_meta + mf_par * 4 + 3] >> {MF_META_ROW_TYPE_BITS});
                      patch_row >= 0 && patch_row != mf_par;
-                     patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
+                     patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> {MF_META_ROW_TYPE_BITS}))
                     lambda_n += s_lam_mf[patch_row];
                 radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);
                 // A zero disk with no carried impulse cannot change the velocity.
@@ -16813,7 +16818,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
             for (int i = lane; i < m_mf; i += 32) {{
                 float lam = s_lam_mf[i];
-                float y = (mf_meta.data[off_meta + i * 4 + 3] & 0xFFFF) == {vlim_type} ? lam : lam + beta * (lam - mom_prev_m[i]);
+                float y = (mf_meta.data[off_meta + i * 4 + 3] & {MF_META_ROW_TYPE_MASK}) == {vlim_type} ? lam : lam + beta * (lam - mom_prev_m[i]);
                 mom_prev_m[i] = lam;
                 mom_e_m[i] = y - lam;
                 s_lam_mf[i] = y;
@@ -16985,7 +16990,7 @@ def _get_pgs_solve_mf_gs_kernel(
             float cur_MiJtb = pre_MiJtb;
             // The first row of a friction pair also solves the second, so the sweep steps over it.
             next_i = i + 1;
-            if ((meta.w & 0xFFFF) == {int(PGS_CONSTRAINT_TYPE_FRICTION)} && i == (meta.w >> 16) + 1) next_i = i + 2;
+            if ((meta.w & {MF_META_ROW_TYPE_MASK}) == {int(PGS_CONSTRAINT_TYPE_FRICTION)} && i == (meta.w >> {MF_META_ROW_TYPE_BITS}) + 1) next_i = i + 2;
             if (next_i < mf_main_end) {{
                 int next_mf6 = mf6_base + next_i * 6;
                 pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + next_i * 4]);
@@ -17003,8 +17008,8 @@ def _get_pgs_solve_mf_gs_kernel(
             int dof_b = (meta.x << 16) >> 16;
             float mf_diag = __int_as_float(meta.y);
             int packed_tp = meta.w;
-            int mf_rt = packed_tp & 0xFFFF;
-            int mf_par = packed_tp >> 16;
+            int mf_rt = packed_tp & {MF_META_ROW_TYPE_MASK};
+            int mf_par = packed_tp >> {MF_META_ROW_TYPE_BITS};
             if (mf_rt == {int(PGS_CONSTRAINT_TYPE_FRICTION)} && global_iter < friction_start_iteration) {{
                 s_lam_mf[i] = 0.0f;
                 if (next_i == i + 2) s_lam_mf[i + 1] = 0.0f;
@@ -17052,7 +17057,7 @@ def _get_pgs_solve_mf_gs_kernel(
 {fused_velocity_clamp_pass}
         for (int i = mf_contact_end; i < m_mf; i++) {{
             int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);
-            if ((meta.w & 0xFFFF) != {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)}) continue;
+            if ((meta.w & {MF_META_ROW_TYPE_MASK}) != {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)}) continue;
             int dof_a = meta.x >> 16;
             int dof_b = (meta.x << 16) >> 16;
             float mf_diag = __int_as_float(meta.y);

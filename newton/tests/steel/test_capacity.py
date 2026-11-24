@@ -12,7 +12,11 @@ import warp as wp
 
 import newton
 from newton._src.solvers.steel.friction_patches import FrictionPatches
-from newton._src.solvers.steel.kernels import allocate_world_contact_slots, finalize_mf_constraint_counts
+from newton._src.solvers.steel.kernels import (
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    allocate_world_contact_slots,
+    finalize_mf_constraint_counts,
+)
 from newton._src.solvers.steel.solver_steel import _STATIC_SHARED_MEMORY_BYTES, _mfgs_block_shared_bytes
 from newton.solvers import SolverSteel
 from newton.tests.steel._fixtures import printf_capture_is_reliable, steel_mode_options
@@ -1159,6 +1163,41 @@ def test_sweep_shared_memory_fits_static_limit(test, device):
         SolverSteel(model, articulation_constraint_max=16384)
 
 
+def test_free_body_rows_past_16_bit_parent_index(test, device):
+    """Apply the sliding rows of free-body contacts whose normal row index is 32768 or more."""
+    # 900 bodies of nine boxes each: about 36,000 live rows from 5,400 DOFs.
+    builder = newton.ModelBuilder()
+    builder.rigid_gap = 0.002
+    builder.add_ground_plane()
+    for ix in range(30):
+        for iy in range(30):
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.1 * ix, 0.1 * iy, 0.01), wp.quat_identity()))
+            for k in range(9):
+                offset = wp.vec3(0.025 * (k % 3), 0.025 * (k // 3), 0.0)
+                builder.add_shape_box(body, xform=wp.transform(offset, wp.quat_identity()), hx=0.01, hy=0.01, hz=0.01)
+    model = builder.finalize(device=device)
+    solver = SolverSteel(model, free_body_constraint_max=65536)
+    pipeline = newton.CollisionPipeline(model, broad_phase="sap")
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    qd = state_0.body_qd.numpy()
+    qd[:, 0] = 0.5
+    state_0.body_qd.assign(qd)
+    for _ in range(12):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    test.assertFalse(solver.constraint_overflow.numpy().any())
+    live_rows = int(solver._mf_constraint_count.numpy()[0])
+    row_type = solver._mf_row_type.numpy()[0, :live_rows]
+    row_parent = solver._mf_row_parent.numpy()[0, :live_rows]
+    test.assertTrue((row_parent[row_type == PGS_CONSTRAINT_TYPE_FRICTION] >= 32768).any())
+    # Friction of mu 1 over 0.05 s stops every box; a box whose sliding rows were skipped keeps 0.5 m/s.
+    np.testing.assert_array_less(np.abs(state_0.body_qd.numpy()[:, 0]), 0.1)
+    with test.assertRaisesRegex(ValueError, "free_body_constraint_max must be at most 8388608"):
+        SolverSteel(model, free_body_constraint_max=(1 << 23) + 1)
+
+
 class TestSteelSweepSharedMemory(unittest.TestCase):
     pass
 
@@ -1173,6 +1212,12 @@ add_function_test(
     TestSteelSweepSharedMemory,
     "test_sweep_shared_memory_fits_static_limit",
     test_sweep_shared_memory_fits_static_limit,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelSweepSharedMemory,
+    "test_free_body_rows_past_16_bit_parent_index",
+    test_free_body_rows_past_16_bit_parent_index,
     devices=get_cuda_test_devices(),
 )
 
