@@ -2530,7 +2530,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 shapes (other notifications and changes to static or kinematic owners wake
                 every island). Driven articulations (nonzero drive gains) and articulations with
                 passive springs (nonzero :attr:`~newton.Model.joint_stiffness` on a PRISMATIC,
-                REVOLUTE or D6 tree joint) stay awake.
+                REVOLUTE or D6 tree joint) stay awake. For resting stacks that stay awake with the
+                default contact order, see :ref:`Tuning Solver Reference`.
                 Sleeping is configured at construction; rebuild captured graphs to change it. Construction raises :class:`ValueError` with ``contact_warmstart``
                 or ``velocity_iterations``, or for a model without articulations, and
                 :class:`NotImplementedError` with ``articulated_contact_response="propagation"`` and
