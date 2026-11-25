@@ -4029,6 +4029,15 @@ class TestSteelLatencyFused(unittest.TestCase):
         """Match the per-pass launches with trees (a limited arm, a ball chain) and free boxes in every block role."""
         self._check_fused_matches(_build_latency_scene("cuda:0"), iterations=8, enable_joint_limits=True)
 
+    def test_fused_momentum_build_failure_is_reported(self):
+        """An accelerated fused solve reports its compilation error on the selected path."""
+        model = _build_latency_scene("cuda:0")
+        with patch.object(solver_steel.latency_fused, "get_fused_iteration_kernel") as build:
+            build.return_value.module.load.side_effect = RuntimeError("fused kernel load failed")
+            with self.assertRaisesRegex(RuntimeError, "could not compile Nesterov momentum"):
+                SolverSteel(model, **steel_mode_options("colored"), nesterov_momentum=True)
+        build.assert_called_once()
+
     def test_fused_momentum_matches_per_pass_launches(self):
         """Apply the same momentum to the colored solve inside and outside the fused loop."""
         model = _build_latency_scene("cuda:0")

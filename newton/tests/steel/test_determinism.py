@@ -784,6 +784,39 @@ def test_deterministic_joint_friction_rows_follow_dof_order(test, device):
         np.testing.assert_allclose(row_mu[world, friction_rows], expected, rtol=1.0e-6)
 
 
+def test_multiwarp_closures_keep_joint_order(test, device):
+    """Reserve a redundant loop's active joints in model order for both momentum settings."""
+    builder = _build_four_bar()
+    first = builder.joint_count - 1
+    for _ in range(95):
+        builder.add_joint_ball(
+            parent=builder.joint_parent[first],
+            child=builder.joint_child[first],
+            parent_xform=builder.joint_X_p[first],
+            child_xform=builder.joint_X_c[first],
+        )
+    model = builder.finalize(device=device)
+    enabled = model.joint_enabled.numpy()
+    enabled[first::7] = False
+    model.joint_enabled.assign(enabled)
+    for momentum in (False, True):
+        solver = SolverSteel(
+            model,
+            iterations=2,
+            deterministic=wp.DeterministicMode.NOT_GUARANTEED,
+            nesterov_momentum=momentum,
+            articulation_constraint_max=320,
+        )
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        for _ in range(8):
+            solver.step(state, model.state(), model.control(), None, 0.005)
+            slots = solver._connect_slot.numpy()
+            active = enabled[first:].astype(bool)
+            np.testing.assert_array_equal(slots[~active], -1)
+            np.testing.assert_array_equal(np.diff(slots[active]), 3)
+
+
 def test_deterministic_bilateral_rows_follow_element_order(test, device):
     """Give a world's mimic rows, then its loop-closure rows, their slots in element order."""
     mimic_count = 512
@@ -925,6 +958,7 @@ for _fn in (
     test_deterministic_launches_replay_identically,
     test_deterministic_joint_rows_follow_articulation_order,
     test_deterministic_joint_friction_rows_follow_dof_order,
+    test_multiwarp_closures_keep_joint_order,
     test_deterministic_bilateral_rows_follow_element_order,
     test_inherited_global_mode_keeps_steel_ordering,
 ):

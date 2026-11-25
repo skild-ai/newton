@@ -4,11 +4,13 @@
 """Nesterov sweep history for CUDA PGS owners."""
 
 from dataclasses import dataclass
+from functools import cache
 
 import warp as wp
 
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_TORSION,
@@ -118,17 +120,10 @@ class SplitSweep:
     twist: wp.array2d[float]
     prev_twist: wp.array2d[float]
     prev_velocity: wp.array[float]
-    prev: wp.array2d[float]
-    extrap: wp.array2d[float]
+    history: wp.array2d[wp.vec2]
     age: wp.array[int]
     correction_norm_sq: wp.array[float]
-    propagation: int
-    torsion: int
     prop_torsion_head: wp.array[int]
-    warmstart: int
-    initial_norm_sq: wp.array[float]
-    fixed_normal: int
-    compliance: int
     dense_gamma: wp.array2d[float]
     free_gamma: wp.array2d[float]
     prop_gamma: wp.array2d[float]
@@ -149,11 +144,7 @@ _WARP_SUM = """
 
 
 @wp.func_native(_WARP_SUM)
-def _warp_sum(x: float) -> float: ...
-
-
-@wp.func_native(_WARP_SUM)
-def _warp_sum_fp64(x: wp.float64) -> float: ...
+def _warp_sum_double(x: wp.float64) -> wp.float64: ...
 
 
 @wp.func_native("""
@@ -164,50 +155,52 @@ def _warp_sum_fp64(x: wp.float64) -> float: ...
 def _warp_sync(): ...
 
 
+_Progress = wp.types.vector(length=5, dtype=wp.float64)
+
+
 @wp.func
 def _sweep_progress(
     world: int,
     lane: int,
+    stride: int,
     rows: wp.array2d[float],
     kinds: wp.array2d[int],
     count: wp.array[int],
     offset: int,
     h: SplitSweep,
+    measure_load: bool,
 ):
     # Color capacity changes the packing order. Round the world sum once
     # before choosing beta so a different packing gives the same lookahead.
+    load = wp.float64(0.0)
     dot = wp.float64(0.0)
     norm = wp.float64(0.0)
     released = wp.float64(0.0)
     displacement = wp.float64(0.0)
-    for i in range(lane, wp.min(count[world], rows.shape[1]), 32):
-        e = h.extrap[world, offset + i]
+    for i in range(lane, wp.min(count[world], rows.shape[1]), stride):
+        old = h.history[world, offset + i]
         x = rows[world, i]
-        prev = h.prev[world, offset + i]
+        prev, e = old[0], old[1]
         correction = x - prev - e
         dot += wp.float64(correction * e)
         norm += wp.float64(correction * correction)
         displacement += wp.float64((x - prev) * (x - prev))
         # Extrapolating a newly released unilateral row would reapply it in tension.
-        kind = kinds[world, i]
-        if (kind == PGS_CONSTRAINT_TYPE_CONTACT or kind == PGS_CONSTRAINT_TYPE_JOINT_LIMIT) and x == 0.0 and prev > 0.0:
-            released = wp.float64(1.0)
-    return wp.vec4d(dot, norm, released, displacement)
+        if measure_load:
+            kind = kinds[world, i]
+            if kind == PGS_CONSTRAINT_TYPE_CONTACT or kind == PGS_CONSTRAINT_TYPE_FRICTION:
+                load += wp.float64(x * x)
+        if x == 0.0 and prev > 0.0:
+            kind = kinds[world, i]
+            if kind == PGS_CONSTRAINT_TYPE_CONTACT or kind == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
+                released = wp.float64(1.0)
+    return _Progress(dot, norm, released, displacement, load)
 
 
 @wp.func
-def _impulse_norm_sq(world: int, lane: int, count: wp.array[int], rows: wp.array2d[float]):
-    norm = wp.float64(0.0)
-    for i in range(lane, wp.min(count[world], rows.shape[1]), 32):
-        x = rows[world, i]
-        norm += wp.float64(x * x)
-    return norm
-
-
-@wp.func
-def _has_soft_row(world: int, lane: int, count: wp.array[int], gamma: wp.array2d[float]):
+def _has_soft_row(world: int, lane: int, stride: int, count: wp.array[int], gamma: wp.array2d[float]):
     soft = int(0)
-    for i in range(lane, wp.min(count[world], gamma.shape[1]), 32):
+    for i in range(lane, wp.min(count[world], gamma.shape[1]), stride):
         if gamma[world, i] > 0.0:
             soft = 1
     return soft
@@ -217,144 +210,287 @@ def _has_soft_row(world: int, lane: int, count: wp.array[int], gamma: wp.array2d
 def _update_rows(
     world: int,
     lane: int,
+    stride: int,
     rows: wp.array2d[float],
     kinds: wp.array2d[int],
     count: wp.array[int],
     offset: int,
     beta: float,
+    has_velocity_limits: bool,
     h: SplitSweep,
 ):
-    for i in range(lane, wp.min(count[world], rows.shape[1]), 32):
+    for i in range(lane, wp.min(count[world], rows.shape[1]), stride):
         x = rows[world, i]
         e = float(0.0)
-        if beta != 0.0 and kinds[world, i] != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-            y = x + beta * (x - h.prev[world, offset + i])
+        if beta != 0.0 and (not has_velocity_limits or kinds[world, i] != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT):
+            y = x + beta * (x - h.history[world, offset + i][0])
             rows[world, i] = y
             e = y - x
-        h.prev[world, offset + i] = x
-        h.extrap[world, offset + i] = e
+        h.history[world, offset + i] = wp.vec2(x, e)
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    __syncthreads();
+#endif
+""")
+def _block_sync(): ...
+
+
+@cache
+def _get_block_progress(warps: int):
+    """Sum one progress vector across all warps of a world's fused solve."""
+
+    @wp.func_native(
+        """
+    #if defined(__CUDA_ARCH__)
+        const int lane = threadIdx.x % 32;
+        const int warp = threadIdx.x / 32;
+        __shared__ double partial[WARPS][5];
+        #pragma unroll
+        for (int i = 0; i < 5; ++i) {
+            for (int d = 16; d; d >>= 1) x[i] += __shfl_xor_sync(0xffffffff, x[i], d);
+            if (lane == 0) partial[warp][i] = x[i];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < 5; ++i) {
+            double sum = 0;
+            for (int w = 0; w < blockDim.x / 32; ++w) sum += partial[w][i];
+            x[i] = sum;
+        }
+        __syncthreads();
+    #endif
+        return x;
+    """.replace("WARPS", str(warps))
+    )
+    def _block_progress(x: _Progress) -> _Progress: ...
+
+    return _block_progress
 
 
 @wp.func
-def split_momentum(world: int, lane: int, iteration: int, friction_transition: bool, h: SplitSweep):
-    """Advance the complete iterate once, before its first row phase, including cached tree twists."""
-    free_offset = h.dense.shape[1]
-    prop_offset = free_offset + h.free.shape[1]
-    age = int(0)
-    beta = float(0.0)
-    if iteration == 0 and h.warmstart != 0:
-        carried = _impulse_norm_sq(world, lane, h.dense_count, h.dense)
-        carried += _impulse_norm_sq(world, lane, h.free_count, h.free)
-        carried += _impulse_norm_sq(world, lane, h.prop_count, h.prop)
-        carried_norm = _warp_sum_fp64(carried)
-        if lane == 0:
-            h.initial_norm_sq[world] = carried_norm
-    if iteration > 0:
-        progress = _sweep_progress(world, lane, h.dense, h.dense_type, h.dense_count, 0, h)
-        progress += _sweep_progress(world, lane, h.free, h.free_type, h.free_count, free_offset, h)
-        progress += _sweep_progress(world, lane, h.prop, h.prop_type, h.prop_count, prop_offset, h)
-        dot = _warp_sum_fp64(progress[0])
-        norm = _warp_sum_fp64(progress[1])
-        released = _warp_sum_fp64(progress[2])
-        displacement = _warp_sum_fp64(progress[3])
-        contracting = iteration == 1 or norm <= h.correction_norm_sq[world]
-        restart = friction_transition or dot < 0.0
-        if h.propagation != 0:
-            restart = restart or h.clamp[world, 0] != 0.0
-        if h.propagation != 0 and h.fixed_normal != 0:
-            restart = restart or released != 0.0
-        torsion = False
-        if h.torsion != 0:
-            # Torsion rows occur on either articulated contact route. Shape
-            # filtering can leave a world with ordinary contacts only.
-            present = int(0)
-            for i in range(lane, wp.min(h.dense_count[world], h.dense.shape[1]), 32):
-                if h.dense_type[world, i] == PGS_CONSTRAINT_TYPE_TORSION:
+def _warp_progress(x: _Progress):
+    return _Progress(
+        _warp_sum_double(x[0]),
+        _warp_sum_double(x[1]),
+        _warp_sum_double(x[2]),
+        _warp_sum_double(x[3]),
+        _warp_sum_double(x[4]),
+    )
+
+
+@dataclass(frozen=True)
+class SplitSweepOptions:
+    """Sweep features fixed when the solver selects its CUDA kernels."""
+
+    propagation: bool
+    torsion: bool
+    warmstart: bool
+    fixed_normal: bool
+    compliance: bool
+    velocity_limits: bool
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    return __syncthreads_or(x);
+#else
+    return x;
+#endif
+""")
+def _block_any(x: int) -> int: ...
+
+
+@wp.func
+def _released(
+    world: int,
+    lane: int,
+    stride: int,
+    rows: wp.array2d[float],
+    kinds: wp.array2d[int],
+    count: wp.array[int],
+    offset: int,
+    h: SplitSweep,
+):
+    hit = int(0)
+    for i in range(lane, wp.min(count[world], rows.shape[1]), stride):
+        if rows[world, i] == 0.0 and h.history[world, offset + i][0] > 0.0:
+            kind = kinds[world, i]
+            if kind == PGS_CONSTRAINT_TYPE_CONTACT or kind == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
+                hit = 1
+    return hit
+
+
+@cache
+def get_split_momentum(warps: int, options: SplitSweepOptions):
+    """Use the owner block to advance the iterate before its first row phase."""
+    measure_load = options.warmstart or (options.propagation and options.fixed_normal)
+    release_only = (
+        warps > 1 and options.fixed_normal and not (options.torsion or options.warmstart or options.compliance)
+    )
+    stride = 32 * warps
+    sync = _warp_sync if warps == 1 else _block_sync
+    reduce_progress = _warp_progress if warps == 1 else _get_block_progress(warps)
+
+    @wp.func(module="unique")
+    def advance(world: int, lane: int, iteration: int, previous_age: int, friction_transition: bool, h: SplitSweep):
+        """Advance the complete iterate once, before its first row phase, including cached tree twists."""
+        free_offset = h.dense.shape[1]
+        prop_offset = free_offset + h.free.shape[1]
+        age = int(0)
+        beta = float(0.0)
+        if iteration > 0:
+            if wp.static(release_only) and previous_age == 0:
+                # The recovery sweep cannot extrapolate yet. Only a newly
+                # released row can prevent the age counter from advancing.
+                released_row = _released(world, lane, stride, h.dense, h.dense_type, h.dense_count, 0, h)
+                released_row |= _released(world, lane, stride, h.free, h.free_type, h.free_count, free_offset, h)
+                released_row |= _released(world, lane, stride, h.prop, h.prop_type, h.prop_count, prop_offset, h)
+                dot, norm, released, displacement, load = (
+                    float(0.0),
+                    float(0.0),
+                    float(_block_any(released_row)),
+                    float(0.0),
+                    float(0.0),
+                )
+            else:
+                progress = _sweep_progress(
+                    world, lane, stride, h.dense, h.dense_type, h.dense_count, 0, h, measure_load
+                )
+                progress += _sweep_progress(
+                    world, lane, stride, h.free, h.free_type, h.free_count, free_offset, h, measure_load
+                )
+                progress += _sweep_progress(
+                    world, lane, stride, h.prop, h.prop_type, h.prop_count, prop_offset, h, measure_load
+                )
+                total = reduce_progress(progress)
+                dot, norm, released, displacement = float(total[0]), float(total[1]), float(total[2]), float(total[3])
+                load = float(total[4])
+            restart = friction_transition or dot < 0.0
+            if wp.static(options.propagation and options.velocity_limits):
+                restart = restart or h.clamp[world, 0] != 0.0
+            if wp.static(options.propagation) and wp.static(options.fixed_normal):
+                restart = restart or released != 0.0
+            torsion = False
+            if wp.static(options.torsion):
+                # Torsion rows occur on either articulated contact route. Shape
+                # filtering can leave a world with ordinary contacts only.
+                present = int(0)
+                for i in range(lane, wp.min(h.dense_count[world], h.dense.shape[1]), stride):
+                    if h.dense_type[world, i] == PGS_CONSTRAINT_TYPE_TORSION:
+                        present = 1
+                # Propagation reserves inert spin slots before grouping. The list
+                # contains only groups admitted to the current constraint solve.
+                if world < h.prop_torsion_head.shape[0] and h.prop_torsion_head[world] >= 0:
                     present = 1
-            # Propagation reserves inert spin slots before grouping. The list
-            # contains only groups admitted to the current constraint solve.
-            if world < h.prop_torsion_head.shape[0] and h.prop_torsion_head[world] >= 0:
-                present = 1
-            torsion = _warp_sum(float(present)) > 0.0
-            restart = restart or (torsion and (not contracting or released != 0.0))
-        if not restart:
-            age = h.age[world] + 1
-            if age > 1:
-                beta = float(age - 1) / float(age + 2)
-                if h.warmstart != 0 and h.initial_norm_sq[world] > 0.0:
-                    # A nearly satisfied warm start already carries the contact
-                    # load. Weight the lookahead by the new correction's share
-                    # of the squared impulse, to avoid re-exciting the grasp.
-                    beta *= norm / (norm + h.initial_norm_sq[world])
-                bounded = torsion or (h.propagation != 0 and h.fixed_normal != 0)
-                if h.compliance != 0:
-                    soft = _has_soft_row(world, lane, h.dense_count, h.dense_gamma)
-                    soft += _has_soft_row(world, lane, h.free_count, h.free_gamma)
-                    soft += _has_soft_row(world, lane, h.prop_count, h.prop_gamma)
-                    bounded = bounded or _warp_sum(float(soft)) > 0.0
-                if displacement > 0.0 and bounded:
-                    # Keep the extrapolated impulse within the size of the last projected correction.
-                    beta = wp.min(beta, wp.sqrt(norm / displacement))
-        _warp_sync()
-        if lane == 0:
-            h.correction_norm_sq[world] = norm
-    _warp_sync()
-    if lane == 0:
-        h.age[world] = age
-        h.clamp[world, 0] = 0.0
-    _update_rows(world, lane, h.dense, h.dense_type, h.dense_count, 0, beta, h)
-    _update_rows(world, lane, h.free, h.free_type, h.free_count, free_offset, beta, h)
-    _update_rows(world, lane, h.prop, h.prop_type, h.prop_count, prop_offset, beta, h)
-    _warp_sync()
-    if h.propagation == 0:
-        # Stateless clamps contribute to velocity independently of stored
-        # impulses. Apply only the extrapolated row impulses on phased sweeps.
-        if beta != 0.0:
-            for i in range(lane, h.dofs.shape[1], 32):
+                contracting = iteration == 1 or norm <= h.correction_norm_sq[world]
+                torsion = reduce_progress(_Progress(wp.float64(present), 0.0, 0.0, 0.0, 0.0))[0] > 0.0
+                restart = restart or (torsion and (not contracting or released != 0.0))
+            if not restart:
+                age = previous_age + 1
+                if age > 1:
+                    beta = float(age - 1) / float(age + 2)
+                    has_soft_contacts = False
+                    if wp.static(options.compliance):
+                        soft = _has_soft_row(world, lane, stride, h.dense_count, h.dense_gamma)
+                        soft += _has_soft_row(world, lane, stride, h.free_count, h.free_gamma)
+                        soft += _has_soft_row(world, lane, stride, h.prop_count, h.prop_gamma)
+                        has_soft_contacts = reduce_progress(_Progress(wp.float64(soft), 0.0, 0.0, 0.0, 0.0))[0] > 0.0
+                    if wp.static(measure_load) and load > 0.0:
+                        if wp.static(options.warmstart):
+                            # A matching contact may gain load after the seed is applied.
+                            beta *= norm / (norm + load)
+                        elif not has_soft_contacts:
+                            # Limit lookahead as corrections become small relative to the
+                            # supported load, including before a projectile leaves its cup.
+                            beta = wp.min(beta, wp.sqrt(norm / load))
+                    bounded = (
+                        torsion
+                        or (wp.static(options.propagation) and wp.static(options.fixed_normal))
+                        or has_soft_contacts
+                    )
+                    if displacement > 0.0 and bounded:
+                        # Keep the extrapolated impulse within the size of the last projected correction.
+                        beta = wp.min(beta, wp.sqrt(norm / displacement))
+            if wp.static(options.torsion):
+                sync()
+                if lane == 0:
+                    h.correction_norm_sq[world] = norm
+        if wp.static(options.propagation and options.velocity_limits):
+            sync()
+            if lane == 0:
+                h.clamp[world, 0] = 0.0
+        _update_rows(world, lane, stride, h.dense, h.dense_type, h.dense_count, 0, beta, True, h)
+        _update_rows(world, lane, stride, h.free, h.free_type, h.free_count, free_offset, beta, True, h)
+        _update_rows(world, lane, stride, h.prop, h.prop_type, h.prop_count, prop_offset, beta, False, h)
+        if wp.static(not options.propagation):
+            sync()
+            # Stateless clamps contribute to velocity independently of stored
+            # impulses. Apply only the extrapolated row impulses on phased sweeps.
+            if beta != 0.0:
+                for i in range(lane, h.dofs.shape[1], stride):
+                    dof = h.dofs[world, i]
+                    if dof >= 0:
+                        v = h.velocity[dof]
+                        for row in range(wp.min(h.dense_count[world], h.dense.shape[1])):
+                            e = h.history[world, row][1]
+                            if e != 0.0:
+                                v += h.response[world, row, i] * e
+                        h.velocity[dof] = v
+                sync()
+                # Each lane owns one component of every free body, including
+                # coincident endpoints. Apply both responses in row order.
+                if lane < 6:
+                    for row in range(wp.min(h.free_count[world], h.free.shape[1])):
+                        e = h.history[world, free_offset + row][1]
+                        if e != 0.0:
+                            first = h.free_a[world, row]
+                            second = h.free_b[world, row]
+                            if first >= 0:
+                                dof = h.dofs[world, first + lane]
+                                h.velocity[dof] += e * h.response_a[world, row, lane]
+                            if second >= 0:
+                                dof = h.dofs[world, second + lane]
+                                h.velocity[dof] += e * h.response_b[world, row, lane]
+                sync()
+            return age
+        # After a restart the next sweep has zero lookahead too. No later
+        # extrapolation can read this iteration's velocity or twist snapshot.
+        if age > 0:
+            for i in range(lane, h.dofs.shape[1], stride):
                 dof = h.dofs[world, i]
                 if dof >= 0:
                     v = h.velocity[dof]
-                    for row in range(wp.min(h.dense_count[world], h.dense.shape[1])):
-                        e = h.extrap[world, row]
-                        if e != 0.0:
-                            v += h.response[world, row, i] * e
-                    h.velocity[dof] = v
-            _warp_sync()
-            # Each lane owns one component of every free body, including
-            # coincident endpoints. Apply both responses in row order.
-            if lane < 6:
-                for row in range(wp.min(h.free_count[world], h.free.shape[1])):
-                    e = h.extrap[world, free_offset + row]
-                    if e != 0.0:
-                        first = h.free_a[world, row]
-                        second = h.free_b[world, row]
-                        if first >= 0:
-                            dof = h.dofs[world, first + lane]
-                            h.velocity[dof] += e * h.response_a[world, row, lane]
-                        if second >= 0:
-                            dof = h.dofs[world, second + lane]
-                            h.velocity[dof] += e * h.response_b[world, row, lane]
-            _warp_sync()
-        return
-    for i in range(lane, h.dofs.shape[1], 32):
-        dof = h.dofs[world, i]
-        if dof >= 0:
-            v = h.velocity[dof]
-            if beta != 0.0:
-                h.velocity[dof] = v + beta * (v - h.prev_velocity[dof])
-            h.prev_velocity[dof] = v
-    start = h.body_start[world]
-    for i in range(lane, 6 * (h.body_start[world + 1] - start), 32):
-        body = h.bodies[start + i // 6]
-        axis = i % 6
-        v = h.twist[body, axis]
-        if beta != 0.0:
-            h.twist[body, axis] = v + beta * (v - h.prev_twist[body, axis])
-        h.prev_twist[body, axis] = v
-    _warp_sync()
+                    if beta != 0.0:
+                        h.velocity[dof] = v + beta * (v - h.prev_velocity[dof])
+                    h.prev_velocity[dof] = v
+            start = h.body_start[world]
+            for i in range(lane, 6 * (h.body_start[world + 1] - start), stride):
+                body = h.bodies[start + i // 6]
+                axis = i % 6
+                v = h.twist[body, axis]
+                if beta != 0.0:
+                    h.twist[body, axis] = v + beta * (v - h.prev_twist[body, axis])
+                h.prev_twist[body, axis] = v
+        sync()
+        return age
+
+    return advance
 
 
-@wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)
-def advance_split_sweep(histories: wp.array[SplitSweep], iteration: int, friction_transition: bool):
-    world, lane = wp.tid()
-    split_momentum(world, lane, iteration, friction_transition, histories[0])
+@cache
+def get_advance_split_sweep(options: SplitSweepOptions) -> wp.Kernel:
+    advance = get_split_momentum(1, options)
+
+    @wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)
+    def advance_split_sweep(histories: wp.array[SplitSweep], iteration: int, friction_transition: bool):
+        world, lane = wp.tid()
+        age = int(0)
+        if iteration > 0:
+            age = histories[0].age[world]
+        age = advance(world, lane, iteration, age, friction_transition, histories[0])
+        if lane == 0:
+            histories[0].age[world] = age
+
+    return advance_split_sweep

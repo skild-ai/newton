@@ -202,9 +202,9 @@ def _relative_rotation(q_hand, q_box):
 
 def test_warmstart_holds_carried_pinch(test, device):
     """Keep the warm start of a pinch carried at 0.2 m/s with body-frame matching, so the box does not twist."""
-    twist, matched = _twist_deg(device, warmstart=True, lift_speed=0.2)
+    twist, matched = _twist_deg(device, warmstart=True, lift_speed=0.2, worlds=32)
     test.assertGreater(matched, 0.9, f"only {matched:.1%} of the carried finger contacts kept their warm start")
-    test.assertLess(float(np.median(twist)), 1.0, f"carried box twisted {np.round(twist, 2)} deg in the grasp")
+    test.assertLess(float(np.median(twist)), 0.7, f"carried box twisted {np.round(twist, 2)} deg in the grasp")
 
 
 def test_rotating_color_order_holds_pinch_from_sorted_contacts(test, device):

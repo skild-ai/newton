@@ -32,7 +32,7 @@ from typing import Any
 import warp as wp
 
 from .kernels import WARP_DETERMINISM_OFF
-from .momentum import SplitSweep, split_momentum
+from .momentum import SplitSweep, SplitSweepOptions, get_split_momentum
 
 # Tree groups one fused kernel can carry, one warp each.
 MAX_TREE_SLOTS = 4
@@ -277,9 +277,9 @@ def _cache_snapshot(
                     cache.qd_base[world, slot, r] = body_qd[body, r]
 
 
-def warp_count(tree_slots: int) -> int:
-    """Warps per block: the row warp, one per tree group and the free-body warp."""
-    return 2 + tree_slots
+def warp_count(tree_slots: int, max_bodies: int) -> int:
+    """Reserve a warp for each stage and four warps for broad colored contact sweeps."""
+    return max(2 + tree_slots, 4 if max_bodies >= 32 else 0)
 
 
 def get_fused_iteration_kernel(
@@ -289,7 +289,8 @@ def get_fused_iteration_kernel(
     tree_natives: tuple[tuple[Any, Any, bool], ...],
     has_phase3: bool,
     has_phase5: bool,
-    nesterov_momentum: bool = False,
+    warps: int,
+    momentum_options: SplitSweepOptions | None = None,
 ) -> wp.Kernel:
     """Build the fused loop kernel for one solver configuration.
 
@@ -300,6 +301,7 @@ def get_fused_iteration_kernel(
     """
     n_slots = len(tree_natives)
     free_warp = 1 + n_slots
+    advance_momentum = get_split_momentum(warps, momentum_options) if momentum_options is not None else None
 
     @wp.func(module="unique")
     def row_phase(
@@ -350,12 +352,13 @@ def get_fused_iteration_kernel(
         world, t = wp.tid()
         warp_id = t // 32
         lane = t - warp_id * 32
+        momentum_age = int(0)
         for i in range(iterations):
             g = iteration_offset + i
-            if wp.static(nesterov_momentum):
-                if warp_id == 0:
-                    split_momentum(world, lane, i, g == friction_start_iteration, momentum[0])
-                _block_sync()
+            if wp.static(momentum_options is not None):
+                momentum_age = wp.static(advance_momentum)(
+                    world, t, i, momentum_age, g == friction_start_iteration, momentum[0]
+                )
             # row phases 3 (internal rows) and 4 (dense and free-body contacts)
             if warp_id == 0:
                 if wp.static(has_phase3):
@@ -426,6 +429,9 @@ def get_fused_iteration_kernel(
             if wp.static(has_phase5):
                 if warp_id == 0:
                     row_phase(world, 5, rows, omega, regularize, freeze_drive_rows, friction_start_iteration, g, v_out)
+                # The next lookahead reads phase 5 across the whole block.
+                if wp.static(momentum_options is not None):
+                    _block_sync()
 
     return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(
         steel_fused_propagation_loop
