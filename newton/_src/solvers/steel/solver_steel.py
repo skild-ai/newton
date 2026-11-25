@@ -116,6 +116,7 @@ from .kernels import (
     apply_world_impulses_to_velocity,
     assign_world_contact_slots,
     bound_world_contact_depenetration_bias,
+    build_distance_limit_rows,
     build_joint_limit_rows,
     build_mass_update_mask,
     build_mf_body_map,
@@ -1497,8 +1498,15 @@ class SolverSteel(SolverBase, CouplingInterface):
       stay stable only for roughly ``dt * sqrt(stiffness / m_eff) < 2`` per DOF.
     - Joint limits: with ``enable_joint_limits=True``, every finite
       :attr:`~newton.Model.joint_limit_lower` / :attr:`~newton.Model.joint_limit_upper` of a
-      PRISMATIC, REVOLUTE or D6 DOF is a unilateral row. Joint limits are not enforced by
-      default. Joint velocity limits (:attr:`~newton.Model.joint_velocity_limit`) are
+      PRISMATIC, REVOLUTE or D6 DOF is a unilateral row, and so is each positive
+      ``min_distance`` and non-negative ``max_distance`` of a DISTANCE joint that roots its articulation (the
+      limits of its first DOF) on the distance between the joint's two anchors, along the anchors' predicted
+      relative velocity while they coincide; a zero ``max_distance`` holds the anchors together on all three
+      axes. The row bounds the anchor's velocity along one direction, not the next anchor distance: when the
+      child anchor is offset from the child's center of mass, its impulse can also change the anchor's transverse
+      velocity, and rotation adds integration error, so the anchor can pass a positive bound. More iterations of
+      the same row do not remove this. Any other DISTANCE joint raises :class:`NotImplementedError` when limits
+      are enabled. Joint limits are not enforced by default. Joint velocity limits (:attr:`~newton.Model.joint_velocity_limit`) are
       enforced as rows when ``enable_joint_velocity_limits`` is set.
     - Experimental dry joint friction: with ``enable_joint_friction=True``,
       :attr:`~newton.Model.joint_friction` of PRISMATIC, REVOLUTE, BALL and D6 DOFs bounds one
@@ -1575,6 +1583,9 @@ class SolverSteel(SolverBase, CouplingInterface):
       when its ``target_kind`` / ``target`` link names a loop joint or mimic constraint
       between the row's own bodies or joints. Particles are not simulated.
     - Gradients are not supported.
+    - Bias (Coriolis and centrifugal) forces are explicit, so articulated chains with high joint
+      speeds can gain energy; a smaller ``dt`` reduces it and more ``iterations`` do not. See
+      :ref:`Tuning Solver Reference`.
 
     On CUDA, branched articulations use sparse mass factors when
     every articulated (non-free-body) response group shares one joint topology with at most
@@ -1605,6 +1616,12 @@ class SolverSteel(SolverBase, CouplingInterface):
     dropped by global contact reduction. The flags persist until :meth:`reset`. Read them
     in a device kernel (for example an RL termination term) or call
     :meth:`check_constraint_capacity` outside graph capture.
+
+    Treat row and contact-buffer overflow as a sizing error and raise those capacities until no world is flagged.
+    The unsolvable cross-world contacts described below set the same flag, and no capacity clears them. Which
+    contacts keep their rows is described under ``deterministic``. As that set changes, a contact that penetrated
+    while it had no rows is pushed out by the position correction when it regains them, which can add energy and
+    make the state diverge.
 
     Global articulations are solved together with world 0. A kinematic global free body
     (for example a moving platform) contacts the bodies of every world.
@@ -1968,6 +1985,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="condim",
+                update_flags=ModelFlags.SHAPE_PROPERTIES,
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.SHAPE,
                 assignment=Model.AttributeAssignment.MODEL,
@@ -1981,6 +1999,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="adhesion",
+                update_flags=ModelFlags.SHAPE_PROPERTIES,
                 namespace=_ATTRIBUTE_NAMESPACE,
                 frequency=Model.AttributeFrequency.SHAPE,
                 assignment=Model.AttributeAssignment.MODEL,
@@ -2108,10 +2127,13 @@ class SolverSteel(SolverBase, CouplingInterface):
             iterations: Number of projected Gauss-Seidel iterations per step.
             baumgarte: Baumgarte position-correction factor of contact and joint-limit rows,
                 as a fraction of the position error removed per step.
-            cfm: Constraint force mixing added to every row's effective-mass diagonal,
-                which regularizes redundant rows. Drive rows of ``drive_mode="rows"`` use
-                their exact unit response instead, and the coupled contact solves of a
-                ``friction_mode`` other than ``"fixed_normal"`` leave it off their contact blocks.
+            cfm: Shift added to the step denominator ``J H^-1 J^T`` of the scalar PGS rows. Drive
+                rows of ``drive_mode="rows"`` use their exact unit response instead, the coupled contact
+                solves of a ``friction_mode`` other than ``"fixed_normal"`` leave it off their contact
+                blocks, and compliant normal rows replace it with their compliance term. It damps
+                unconverged sweeps, leaves the converged solution of unregularized rows unchanged and
+                scales the penetration of rows regularized by ``contact_regularization``; to soften
+                contacts use ``contact_regularization`` or ``contact_compliance``.
             relaxation: Successive over-relaxation factor of the PGS sweep.
             update_mass_matrix_interval: Rebuild and refactor the mass matrix every this many
                 calls to :meth:`step`; ``1`` rebuilds it every step. Larger values reuse a
@@ -2123,8 +2145,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 is checked on the device, so replaying a graph after a step or graph with a
                 different timestep refreshes the factor even between scheduled rebuilds.
             enable_joint_limits: Enforce :attr:`~newton.Model.joint_limit_lower` and
-                :attr:`~newton.Model.joint_limit_upper` of PRISMATIC, REVOLUTE and D6 DOFs as
-                unilateral rows. When ``False`` (the default), no joint-limit rows are created,
+                :attr:`~newton.Model.joint_limit_upper` of PRISMATIC, REVOLUTE and D6 DOFs, and the
+                anchor-distance bounds of root DISTANCE joints, as unilateral rows. When ``False`` (the
+                default), no joint-limit rows are created,
                 joint position limits are not enforced, and limits use no
                 ``articulation_constraint_max`` capacity. The default matches the Steel
                 reference implementation this solver is ported from.
@@ -2134,7 +2157,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ``q <= lower + gap`` or ``q >= upper - gap``. ``None`` (the default) uses a
                 speed-aware gap of ``0.05 + 2 * dt * |v|`` per DOF, where ``v`` is the joint's
                 unconstrained velocity at the end of the step, after drives, gravity and parent
-                motion. Limit rows are speculative and apply no impulse while the joint cannot reach
+                motion; a DISTANCE joint uses its first DOF's gap and its anchor-distance rate.
+                Limit rows are speculative and apply no impulse while the joint cannot reach
                 its bound within the step, so the skipped rows are no-ops unless constraint impulses
                 in the solve, such as contacts, accelerate the joint toward the bound by more than
                 the margin in one step. Mimic and connect rows also act inside the solve, so both
@@ -2360,7 +2384,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 the free-body contact rows, then the velocity limits. ``"contact_then_internal"``
                 runs every iteration of the contact rows first, then every iteration of the
                 internal rows (drive, mimic, connect, joint-limit and joint-friction rows) and
-                the velocity limits. ``"phased"`` approximates the order PhysX uses for grasping: each
+                the velocity limits. In the position solve, internal-row corrections never reach the
+                contacts, so a contact load carried by an internal row (e.g. a body on a link at its
+                joint limit) sinks, and a heavy one falls through at any iteration count; use
+                ``"interleaved"`` or ``"phased"`` there. ``velocity_iterations`` start from the
+                corrected velocities, so they change the output velocity but not the integrated
+                positions. ``"phased"`` approximates the order PhysX uses for grasping: each
                 iteration solves the internal rows, then the contact rows, then the velocity
                 limits, each in a launch of its own; the propagation responses use this order
                 with ``"interleaved"`` as well. Contact torsion and contact compliance require
@@ -2526,7 +2555,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 shapes (other notifications and changes to static or kinematic owners wake
                 every island). Driven articulations (nonzero drive gains) and articulations with
                 passive springs (nonzero :attr:`~newton.Model.joint_stiffness` on a PRISMATIC,
-                REVOLUTE or D6 tree joint) stay awake.
+                REVOLUTE or D6 tree joint) stay awake. For resting stacks that stay awake with the
+                default contact order, see :ref:`Tuning Solver Reference`.
                 Sleeping is configured at construction; rebuild captured graphs to change it. Construction raises :class:`ValueError` with ``contact_warmstart``
                 or ``velocity_iterations``, or for a model without articulations, and
                 :class:`NotImplementedError` with ``articulated_contact_response="propagation"`` and
@@ -3057,6 +3087,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._build_mimic_plan(model)
         self._build_connect_plan(model)
         self._build_joint_limit_gap(model)
+        self._build_distance_limit_plan(model)
         self._warn_persistent_row_capacity(model)
         if self._articulated_contact_response != "immediate" and self._connect_count:
             # The propagation tree passes walk whole articulation joint ranges.
@@ -4294,8 +4325,8 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         With ``enable_joint_limits`` each finite position limit of a responding PRISMATIC, REVOLUTE or D6 DOF whose
         activation gap is ``inf`` is a row in every step, mirroring the joint-limit row builder; a bound at or beyond
-        the builder's unlimited default ``MAXVAL`` has no row. With ``enable_joint_friction`` each responding,
-        non-kinematic DOF with positive friction is one row in every step.
+        the builder's unlimited default ``MAXVAL`` has no row; so is each bound of a root DISTANCE joint. With
+        ``enable_joint_friction`` each responding, non-kinematic DOF with positive friction is one row in every step.
         """
         limit_rows = np.zeros(max(self._world_count, 1), dtype=np.int64)
         friction_rows = np.zeros_like(limit_rows)
@@ -4309,6 +4340,16 @@ class SolverSteel(SolverBase, CouplingInterface):
                 0,
             )
             self._add_articulation_rows(limit_rows, per_dof, self._joint_limit_sizes)
+        if self._distance_limit_count:
+            joints = self._distance_limit_joint.numpy()
+            dofs = model.joint_qd_start.numpy()[joints]
+            lower = model.joint_limit_lower.numpy()[dofs]
+            upper = model.joint_limit_upper.numpy()[dofs]
+            bounds = ((lower > 0.0) & (lower < MAXVAL)).astype(np.int64) + ((upper >= 0.0) & (upper < MAXVAL))
+            # A zero maximum takes six rows in every step, whatever the activation gap.
+            per_joint = np.where(upper == 0.0, 6, np.where(np.isinf(self._joint_limit_gap.numpy()[dofs]), bounds, 0))
+            worlds = self._art_to_world.numpy()[model.joint_articulation.numpy()[joints]]
+            np.add.at(limit_rows, worlds, per_joint)
         if self._joint_friction_warp_kernels:
             friction = model.joint_friction.numpy()
             with np.errstate(invalid="ignore"):
@@ -4542,6 +4583,38 @@ class SolverSteel(SolverBase, CouplingInterface):
                 if not seeds.isdisjoint(path(int(joint_child[joint]))):
                     gap[joint_qd_start[joint] : joint_qd_start[joint + 1]] = np.inf
         self._joint_limit_gap = wp.array(gap, dtype=float, device=model.device)
+
+    def _build_distance_limit_plan(self, model) -> None:
+        """Index the responding root DISTANCE joints by articulation; their bounds are read every step.
+
+        Raises :class:`NotImplementedError` for a DISTANCE joint in a tree that does not root its articulation.
+        """
+        self._distance_limit_count = 0
+        self._distance_limit_sizes = frozenset()
+        if not self._enable_joint_limits or not model.articulation_count or not model.joint_count:
+            return
+        joint_articulation = model.joint_articulation.numpy()
+        joints = np.flatnonzero((model.joint_type.numpy() == int(JointType.DISTANCE)) & (joint_articulation >= 0))
+        # A descendant FREE or DISTANCE joint integrates its coordinates about the child COM but takes its
+        # dynamics about the articulation origin, so no anchor-distance row is consistent with both.
+        root = (joints == model.articulation_start.numpy()[joint_articulation[joints]]) & (
+            model.joint_parent.numpy()[joints] < 0
+        )
+        if not np.all(root):
+            raise NotImplementedError(
+                f"SolverSteel enforces DISTANCE joint limits only on articulation roots, not joint {joints[~root][0]}."
+            )
+        response = self._model_plan.response_dof_count
+        joints = joints[response[joint_articulation[joints]] > 0]
+        if not joints.size:
+            return
+        joints = joints[np.argsort(joint_articulation[joints], kind="stable")]
+        owners = joint_articulation[joints]
+        start = np.searchsorted(owners, np.arange(model.articulation_count + 1))
+        self._distance_limit_joint = wp.array(joints, dtype=wp.int32, device=model.device)
+        self._distance_limit_start = wp.array(start, dtype=wp.int32, device=model.device)
+        self._distance_limit_count = int(joints.size)
+        self._distance_limit_sizes = frozenset(int(response[art]) for art in np.unique(owners))
 
     def _build_connect_plan(self, model) -> None:
         """Build the static lookup tables of the connect (loop-closure) rows.
@@ -5516,6 +5589,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             and not self._contact_torsion_enabled
             and self._mimic_count == 0
             and self._connect_count == 0
+            and self._distance_limit_count == 0
             and not self._nesterov_momentum
             and self._has_owned_dof_topology(model)
         )
@@ -5892,8 +5966,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         their dense 6 x 6 factors. Otherwise the dense factors are kept.
 
         Models with mimic relationships or loop-closing joints, including disabled ones that
-        can be re-enabled at runtime, keep the dense factors: their bilateral rows are built
-        on the dense response storage, which the sparse factors replace by placeholders.
+        can be re-enabled at runtime, or with DISTANCE joint limits keep the dense factors: these
+        rows are built on the dense response storage, which the sparse factors replace by placeholders.
         """
         self._sparse_mass_matrix_size = None
         self._sparse_mass_matrix_plan = None
@@ -5903,7 +5977,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             or self._nesterov_momentum
         ):
             return
-        if _model_has_bilateral_constraints(model):
+        if _model_has_bilateral_constraints(model) or self._distance_limit_count:
             return
         # The sparse rows and sweep exist only in the interleaved CUDA solve, without drive rows.
         if not model.device.is_cuda or self._has_drive_rows or self._row_schedule != "interleaved":
@@ -7237,6 +7311,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         has_internal_rows = bool(
             self._has_drive_rows
             or (self._enable_joint_limits and self._joint_limit_sizes)
+            or self._distance_limit_count
             or self._joint_friction_warp_kernels
             or self._mimic_count
             or self._connect_count
@@ -10346,8 +10421,50 @@ class SolverSteel(SolverBase, CouplingInterface):
                     block_dim=32 * _JOINT_LIMIT_WARPS_PER_BLOCK,
                     device=model.device,
                 )
+            for size in self._distance_limit_sizes:
+                wp.launch(
+                    build_distance_limit_rows,
+                    dim=self._n_arts_by_size[size],
+                    inputs=[
+                        self._articulation_dof_start,
+                        self._art_to_world,
+                        self._group_to_art[size],
+                        distance_active,
+                        self._distance_limit_start,
+                        self._distance_limit_joint,
+                        model.joint_child,
+                        model.joint_X_c,
+                        model.joint_q_start,
+                        model.joint_qd_start,
+                        model.joint_limit_lower,
+                        model.joint_limit_upper,
+                        model.body_com,
+                        state_in.joint_q,
+                        self._joint_limit_gap,
+                        self._v_hat,
+                        self._joint_limit_activation_speed_scale,
+                        dt,
+                        max_constraints,
+                    ],
+                    outputs=[
+                        self._slot_counter,
+                        self._J_by_size[size],
+                        self._row_type,
+                        self._row_parent,
+                        self._row_mu,
+                        self._phi,
+                        self._target_velocity,
+                        mode,
+                        self._row_cursor,
+                    ],
+                    device=model.device,
+                )
 
-        if limit_sizes:
+        # Sleeping islands that skip constraints get no DISTANCE limit rows, as their limit coordinates are masked.
+        distance_active = self._constraint_art_active
+        if sleeping is not None and sleeping.skip_constraints:
+            distance_active = sleeping.art_awake
+        if limit_sizes or self._distance_limit_count:
             self._reserve_rows(self._articulation_world_index, self._slot_counter, launch_limits)
 
         joint_friction = self._joint_friction_total if self._joint_friction_load_active else model.joint_friction

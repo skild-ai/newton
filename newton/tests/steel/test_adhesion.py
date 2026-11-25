@@ -372,8 +372,10 @@ def test_validation(test, device):
             SolverSteel(model, **options)
     solver = SolverSteel(model)
     _set_adhesion(model, ceiling, -1.0)
+    flags = model.get_attribute_update_flags("steel:adhesion")
+    test.assertEqual(flags, newton.ModelFlags.SHAPE_PROPERTIES)
     with test.assertRaisesRegex(ValueError, "steel:adhesion"):
-        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+        solver.notify_model_changed(flags)
     model.steel.adhesion = wp.ones(model.shape_count - 1, dtype=wp.float32, device=device)
     with test.assertRaisesRegex(ValueError, "steel:adhesion has shape"):
         solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)

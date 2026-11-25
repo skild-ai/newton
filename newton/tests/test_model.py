@@ -1423,6 +1423,7 @@ class TestModelMesh(unittest.TestCase):
             mesh = builder.shape_source[shape]
             self.assertEqual(len(mesh.vertices), mesh.maxhullvert)
 
+    @requires("scipy")
     def test_mesh_approximation_coacd_unavailable_falls_back_to_convex_hull(self):
         builder = ModelBuilder()
         box = newton.Mesh.create_box(
