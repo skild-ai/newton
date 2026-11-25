@@ -375,21 +375,16 @@ _COUPLED_CONTACT_BISECTION = """
                     && G_nn * axis_tt - axis_nt * axis_nt <= 1.0e-4f * G_nn * axis_tt
                 : minor_nn > 0.0f && det_block <= 1.0e-6f * G_nn * minor_nn
                     && minor_n1 * minor_n1 + minor_n2 * minor_n2 <= mu * mu * minor_nn * minor_nn * (1.0f + 2.0e-5f));
-            // A numerically singular rank-one jam (complement at most 1e-6 G_nn) whose probes slip off the axis tends, at large
-            // loads, to its sticking residual plus k^2 |off-axis slip| / sqrt(mu^2 - k^2), k = axis_nt / axis_tt. A negative
-            // limit means no root; the search then keeps the first approaching load. A small positive complement is ignored.
-            const float axis_ratio = axis_nt / axis_tt;
-            const float cone_left = mu * mu - axis_ratio * axis_ratio;
-            const float sticking_residual = u_n - target_vel_n - axis_ratio * (pair_vx * u_t1 + pair_vy * u_t2);
-            const bool no_root = jammed && rank_one && !clamp_axis
-                && G_nn * axis_tt - axis_nt * axis_nt <= 1.0e-6f * G_nn * axis_tt && cone_left > 0.0f
-                && axis_ratio * axis_ratio * fabsf(pair_vx * u_t2 - pair_vy * u_t1) < -sticking_residual * sqrtf(cone_left);
+            // A jammed search pursues a root up to 2^15 times its first load; without one it keeps that load.
+            const float x_first = x, gap = fabsf(f_lo);
             for (int _it = 0; _it < 64; _it++) {
                 const float f_x = probe(x, new_lambda_t1, new_lambda_t2);
                 new_lambda_n = x;
-                // Within what a 1e-5 relative error in the load would leave.
-                if (last_probe || fabsf(f_x) <= 1.0e-5f * G_nn * x) break;
+                // Within what a 1e-5 relative error in the load would leave. A jammed block, whose load can grow without
+                // approaching a root, is held to its starting gap instead.
+                if (last_probe || fabsf(f_x) <= (jammed ? 1.0e-5f * gap : 1.0e-5f * G_nn * x)) break;
                 if (jammed && f_x < 0.0f) {
+                    bool sticks_here = false;
                     if (clamp_axis || !rank_one) {
                         // The probe sticks if its unconstrained tangent pair lies in the cone, within rounding.
                         const float r_t1 = u_t1 + G_nt1 * (x - old_lambda_n), r_t2 = u_t2 + G_nt2 * (x - old_lambda_n);
@@ -402,9 +397,15 @@ _COUPLED_CONTACT_BISECTION = """
                             stick_t1 = old_lambda_t1 - (G_t2t2 * r_t1 - G_t1t2 * r_t2) / minor_nn;
                             stick_t2 = old_lambda_t2 - (G_t1t1 * r_t2 - G_t1t2 * r_t1) / minor_nn;
                         }
-                        if (stick_t1 * stick_t1 + stick_t2 * stick_t2 <= mu * mu * x * x * (1.0f + 2.0e-5f)) break;
+                        sticks_here = stick_t1 * stick_t1 + stick_t2 * stick_t2 <= mu * mu * x * x * (1.0f + 2.0e-5f);
                     }
-                    if (no_root) break;
+                    // No root lies above a sticking probe, and none is pursued past the cap: re-probe the first load and keep it.
+                    if (sticks_here || (!bracketed && x >= 32768.0f * x_first)) {
+                        if (_it >= 63 || x <= x_first) break;
+                        x = x_first;
+                        last_probe = true;
+                        continue;
+                    }
                 }
                 if (f_x < 0.0f) {
                     lo = x;

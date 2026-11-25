@@ -1207,6 +1207,13 @@ _JAMMED_BLOCKS = {
     "rank_one_slipping_off_axis": (-1.0, 0.0, 0.1, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
     # The same jam slipping just slower than its limit: the residual tends to -1.85e-5 and never reaches zero.
     "rank_one_slipping_under_its_limit": (-0.001, 0.0, 0.0017, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+    # Near rank one, the second tangent eigenvalue bounds the off-axis impulse: the residual peaks below zero.
+    "near_rank_one_slipping": (-0.001, 0.0, 0.001733, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-6, 2.0),
+    # Regular near-singular blocks: the probe sticks again only at a load near 1e4 times the frictionless one.
+    "stiff_slipping_off_axis": (-1.0, 0.0, 0.1, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-5, 2.0),
+    "stiffer_slipping_off_axis": (-1.0, 0.0, 0.1, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-4, 2.0),
+    "stiff_slipping_under_its_limit": (-0.001, 0.0, 0.0017, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-5, 2.0),
+    "stiffer_slipping_under_its_limit": (-0.001, 0.0, 0.0017, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-4, 2.0),
 }
 
 
@@ -1222,51 +1229,55 @@ def test_bisection_keeps_a_jammed_contact_near_the_frictionless_load(test, devic
                     test.assertLessEqual(float(np.linalg.norm(tangent)), block[9] * normal * (1.0 + 1.0e-6))
 
 
-# A rank-one block slipping off its axis whose Schur complement, 9e-5 G_nn, is small but not rounding: its root
-# lies near 1e4 times the frictionless load. Values as in _JAMMED_BLOCKS.
-_FAR_ROOT_BLOCK = (-1.0, 0.0, 0.1, 1.00009, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0)
+# The slipping jam with a positive normal complement s has a root near 0.95 / s times its first load. Roots up to
+# 2^15 times that load are solved; past it the search keeps the first load. Values as in _JAMMED_BLOCKS.
+_ROOT_WITHIN_CAP_BLOCKS = {
+    "complement_9e-5": (-1.0, 0.0, 0.1, 1.00009, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+    "complement_3e-5": (-1.0, 0.0, 0.1, 1.00003, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+}
+_ROOT_PAST_CAP_BLOCKS = {
+    "complement_2.5e-5": (-1.0, 0.0, 0.1, 1.000025, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+    "complement_2^-20": (-1.0, 0.0, 0.1, 1.0 + 2.0**-20, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+}
 
 
-def test_bisection_reaches_the_far_root_of_a_nearly_jammed_block(test, device):
-    """Search past the flat start of a nearly jammed residual to its root instead of stopping as if it had none."""
-    block = np.array(_FAR_ROOT_BLOCK, dtype=np.float32)
-    g_nn, g_nt1, g_nt2 = (float(v) for v in block[3:6])
+def test_bisection_solves_a_jammed_root_within_the_cap(test, device):
+    """Solve the far root of a nearly jammed block when it lies within 2^15 times the first load."""
     for mode in ("bisection", "bisection_desaxce"):
-        with test.subTest(mode=mode):
-            normal, tangent1, tangent2 = (float(v) for v in _mf_block(device, block, mode))
-            bias = float(block[9] * np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
-            residual = float(block[0]) + g_nn * normal + g_nt1 * tangent1 + g_nt2 * tangent2 - bias
-            test.assertGreater(normal, 1.0e3)
-            test.assertLessEqual(abs(residual), 1.0e-5 * g_nn * normal)
+        for name, block in _ROOT_WITHIN_CAP_BLOCKS.items():
+            with test.subTest(mode=mode, block=name):
+                normal, tangent1, tangent2 = (float(v) for v in _mf_block(device, np.array(block, np.float32), mode))
+                bias = block[9] * float(np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
+                residual = block[0] + block[3] * normal + block[4] * tangent1 + block[5] * tangent2 - bias
+                test.assertGreater(normal, 1.0e3)
+                test.assertLessEqual(abs(residual), 1.0e-6 * normal)
 
 
-# The same block with a complement of 2^-20 G_nn, under the 1e-6 G_nn cutoff: it is treated as numerically singular,
-# and its load stays at the frictionless one although a root exists near 1e6 times it.
-_SINGULAR_CUTOFF_BLOCK = (-1.0, 0.0, 0.1, 1.0 + 2.0**-20, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0)
-
-
-def test_bisection_bounds_the_load_below_the_singular_cutoff(test, device):
-    """Keep the frictionless load on a slipping jam whose Schur complement is under the numerical-singularity cutoff."""
-    block = np.array(_SINGULAR_CUTOFF_BLOCK, dtype=np.float32)
+def test_bisection_keeps_the_first_load_past_the_root_cap(test, device):
+    """Keep the frictionless load on a nearly jammed block whose root lies beyond 2^15 times it."""
     for mode in ("bisection", "bisection_desaxce"):
-        with test.subTest(mode=mode):
-            normal, *_ = _mf_block(device, block, mode)
-            bias = float(block[9] * np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
-            test.assertLessEqual(float(normal), (bias - float(block[0])) / float(block[3]) * (1.0 + 1.0e-5))
+        for name, block in _ROOT_PAST_CAP_BLOCKS.items():
+            with test.subTest(mode=mode, block=name):
+                normal, *_ = _mf_block(device, np.array(block, dtype=np.float32), mode)
+                bias = block[9] * float(np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
+                test.assertLessEqual(float(normal), (bias - block[0]) / block[3] * (1.0 + 1.0e-5))
 
 
-# A singular rank-one jam whose sliding direction turns with the load: its residual starts flat but has a root near
-# 0.232005 (from tan(theta) = 1.74378288 and mu = 2).
-_TURNING_SLIP_BLOCK = (-0.001, 1.0, 1.74378288, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0)
+# A jam whose sliding direction turns with the load: its residual starts flat but has a root, 0.232005 at rank one
+# (from tan(theta) = 1.74378288 and mu = 2). The second tangent eigenvalue shifts it slightly.
+_TURNING_SLIP_BLOCKS = {
+    eps: (-0.001, 1.0, 1.74378288, 1.0, 1.0, 0.0, 1.0, 0.0, eps, 2.0) for eps in (0.0, 1.0e-5, 1.0e-4)
+}
 
 
 def test_bisection_finds_the_root_of_a_jam_whose_slip_turns(test, device):
-    """Reach the root of a singular jam whose residual is flat at the first probe but rises as the slip turns."""
-    block = np.array(_TURNING_SLIP_BLOCK, dtype=np.float32)
-    normal, tangent1, _ = (float(v) for v in _mf_block(device, block, "bisection"))
-    residual = float(block[0]) + normal + tangent1
-    test.assertAlmostEqual(normal, 0.232005, delta=1.0e-4)
-    test.assertLessEqual(abs(residual), 1.0e-5 * normal)
+    """Reach the root of a jam whose residual is flat at the first probe but rises as the slip turns."""
+    for eps, block in _TURNING_SLIP_BLOCKS.items():
+        with test.subTest(eps=eps):
+            normal, tangent1, _ = (float(v) for v in _mf_block(device, np.array(block, np.float32), "bisection"))
+            expected = 0.232005 if eps == 0.0 else _bisection_reference(block, False)[0]
+            test.assertAlmostEqual(normal, expected, delta=1.0e-4 * expected)
+            test.assertLessEqual(abs(block[0] + normal + tangent1), 1.0e-5 * normal)
 
 
 # A block whose second tangent direction barely responds but slips at 1 m/s: friction must still oppose that slip.
@@ -1392,8 +1403,8 @@ for _fn in (
     test_bisection_leaves_an_ill_conditioned_sticking_contact_at_rest,
     test_bisection_keeps_a_jammed_contact_near_the_frictionless_load,
     test_bisection_keeps_friction_on_a_stiff_slipping_direction,
-    test_bisection_reaches_the_far_root_of_a_nearly_jammed_block,
-    test_bisection_bounds_the_load_below_the_singular_cutoff,
+    test_bisection_solves_a_jammed_root_within_the_cap,
+    test_bisection_keeps_the_first_load_past_the_root_cap,
     test_bisection_finds_the_root_of_a_jam_whose_slip_turns,
     test_bisection_bounds_the_normal_force_on_a_hinged_rod,
     test_bisection_reports_no_friction_without_tangential_mobility,
