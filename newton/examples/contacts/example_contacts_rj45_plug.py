@@ -421,7 +421,10 @@ class Example:
             self.model,
             args,
             enable_joint_limits=True,
-            contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies) + self.model.joint_dof_count,
+            # Per world: three rows per budgeted contact, six per clamped body and one limit row per DOF.
+            contact_rows=3 * self.contacts_per_world
+            + 6 * len(self.clamps.bodies)
+            + self.model.joint_dof_count // max(self.model.world_count, 1),
             iterations=12,
             rigid_body_contact_buffer_size=256,
         )
