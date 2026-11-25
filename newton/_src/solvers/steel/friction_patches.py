@@ -1490,12 +1490,14 @@ class _FrictionPatchState:
         recovery_phi=None,
         dt=0.0,
         angular_mu=None,
+        record_tape=True,
     ):
         """Build this step's friction patches.
 
         ``angular_mu`` is ``(torsional, rolling, route)`` with free-rigid angular rows: the gated per-shape
         coefficients [m] and a per-body flag of the bodies whose contacts take the free-rigid route. Such
         contacts then share a patch only if their pair coefficients match.
+        ``record_tape=False`` keeps the build off an active :class:`warp.Tape`; the patches are stop-gradient.
         """
         wp.launch(
             _prepare,
@@ -1525,6 +1527,7 @@ class _FrictionPatchState:
                 self.view,
             ],
             device=model.device,
+            record_tape=record_tape,
         )
         wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity)
         wp.launch(
@@ -1532,6 +1535,7 @@ class _FrictionPatchState:
             dim=self.capacity,
             inputs=[contacts.rigid_contact_count, self.current],
             device=model.device,
+            record_tape=record_tape,
         )
         if frozen_bodies is not None:
             wp.launch(
@@ -1539,12 +1543,14 @@ class _FrictionPatchState:
                 dim=self.capacity,
                 inputs=[contacts.rigid_contact_count, frozen_bodies, self.current, self.previous],
                 device=model.device,
+                record_tape=record_tape,
             )
             wp.launch(
                 _carry_frozen_pairs,
                 dim=self.capacity,
                 inputs=[contacts.rigid_contact_count, state.body_q, frozen_bodies, self.current, self.previous],
                 device=model.device,
+                record_tape=record_tape,
             )
         # The warp-per-pair flood matches the serial one exactly; the switch exists so
         # tests can compare them.
@@ -1565,6 +1571,7 @@ class _FrictionPatchState:
                     self._flood_pair_count,
                 ],
                 device=model.device,
+                record_tape=record_tape,
             )
             wp.launch_tiled(
                 _flood_regions,
@@ -1582,6 +1589,7 @@ class _FrictionPatchState:
                 ],
                 block_dim=32,
                 device=model.device,
+                record_tape=record_tape,
             )
         wp.launch(
             _build,
@@ -1601,6 +1609,7 @@ class _FrictionPatchState:
                 dt,
             ],
             device=model.device,
+            record_tape=record_tape,
         )
 
     def reserve_history_snapshot(self):

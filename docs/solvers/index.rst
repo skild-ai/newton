@@ -136,7 +136,7 @@ Supported Features
      - ❌
      - ❌
      - ❌
-     - ❌
+     - 🟨 experimental :sup:`5`
      - ✅
    * - :class:`~newton.solvers.SolverStyle3D`
      - Implicit
@@ -175,6 +175,7 @@ Supported Features
   see :doc:`/concepts/determinism` for limitations and performance trade-offs.
 | :sup:`4` Simulated as MuJoCo flexes; particles that belong to no spring,
   triangle, or tetrahedron are not simulated. See :ref:`mujoco-flexes`.
+| :sup:`5` Opt-in with ``SolverSteel(differentiable=True)``, for a subset of options and a fixed contact set.
 
 .. experimental::
     :class:`~newton.solvers.SolverSteel`'s public API and behavior may change without prior notice.
