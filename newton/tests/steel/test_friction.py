@@ -1214,6 +1214,9 @@ _JAMMED_BLOCKS = {
     "stiffer_slipping_off_axis": (-1.0, 0.0, 0.1, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-4, 2.0),
     "stiff_slipping_under_its_limit": (-0.001, 0.0, 0.0017, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-5, 2.0),
     "stiffer_slipping_under_its_limit": (-0.001, 0.0, 0.0017, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-4, 2.0),
+    # Exactly rank two: the first row is the sum of the others, so the Schur complement is zero, but float32
+    # cofactors leave it slightly positive, which places a false sticking root at 1663 times the first load.
+    "rank_two_sticking": (-1.0, -0.49995, -0.49995, 4712.0, 1548.0, 3164.0, 1275.0, 273.0, 2891.0, 4.0),
 }
 
 
