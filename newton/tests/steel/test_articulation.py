@@ -4765,6 +4765,20 @@ def test_sparse_direct_closure_solve_matches_the_serial_sweep(test, device):
     np.testing.assert_array_equal(again.joint_qd.numpy(), sparse.joint_qd.numpy())
 
 
+def test_sparse_direct_closure_solve_matches_with_the_articulated_body_solve(test, device):
+    """The sparse direct solve steps alike on the Cholesky and the articulated-body mass solves.
+
+    Only the unconstrained velocity comes from the mass solve; the closure system is factored by the sparse solve
+    either way. Twenty steps agree to 1e-4 rad/s; later the ladder's motion amplifies float32 differences for the
+    serial sweep as much as for the direct solve.
+    """
+    _, _, cholesky = _sparse_ladder_run(device, steps=20)
+    solver, _, ab = _sparse_ladder_run(device, steps=20, overrides={**_SPARSE_DIRECT, "mass_solve": "articulated_body"})
+    test.assertTrue(solver._articulated_body_sizes)
+    np.testing.assert_allclose(ab.joint_q.numpy(), cholesky.joint_q.numpy(), rtol=0.0, atol=1.0e-5)
+    np.testing.assert_allclose(ab.joint_qd.numpy(), cholesky.joint_qd.numpy(), rtol=0.0, atol=1.0e-4)
+
+
 def test_sparse_direct_closure_solve_is_independent_of_block_size(test, device):
     """The per-world solve block gives the same steps at 64, 256 and 512 threads.
 
@@ -4822,6 +4836,7 @@ class TestSteelSparseDirectClosureSolve(unittest.TestCase):
 for _name in (
     "test_sparse_direct_closure_solve_matches_float64",
     "test_sparse_direct_closure_solve_matches_the_serial_sweep",
+    "test_sparse_direct_closure_solve_matches_with_the_articulated_body_solve",
     "test_sparse_direct_closure_solve_is_independent_of_block_size",
 ):
     add_function_test(TestSteelSparseDirectClosureSolve, _name, globals()[_name], devices=get_cuda_test_devices())

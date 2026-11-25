@@ -9661,8 +9661,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._ab_Dinv_by_size[size] = wp.zeros((n_arts, size, 6), dtype=wp.float32, device=device)
             self._ab_diag_by_size[size] = wp.zeros((n_arts, size), dtype=wp.float32, device=device)
             self._ab_rhs_by_size[size] = wp.zeros((n_arts, 1, size), dtype=wp.float32, device=device)
+            # The sparse direct solve forms no row responses; the tau solve uses column 0 only.
+            scratch_cols = 1 if self._closure_ds_active else max_constraints
             self._ab_scratch_by_size[size] = wp.zeros(
-                (n_arts, max_slots, max_constraints), dtype=wp.spatial_vector, device=device
+                (n_arts, max_slots, scratch_cols), dtype=wp.spatial_vector, device=device
             )
             # Threads per articulation of the row solve: enough to fill the GPU (about 512
             # resident per SM), each looping over the world's rows, at most one per row.
