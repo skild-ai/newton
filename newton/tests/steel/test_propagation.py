@@ -3097,6 +3097,7 @@ def test_serial_selection_skips_tree_setup(test, device):
             build.assert_not_called()
             test.assertIsNone(solver._tree_plan)
             test.assertEqual(solver._tree_net_wrenches, ())
+            test.assertEqual(solver._tree_composite_launches, ())
             state = model.state()
             solver._prepare_augmented_state(state)
             solver._stage7_update_kinematics(state)
@@ -3312,6 +3313,69 @@ def test_stage1_matches_serial_on_loop_closures(test, device):
         np.testing.assert_array_equal(getattr(solvers[1], name).numpy(), getattr(solvers[0], name).numpy(), name)
 
 
+def test_mass_passes_match_serial_bitwise(test, device):
+    """Match the serial composite inertia, articulated-body factor and tau solve and root-relative poses bit for bit.
+
+    Both solvers start each pass from the serial solver's inputs, on a looped model and on trees of several
+    sizes and traversal widths.
+    """
+    dt = 1.0 / 240.0
+    for name, model in (
+        ("loops", _build_looped_fingers(device)),
+        ("trees", _build_fingers(device, include_chain=True, ragged=True)),
+    ):
+        with test.subTest(model=name):
+            # Drives and damping on the tree DOFs; loop-closing joints ignore them.
+            qd_start = model.joint_qd_start.numpy()
+            tree_dof = np.zeros(model.joint_dof_count, dtype=bool)
+            for joint in np.flatnonzero(model.joint_articulation.numpy() >= 0):
+                tree_dof[qd_start[joint] : qd_start[joint + 1]] = True
+            for array, low, high in (
+                (model.joint_target_ke, 0.0, 8.0),
+                (model.joint_target_kd, 0.5, 0.0),
+                (model.joint_damping, 0.0, 0.3),
+            ):
+                array.assign(np.where(tree_dof, np.linspace(low, high, model.joint_dof_count), 0.0).astype(np.float32))
+            with kernel_overrides({"mass_solve": "articulated_body"}):
+                solvers = [_solver(model, enabled=value, articulation_constraint_max=64) for value in (False, True)]
+            serial, tree = solvers
+            test.assertTrue(tree._ab_tree_launches_by_size)
+            test.assertTrue(tree._tree_composite_launches)
+            test.assertEqual(serial._ab_tree_launches_by_size, {})
+            states = [model.state() for _ in solvers]
+            outputs = [model.state() for _ in solvers]
+            control = model.control()
+            for solver, state, following in zip(solvers, states, outputs, strict=True):
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                solver._stage1_fk_id(state, solver, following)
+                solver._stage1_joint_tau(state, solver, following, control, dt)
+            for array in ("_joint_S_s", "_body_I_s", "_joint_tau"):
+                wp.copy(getattr(tree, array), getattr(serial, array))
+            wp.copy(states[1].body_q, states[0].body_q)
+            for solver in solvers:
+                solver._stage1_crba(solver, dt)
+                for size in sorted(solver._articulated_body_sizes):
+                    solver._stage2_factor_articulated_body(size, solver)
+                solver._joint_qdd.zero_()
+                for size in sorted(solver._articulated_body_sizes):
+                    solver._stage3_solve_articulated_body(size, solver)
+            compared = {
+                "_body_I_c": (serial._body_I_c, tree._body_I_c),
+                "_joint_qdd": (serial._joint_qdd, tree._joint_qdd),
+            }
+            for size in serial._articulated_body_sizes:
+                for prefix in ("_ab_S_by_size", "_ab_U_by_size", "_ab_Dinv_by_size", "_ab_diag_by_size"):
+                    compared[f"{prefix}[{size}]"] = (getattr(serial, prefix)[size], getattr(tree, prefix)[size])
+            if serial._connect_count:
+                for solver, state in zip(solvers, states, strict=True):
+                    solver._launch_body_relative_poses(state)
+                compared["_body_rel_t"] = (serial._body_rel_t, tree._body_rel_t)
+                compared["_articulation_ref_t"] = (serial._articulation_ref_t, tree._articulation_ref_t)
+            for label, (expected, actual) in compared.items():
+                np.testing.assert_array_equal(actual.numpy(), expected.numpy(), err_msg=label)
+            test.assertGreater(float(np.max(np.abs(serial._joint_qdd.numpy()))), 0.1)
+
+
 class TestSteelTreeExecution(unittest.TestCase):
     pass
 
@@ -3324,6 +3388,7 @@ for _name in (
     "test_publication_matches_public_fk",
     "test_contact_trajectory_matches_serial",
     "test_stage1_matches_serial_on_loop_closures",
+    "test_mass_passes_match_serial_bitwise",
 ):
     add_function_test(TestSteelTreeExecution, _name, globals()[_name], devices=devices)
 

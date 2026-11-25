@@ -92,6 +92,11 @@ from .kernels import (
     ROW_WATERMARK_FAMILY_STRIDE,
     WARP_DETERMINISM_OFF,
     SweepField,
+    _get_tree_ab_factor_kernel,
+    _get_tree_ab_solve_tau_kernel,
+    _get_tree_augmented_drives_kernel,
+    _get_tree_body_relative_poses_kernel,
+    _get_tree_composite_inertia_kernel,
     _get_tree_fk_kernel,
     _get_tree_tau_kernel,
     accumulate_connect_wrenches_from_impulses,
@@ -163,7 +168,6 @@ from .kernels import (
     crba_fill_par_dof,
     diag_from_JY_par_art,
     diag_from_JY_world,
-    eval_augmented_drives,
     eval_body_relative_poses,
     eval_joint_friction_load,
     eval_post_solve_parent_wrenches,
@@ -2376,11 +2380,15 @@ class SolverSteel(SolverBase, CouplingInterface):
                 mimic rows iterative, which avoids a singular block when a mimic row is
                 nearly dependent on a closure.
             parallel_tree: Traverse the independent branches of each articulation tree in
-                parallel (forward kinematics and dynamics, the inverse-dynamics backward pass
-                and state publication), with up to 32 threads per articulation instead of
-                one. Results match the serial traversal up to floating-point summation order.
-                Unbranched articulations, models whose joints are not ordered parent before
-                child, and CPU devices keep the serial traversal. Broad trees can benefit; narrow trees can be
+                parallel (forward kinematics and dynamics, the inverse-dynamics backward pass,
+                the drive pass, the composite-inertia reduction, the articulated-body factor and
+                solve, the root-relative poses of loop closures and state publication), with up
+                to 32 threads per articulation instead of one. Forward kinematics and inverse
+                dynamics match the serial traversal up to floating-point summation order; the
+                other passes match it bit for bit. Articulations closed by loop joints traverse
+                their spanning tree; the loop joints stay constraint rows. Unbranched
+                articulations, models whose joints are not ordered parent before child, and CPU
+                devices keep the serial traversal. Broad trees can benefit; narrow trees can be
                 slower, so measure the full step before enabling it.
             reuse_kinematics: Opt in to carrying the kinematics and inverse-dynamics terms the solver
                 forms when it publishes a step's body state into the next step, instead of re-deriving
@@ -3215,6 +3223,15 @@ class SolverSteel(SolverBase, CouplingInterface):
             if self._tree_plan is not None
             else ()
         )
+        # The cooperative drive pass splits each articulation's joints into chunks of its lanes.
+        self._tree_max_joints = ()
+        if self._tree_plan is not None:
+            starts = model.articulation_start.numpy()
+            ends = self._articulation_joint_end.numpy()
+            self._tree_max_joints = tuple(
+                int(np.max(ends[arts] - starts[arts]))
+                for arts in (group.articulations.numpy() for group in self._tree_plan.groups)
+            )
         self._setup_propagation(model)
         self._articulation_constraint_max = self._requested_dense_max_constraints
         self._setup_diagonal_mass(model)
@@ -3311,6 +3328,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             if self._composite_articulation_count and model.device.is_cuda
             else None
         )
+        # With a tree plan the global reduction walks the tree levels instead.
+        self._tree_composite_launches = self._tree_plan_rows(composite_articulations)
         self._dummy_is_free_rigid = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._dummy_mf_slot_counter = wp.zeros((self._world_count,), dtype=wp.int32, device=model.device)
         self._dummy_contact_count = wp.zeros((1,), dtype=wp.int32, device=model.device)
@@ -5097,25 +5116,46 @@ class SolverSteel(SolverBase, CouplingInterface):
         anchors would inherit in full and a nearly degenerate (normalized) closure row would amplify.
         """
         model = self.model
+        inputs = [
+            model.articulation_start,
+            self._articulation_joint_end,
+            self._body_to_articulation,
+            model.joint_type,
+            model.joint_parent,
+            model.joint_child,
+            model.joint_q_start,
+            model.joint_qd_start,
+            state_in.joint_q,
+            model.joint_X_p,
+            model.joint_X_c,
+            model.joint_axis,
+            model.joint_dof_dim,
+            state_in.body_q,
+        ]
+        if self._tree_plan is not None:
+            for group in self._tree_plan.groups:
+                per_warp = 32 // group.lanes
+                wp.launch(
+                    _get_tree_body_relative_poses_kernel(group.lanes),
+                    dim=((group.articulation_count + per_warp - 1) // per_warp, 32),
+                    inputs=[
+                        group.articulation_count,
+                        group.max_levels,
+                        group.articulations,
+                        group.level_offsets,
+                        group.segment_offsets,
+                        group.segment_joints,
+                        *inputs,
+                    ],
+                    outputs=[self._body_rel_t, self._articulation_ref_t],
+                    block_dim=32,
+                    device=model.device,
+                )
+            return
         wp.launch(
             eval_body_relative_poses,
             dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                self._articulation_joint_end,
-                self._body_to_articulation,
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state_in.joint_q,
-                model.joint_X_p,
-                model.joint_X_c,
-                model.joint_axis,
-                model.joint_dof_dim,
-                state_in.body_q,
-            ],
+            inputs=inputs,
             outputs=[self._body_rel_t, self._articulation_ref_t],
             device=model.device,
             block_dim=self._serial_block_dim(model.articulation_count),
@@ -9405,35 +9445,40 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._tree_plan is not None:
             self._launch_tree_tau(tau_inputs, state_aug)
             if self._articulation_max_dofs > 0:
-                wp.launch(
-                    eval_augmented_drives,
-                    dim=model.articulation_count,
-                    inputs=[
-                        model.articulation_start,
-                        self._articulation_joint_end,
-                        self._articulation_H_rows,
-                        model.joint_type,
-                        model.joint_qd_start,
-                        model.joint_q_start,
-                        model.joint_dof_dim,
-                        state_in.joint_q,
-                        state_in.joint_qd,
-                        self._passive_joint_damping,
-                        self._drive_mode == "augmented",
-                        model.joint_target_ke,
-                        model.joint_target_kd,
-                        control.joint_target_q,
-                        model.joint_target_q_start,
-                        control.joint_target_qd,
-                        model.joint_effort_limit,
-                        self._articulation_max_dofs,
-                        dt,
-                        self._dynamics_art_active,
-                    ],
-                    outputs=[self._aug_row_counts, self._aug_row_dof_index, self._aug_row_K, state_aug._joint_tau],
-                    block_dim=self._serial_block_dim(model.articulation_count),
-                    device=model.device,
-                )
+                for group, max_joints in zip(self._tree_plan.groups, self._tree_max_joints, strict=True):
+                    per_warp = 32 // group.lanes
+                    wp.launch(
+                        _get_tree_augmented_drives_kernel(group.lanes),
+                        dim=((group.articulation_count + per_warp - 1) // per_warp, 32),
+                        inputs=[
+                            group.articulation_count,
+                            max_joints,
+                            group.articulations,
+                            model.articulation_start,
+                            self._articulation_joint_end,
+                            self._articulation_H_rows,
+                            model.joint_type,
+                            model.joint_qd_start,
+                            model.joint_q_start,
+                            model.joint_dof_dim,
+                            state_in.joint_q,
+                            state_in.joint_qd,
+                            self._passive_joint_damping,
+                            self._drive_mode == "augmented",
+                            model.joint_target_ke,
+                            model.joint_target_kd,
+                            control.joint_target_q,
+                            model.joint_target_q_start,
+                            control.joint_target_qd,
+                            model.joint_effort_limit,
+                            self._articulation_max_dofs,
+                            dt,
+                            self._dynamics_art_active,
+                        ],
+                        outputs=[self._aug_row_counts, self._aug_row_dof_index, self._aug_row_K, state_aug._joint_tau],
+                        block_dim=32,
+                        device=model.device,
+                    )
         elif self._articulation_max_dofs > 0:
             wp.launch(
                 eval_rigid_tau_and_augmented_drives,
@@ -9595,6 +9640,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._ab_rows_launch_by_size = {}
         self._ab_body_I_A = None
         self._ab_branch_slot = None
+        self._ab_tree_launches_by_size = {}
+        self._ab_tree_body_scratch = None
         if not self._articulated_body_sizes:
             return
         self._ab_body_I_A = wp.zeros(max(model.body_count, 1), dtype=wp.spatial_matrix, device=device)
@@ -9642,10 +9689,94 @@ class SolverSteel(SolverBase, CouplingInterface):
             while rows_launch < max_constraints and n_arts * rows_launch < 512 * max(self._sm_count, 1):
                 rows_launch *= 2
             self._ab_rows_launch_by_size[size] = min(rows_launch, max_constraints)
+        self._setup_tree_articulated_body(model)
+
+    def _setup_tree_articulated_body(self, model: Model) -> None:
+        """Map each articulated-body group onto the tree plan for the cooperative factor and tau solve.
+
+        Every articulation of a group is in exactly one tree-plan group; a launch covers the
+        articulations a (group, tree-plan group) pair shares, by their rows in both.
+        """
+        if self._tree_plan is None:
+            return
+        for size in sorted(self._articulated_body_sizes):
+            self._ab_tree_launches_by_size[size] = self._tree_plan_rows(self._group_to_art[size].numpy())
+        if self._ab_tree_launches_by_size:
+            self._ab_tree_body_scratch = wp.zeros(
+                max(model.body_count, 1), dtype=wp.spatial_vector, device=model.device
+            )
+
+    def _tree_plan_rows(self, articulations: np.ndarray) -> tuple:
+        """Return the cooperative launches over ``articulations``, one per tree-plan group holding any.
+
+        Each launch is ``(group, count, plan_rows, positions)``: the plan rows of the selected
+        articulations in that group and their positions in ``articulations``. Empty without a plan.
+        """
+        if self._tree_plan is None:
+            return ()
+        device = self.model.device
+        position = {int(art): index for index, art in enumerate(articulations)}
+        launches = []
+        for group in self._tree_plan.groups:
+            group_arts = group.articulations.numpy()
+            plan_rows = [row for row, art in enumerate(group_arts) if int(art) in position]
+            if not plan_rows:
+                continue
+            launches.append(
+                (
+                    group,
+                    len(plan_rows),
+                    wp.array(plan_rows, dtype=wp.int32, device=device),
+                    wp.array([position[int(art)] for art in group_arts[plan_rows]], dtype=wp.int32, device=device),
+                )
+            )
+        return tuple(launches)
 
     def _stage2_factor_articulated_body(self, size: int, state_aug: State) -> None:
         """Factor the augmented mass matrices of an articulated-body group."""
         model = self.model
+        launches = self._ab_tree_launches_by_size.get(size)
+        if launches:
+            for group, count, plan_rows, group_index in launches:
+                per_warp = 32 // group.lanes
+                wp.launch(
+                    _get_tree_ab_factor_kernel(group.lanes),
+                    dim=((count + per_warp - 1) // per_warp, 32),
+                    inputs=[
+                        count,
+                        group.max_levels,
+                        plan_rows,
+                        group_index,
+                        group.articulations,
+                        group.level_offsets,
+                        group.segment_offsets,
+                        group.segment_joints,
+                        group.child_offsets,
+                        group.child_segments,
+                        self._articulation_dof_start,
+                        self._mass_update_mask,
+                        model.joint_child,
+                        model.joint_qd_start,
+                        state_aug._joint_S_s,
+                        state_aug._body_I_s,
+                        self._R_by_size[size],
+                        size,
+                        self._articulation_max_dofs,
+                        self._aug_row_counts,
+                        self._aug_row_dof_index,
+                        self._aug_row_K,
+                    ],
+                    outputs=[
+                        self._ab_body_I_A,
+                        self._ab_diag_by_size[size],
+                        self._ab_S_by_size[size],
+                        self._ab_U_by_size[size],
+                        self._ab_Dinv_by_size[size],
+                    ],
+                    block_dim=32,
+                    device=model.device,
+                )
+            return
         wp.launch(
             factor_articulated_body,
             dim=self._n_arts_by_size[size],
@@ -9682,6 +9813,40 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _stage3_solve_articulated_body(self, size: int, state_aug: State) -> None:
         """Solve the unconstrained accelerations of an articulated-body group."""
         model = self.model
+        launches = self._ab_tree_launches_by_size.get(size)
+        if launches:
+            for group, count, plan_rows, group_index in launches:
+                per_warp = 32 // group.lanes
+                wp.launch(
+                    _get_tree_ab_solve_tau_kernel(group.lanes),
+                    dim=((count + per_warp - 1) // per_warp, 32),
+                    inputs=[
+                        count,
+                        group.max_levels,
+                        plan_rows,
+                        group_index,
+                        group.articulations,
+                        group.level_offsets,
+                        group.segment_offsets,
+                        group.segment_joints,
+                        group.child_offsets,
+                        group.child_segments,
+                        self._articulation_dof_start,
+                        self._dynamics_art_active,
+                        model.joint_ancestor,
+                        model.joint_child,
+                        model.joint_qd_start,
+                        self._ab_S_by_size[size],
+                        self._ab_U_by_size[size],
+                        self._ab_Dinv_by_size[size],
+                        size,
+                        state_aug._joint_tau,
+                    ],
+                    outputs=[self._ab_rhs_by_size[size], self._ab_tree_body_scratch, state_aug._joint_qdd],
+                    block_dim=32,
+                    device=model.device,
+                )
+            return
         wp.launch(
             solve_articulated_body_tau,
             dim=self._n_arts_by_size[size],
@@ -9772,7 +9937,31 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[state_aug._body_I_s, self._body_inertia_terms],
                 device=model.device,
             )
-        if global_flag and self._composite_inertia_warp_kernel is not None:
+        if global_flag and self._tree_composite_launches:
+            for group, count, plan_rows, _ in self._tree_composite_launches:
+                per_warp = 32 // group.lanes
+                wp.launch(
+                    _get_tree_composite_inertia_kernel(group.lanes),
+                    dim=((count + per_warp - 1) // per_warp, 32),
+                    inputs=[
+                        count,
+                        group.max_levels,
+                        plan_rows,
+                        group.articulations,
+                        group.level_offsets,
+                        group.segment_offsets,
+                        group.segment_joints,
+                        group.child_offsets,
+                        group.child_segments,
+                        model.joint_child,
+                        state_aug._body_I_s,
+                        self._dynamics_art_active,
+                    ],
+                    outputs=[self._body_I_c],
+                    block_dim=32,
+                    device=model.device,
+                )
+        elif global_flag and self._composite_inertia_warp_kernel is not None:
             # A global refresh reduces every articulation that reads composite inertias,
             # one warp per articulation.
             wp.launch_tiled(

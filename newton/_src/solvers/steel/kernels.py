@@ -2677,6 +2677,100 @@ def _invert_psd3(D: wp.mat33) -> wp.mat33:
     return inv
 
 
+@wp.func
+def _ab_factor_joint(
+    idx: int,
+    j: int,
+    dof0: int,
+    IA: wp.spatial_matrix,
+    joint_qd_start: wp.array[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    diag_group: wp.array2d[float],
+    S_group: wp.array2d[wp.spatial_vector],
+    U_group: wp.array2d[wp.spatial_vector],
+    Dinv_group: wp.array3d[float],
+) -> wp.spatial_matrix:
+    """Factor joint ``j`` given its articulated inertia ``IA``; return the inertia it hands to its parent."""
+    d0 = joint_qd_start[j] - dof0
+    k = joint_qd_start[j + 1] - joint_qd_start[j]
+    if k == 1:
+        S = joint_S_s[dof0 + d0]
+        U = IA * S
+        D1 = wp.dot(S, U) + diag_group[idx, d0]
+        # A massless DOF without armature responds with zero, like a zero Cholesky pivot.
+        dinv = float(0.0)
+        if D1 > 0.0:
+            dinv = 1.0 / D1
+        S_group[idx, d0] = S
+        U_group[idx, d0] = U
+        Dinv_group[idx, d0, 0] = dinv
+        for b in range(1, 6):
+            Dinv_group[idx, d0, b] = 0.0
+        IA = IA - wp.outer(U, dinv * U)
+    elif k == 3:
+        S0 = joint_S_s[dof0 + d0]
+        S1 = joint_S_s[dof0 + d0 + 1]
+        S2 = joint_S_s[dof0 + d0 + 2]
+        U0 = IA * S0
+        U1 = IA * S1
+        U2 = IA * S2
+        # Build D symmetric: rounding leaves I^A slightly asymmetric, and an asymmetric D^-1 feeds
+        # an antisymmetric part back into the parent's I^A that grows at every multi-DOF joint.
+        d01 = 0.5 * (wp.dot(S0, U1) + wp.dot(S1, U0))
+        d02 = 0.5 * (wp.dot(S0, U2) + wp.dot(S2, U0))
+        d12 = 0.5 * (wp.dot(S1, U2) + wp.dot(S2, U1))
+        D = wp.mat33(
+            wp.dot(S0, U0) + diag_group[idx, d0],
+            d01,
+            d02,
+            d01,
+            wp.dot(S1, U1) + diag_group[idx, d0 + 1],
+            d12,
+            d02,
+            d12,
+            wp.dot(S2, U2) + diag_group[idx, d0 + 2],
+        )
+        Di = _invert_psd3(D)
+        S_group[idx, d0] = S0
+        S_group[idx, d0 + 1] = S1
+        S_group[idx, d0 + 2] = S2
+        U_group[idx, d0] = U0
+        U_group[idx, d0 + 1] = U1
+        U_group[idx, d0 + 2] = U2
+        for a in range(3):
+            for b in range(3):
+                Dinv_group[idx, d0 + a, b] = Di[a, b]
+            for b in range(3, 6):
+                Dinv_group[idx, d0 + a, b] = 0.0
+        W0 = Di[0, 0] * U0 + Di[0, 1] * U1 + Di[0, 2] * U2
+        W1 = Di[1, 0] * U0 + Di[1, 1] * U1 + Di[1, 2] * U2
+        W2 = Di[2, 0] * U0 + Di[2, 1] * U1 + Di[2, 2] * U2
+        IA = IA - wp.outer(U0, W0) - wp.outer(U1, W1) - wp.outer(U2, W2)
+    else:
+        for a in range(k):
+            S = joint_S_s[dof0 + d0 + a]
+            S_group[idx, d0 + a] = S
+            U_group[idx, d0 + a] = IA * S
+        Dg = wp.spatial_matrix()
+        for a in range(k):
+            for b in range(k):
+                # Symmetric by construction, as in the 3-DOF branch.
+                Dg[a, b] = 0.5 * (
+                    wp.dot(S_group[idx, d0 + a], U_group[idx, d0 + b])
+                    + wp.dot(S_group[idx, d0 + b], U_group[idx, d0 + a])
+                )
+            Dg[a, a] = Dg[a, a] + diag_group[idx, d0 + a]
+        Dinv = _invert_spd_block(Dg, k)
+        for a in range(k):
+            for b in range(6):
+                Dinv_group[idx, d0 + a, b] = Dinv[a, b]
+        for a in range(k):
+            Ua = U_group[idx, d0 + a]
+            for b in range(k):
+                IA = IA - Dinv[a, b] * wp.outer(Ua, U_group[idx, d0 + b])
+    return IA
+
+
 @wp.kernel
 def factor_articulated_body(
     group_to_art: wp.array[int],
@@ -2736,89 +2830,106 @@ def factor_articulated_body(
         carry = zero
         if branch_slot[j] >= 0:
             IA = IA + body_I_A[joint_child[j]]
-        d0 = joint_qd_start[j] - dof0
-        k = joint_qd_start[j + 1] - joint_qd_start[j]
+        IA = _ab_factor_joint(idx, j, dof0, IA, joint_qd_start, joint_S_s, diag_group, S_group, U_group, Dinv_group)
         parent = joint_ancestor[j]
-        if k == 1:
-            S = joint_S_s[dof0 + d0]
-            U = IA * S
-            D1 = wp.dot(S, U) + diag_group[idx, d0]
-            # A massless DOF without armature responds with zero, like a zero Cholesky pivot.
-            dinv = float(0.0)
-            if D1 > 0.0:
-                dinv = 1.0 / D1
-            S_group[idx, d0] = S
-            U_group[idx, d0] = U
-            Dinv_group[idx, d0, 0] = dinv
-            for b in range(1, 6):
-                Dinv_group[idx, d0, b] = 0.0
-            IA = IA - wp.outer(U, dinv * U)
-        elif k == 3:
-            S0 = joint_S_s[dof0 + d0]
-            S1 = joint_S_s[dof0 + d0 + 1]
-            S2 = joint_S_s[dof0 + d0 + 2]
-            U0 = IA * S0
-            U1 = IA * S1
-            U2 = IA * S2
-            # Build D symmetric: rounding leaves I^A slightly asymmetric, and an asymmetric D^-1 feeds
-            # an antisymmetric part back into the parent's I^A that grows at every multi-DOF joint.
-            d01 = 0.5 * (wp.dot(S0, U1) + wp.dot(S1, U0))
-            d02 = 0.5 * (wp.dot(S0, U2) + wp.dot(S2, U0))
-            d12 = 0.5 * (wp.dot(S1, U2) + wp.dot(S2, U1))
-            D = wp.mat33(
-                wp.dot(S0, U0) + diag_group[idx, d0],
-                d01,
-                d02,
-                d01,
-                wp.dot(S1, U1) + diag_group[idx, d0 + 1],
-                d12,
-                d02,
-                d12,
-                wp.dot(S2, U2) + diag_group[idx, d0 + 2],
-            )
-            Di = _invert_psd3(D)
-            S_group[idx, d0] = S0
-            S_group[idx, d0 + 1] = S1
-            S_group[idx, d0 + 2] = S2
-            U_group[idx, d0] = U0
-            U_group[idx, d0 + 1] = U1
-            U_group[idx, d0 + 2] = U2
-            for a in range(3):
-                for b in range(3):
-                    Dinv_group[idx, d0 + a, b] = Di[a, b]
-                for b in range(3, 6):
-                    Dinv_group[idx, d0 + a, b] = 0.0
-            W0 = Di[0, 0] * U0 + Di[0, 1] * U1 + Di[0, 2] * U2
-            W1 = Di[1, 0] * U0 + Di[1, 1] * U1 + Di[1, 2] * U2
-            W2 = Di[2, 0] * U0 + Di[2, 1] * U1 + Di[2, 2] * U2
-            IA = IA - wp.outer(U0, W0) - wp.outer(U1, W1) - wp.outer(U2, W2)
-        else:
-            for a in range(k):
-                S = joint_S_s[dof0 + d0 + a]
-                S_group[idx, d0 + a] = S
-                U_group[idx, d0 + a] = IA * S
-            Dg = wp.spatial_matrix()
-            for a in range(k):
-                for b in range(k):
-                    # Symmetric by construction, as in the 3-DOF branch.
-                    Dg[a, b] = 0.5 * (
-                        wp.dot(S_group[idx, d0 + a], U_group[idx, d0 + b])
-                        + wp.dot(S_group[idx, d0 + b], U_group[idx, d0 + a])
-                    )
-                Dg[a, a] = Dg[a, a] + diag_group[idx, d0 + a]
-            Dinv = _invert_spd_block(Dg, k)
-            for a in range(k):
-                for b in range(6):
-                    Dinv_group[idx, d0 + a, b] = Dinv[a, b]
-            for a in range(k):
-                Ua = U_group[idx, d0 + a]
-                for b in range(k):
-                    IA = IA - Dinv[a, b] * wp.outer(Ua, U_group[idx, d0 + b])
         if parent >= start:
             if parent == j - 1:
                 carry = IA
             else:
                 body_I_A[joint_child[parent]] = body_I_A[joint_child[parent]] + IA
+
+
+@wp.func
+def _ab_solve_up_joint(
+    idx: int,
+    row: int,
+    j: int,
+    dof0: int,
+    p: wp.spatial_vector,
+    joint_qd_start: wp.array[int],
+    S_group: wp.array2d[wp.spatial_vector],
+    U_group: wp.array2d[wp.spatial_vector],
+    Dinv_group: wp.array3d[float],
+    x: wp.array3d[float],
+    y: wp.array3d[float],
+) -> wp.spatial_vector:
+    """Inward step of :func:`_articulated_body_solve` at joint ``j``.
+
+    ``p`` is the articulated bias force its children hand up; returns the force ``j`` hands to its parent.
+    """
+    d0 = joint_qd_start[j] - dof0
+    k = joint_qd_start[j + 1] - joint_qd_start[j]
+    if k == 1:
+        u = x[idx, row, d0] - wp.dot(S_group[idx, d0], p)
+        y[idx, row, d0] = u
+        p = p + (Dinv_group[idx, d0, 0] * u) * U_group[idx, d0]
+    elif k == 3:
+        u0 = x[idx, row, d0] - wp.dot(S_group[idx, d0], p)
+        u1 = x[idx, row, d0 + 1] - wp.dot(S_group[idx, d0 + 1], p)
+        u2 = x[idx, row, d0 + 2] - wp.dot(S_group[idx, d0 + 2], p)
+        y[idx, row, d0] = u0
+        y[idx, row, d0 + 1] = u1
+        y[idx, row, d0 + 2] = u2
+        w0 = Dinv_group[idx, d0, 0] * u0 + Dinv_group[idx, d0, 1] * u1 + Dinv_group[idx, d0, 2] * u2
+        w1 = Dinv_group[idx, d0 + 1, 0] * u0 + Dinv_group[idx, d0 + 1, 1] * u1 + Dinv_group[idx, d0 + 1, 2] * u2
+        w2 = Dinv_group[idx, d0 + 2, 0] * u0 + Dinv_group[idx, d0 + 2, 1] * u1 + Dinv_group[idx, d0 + 2, 2] * u2
+        p = p + w0 * U_group[idx, d0] + w1 * U_group[idx, d0 + 1] + w2 * U_group[idx, d0 + 2]
+    else:
+        for a in range(k):
+            y[idx, row, d0 + a] = x[idx, row, d0 + a] - wp.dot(S_group[idx, d0 + a], p)
+        for a in range(k):
+            w = float(0.0)
+            for b in range(k):
+                w += Dinv_group[idx, d0 + a, b] * y[idx, row, d0 + b]
+            p = p + w * U_group[idx, d0 + a]
+    return p
+
+
+@wp.func
+def _ab_solve_down_joint(
+    idx: int,
+    row: int,
+    j: int,
+    dof0: int,
+    acc: wp.spatial_vector,
+    joint_qd_start: wp.array[int],
+    S_group: wp.array2d[wp.spatial_vector],
+    U_group: wp.array2d[wp.spatial_vector],
+    Dinv_group: wp.array3d[float],
+    y: wp.array3d[float],
+) -> wp.spatial_vector:
+    """Outward step of :func:`_articulated_body_solve` at joint ``j``.
+
+    ``acc`` is the parent's spatial acceleration; returns joint ``j``'s.
+    """
+    d0 = joint_qd_start[j] - dof0
+    k = joint_qd_start[j + 1] - joint_qd_start[j]
+    if k == 1:
+        q = Dinv_group[idx, d0, 0] * (y[idx, row, d0] - wp.dot(U_group[idx, d0], acc))
+        y[idx, row, d0] = q
+        acc = acc + q * S_group[idx, d0]
+    elif k == 3:
+        t0 = y[idx, row, d0] - wp.dot(U_group[idx, d0], acc)
+        t1 = y[idx, row, d0 + 1] - wp.dot(U_group[idx, d0 + 1], acc)
+        t2 = y[idx, row, d0 + 2] - wp.dot(U_group[idx, d0 + 2], acc)
+        q0 = Dinv_group[idx, d0, 0] * t0 + Dinv_group[idx, d0, 1] * t1 + Dinv_group[idx, d0, 2] * t2
+        q1 = Dinv_group[idx, d0 + 1, 0] * t0 + Dinv_group[idx, d0 + 1, 1] * t1 + Dinv_group[idx, d0 + 1, 2] * t2
+        q2 = Dinv_group[idx, d0 + 2, 0] * t0 + Dinv_group[idx, d0 + 2, 1] * t1 + Dinv_group[idx, d0 + 2, 2] * t2
+        y[idx, row, d0] = q0
+        y[idx, row, d0 + 1] = q1
+        y[idx, row, d0 + 2] = q2
+        acc = acc + q0 * S_group[idx, d0] + q1 * S_group[idx, d0 + 1] + q2 * S_group[idx, d0 + 2]
+    else:
+        t = wp.spatial_vector()
+        for a in range(k):
+            t[a] = y[idx, row, d0 + a] - wp.dot(U_group[idx, d0 + a], acc)
+        for a in range(k):
+            q = float(0.0)
+            for b in range(k):
+                q += Dinv_group[idx, d0 + a, b] * t[b]
+            y[idx, row, d0 + a] = q
+            acc = acc + q * S_group[idx, d0 + a]
+    return acc
 
 
 @wp.func
@@ -2855,31 +2966,7 @@ def _articulated_body_solve(
         slot = branch_slot[j]
         if slot >= 0:
             p = p + scratch[idx, slot, row]
-        d0 = joint_qd_start[j] - dof0
-        k = joint_qd_start[j + 1] - joint_qd_start[j]
-        if k == 1:
-            u = x[idx, row, d0] - wp.dot(S_group[idx, d0], p)
-            y[idx, row, d0] = u
-            p = p + (Dinv_group[idx, d0, 0] * u) * U_group[idx, d0]
-        elif k == 3:
-            u0 = x[idx, row, d0] - wp.dot(S_group[idx, d0], p)
-            u1 = x[idx, row, d0 + 1] - wp.dot(S_group[idx, d0 + 1], p)
-            u2 = x[idx, row, d0 + 2] - wp.dot(S_group[idx, d0 + 2], p)
-            y[idx, row, d0] = u0
-            y[idx, row, d0 + 1] = u1
-            y[idx, row, d0 + 2] = u2
-            w0 = Dinv_group[idx, d0, 0] * u0 + Dinv_group[idx, d0, 1] * u1 + Dinv_group[idx, d0, 2] * u2
-            w1 = Dinv_group[idx, d0 + 1, 0] * u0 + Dinv_group[idx, d0 + 1, 1] * u1 + Dinv_group[idx, d0 + 1, 2] * u2
-            w2 = Dinv_group[idx, d0 + 2, 0] * u0 + Dinv_group[idx, d0 + 2, 1] * u1 + Dinv_group[idx, d0 + 2, 2] * u2
-            p = p + w0 * U_group[idx, d0] + w1 * U_group[idx, d0 + 1] + w2 * U_group[idx, d0 + 2]
-        else:
-            for a in range(k):
-                y[idx, row, d0 + a] = x[idx, row, d0 + a] - wp.dot(S_group[idx, d0 + a], p)
-            for a in range(k):
-                w = float(0.0)
-                for b in range(k):
-                    w += Dinv_group[idx, d0 + a, b] * y[idx, row, d0 + b]
-                p = p + w * U_group[idx, d0 + a]
+        p = _ab_solve_up_joint(idx, row, j, dof0, p, joint_qd_start, S_group, U_group, Dinv_group, x, y)
         parent = joint_ancestor[j]
         if parent >= start:
             if parent == j - 1:
@@ -2896,33 +2983,7 @@ def _articulated_body_solve(
                 acc = acc_prev
             else:
                 acc = scratch[idx, branch_slot[parent], row]
-        d0 = joint_qd_start[j] - dof0
-        k = joint_qd_start[j + 1] - joint_qd_start[j]
-        if k == 1:
-            q = Dinv_group[idx, d0, 0] * (y[idx, row, d0] - wp.dot(U_group[idx, d0], acc))
-            y[idx, row, d0] = q
-            acc = acc + q * S_group[idx, d0]
-        elif k == 3:
-            t0 = y[idx, row, d0] - wp.dot(U_group[idx, d0], acc)
-            t1 = y[idx, row, d0 + 1] - wp.dot(U_group[idx, d0 + 1], acc)
-            t2 = y[idx, row, d0 + 2] - wp.dot(U_group[idx, d0 + 2], acc)
-            q0 = Dinv_group[idx, d0, 0] * t0 + Dinv_group[idx, d0, 1] * t1 + Dinv_group[idx, d0, 2] * t2
-            q1 = Dinv_group[idx, d0 + 1, 0] * t0 + Dinv_group[idx, d0 + 1, 1] * t1 + Dinv_group[idx, d0 + 1, 2] * t2
-            q2 = Dinv_group[idx, d0 + 2, 0] * t0 + Dinv_group[idx, d0 + 2, 1] * t1 + Dinv_group[idx, d0 + 2, 2] * t2
-            y[idx, row, d0] = q0
-            y[idx, row, d0 + 1] = q1
-            y[idx, row, d0 + 2] = q2
-            acc = acc + q0 * S_group[idx, d0] + q1 * S_group[idx, d0 + 1] + q2 * S_group[idx, d0 + 2]
-        else:
-            t = wp.spatial_vector()
-            for a in range(k):
-                t[a] = y[idx, row, d0 + a] - wp.dot(U_group[idx, d0 + a], acc)
-            for a in range(k):
-                q = float(0.0)
-                for b in range(k):
-                    q += Dinv_group[idx, d0 + a, b] * t[b]
-                y[idx, row, d0 + a] = q
-                acc = acc + q * S_group[idx, d0 + a]
+        acc = _ab_solve_down_joint(idx, row, j, dof0, acc, joint_qd_start, S_group, U_group, Dinv_group, y)
         acc_prev = acc
         slot = branch_slot[j]
         if slot >= 0:
@@ -3039,6 +3100,597 @@ def hinv_jt_articulated_body(
             for d in range(n_dofs):
                 J_world[world, row, offset + d] = J_group[idx, row, d]
                 Y_world[world, row, offset + d] = Y_group[idx, row, d]
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    int v = value;
+    const int local = threadIdx.x & (width - 1);
+    for (int offset = 1; offset < width; offset <<= 1) {
+        const int n = __shfl_up_sync(0xffffffffu, v, offset, width);
+        if (local >= offset)
+            v += n;
+    }
+    return v;
+#else
+    return value;
+#endif
+""")
+def _tree_lane_inclusive_scan(value: int, width: int) -> int:
+    """Inclusive prefix sum over the ``width`` lanes of one articulation; every warp lane must call it."""
+    ...
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    return __shfl_sync(0xffffffffu, value, width - 1, width);
+#else
+    return value;
+#endif
+""")
+def _tree_lane_last(value: int, width: int) -> int:
+    """Return the last lane's ``value`` within the ``width`` lanes of one articulation; every warp lane must call it."""
+    ...
+
+
+@cache
+def _get_tree_ab_factor_kernel(lanes: int):
+    """Build the cooperative :func:`factor_articulated_body` over independent tree branches.
+
+    Each launch row is one articulation of an articulated-body group, given by its tree-plan row
+    and its index in the group. Levels run deepest first. A segment's tail joint adds its children's
+    articulated inertias in the serial pass's order (the next joint's first, then the others in
+    descending joint order), so the factor matches the serial kernel bit for bit. A segment's head
+    hands its inertia to the parent through ``body_I_A`` of its child body.
+    """
+    if lanes not in (1, 2, 4, 8, 16, 32):
+        raise ValueError("Tree traversal lanes must be a power of two between 1 and 32")
+    module = _steel_module(f"{__name__}.tree_ab_factor_{lanes}")
+
+    @wp.kernel(module=module, enable_backward=False)
+    def tree_ab_factor(
+        row_count: int,
+        max_levels: int,
+        plan_rows: wp.array[int],
+        group_index: wp.array[int],
+        art_indices: wp.array[int],
+        level_offsets: wp.array2d[int],
+        segment_offsets: wp.array[int],
+        segment_joints: wp.array[int],
+        child_offsets: wp.array[int],
+        child_segments: wp.array[int],
+        articulation_dof_start: wp.array[int],
+        mass_update_mask: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_S_s: wp.array[wp.spatial_vector],
+        body_I_s: wp.array[wp.spatial_matrix],
+        R_group: wp.array2d[float],
+        n_dofs: int,
+        max_dofs: int,
+        drive_row_counts: wp.array[int],
+        drive_row_dof_index: wp.array[int],
+        drive_row_K: wp.array[float],
+        # outputs
+        body_I_A: wp.array[wp.spatial_matrix],
+        diag_group: wp.array2d[float],
+        S_group: wp.array2d[wp.spatial_vector],
+        U_group: wp.array2d[wp.spatial_vector],
+        Dinv_group: wp.array3d[float],
+    ):
+        block, lane = wp.tid()
+        row = block * (32 // lanes) + lane // lanes
+        local = lane % lanes
+        active = row < row_count
+        plan_row = int(0)
+        idx = int(0)
+        art = int(0)
+        if active:
+            plan_row = plan_rows[row]
+            idx = group_index[row]
+            art = art_indices[plan_row]
+            active = mass_update_mask[art] != 0
+        dof0 = int(0)
+        if active:
+            dof0 = articulation_dof_start[art]
+            d = local
+            while d < n_dofs:
+                diag_group[idx, d] = R_group[idx, d]
+                d += lanes
+        if wp.static(lanes > 1):
+            _tree_warp_sync()
+        if active:
+            # Each drive row targets its own DOF, so the lanes add them without conflicts.
+            i = local
+            while i < drive_row_counts[art]:
+                drive_row = art * max_dofs + i
+                d = drive_row_dof_index[drive_row] - dof0
+                K = drive_row_K[drive_row]
+                if d >= 0 and d < n_dofs and K > 0.0:
+                    diag_group[idx, d] += K
+                i += lanes
+        if wp.static(lanes > 1):
+            _tree_warp_sync()
+        for reverse_level in range(max_levels):
+            level = max_levels - reverse_level - 1
+            if active:
+                segment = level_offsets[plan_row, level] + local
+                end = level_offsets[plan_row, level + 1]
+                while segment < end:
+                    begin = segment_offsets[segment]
+                    finish = segment_offsets[segment + 1]
+                    tail = segment_joints[finish - 1]
+                    IA = body_I_s[joint_child[tail]]
+                    first = child_offsets[segment]
+                    last = child_offsets[segment + 1]
+                    if last > first:
+                        head = segment_joints[segment_offsets[child_segments[last - 1]]]
+                        if head == tail + 1:
+                            IA = IA + body_I_A[joint_child[head]]
+                            last = last - 1
+                    if last > first:
+                        rest = body_I_A[joint_child[segment_joints[segment_offsets[child_segments[first]]]]]
+                        for entry in range(first + 1, last):
+                            rest = rest + body_I_A[joint_child[segment_joints[segment_offsets[child_segments[entry]]]]]
+                        IA = IA + rest
+                    for offset in range(finish - begin):
+                        j = segment_joints[finish - offset - 1]
+                        if offset > 0:
+                            IA = body_I_s[joint_child[j]] + IA
+                        IA = _ab_factor_joint(
+                            idx, j, dof0, IA, joint_qd_start, joint_S_s, diag_group, S_group, U_group, Dinv_group
+                        )
+                    body_I_A[joint_child[segment_joints[begin]]] = IA
+                    segment += lanes
+            # Inactive rows still participate in every full-warp barrier.
+            if wp.static(lanes > 1):
+                _tree_warp_sync()
+
+    return tree_ab_factor
+
+
+@cache
+def _get_tree_ab_solve_tau_kernel(lanes: int):
+    """Build the cooperative :func:`solve_articulated_body_tau` over independent tree branches.
+
+    The launch rows are those of :func:`_get_tree_ab_factor_kernel`. The inward pass sums the
+    children's bias forces in the serial order, so the accelerations match the serial kernel bit
+    for bit. ``body_scratch`` holds a segment head's bias force on the way in and a segment tail's
+    spatial acceleration on the way out, both at the joint's child body.
+    """
+    if lanes not in (1, 2, 4, 8, 16, 32):
+        raise ValueError("Tree traversal lanes must be a power of two between 1 and 32")
+    module = _steel_module(f"{__name__}.tree_ab_solve_tau_{lanes}")
+
+    @wp.kernel(module=module, enable_backward=False)
+    def tree_ab_solve_tau(
+        row_count: int,
+        max_levels: int,
+        plan_rows: wp.array[int],
+        group_index: wp.array[int],
+        art_indices: wp.array[int],
+        level_offsets: wp.array2d[int],
+        segment_offsets: wp.array[int],
+        segment_joints: wp.array[int],
+        child_offsets: wp.array[int],
+        child_segments: wp.array[int],
+        articulation_dof_start: wp.array[int],
+        articulation_active: wp.array[int],
+        joint_ancestor: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        S_group: wp.array2d[wp.spatial_vector],
+        U_group: wp.array2d[wp.spatial_vector],
+        Dinv_group: wp.array3d[float],
+        n_dofs: int,
+        joint_tau: wp.array[float],
+        # outputs
+        rhs_group: wp.array3d[float],
+        body_scratch: wp.array[wp.spatial_vector],
+        joint_qdd: wp.array[float],
+    ):
+        block, lane = wp.tid()
+        row = block * (32 // lanes) + lane // lanes
+        local = lane % lanes
+        active = row < row_count
+        plan_row = int(0)
+        idx = int(0)
+        art = int(0)
+        if active:
+            plan_row = plan_rows[row]
+            idx = group_index[row]
+            art = art_indices[plan_row]
+            active = articulation_active[art] != 0
+        dof0 = int(0)
+        if active:
+            dof0 = articulation_dof_start[art]
+            d = local
+            while d < n_dofs:
+                rhs_group[idx, 0, d] = joint_tau[dof0 + d]
+                d += lanes
+        if wp.static(lanes > 1):
+            _tree_warp_sync()
+        zero = wp.spatial_vector()
+        for reverse_level in range(max_levels):
+            level = max_levels - reverse_level - 1
+            if active:
+                segment = level_offsets[plan_row, level] + local
+                end = level_offsets[plan_row, level + 1]
+                while segment < end:
+                    begin = segment_offsets[segment]
+                    finish = segment_offsets[segment + 1]
+                    tail = segment_joints[finish - 1]
+                    p = zero
+                    first = child_offsets[segment]
+                    last = child_offsets[segment + 1]
+                    if last > first:
+                        head = segment_joints[segment_offsets[child_segments[last - 1]]]
+                        if head == tail + 1:
+                            p = body_scratch[joint_child[head]]
+                            last = last - 1
+                    if last > first:
+                        rest = body_scratch[joint_child[segment_joints[segment_offsets[child_segments[first]]]]]
+                        for entry in range(first + 1, last):
+                            rest = (
+                                rest + body_scratch[joint_child[segment_joints[segment_offsets[child_segments[entry]]]]]
+                            )
+                        p = p + rest
+                    for offset in range(finish - begin):
+                        j = segment_joints[finish - offset - 1]
+                        p = _ab_solve_up_joint(
+                            idx, 0, j, dof0, p, joint_qd_start, S_group, U_group, Dinv_group, rhs_group, rhs_group
+                        )
+                    body_scratch[joint_child[segment_joints[begin]]] = p
+                    segment += lanes
+            if wp.static(lanes > 1):
+                _tree_warp_sync()
+        for level in range(max_levels):
+            if active:
+                segment = level_offsets[plan_row, level] + local
+                end = level_offsets[plan_row, level + 1]
+                while segment < end:
+                    begin = segment_offsets[segment]
+                    finish = segment_offsets[segment + 1]
+                    parent = joint_ancestor[segment_joints[begin]]
+                    acc = zero
+                    if parent >= 0:
+                        acc = body_scratch[joint_child[parent]]
+                    for entry in range(begin, finish):
+                        acc = _ab_solve_down_joint(
+                            idx,
+                            0,
+                            segment_joints[entry],
+                            dof0,
+                            acc,
+                            joint_qd_start,
+                            S_group,
+                            U_group,
+                            Dinv_group,
+                            rhs_group,
+                        )
+                    body_scratch[joint_child[segment_joints[finish - 1]]] = acc
+                    segment += lanes
+            if wp.static(lanes > 1):
+                _tree_warp_sync()
+        if active:
+            d = local
+            while d < n_dofs:
+                joint_qdd[dof0 + d] = rhs_group[idx, 0, d]
+                d += lanes
+
+    return tree_ab_solve_tau
+
+
+@cache
+def _get_tree_augmented_drives_kernel(lanes: int):
+    """Build the augmented-drive pass of :func:`eval_rigid_tau_and_augmented_drives` with the joints of an articulation split over its lanes.
+
+    The lanes take consecutive joints; a prefix sum over their row counts gives every row the slot
+    of the serial pass, so the row lists and ``tau`` match it bit for bit. Launch complete warps.
+    """
+    if lanes not in (1, 2, 4, 8, 16, 32):
+        raise ValueError("Tree traversal lanes must be a power of two between 1 and 32")
+    module = _steel_module(f"{__name__}.tree_augmented_drives_{lanes}")
+
+    @wp.kernel(module=module, enable_backward=False)
+    def tree_augmented_drives(
+        group_count: int,
+        max_joints: int,
+        art_indices: wp.array[int],
+        articulation_start: wp.array[int],
+        articulation_joint_end: wp.array[int],
+        articulation_H_rows: wp.array[int],
+        joint_type: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_q_start: wp.array[int],
+        joint_dof_dim: wp.array2d[int],
+        joint_q: wp.array[float],
+        joint_qd: wp.array[float],
+        joint_damping: wp.array[float],
+        augment_drives: bool,
+        joint_target_ke: wp.array[float],
+        joint_target_kd: wp.array[float],
+        joint_target_pos: wp.array[float],
+        joint_target_q_start: wp.array[int],
+        joint_target_vel: wp.array[float],
+        joint_effort_limit: wp.array[float],
+        max_dofs: int,
+        dt: float,
+        articulation_active: wp.array[int],
+        row_counts: wp.array[int],
+        row_dof_index: wp.array[int],
+        row_K: wp.array[float],
+        tau: wp.array[float],
+    ):
+        block, lane = wp.tid()
+        group = block * (32 // lanes) + lane // lanes
+        local = lane % lanes
+        active = group < group_count
+        art = int(0)
+        if active:
+            art = art_indices[group]
+            active = articulation_active[art] != 0
+        if active:
+            if articulation_H_rows[art] == 0:
+                if local == 0:
+                    row_counts[art] = 0
+                active = False
+        joint_start = int(0)
+        joint_end = int(0)
+        if active:
+            joint_start = articulation_start[art]
+            joint_end = articulation_joint_end[art]
+        base = int(0)
+        # Every lane runs the same number of chunks: the scan synchronizes the whole warp.
+        for chunk in range(0, max_joints, lanes):
+            joint = joint_start + chunk + local
+            mine = joint < joint_end
+            count = int(0)
+            type = int(0)
+            if mine:
+                type = joint_type[joint]
+                if (
+                    type != JointType.PRISMATIC
+                    and type != JointType.REVOLUTE
+                    and type != JointType.D6
+                    and type != JointType.BALL
+                ):
+                    mine = False
+            if mine:
+                for axis in range(joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]):
+                    dof = joint_qd_start[joint] + axis
+                    K = wp.max(joint_damping[dof], 0.0) * dt
+                    if augment_drives and type != JointType.BALL:
+                        ke = joint_target_ke[dof]
+                        kd = joint_target_kd[dof]
+                        drive_K = ke * dt * dt + kd * dt
+                        if (ke > 0.0 or kd > 0.0) and drive_K > 0.0:
+                            K = drive_K + K
+                    if K > 0.0:
+                        count += 1
+            inclusive = _tree_lane_inclusive_scan(count, lanes)
+            slot = base + inclusive - count
+            if mine:
+                axis_count = joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
+                qd_start = joint_qd_start[joint]
+                coord_start = joint_q_start[joint]
+                for axis in range(axis_count):
+                    if slot >= max_dofs:
+                        break
+                    dof_index = qd_start + axis
+                    ke = float(0.0)
+                    kd = float(0.0)
+                    if augment_drives and type != JointType.BALL:
+                        ke = joint_target_ke[dof_index]
+                        kd = joint_target_kd[dof_index]
+                    drive = augment_drives and type != JointType.BALL and (ke > 0.0 or kd > 0.0)
+                    drive_K = ke * dt * dt + kd * dt
+                    drive = drive and drive_K > 0.0
+                    if not drive:
+                        drive_K = 0.0
+                    K = drive_K + wp.max(joint_damping[dof_index], 0.0) * dt
+                    if K <= 0.0:
+                        continue
+                    u0 = float(0.0)
+                    if drive:
+                        q = joint_q[coord_start + axis]
+                        qd = joint_qd[dof_index]
+                        target_pos = joint_target_pos[joint_target_q_start[joint] + axis]
+                        u0 = -(ke * (q - target_pos + dt * qd) + kd * (qd - joint_target_vel[dof_index]))
+                        effort_limit = joint_effort_limit[dof_index]
+                        if effort_limit > 0.0:
+                            u0 = wp.clamp(u0, -effort_limit, effort_limit)
+                    row_index = art * max_dofs + slot
+                    row_dof_index[row_index] = dof_index
+                    row_K[row_index] = K
+                    tau[dof_index] = tau[dof_index] + u0
+                    slot += 1
+            base += _tree_lane_last(inclusive, lanes)
+        if active and local == 0:
+            row_counts[art] = wp.min(base, max_dofs)
+
+    return tree_augmented_drives
+
+
+@cache
+def _get_tree_body_relative_poses_kernel(lanes: int):
+    """Build :func:`eval_body_relative_poses` over independent tree branches.
+
+    A joint needs only its parent's relative position, so the levels of the tree plan run in
+    order and the results match the serial kernel bit for bit. Launch complete warps.
+    """
+    if lanes not in (1, 2, 4, 8, 16, 32):
+        raise ValueError("Tree traversal lanes must be a power of two between 1 and 32")
+    module = _steel_module(f"{__name__}.tree_body_relative_poses_{lanes}")
+
+    @wp.kernel(module=module, enable_backward=False)
+    def tree_body_relative_poses(
+        group_count: int,
+        max_levels: int,
+        art_indices: wp.array[int],
+        level_offsets: wp.array2d[int],
+        segment_offsets: wp.array[int],
+        segment_joints: wp.array[int],
+        articulation_start: wp.array[int],
+        articulation_joint_end: wp.array[int],
+        body_to_articulation: wp.array[int],
+        joint_type: wp.array[int],
+        joint_parent: wp.array[int],
+        joint_child: wp.array[int],
+        joint_q_start: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_q: wp.array[float],
+        joint_X_p: wp.array[wp.transform],
+        joint_X_c: wp.array[wp.transform],
+        joint_axis: wp.array[wp.vec3],
+        joint_dof_dim: wp.array2d[int],
+        body_q: wp.array[wp.transform],
+        # outputs
+        body_rel_t: wp.array[wp.vec3],
+        articulation_ref_t: wp.array[wp.vec3],
+    ):
+        block, lane = wp.tid()
+        group = block * (32 // lanes) + lane // lanes
+        local = lane % lanes
+        active = group < group_count
+        art = int(0)
+        start = int(0)
+        if active:
+            art = art_indices[group]
+            start = articulation_start[art]
+            active = start < articulation_joint_end[art]
+        # Every lane forms the reference point and the root body's offset itself, composed as in
+        # the serial kernel.
+        ref_t = wp.vec3()
+        root_rel = wp.vec3()
+        if active:
+            X_j0 = jcalc_transform(
+                joint_type[start],
+                joint_axis,
+                joint_qd_start[start],
+                joint_dof_dim[start, 0],
+                joint_dof_dim[start, 1],
+                joint_q,
+                joint_q_start[start],
+            )
+            X_pj0 = joint_X_p[start]
+            X_cinv0 = wp.transform_inverse(joint_X_c[start])
+            if joint_parent[start] < 0:
+                ref_t = wp.transform_get_translation(X_pj0) + wp.quat_rotate(
+                    wp.transform_get_rotation(X_pj0), wp.transform_get_translation(X_j0)
+                )
+                root_rel = wp.quat_rotate(
+                    wp.transform_get_rotation(X_pj0) * wp.transform_get_rotation(X_j0),
+                    wp.transform_get_translation(X_cinv0),
+                )
+            else:
+                X_parent = body_q[joint_parent[start]]
+                ref_t = wp.transform_get_translation(X_parent)
+                root_rel = wp.quat_rotate(
+                    wp.transform_get_rotation(X_parent), wp.transform_get_translation(X_pj0 * X_j0 * X_cinv0)
+                )
+            if local == 0:
+                articulation_ref_t[art] = ref_t
+        for level in range(max_levels):
+            if active:
+                segment = level_offsets[group, level] + local
+                end = level_offsets[group, level + 1]
+                while segment < end:
+                    for entry in range(segment_offsets[segment], segment_offsets[segment + 1]):
+                        i = segment_joints[entry]
+                        parent = joint_parent[i]
+                        X_wpj = joint_X_p[i]
+                        in_tree = False
+                        if parent >= 0:
+                            in_tree = body_to_articulation[parent] == art
+                        if in_tree:
+                            X_wpj = wp.transform(body_rel_t[parent], wp.transform_get_rotation(body_q[parent])) * X_wpj
+                        else:
+                            if parent >= 0:
+                                X_wpj = body_q[parent] * X_wpj
+                            X_wpj = wp.transform(
+                                wp.transform_get_translation(X_wpj) - ref_t, wp.transform_get_rotation(X_wpj)
+                            )
+                        X_j = jcalc_transform(
+                            joint_type[i],
+                            joint_axis,
+                            joint_qd_start[i],
+                            joint_dof_dim[i, 0],
+                            joint_dof_dim[i, 1],
+                            joint_q,
+                            joint_q_start[i],
+                        )
+                        if i == start:
+                            body_rel_t[joint_child[i]] = root_rel
+                        else:
+                            body_rel_t[joint_child[i]] = wp.transform_get_translation(
+                                X_wpj * X_j * wp.transform_inverse(joint_X_c[i])
+                            )
+                    segment += lanes
+            if wp.static(lanes > 1):
+                _tree_warp_sync()
+
+    return tree_body_relative_poses
+
+
+@cache
+def _get_tree_composite_inertia_kernel(lanes: int):
+    """Build :func:`compute_composite_inertia` over independent tree branches.
+
+    The launch rows select articulations of the tree plan (see :func:`_get_tree_ab_factor_kernel`).
+    Levels run deepest first. A segment's tail adds its children's composite inertias in descending
+    joint order, the order of the serial reduction, so the results match it bit for bit.
+    """
+    if lanes not in (1, 2, 4, 8, 16, 32):
+        raise ValueError("Tree traversal lanes must be a power of two between 1 and 32")
+    module = _steel_module(f"{__name__}.tree_composite_inertia_{lanes}")
+
+    @wp.kernel(module=module, enable_backward=False)
+    def tree_composite_inertia(
+        row_count: int,
+        max_levels: int,
+        plan_rows: wp.array[int],
+        art_indices: wp.array[int],
+        level_offsets: wp.array2d[int],
+        segment_offsets: wp.array[int],
+        segment_joints: wp.array[int],
+        child_offsets: wp.array[int],
+        child_segments: wp.array[int],
+        joint_child: wp.array[int],
+        body_I_s: wp.array[wp.spatial_matrix],
+        articulation_active: wp.array[int],
+        # outputs
+        body_I_c: wp.array[wp.spatial_matrix],
+    ):
+        block, lane = wp.tid()
+        row = block * (32 // lanes) + lane // lanes
+        local = lane % lanes
+        active = row < row_count
+        plan_row = int(0)
+        if active:
+            plan_row = plan_rows[row]
+            active = articulation_active[art_indices[plan_row]] != 0
+        for reverse_level in range(max_levels):
+            level = max_levels - reverse_level - 1
+            if active:
+                segment = level_offsets[plan_row, level] + local
+                end = level_offsets[plan_row, level + 1]
+                while segment < end:
+                    begin = segment_offsets[segment]
+                    finish = segment_offsets[segment + 1]
+                    Ic = body_I_s[joint_child[segment_joints[finish - 1]]]
+                    for entry in range(child_offsets[segment], child_offsets[segment + 1]):
+                        Ic = Ic + body_I_c[joint_child[segment_joints[segment_offsets[child_segments[entry]]]]]
+                    for offset in range(finish - begin):
+                        child = joint_child[segment_joints[finish - offset - 1]]
+                        if offset > 0:
+                            Ic = body_I_s[child] + Ic
+                        body_I_c[child] = Ic
+                    segment += lanes
+            if wp.static(lanes > 1):
+                _tree_warp_sync()
+
+    return tree_composite_inertia
 
 
 @wp.func
@@ -4016,65 +4668,6 @@ def prepare_articulation_augmented_drives(
                 break
 
     row_counts[articulation] = slot
-
-
-@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE, enable_backward=False)
-def eval_augmented_drives(
-    articulation_start: wp.array[int],
-    articulation_joint_end: wp.array[int],
-    articulation_H_rows: wp.array[int],
-    joint_type: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    joint_damping: wp.array[float],
-    augment_drives: bool,
-    joint_target_ke: wp.array[float],
-    joint_target_kd: wp.array[float],
-    joint_target_pos: wp.array[float],
-    joint_target_q_start: wp.array[int],
-    joint_target_vel: wp.array[float],
-    joint_effort_limit: wp.array[float],
-    max_dofs: int,
-    dt: float,
-    articulation_active: wp.array[int],
-    row_counts: wp.array[int],
-    row_dof_index: wp.array[int],
-    row_K: wp.array[float],
-    tau: wp.array[float],
-):
-    """Add the augmented drives to an already accumulated ``tau``, one thread per articulation."""
-    if articulation_active[wp.tid()] == 0:
-        return
-    prepare_articulation_augmented_drives(
-        wp.tid(),
-        articulation_start,
-        articulation_joint_end,
-        articulation_H_rows,
-        joint_type,
-        joint_qd_start,
-        joint_q_start,
-        joint_dof_dim,
-        joint_q,
-        joint_qd,
-        joint_damping,
-        augment_drives,
-        joint_target_ke,
-        joint_target_kd,
-        joint_target_pos,
-        joint_target_q_start,
-        joint_target_vel,
-        joint_effort_limit,
-        max_dofs,
-        dt,
-        0,
-        row_counts,
-        row_dof_index,
-        row_K,
-        tau,
-    )
 
 
 @wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE, enable_backward=False)

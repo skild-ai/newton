@@ -386,7 +386,8 @@ repository examples spend tuning effort, not a shared solver API.
        and shapes with a positive restitution coefficient
        keep the dense factors;
        ``parallel_tree`` traverses independent tree branches in parallel and is
-       worth measuring on broad trees such as hands. The opt-in
+       worth measuring on broad trees such as hands and on articulations with
+       many loop closures, whose spanning tree it traverses. The opt-in
        ``reuse_kinematics`` (off by default) carries the kinematics a step
        publishes into the next step on CUDA when none of the restrictions in
        the option's docstring apply (gradients, joint velocity limits, sleeping,
