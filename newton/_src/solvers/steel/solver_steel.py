@@ -2645,10 +2645,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 with Nesterov momentum: at each tree propagation but the last, the row impulses move on by a
                 growing share of their change since the previous one, and that propagation installs the velocity
                 of the move with the sweeps'. The momentum restarts whenever the sweeps move the impulses against
-                it. A sweep moves only the bodies its rows touch, so the rows of one articulation share each
-                joint's mobility (mass splitting), which keeps every sweep stable but slows long trees that carry
-                rows on most links (a cable lying on a surface, pushed or held); momentum recovers much of that
-                convergence without loosening the split. It keeps rod chains off their contracted iterations.
+                it or reverse its last step. A sweep moves only the bodies its rows touch, so the rows of one
+                articulation share each joint's mobility (mass splitting), which keeps every sweep stable but slows
+                long trees that carry rows on most links (a cable lying on a surface, pushed or held); momentum
+                recovers much of that convergence without loosening the split. It keeps rod chains off their
+                contracted iterations.
                 ``None`` (default) turns it on when the model has rod material.
             propagation_color_order: Order in which ``solve_mode="colored"`` colors a world's
                 contacts and runs those left without a batch: ``"contact"`` (default) by contact
@@ -12349,7 +12350,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._momentum_delta = wp.zeros(momentum_shape, dtype=wp.float32, device=device)
         self._momentum_t = wp.ones(worlds if self._propagation_momentum else 1, dtype=wp.float32, device=device)
         self._momentum_beta = wp.zeros(worlds if self._propagation_momentum else 1, dtype=wp.float32, device=device)
-        self._momentum_dot = wp.zeros(worlds if self._propagation_momentum else 1, dtype=wp.float32, device=device)
+        self._momentum_dot = wp.zeros((worlds if self._propagation_momentum else 1, 2), dtype=wp.float32, device=device)
         # Articulated-body factorization and scratch of the tree passes.
         self._propagation_joint_S_flat = wp.zeros((dofs, 6), dtype=wp.float32, device=device)
         self._propagation_tree_Ia = wp.zeros((bodies, 6, 6), dtype=wp.float32, device=device)

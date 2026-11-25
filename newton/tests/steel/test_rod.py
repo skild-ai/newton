@@ -611,6 +611,59 @@ def test_propagation_momentum(test, device):
 add_function_test(TestSteelRod, "test_propagation_momentum", test_propagation_momentum, devices=get_cuda_test_devices())
 
 
+def test_propagation_momentum_restarts_on_a_turn(test, device):
+    """Momentum restarts when the sweeps reverse its last step, even if they agree with the latest move.
+
+    The impulses stood at 1, the momentum carried them on to 1.5, and the sweeps brought them back to 0.2: the sweeps
+    moved the same way as the block's move (the gradient test passes), but against the momentum's step, which on an
+    oscillating mode would otherwise grow each block.
+    """
+    from newton._src.solvers.steel.kernels import (  # noqa: PLC0415
+        propagation_momentum_dot,
+        propagation_momentum_step,
+        propagation_momentum_world,
+    )
+
+    rows = 3
+    count = wp.array([rows], dtype=wp.int32, device=device)
+    prev = wp.full((1, rows), 1.0, dtype=wp.float32, device=device)
+    start = wp.full((1, rows), 1.5, dtype=wp.float32, device=device)
+    impulses = wp.full((1, rows), 0.2, dtype=wp.float32, device=device)
+    for fused in (True, False):
+        t = wp.full(1, 5.0, dtype=wp.float32, device=device)
+        beta = wp.full(1, 0.7, dtype=wp.float32, device=device)
+        if fused:
+            wp.launch(
+                propagation_momentum_step,
+                dim=256,
+                inputs=[1, count, start, impulses, prev],
+                outputs=[t, beta],
+                block_dim=256,
+                device=device,
+            )
+        else:
+            dot = wp.zeros((1, 2), dtype=wp.float32, device=device)
+            wp.launch(
+                propagation_momentum_dot,
+                dim=rows,
+                inputs=[count, rows, impulses, prev, start],
+                outputs=[dot],
+                device=device,
+            )
+            test.assertGreater(float(dot.numpy()[0, 0]), 0.0)
+            wp.launch(propagation_momentum_world, dim=1, inputs=[dot], outputs=[t, beta], device=device)
+        test.assertEqual(float(beta.numpy()[0]), 0.0)
+        test.assertEqual(float(t.numpy()[0]), 1.0)
+
+
+add_function_test(
+    TestSteelRod,
+    "test_propagation_momentum_restarts_on_a_turn",
+    test_propagation_momentum_restarts_on_a_turn,
+    devices=get_cuda_test_devices(),
+)
+
+
 def test_propagation_tree_dynamics(test, device):
     """Rod trees take their unconstrained velocity from the propagation factorization, as the dense solve does."""
     from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415

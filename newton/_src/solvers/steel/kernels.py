@@ -9090,18 +9090,23 @@ def propagation_momentum_dot(
     momentum_prev: wp.array2d[float],
     momentum_start: wp.array2d[float],
     # outputs
-    momentum_dot: wp.array[float],
+    momentum_dot: wp.array2d[float],
 ):
-    """Each row's share of its world's restart test: (this sweep's move) . (the move since the last sweep)."""
+    """Each row's share of its world's two restart tests (see :func:`propagation_momentum_world`)."""
     tid = wp.tid()
     world = tid // propagation_max_constraints
     i = tid - world * propagation_max_constraints
     if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
         return
     lam = propagation_impulses[world, i]
-    value = (lam - momentum_start[world, i]) * (lam - momentum_prev[world, i])
+    prev = momentum_prev[world, i]
+    start = momentum_start[world, i]
+    value = (lam - start) * (lam - prev)
     if value != 0.0:
-        wp.atomic_add(momentum_dot, world, value)
+        wp.atomic_add(momentum_dot, world, 0, value)
+    turn = (lam - prev) * (start - prev)
+    if turn != 0.0:
+        wp.atomic_add(momentum_dot, world, 1, turn)
 
 
 @wp.kernel
@@ -9111,21 +9116,26 @@ def propagation_momentum_dot_ordered(
     momentum_prev: wp.array2d[float],
     momentum_start: wp.array2d[float],
     # outputs
-    momentum_dot: wp.array[float],
+    momentum_dot: wp.array2d[float],
 ):
     """``propagation_momentum_dot`` summed in row order, one thread per world (deterministic runs)."""
     world = wp.tid()
     m = wp.min(propagation_constraint_count[world], propagation_impulses.shape[1])
     dot = float(0.0)
+    turn = float(0.0)
     for i in range(m):
         lam = propagation_impulses[world, i]
-        dot += (lam - momentum_start[world, i]) * (lam - momentum_prev[world, i])
-    momentum_dot[world] = dot
+        prev = momentum_prev[world, i]
+        start = momentum_start[world, i]
+        dot += (lam - start) * (lam - prev)
+        turn += (lam - prev) * (start - prev)
+    momentum_dot[world, 0] = dot
+    momentum_dot[world, 1] = turn
 
 
 @wp.kernel
 def propagation_momentum_world(
-    momentum_dot: wp.array[float],
+    momentum_dot: wp.array2d[float],
     # in/out
     momentum_t: wp.array[float],
     # outputs
@@ -9133,12 +9143,17 @@ def propagation_momentum_world(
 ):
     """Nesterov momentum of one world's propagation sweep (``SolverSteel(propagation_momentum=True)``).
 
-    ``momentum_dot`` is the restart test: the sweep's move against the momentum's. The momentum restarts when the
-    sweep moved the impulses against it (gradient restart), otherwise it advances the Nesterov sequence.
+    With ``x`` the impulses after a block of sweeps, ``x_prev`` the previous block's and ``y`` the extrapolated
+    point that block started from, ``momentum_dot`` holds two restart tests. The gradient test
+    ``(x - y) . (x - x_prev)`` catches sweeps that move against the iterates' progress. The turn test
+    ``(x - x_prev) . (y - x_prev)`` catches progress that reverses the last momentum step: on a mode the sweeps
+    overshoot, each sweep agrees with the latest move and passes the gradient test while the momentum, pointing
+    along the move before, amplifies the oscillation. The momentum restarts when either is negative, otherwise it
+    advances the Nesterov sequence.
     """
     world = wp.tid()
     t = momentum_t[world]
-    if momentum_dot[world] < 0.0:
+    if momentum_dot[world, 0] < 0.0 or momentum_dot[world, 1] < 0.0:
         momentum_t[world] = 1.0
         momentum_beta[world] = 0.0
     else:
@@ -9152,6 +9167,7 @@ _MOMENTUM_STEP_THREADS = 256
 _MOMENTUM_STEP = """
 #if defined(__CUDA_ARCH__)
     __shared__ float s_red[256];
+    __shared__ float s_turn[256];
     __shared__ float s_beta;
     const int t = threadIdx.x;
     const int world = blockIdx.x;
@@ -9161,19 +9177,27 @@ _MOMENTUM_STEP = """
     if (m > mc) m = mc;
     const size_t base = (size_t)world * mc;
     float dot = 0.0f;
+    float turn = 0.0f;
     for (int i = t; i < m; i += 256) {
         const float lam = impulses.data[base + i];
-        dot += (lam - start.data[base + i]) * (lam - prev.data[base + i]);
+        const float p = prev.data[base + i];
+        const float y = start.data[base + i];
+        dot += (lam - y) * (lam - p);
+        turn += (lam - p) * (y - p);
     }
     s_red[t] = dot;
+    s_turn[t] = turn;
     __syncthreads();
     for (int o = 128; o > 0; o >>= 1) {
-        if (t < o) s_red[t] += s_red[t + o];
+        if (t < o) {
+            s_red[t] += s_red[t + o];
+            s_turn[t] += s_turn[t + o];
+        }
         __syncthreads();
     }
     if (t == 0) {
         const float tk = momentum_t.data[world];
-        if (s_red[0] < 0.0f) {
+        if (s_red[0] < 0.0f || s_turn[0] < 0.0f) {
             momentum_t.data[world] = 1.0f;
             s_beta = 0.0f;
         } else {
@@ -9210,7 +9234,8 @@ def propagation_momentum_step(
     momentum_t: wp.array[float],
     momentum_beta: wp.array[float],
 ):
-    """One world per block: the restart test, summed in shared memory, and the world's Nesterov step."""
+    """One world per block: the restart tests of :func:`propagation_momentum_world`, summed in shared memory, and the
+    world's Nesterov step."""
     _tid = wp.tid()
     _propagation_momentum_step_native(world_count, count, start, impulses, prev, momentum_t, momentum_beta)
 
