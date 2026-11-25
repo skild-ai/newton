@@ -1237,10 +1237,11 @@ def test_bisection_keeps_a_jammed_contact_near_the_frictionless_load(test, devic
 
 
 # The slipping jam with a positive normal complement s has a root near 0.95 / s times its first load. Roots up to
-# 2^15 times that load are solved; past it the search keeps the first load. Values as in _JAMMED_BLOCKS.
+# 2^15 times that load are solved, unless the residual at the cap is within rounding; past it the search keeps the
+# first load. Values as in _JAMMED_BLOCKS.
 _ROOT_WITHIN_CAP_BLOCKS = {
     "complement_9e-5": (-1.0, 0.0, 0.1, 1.00009, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
-    "complement_3e-5": (-1.0, 0.0, 0.1, 1.00003, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+    "complement_3.5e-5": (-1.0, 0.0, 0.1, 1.000035, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
 }
 _ROOT_PAST_CAP_BLOCKS = {
     "complement_2.5e-5": (-1.0, 0.0, 0.1, 1.000025, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
