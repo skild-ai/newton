@@ -1,0 +1,1 @@
+Fix `SolverSteel` loop closures to the world, or to a body outside the closure's articulation, opening with distance from the world origin: their gap and lever arms are now measured from an exactly held reference point of the articulation's root joint, as closures within one articulation already were.
