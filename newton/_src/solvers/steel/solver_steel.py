@@ -115,6 +115,7 @@ from .kernels import (
     apply_world_contact_restitution,
     apply_world_impulses_to_velocity,
     assign_world_contact_slots,
+    bound_world_contact_depenetration_bias,
     build_distance_limit_rows,
     build_joint_limit_rows,
     build_mass_update_mask,
@@ -1820,8 +1821,11 @@ class SolverSteel(SolverBase, CouplingInterface):
         - ``steel:rigid_body_max_linear_velocity`` [m/s] and ``steel:rigid_body_max_angular_velocity`` [rad/s]
           bound the velocity of free bodies (``physxRigidBody:maxLinearVelocity`` and
           ``physxRigidBody:maxAngularVelocity``, default unbounded).
-        - ``steel:rigid_body_max_depenetration_velocity`` [m/s] bounds the contact correction velocity
-          of free bodies (``physxRigidBody:maxDepenetrationVelocity``, default unbounded).
+        - ``steel:rigid_body_max_depenetration_velocity`` [m/s] bounds the Baumgarte correction
+          velocity of penetrating contacts on free bodies and articulation links
+          (``physxRigidBody:maxDepenetrationVelocity``, default unbounded). A contact takes the
+          smaller positive bound of its two bodies, kinematic and zero-DOF bodies included. As in
+          PhysX, joint limits and compliant contacts are not bounded.
 
         One per-shape attribute enables contact torsion, see ``contact_torsion_device``:
 
@@ -6543,6 +6547,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._phi = wp.zeros(shape, dtype=wp.float32, device=device)
         self._target_velocity = wp.zeros(shape, dtype=wp.float32, device=device)
         self._row_rebound_velocity = wp.zeros(shape, dtype=wp.float32, device=device)
+        self._row_max_depenetration_velocity = wp.zeros(shape, dtype=wp.float32, device=device)
         # Regularization weight per row, read by the solve only when regularization is on.
         self._row_w = wp.ones(shape if self._regularization_enabled else (1, 1), dtype=wp.float32, device=device)
         # Right-hand side of the velocity-only iterations.
@@ -6614,6 +6619,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         #   .z = rhs bits, .w = row_type | (row_parent << 16)
         self._mf_meta_packed = wp.zeros((worlds, rows * 4), dtype=wp.int32, device=device)
         self._mf_row_rebound_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
+        self._mf_row_max_depenetration_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._mf_row_w = wp.ones(
             (worlds, rows) if self._regularization_enabled else (1, 1), dtype=wp.float32, device=device
         )
@@ -8458,6 +8464,22 @@ class SolverSteel(SolverBase, CouplingInterface):
                 dt,
             ],
             outputs=[self._rhs, self._row_w],
+            device=model.device,
+        )
+        wp.launch(
+            bound_world_contact_depenetration_bias,
+            dim=self._world_count * self._articulation_constraint_max,
+            inputs=[
+                self._constraint_count,
+                self._articulation_constraint_max,
+                self._phi,
+                self._row_type,
+                self._target_velocity,
+                self._row_max_depenetration_velocity,
+                self._baumgarte,
+                dt,
+            ],
+            outputs=[self._rhs],
             device=model.device,
         )
         if self._has_free_rigid_bodies:
@@ -10708,6 +10730,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._friction_combine_id,
                     self._restitution_combine_id,
                     recovery_phi,
+                    self._rigid_body_max_depenetration_velocity,
                 ],
                 outputs=[
                     self._row_type,
@@ -10716,6 +10739,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._phi,
                     self._target_velocity,
                     self._row_rebound_velocity,
+                    self._row_max_depenetration_velocity,
                 ],
                 device=model.device,
             )
@@ -10866,6 +10890,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._friction_combine_id,
                         self._restitution_combine_id,
                         recovery_phi,
+                        self._rigid_body_max_depenetration_velocity,
                     ],
                     outputs=[
                         self._mf_body_a,
@@ -10878,6 +10903,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._mf_phi,
                         self._mf_target_velocity,
                         self._mf_row_rebound_velocity,
+                        self._mf_row_max_depenetration_velocity,
                     ],
                     device=model.device,
                 )
@@ -11380,7 +11406,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._body_to_articulation,
                 self._articulation_dof_start,
                 self._v_hat,
-                self._rigid_body_max_depenetration_velocity,
+                self._mf_row_max_depenetration_velocity,
                 self._cfm,
                 self._baumgarte,
                 self._contact_w,
@@ -11738,6 +11764,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_phi = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._propagation_target_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._propagation_row_rebound_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
+        self._propagation_row_max_depenetration_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         # Rebound bias of each row, kept for the velocity-only iterations.
         self._propagation_restitution_bias = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._propagation_row_w = wp.ones(
@@ -12161,6 +12188,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._friction_combine_id,
                 self._restitution_combine_id,
                 recovery_phi,
+                self._rigid_body_max_depenetration_velocity,
             ],
             outputs=[
                 self._propagation_body_a,
@@ -12173,6 +12201,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_phi,
                 self._propagation_target_velocity,
                 self._propagation_row_rebound_velocity,
+                self._propagation_row_max_depenetration_velocity,
             ],
             device=model.device,
         )
@@ -12500,7 +12529,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_target_velocity,
                 self._propagation_row_rebound_velocity,
                 self._propagation_body_qd,
-                self._rigid_body_max_depenetration_velocity,
+                self._propagation_row_max_depenetration_velocity,
                 self._cfm,
                 self._baumgarte,
                 self._contact_w,
