@@ -24735,7 +24735,6 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                                             && minor_n1 * minor_n1 + minor_n2 * minor_n2 <= mu * mu * minor_nn * minor_nn * (1.0f + 2.0e-5f));
                                     // A jammed search pursues a root up to 2^15 times its first load; without one it keeps that load.
                                     const float x_first = x, gap = fabsf(f_lo);
-                                    bool line_root_probed = false;
                                     for (int _it = 0; _it < 64; _it++) {
                                         const float f_x = probe(x, new_lambda_t1, new_lambda_t2);
                                         new_lambda_n = x;
@@ -24758,19 +24757,9 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                                                 }
                                                 sticks_here = stick_t1 * stick_t1 + stick_t2 * stick_t2 <= mu * mu * x * x * (1.0f + 2.0e-5f);
                                             }
-                                            // A jammed probe that sticks keeps sticking at larger loads, where its residual grows linearly with the
-                                            // block's Schur complement: probe that line's root once if it lies within the cap. Rounding can leave a zero
-                                            // complement slightly positive, so the root counts only if its probe meets the jammed tolerance above.
-                                            if (sticks_here && !line_root_probed && !bracketed) {
-                                                const float slope = rank_one ? G_nn - axis_nt * axis_nt / axis_tt : det_block / minor_nn;
-                                                if (slope > 0.0f && _it < 62 && x - f_x / slope <= 32768.0f * x_first) {
-                                                    x -= f_x / slope;
-                                                    line_root_probed = true;
-                                                    continue;
-                                                }
-                                            }
-                                            // Unbracketed, without such a root, and past the cap, re-probe the first load and keep it.
-                                            if (!bracketed && (sticks_here || line_root_probed || x >= 32768.0f * x_first)) {
+                                            // A sticking jam keeps its first load, even when its Schur complement is slightly positive: on a jammed block that
+                                            // complement is at float32 rounding, so no root above the probe can be certified. Past the cap, the same.
+                                            if (sticks_here || (!bracketed && x >= 32768.0f * x_first)) {
                                                 if (_it >= 63 || x <= x_first) break;
                                                 x = x_first;
                                                 last_probe = true;
@@ -25024,7 +25013,6 @@ _MF_BISECTION_FRICTION_SOURCE = """
                                             && minor_n1 * minor_n1 + minor_n2 * minor_n2 <= mu * mu * minor_nn * minor_nn * (1.0f + 2.0e-5f));
                                     // A jammed search pursues a root up to 2^15 times its first load; without one it keeps that load.
                                     const float x_first = x, gap = fabsf(f_lo);
-                                    bool line_root_probed = false;
                                     for (int _it = 0; _it < 64; _it++) {
                                         const float f_x = probe(x, new_lambda_t1, new_lambda_t2);
                                         new_lambda_n = x;
@@ -25047,19 +25035,9 @@ _MF_BISECTION_FRICTION_SOURCE = """
                                                 }
                                                 sticks_here = stick_t1 * stick_t1 + stick_t2 * stick_t2 <= mu * mu * x * x * (1.0f + 2.0e-5f);
                                             }
-                                            // A jammed probe that sticks keeps sticking at larger loads, where its residual grows linearly with the
-                                            // block's Schur complement: probe that line's root once if it lies within the cap. Rounding can leave a zero
-                                            // complement slightly positive, so the root counts only if its probe meets the jammed tolerance above.
-                                            if (sticks_here && !line_root_probed && !bracketed) {
-                                                const float slope = rank_one ? G_nn - axis_nt * axis_nt / axis_tt : det_block / minor_nn;
-                                                if (slope > 0.0f && _it < 62 && x - f_x / slope <= 32768.0f * x_first) {
-                                                    x -= f_x / slope;
-                                                    line_root_probed = true;
-                                                    continue;
-                                                }
-                                            }
-                                            // Unbracketed, without such a root, and past the cap, re-probe the first load and keep it.
-                                            if (!bracketed && (sticks_here || line_root_probed || x >= 32768.0f * x_first)) {
+                                            // A sticking jam keeps its first load, even when its Schur complement is slightly positive: on a jammed block that
+                                            // complement is at float32 rounding, so no root above the probe can be certified. Past the cap, the same.
+                                            if (sticks_here || (!bracketed && x >= 32768.0f * x_first)) {
                                                 if (_it >= 63 || x <= x_first) break;
                                                 x = x_first;
                                                 last_probe = true;

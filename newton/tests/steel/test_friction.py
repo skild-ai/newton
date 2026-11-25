@@ -1215,8 +1215,10 @@ _JAMMED_BLOCKS = {
     "stiff_slipping_under_its_limit": (-0.001, 0.0, 0.0017, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-5, 2.0),
     "stiffer_slipping_under_its_limit": (-0.001, 0.0, 0.0017, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-4, 2.0),
     # Exactly rank two: the first row is the sum of the others, so the Schur complement is zero, but float32
-    # cofactors leave it slightly positive, which places a false sticking root at 1663 times the first load.
+    # cofactors leave it slightly positive, and any root taken from it is false.
     "rank_two_sticking": (-1.0, -0.49995, -0.49995, 4712.0, 1548.0, 3164.0, 1275.0, 273.0, 2891.0, 4.0),
+    "rank_two_sticking_b": (-1.0, -0.49995, -0.49995, 7973.0, 3543.0, 4430.0, 3726.0, -183.0, 4613.0, 4.0),
+    "rank_two_sticking_c": (-1.0, -0.49995, -0.49995, 3325.0, 1123.0, 2202.0, 943.0, 180.0, 2022.0, 4.0),
 }
 
 
@@ -1268,23 +1270,23 @@ def test_bisection_keeps_the_first_load_past_the_root_cap(test, device):
                 test.assertLessEqual(float(normal), (bias - block[0]) / block[3] * (1.0 + 1.0e-5))
 
 
-# Jams that stick at the first probe with a small positive complement, regular and rank one: on the sticking branch
-# the residual is u_n - u_t1 + (G_nn - 1) n, with its root at 209.75.
-_STICKING_ROOT_BLOCKS = {
+# Jams that stick at the first probe with a small positive complement, regular and rank one. Their sticking residual,
+# u_n - u_t1 + (G_nn - 1) n, has a root at 209.75, but a complement this small is at float32 rounding on a jammed block,
+# so the search keeps the first load.
+_STICKING_COMPLEMENT_BLOCKS = {
     "regular": (-1.0, -0.9999, 0.0, 1.0 + 2.0**-21, 1.0, 0.0, 1.0, 0.0, 1.0, 2.0),
     "rank_one": (-1.0, -0.9999, 0.0, 1.0 + 2.0**-21, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
 }
 
 
-def test_bisection_solves_a_sticking_jam_on_its_linear_branch(test, device):
-    """Solve the root of a sticking jam whose residual still grows with a small positive Schur complement."""
-    for name, block in _STICKING_ROOT_BLOCKS.items():
-        with test.subTest(block=name):
-            b = np.array(block, dtype=np.float32).astype(np.float64)
-            normal, tangent1, _ = (float(v) for v in _mf_block(device, np.array(block, np.float32), "bisection"))
-            expected = (b[1] - b[0]) / (b[3] - 1.0)
-            test.assertAlmostEqual(normal, expected, delta=1.0e-4 * expected)
-            test.assertLessEqual(abs(b[0] + b[3] * normal + tangent1), 1.0e-6 * normal)
+def test_bisection_keeps_the_first_load_of_a_sticking_jam(test, device):
+    """Keep the first load of a jam that sticks there, even when its Schur complement is slightly positive."""
+    for mode in ("bisection", "bisection_desaxce"):
+        for name, block in _STICKING_COMPLEMENT_BLOCKS.items():
+            with test.subTest(mode=mode, block=name):
+                normal, *_ = _mf_block(device, np.array(block, dtype=np.float32), mode)
+                bias = block[9] * float(np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
+                test.assertLessEqual(float(normal), (bias - block[0]) / block[3] * (1.0 + 1.0e-5))
 
 
 # A jam whose sliding direction turns with the load: its residual starts flat but has a root, 0.232005 at rank one
@@ -1429,7 +1431,7 @@ for _fn in (
     test_bisection_keeps_friction_on_a_stiff_slipping_direction,
     test_bisection_solves_a_jammed_root_within_the_cap,
     test_bisection_keeps_the_first_load_past_the_root_cap,
-    test_bisection_solves_a_sticking_jam_on_its_linear_branch,
+    test_bisection_keeps_the_first_load_of_a_sticking_jam,
     test_bisection_finds_the_root_of_a_jam_whose_slip_turns,
     test_bisection_bounds_the_normal_force_on_a_hinged_rod,
     test_bisection_reports_no_friction_without_tangential_mobility,
