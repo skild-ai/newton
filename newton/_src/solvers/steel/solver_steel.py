@@ -2734,9 +2734,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 graph raises ``RuntimeError``.
                 Sleeping is accepted and the step keeps every body awake. With ``deterministic`` set to
                 ``RUN_TO_RUN`` the backward is bitwise repeatable too, unless
-                ``DifferentiableOptions.deterministic_adjoint`` is False. ``collide_done_event`` is waited on
-                before contacts are read. Contact buffers take about nine times the default step's memory per
-                environment and step.
+                ``DifferentiableOptions.deterministic_adjoint`` is False. Contact buffers take about nine times
+                the default step's memory per environment and step.
 
                 Construction raises ``ValueError`` unless the model has ``requires_grad=True`` and no
                 particles, mimic or loop-closing joints, and the solver uses ``solve_mode="serial"``, immediate
