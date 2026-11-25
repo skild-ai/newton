@@ -409,6 +409,139 @@ def _validate_solve_mode(solve_mode, articulated_contact_response) -> None:
         )
 
 
+_INT32_INDEX_MAX = 2**31 - 1
+_PROPAGATION_ROWS_OPTION = "propagation_constraint_max (default free_body_constraint_max + articulation_constraint_max)"
+
+
+def _check_int32_index_range(
+    *,
+    worlds: int,
+    dense_rows: int,
+    world_dofs: int,
+    dense_group_articulations: int = 0,
+    dense_gather_dofs: int = 0,
+    sparse_diagonal: bool = False,
+    free_body_rows: int = 0,
+    free_body_warmstart_bodies: int = 0,
+    propagation_rows: int = 0,
+    colored: bool = False,
+    colored_payload: bool = False,
+    cache_bodies: int = 0,
+    cache_dofs: int = 0,
+    tree_bodies: int = 0,
+    tree_joints: int = 0,
+    tree_dofs: int = 0,
+    tree_world_bodies: int = 0,
+    augmented_rows: int = 0,
+) -> None:
+    """Raise :class:`ValueError` if a buffer or launch that Steel indexes with 32-bit integers would overflow.
+
+    Per-world blocks of rows x DOFs and DOFs x DOFs use 64-bit offsets. The buffers checked here stay
+    32-bit because they grow only with worlds x rows or worlds x DOFs: native kernels index them with
+    ``int`` products that would wrap silently, and Warp rejects one-dimensional arrays and launches past
+    ``2**31 - 1`` elements only when they are allocated or launched. All sizes are Python integers, so the
+    check does no device work. A size of zero leaves its buffer out.
+
+    Args:
+        worlds: Solver worlds.
+        dense_rows: ``articulation_constraint_max``.
+        world_dofs: DOFs of the largest world.
+        dense_group_articulations: Articulations of the largest mass-matrix size group.
+        dense_gather_dofs: Largest ``articulations x DOFs`` of a size group whose rows are gathered into
+            the world rows, or zero when no gather runs.
+        sparse_diagonal: Whether the sparse-diagonal contact solve stores its row Jacobians.
+        free_body_rows: Free-body rows per world, or zero without free bodies.
+        free_body_warmstart_bodies: Free bodies per world listed for the contact warm start, or zero.
+        propagation_rows: Propagation rows per world, or zero without the propagation response.
+        colored: Whether the colored sweep stores its unit records.
+        colored_payload: Whether the colored sweep stores its packed unit payload.
+        cache_bodies: Cached response bodies per world, or zero without cached responses.
+        cache_dofs: DOFs of the largest articulation, the rows of each cached response.
+        tree_bodies: Bodies of the propagation tree buffers, or zero without the propagation response.
+        tree_joints: Joints of the propagation tree buffers.
+        tree_dofs: DOFs of the propagation tree buffers.
+        tree_world_bodies: Tree bodies of the largest world, the width of the propagation body lists.
+        augmented_rows: Articulations x DOFs of the largest articulation, the augmented drive rows.
+    """
+    worlds = int(worlds)
+    dense_rows = int(dense_rows)
+    propagation_rows = int(propagation_rows)
+    cache_bodies = int(cache_bodies)
+    dense = "articulation_constraint_max"
+    extents = (
+        ("dense row metadata (worlds x articulation_constraint_max)", worlds * dense_rows, dense),
+        (
+            "dense row launches (articulations of a size group x articulation_constraint_max)",
+            int(dense_group_articulations) * dense_rows,
+            dense,
+        ),
+        (
+            "dense J/Y gather launch (articulations x DOFs of a size group x articulation_constraint_max)",
+            int(dense_gather_dofs) * dense_rows,
+            dense,
+        ),
+        (
+            "sparse-diagonal row Jacobians (worlds x articulation_constraint_max x 4)",
+            worlds * dense_rows * 4 if sparse_diagonal else 0,
+            dense,
+        ),
+        ("per-world DOF maps (worlds x DOFs of the largest world)", worlds * int(world_dofs), "the DOFs per world"),
+        (
+            "free-body row Jacobians (worlds x free_body_constraint_max x 6)",
+            worlds * int(free_body_rows) * 6,
+            "free_body_constraint_max",
+        ),
+        (
+            "free-body warm-start body lists (worlds x free bodies per world x 6)",
+            worlds * int(free_body_warmstart_bodies) * 6,
+            "the free bodies per world",
+        ),
+        (
+            "propagation row Jacobians (worlds x propagation rows x 6)",
+            worlds * propagation_rows * 6,
+            _PROPAGATION_ROWS_OPTION,
+        ),
+        (
+            "colored-sweep unit records (worlds x propagation rows x 12)",
+            worlds * max(propagation_rows * int(PROPAGATION_UNIT_META), int(PROPAGATION_COLOR_TAIL) + 2)
+            if colored
+            else 0,
+            _PROPAGATION_ROWS_OPTION,
+        ),
+        (
+            "colored-sweep unit payload (worlds x propagation rows x 96)",
+            worlds * propagation_rows * PROPAGATION_UNIT_PAYLOAD if colored_payload else 0,
+            _PROPAGATION_ROWS_OPTION,
+        ),
+        (
+            "cached propagation responses (worlds x cached bodies x cached bodies x 36)",
+            worlds * cache_bodies * max(cache_bodies * 36, int(cache_dofs) * 6),
+            "propagation_cached_response_body_max",
+        ),
+        (
+            "propagation tree buffers (bodies x 36)",
+            max(int(tree_bodies) * 36, int(tree_joints) * 36, int(tree_dofs) * 6, worlds * int(tree_world_bodies)),
+            "the bodies per world",
+        ),
+        (
+            "augmented drive rows (articulations x DOFs of the largest articulation)",
+            int(augmented_rows),
+            "the DOFs per articulation",
+        ),
+    )
+    for buffer, count, option in extents:
+        if count <= _INT32_INDEX_MAX:
+            continue
+        per_world = -(-count // max(worlds, 1))
+        fit = _INT32_INDEX_MAX // per_world
+        fit = f"at most {fit:,} worlds fit" if fit else "not even one world fits"
+        raise ValueError(
+            f"SolverSteel: the {buffer} would hold {count:,} elements at {worlds:,} worlds, past the "
+            f"2**31 - 1 limit of their 32-bit indices ({per_world:,} per world, so {fit}). Simulate fewer "
+            f"worlds per solver (split the scene across several solvers) or reduce {option}."
+        )
+
+
 def _validate_supported_model(model: Model) -> None:
     """Reject model features this solver does not simulate instead of ignoring them.
 
@@ -2718,6 +2851,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 Defaults to enabled on CUDA. CPU uses plain sweeps, so at a fixed iteration count the
                 device defaults can produce different trajectories. Pass ``False`` for plain Gauss-Seidel
                 sweeps on CUDA. Construction-only.
+
+        Raises:
+            ValueError: If the world count and the row capacities would pass the ``2**31 - 1`` elements of a
+                row buffer that Steel indexes with 32-bit integers, for example more than 699,050 worlds with
+                free bodies at the default ``free_body_constraint_max``. The message names the buffer, the
+                largest world count that fits and the capacity to reduce.
         """
         solve_mode, articulated_contact_response = _normalize_solve_mode(solve_mode, articulated_contact_response)
         _validate_solve_mode(solve_mode, articulated_contact_response)
@@ -3187,6 +3326,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._setup_local_solves(model)
         self._setup_paired_response(model)
 
+        self._check_index_range(model)
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
         self._allocate_paired_response_buffers(model)
@@ -6404,6 +6544,41 @@ class SolverSteel(SolverBase, CouplingInterface):
         group_to_art = np.flatnonzero(self._model_plan.response_dof_count == size)
         expected_world = np.arange(len(group_to_art), dtype=articulation_world.dtype)
         return np.array_equal(articulation_world[group_to_art], expected_world)
+
+    def _check_index_range(self, model, *, colored_payload: bool = False) -> None:
+        """Check the 32-bit indexed buffers of this solver's capacities before allocating them.
+
+        The row capacities are fixed at construction; the colored sweep checks its packed payload again
+        when it decides to allocate it.
+        """
+        gather = (
+            self._sparse_mass_matrix_size is None
+            and not self._sparse_diagonal_contact_solve
+            and not self._jy_world_aliased
+            and not self._hinv_jt_writes_world
+        )
+        propagation = self._propagation_active
+        cached = propagation and bool(self._propagation_cached_warps)
+        _check_int32_index_range(
+            worlds=self._world_count,
+            dense_rows=self._articulation_constraint_max,
+            world_dofs=self._max_world_dofs,
+            dense_group_articulations=max(self._n_arts_by_size.values(), default=0),
+            dense_gather_dofs=max((n * size for size, n in self._n_arts_by_size.items()), default=0) if gather else 0,
+            sparse_diagonal=self._sparse_diagonal_contact_solve,
+            free_body_rows=self._free_body_constraint_max if self._has_free_rigid_bodies else 1,
+            free_body_warmstart_bodies=max(self._max_free_rigid_bodies_per_world, 1) if self._contact_warmstart else 0,
+            propagation_rows=self._propagation_max_constraints if propagation else 0,
+            colored=propagation and self._propagation_colored,
+            colored_payload=colored_payload,
+            cache_bodies=max(self._propagation_cache_max_bodies, 1) if cached else 0,
+            cache_dofs=max(self._articulation_max_dofs, 1),
+            tree_bodies=max(model.body_count, 1) if propagation else 0,
+            tree_joints=max(model.joint_count, 1) if propagation else 0,
+            tree_dofs=max(model.joint_dof_count, 1) if propagation else 0,
+            tree_world_bodies=self._max_propagation_bodies if propagation else 0,
+            augmented_rows=model.articulation_count * self._articulation_max_dofs if model.joint_count else 0,
+        )
 
     def _allocate_common_buffers(self, model):
         if model.joint_count:
@@ -12141,6 +12316,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         packed = self._colored_prefetch and bool(overrides.get("colored_packed", self._world_count <= 16))
         self._colored_worlds_per_block = 1 if staged else _COLORED_WORLDS_PER_BLOCK
         if packed or staged:
+            self._check_index_range(model, colored_payload=True)
             self._color_unit_payload = wp.zeros(
                 (max(self._world_count, 1) * rows * PROPAGATION_UNIT_PAYLOAD,), dtype=wp.float32, device=model.device
             )

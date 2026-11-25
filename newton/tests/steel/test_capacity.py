@@ -1316,8 +1316,53 @@ def test_dense_row_offsets_do_not_wrap_at_large_world_counts(test, device):
         test.assertEqual(int(out.numpy()[0]), expected)
 
 
+def test_capacity_past_the_32_bit_index_range_fails_at_construction(test, device):
+    """A capacity whose 32-bit indexed rows pass 2**31 elements raises before any row buffer is allocated."""
+    model = _box_on_ground(device)
+    rows = 2**31 // 6 + 1  # 6-wide rows of one world past 2**31 - 1 elements
+    with test.assertRaisesRegex(
+        ValueError, r"propagation row Jacobians.*not even one world.*propagation_constraint_max"
+    ):
+        SolverSteel(model, articulated_contact_response="propagation", propagation_constraint_max=rows)
+    SolverSteel(model)
+    # The CUDA sweep takes at most 2**23 free-body rows per world, so the free-body rows pass 2**31 across worlds.
+    free_rows = 1 << 23
+    worlds = 2**31 // (6 * free_rows) + 1
+    model = _box_on_ground(device, worlds=worlds)
+    with test.assertRaisesRegex(
+        ValueError, rf"free-body row Jacobians.*at most {worlds - 1} worlds fit.*free_body_constraint_max"
+    ):
+        SolverSteel(model, free_body_constraint_max=free_rows)
+
+
 class TestSteelIndexRange(unittest.TestCase):
-    pass
+    def test_int32_index_guard_bounds_worlds_by_capacity(self):
+        """The guard admits the last world count whose 32-bit indexed buffers fit and rejects the next one.
+
+        The bounds follow from the per-world widths of the buffers: 6-wide free-body and propagation rows and
+        12-int colored unit records. The 64-bit dense J/Y blocks of large scenes are not bounded by it.
+        """
+        from newton._src.solvers.steel.solver_steel import _check_int32_index_range  # noqa: PLC0415
+
+        limit = 2**31 - 1
+        cases = (
+            ("free-body row Jacobians", "free_body_constraint_max", 512 * 6, {"free_body_rows": 512}),
+            ("propagation row Jacobians", "propagation_constraint_max", 544 * 6, {"propagation_rows": 544}),
+            (
+                "colored-sweep unit records",
+                "propagation_constraint_max",
+                544 * 12,
+                {"propagation_rows": 544, "colored": True},
+            ),
+        )
+        for buffer, option, per_world, sizes in cases:
+            fit = limit // per_world
+            _check_int32_index_range(worlds=fit, dense_rows=32, world_dofs=6, **sizes)
+            with self.assertRaisesRegex(ValueError, rf"{buffer}.*at most {fit:,} worlds fit.*{option}"):
+                _check_int32_index_range(worlds=fit + 1, dense_rows=32, world_dofs=6, **sizes)
+        # SMPL-X (320 rows x 159 DOFs) at 65,536 worlds and the resolution-2 flower (921 x 360) at 8,192 worlds.
+        for worlds, rows, dofs in ((65536, 320, 159), (8192, 921, 360)):
+            _check_int32_index_range(worlds=worlds, dense_rows=rows, world_dofs=dofs, dense_group_articulations=worlds)
 
 
 add_function_test(
@@ -1348,6 +1393,12 @@ add_function_test(
     TestSteelIndexRange,
     "test_dense_row_offsets_do_not_wrap_at_large_world_counts",
     test_dense_row_offsets_do_not_wrap_at_large_world_counts,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelIndexRange,
+    "test_capacity_past_the_32_bit_index_range_fails_at_construction",
+    test_capacity_past_the_32_bit_index_range_fails_at_construction,
     devices=get_cuda_test_devices(),
 )
 
