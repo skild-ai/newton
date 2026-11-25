@@ -5441,6 +5441,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             and not self._preelim_active
             and self._sparse_mass_matrix_size is None
             and not self._sparse_diagonal_contact_solve
+            and size not in self._articulated_body_sizes
             and size >= _PAIRED_RESPONSE_MIN_DOF
             and size + 6 <= 32
             and self._execution_plan.use_tiled_hinv_jt(size)
@@ -5451,6 +5452,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             or not self._hinv_jt_writes_world
             or self._hinv_jt_tiled_writes_group
             or 6 not in self._size_groups
+            or 6 in self._articulated_body_sizes
             or self._execution_plan.use_tiled_hinv_jt(6)
         ):
             return
@@ -5791,6 +5793,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 primary_dofs = int(plan.response_dof_count[primary_art])
                 if (
                     primary_dofs <= 0
+                    # The local owners read the dense Cholesky factor.
+                    or primary_dofs in self._articulated_body_sizes
                     or primary_dofs > _LOCAL_INTERNAL_MAX_DOF
                     or self._execution_plan.use_tiled_hinv_jt(primary_dofs)
                     or local_shared_bytes(
@@ -9325,13 +9329,36 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._articulated_body_sizes = frozenset()
         if self._mass_solve != "articulated_body":
             return
+        # Free rigid bodies read their group's dense Cholesky factor in the free-root velocity
+        # correction, so a group holding any of them (for example free boxes next to a six-DOF
+        # arm) keeps the Cholesky path, not only groups made of free bodies alone.
+        is_free_rigid = self._model_plan.is_free_rigid
         self._articulated_body_sizes = frozenset(
             size
             for size in self._size_groups
             if size not in (self._sparse_mass_matrix_size, self._sparse_diagonal_response_size)
             and not self._execution_plan.use_diagonal_mass(size)
-            and size not in self._free_body_inertia_sizes
+            and not np.any(is_free_rigid[self._group_to_art[size].numpy()] != 0)
         )
+        if not self._articulated_body_sizes:
+            return
+        # The passes walk joints in index order: a tree joint that precedes its parent would
+        # silently drop its subtree's inertia and bias forces.
+        model = self.model
+        joint_ancestor = model.joint_ancestor.numpy()
+        articulation_start = model.articulation_start.numpy()
+        response_dofs = self._model_plan.response_dof_count
+        for art in range(model.articulation_count):
+            if int(response_dofs[art]) not in self._articulated_body_sizes:
+                continue
+            joints = np.arange(articulation_start[art], self._model_plan.articulation_joint_end[art])
+            unordered = joints[joint_ancestor[joints] >= joints]
+            if unordered.size:
+                raise NotImplementedError(
+                    "mass_solve='articulated_body' requires every tree joint to follow its parent joint; "
+                    f"joint {int(unordered[0])} of articulation {art} precedes its parent joint "
+                    f"{int(joint_ancestor[unordered[0]])}"
+                )
 
     def _check_articulated_body_sizes(self) -> None:
         """Reject the features that read a dense Cholesky factor of an articulated-body group."""

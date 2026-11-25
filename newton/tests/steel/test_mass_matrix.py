@@ -17,7 +17,7 @@ from newton._src.solvers.steel.friction_patches import _GEOMETRY_FIELDS
 from newton._src.solvers.steel.kernels import accumulate_group_diag_worlds, compute_composite_inertia
 from newton._src.solvers.steel.solver_steel import _get_composite_inertia_warp_kernel, _get_hinv_jt_kernel
 from newton.solvers import SolverSteel
-from newton.tests.steel._fixtures import _build_four_bar, _loop_anchor_gap
+from newton.tests.steel._fixtures import _build_four_bar, _build_mixed_response_model, _loop_anchor_gap
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 
@@ -1591,6 +1591,120 @@ def test_articulated_body_solve_is_stable_on_a_long_ball_chain(test, device):
     np.testing.assert_allclose(result.joint_qd.numpy() - qd0, dqd_ref, rtol=0.0, atol=5.0e-2 * np.abs(dqd_ref).max())
 
 
+def _build_arm_and_free_box(device, revolutes):
+    """Build a fixed-base revolute arm and a free anisotropic box per world, spinning, above the ground."""
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    parent = -1
+    joints = []
+    for i in range(revolutes):
+        link = b.add_link()
+        b.add_shape_box(link, hx=0.1, hy=0.03, hz=0.03)
+        joints.append(
+            b.add_joint_revolute(
+                parent=parent,
+                child=link,
+                axis=(wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 1.0, 0.0), wp.vec3(1.0, 0.0, 0.0))[i % 3],
+                parent_xform=wp.transform(wp.vec3(0.1, 0.0, 0.0) if i else wp.vec3(0.0, 0.0, 0.6), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(-0.1, 0.0, 0.0), wp.quat_identity()),
+                armature=0.002,
+            )
+        )
+        parent = link
+    b.add_articulation(joints)
+    box = b.add_body(xform=wp.transform(wp.vec3(1.0, 0.0, 0.3), wp.quat_rpy(0.3, 0.2, 0.1)))
+    b.add_shape_box(box, hx=0.08, hy=0.04, hz=0.02)
+    world = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    world.replicate(b, 2, spacing=(3.0, 0.0, 0.0))
+    world.add_ground_plane()
+    model = world.finalize(device=device)
+    model.joint_qd.assign(np.random.default_rng(0).uniform(-3.0, 3.0, model.joint_dof_count).astype(np.float32))
+    return model
+
+
+def test_articulated_body_solve_keeps_free_bodies_on_cholesky(test, device):
+    """Keep a size group holding free rigid bodies on Cholesky: their velocity correction reads its dense factor."""
+    # A six-DOF arm shares size group 6 with the free boxes; velocity iterations keep the local solves off.
+    model = _build_arm_and_free_box(device, revolutes=6)
+    _, expected = _run_mass_solve(model, "cholesky", 20, 1.0 / 240.0, velocity_iterations=1)
+    solver, result = _run_mass_solve(model, "articulated_body", 20, 1.0 / 240.0, velocity_iterations=1)
+    np.testing.assert_allclose(result.joint_q.numpy(), expected.joint_q.numpy(), rtol=0.0, atol=1.0e-5)
+    test.assertNotIn(6, solver._articulated_body_sizes)
+
+
+def test_articulated_body_solve_with_local_and_paired_solves(test, device):
+    """Construct where the local or paired solves apply by default, solving the articulated-body worlds generally."""
+    # An arm of at most 16 DOFs and one free body per world selects the local solves; 17 to 26
+    # DOFs with more rows than one response chunk select the paired response.
+    for dof_count, constraint_max, fast_path in (
+        (9, 32, "_local_internal_fast_path"),
+        (20, 64, "_paired_response_primary_size"),
+    ):
+        with test.subTest(dof_count=dof_count):
+            model = _build_mixed_response_model(
+                device, world_count=4, dof_count=dof_count, static_plane=True, friction=0.5
+            )
+            options = {"articulation_constraint_max": constraint_max}
+            reference, expected = _run_mass_solve(model, "cholesky", 30, 1.0 / 240.0, **options)
+            solver, result = _run_mass_solve(model, "articulated_body", 30, 1.0 / 240.0, **options)
+            test.assertTrue(getattr(reference, fast_path))
+            test.assertIn(dof_count, solver._articulated_body_sizes)
+            test.assertFalse(getattr(solver, fast_path))
+            np.testing.assert_allclose(result.joint_q.numpy(), expected.joint_q.numpy(), rtol=0.0, atol=1.0e-5)
+
+
+def _build_link_with_massless_leaves(device, leaves):
+    """Build a fixed-base revolute link, optionally with massless leaves on a revolute and a two-axis D6."""
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    link = b.add_link()
+    b.add_shape_box(link, hx=0.1, hy=0.03, hz=0.03)
+    joints = [
+        b.add_joint_revolute(
+            parent=-1,
+            child=link,
+            axis=wp.vec3(0.0, 1.0, 0.0),
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(-0.1, 0.0, 0.0), wp.quat_identity()),
+        )
+    ]
+    if leaves:
+        tip = wp.transform(wp.vec3(0.1, 0.0, 0.0), wp.quat_identity())
+        joints.append(b.add_joint_revolute(link, b.add_link(), axis=wp.vec3(0.0, 0.0, 1.0), parent_xform=tip))
+        axes = [newton.ModelBuilder.JointDofConfig(axis=axis) for axis in (newton.Axis.X, newton.Axis.Z)]
+        joints.append(b.add_joint_d6(link, b.add_link(), angular_axes=axes, parent_xform=tip))
+    b.add_articulation(joints)
+    model = b.finalize(device=device)
+    qd = np.zeros(model.joint_dof_count, dtype=np.float32)
+    qd[0] = 1.0
+    model.joint_qd.assign(qd)
+    return model
+
+
+def test_articulated_body_solve_handles_massless_links(test, device):
+    """Give massless DOFs without armature a zero response, like a zero Cholesky pivot, instead of NaN."""
+    # Massless leaves exert nothing on the root, which must swing as it does without them.
+    _, expected = _run_mass_solve(_build_link_with_massless_leaves(device, False), "cholesky", 20, 1.0 / 240.0)
+    _, result = _run_mass_solve(_build_link_with_massless_leaves(device, True), "articulated_body", 20, 1.0 / 240.0)
+    test.assertTrue(np.all(np.isfinite(result.joint_qd.numpy())))
+    np.testing.assert_allclose(result.joint_q.numpy()[:1], expected.joint_q.numpy(), rtol=0.0, atol=1.0e-6)
+
+
+def test_articulated_body_solve_rejects_joints_before_their_parent(test, device):
+    """Reject an articulation whose tree joint precedes its parent joint instead of dropping its subtree."""
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    links = [b.add_link() for _ in range(3)]
+    for link in links:
+        b.add_shape_box(link, hx=0.1, hy=0.03, hz=0.03)
+    xform = wp.transform(wp.vec3(0.1, 0.0, 0.0), wp.quat_identity())
+    leaf = b.add_joint_revolute(parent=links[1], child=links[2], axis=wp.vec3(0.0, 0.0, 1.0), parent_xform=xform)
+    root = b.add_joint_revolute(parent=-1, child=links[0], axis=wp.vec3(0.0, 1.0, 0.0))
+    middle = b.add_joint_revolute(parent=links[0], child=links[1], axis=wp.vec3(0.0, 1.0, 0.0), parent_xform=xform)
+    b.add_articulation([leaf, root, middle])
+    model = b.finalize(device=device)
+    with test.assertRaisesRegex(NotImplementedError, "follow its parent joint"):
+        with kernel_overrides({"mass_solve": "articulated_body"}):
+            SolverSteel(model)
+
+
 class TestSteelArticulatedBodySolve(unittest.TestCase):
     pass
 
@@ -1600,8 +1714,18 @@ for _func in (
     test_articulated_body_solve_matches_cholesky_on_a_four_bar,
     test_articulated_body_solve_matches_cholesky_on_a_branched_ball_tree,
     test_articulated_body_solve_is_stable_on_a_long_ball_chain,
+    test_articulated_body_solve_keeps_free_bodies_on_cholesky,
+    test_articulated_body_solve_handles_massless_links,
+    test_articulated_body_solve_rejects_joints_before_their_parent,
 ):
     add_function_test(TestSteelArticulatedBodySolve, _func.__name__, _func, devices=get_test_devices())
+# The local and paired solves run on CUDA only.
+add_function_test(
+    TestSteelArticulatedBodySolve,
+    test_articulated_body_solve_with_local_and_paired_solves.__name__,
+    test_articulated_body_solve_with_local_and_paired_solves,
+    devices=get_cuda_test_devices(),
+)
 
 
 if __name__ == "__main__":
