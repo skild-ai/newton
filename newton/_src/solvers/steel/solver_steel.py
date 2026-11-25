@@ -3207,10 +3207,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         if not self._hinv_jt_writes_world or self._preelim_active or self._sparse_mass_matrix_size is not None:
             self._hinv_jt_diag_sizes = frozenset()
         self._setup_articulated_body_sizes()
-        self._hinv_jt_diag_sizes -= self._articulated_body_sizes
         self._setup_local_solves(model)
         self._setup_paired_response(model)
-        self._check_articulated_body_sizes()
+        self._keep_dense_factor_groups_on_cholesky()
+        self._hinv_jt_diag_sizes -= self._articulated_body_sizes
 
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
@@ -9524,15 +9524,23 @@ class SolverSteel(SolverBase, CouplingInterface):
                     f"{int(joint_ancestor[unordered[0]])}"
                 )
 
-    def _check_articulated_body_sizes(self) -> None:
-        """Reject the features that read a dense Cholesky factor of an articulated-body group."""
+    def _keep_dense_factor_groups_on_cholesky(self) -> None:
+        """Leave the groups whose dense Cholesky factor the paired response or the local solves read on Cholesky.
+
+        Both are selected automatically for small groups (at most 26 DOFs), where the Cholesky path is also the
+        faster one, so the articulated-body solve keeps only the remaining groups.
+        """
         if not self._articulated_body_sizes:
             return
-        paired = {self._paired_response_primary_size, self._paired_response_secondary_size}
-        if paired & self._articulated_body_sizes:
-            raise NotImplementedError("mass_solve='articulated_body' does not support the paired response")
+        dense = {self._paired_response_primary_size, self._paired_response_secondary_size}
         if self._local_internal_fast_path:
-            raise NotImplementedError("mass_solve='articulated_body' does not support the local internal solves")
+            for counts in (
+                self._local_internal_art_counts,
+                self._local_pair_art_counts,
+                self._local_residual_art_counts,
+            ):
+                dense.update(size for size, count in counts.items() if count)
+        self._articulated_body_sizes -= dense
 
     def _allocate_articulated_body_buffers(self, model: Model) -> None:
         """Allocate the articulated-body factors and the per-row scratch of the selected groups."""

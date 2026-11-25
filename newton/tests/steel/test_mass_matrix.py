@@ -1640,18 +1640,24 @@ def test_articulated_body_solve_keeps_free_bodies_on_cholesky(test, device):
     test.assertNotIn(6, solver._articulated_body_sizes)
 
 
-def test_articulated_body_solve_rejects_local_and_paired_solves(test, device):
-    """Raise where the local or paired solves, which read the dense Cholesky factor, would apply."""
+def test_articulated_body_solve_keeps_local_and_paired_groups_on_cholesky(test, device):
+    """Keep the groups that the local or paired solves read on Cholesky, matching the Cholesky-only result."""
     # An arm of at most 16 DOFs and one free body per world selects the local solves; 17 to 26
     # DOFs with more rows than one response chunk select the paired response.
-    for dof_count, constraint_max, message in ((9, 32, "local internal"), (20, 64, "paired response")):
+    for dof_count, constraint_max, fast_path in (
+        (9, 32, "_local_internal_fast_path"),
+        (20, 64, "_paired_response_primary_size"),
+    ):
         with test.subTest(dof_count=dof_count):
             model = _build_mixed_response_model(
                 device, world_count=4, dof_count=dof_count, static_plane=True, friction=0.5
             )
-            with test.assertRaisesRegex(NotImplementedError, message):
-                with kernel_overrides({"mass_solve": "articulated_body"}):
-                    SolverSteel(model, articulation_constraint_max=constraint_max)
+            options = {"articulation_constraint_max": constraint_max}
+            _, expected = _run_mass_solve(model, "cholesky", 30, 1.0 / 240.0, **options)
+            solver, result = _run_mass_solve(model, "articulated_body", 30, 1.0 / 240.0, **options)
+            test.assertTrue(getattr(solver, fast_path))
+            test.assertNotIn(dof_count, solver._articulated_body_sizes)
+            np.testing.assert_allclose(result.joint_q.numpy(), expected.joint_q.numpy(), rtol=0.0, atol=1.0e-5)
 
 
 def _build_link_with_massless_leaves(device, leaves):
@@ -1724,8 +1730,8 @@ for _func in (
 # The local and paired solves run on CUDA only.
 add_function_test(
     TestSteelArticulatedBodySolve,
-    test_articulated_body_solve_rejects_local_and_paired_solves.__name__,
-    test_articulated_body_solve_rejects_local_and_paired_solves,
+    test_articulated_body_solve_keeps_local_and_paired_groups_on_cholesky.__name__,
+    test_articulated_body_solve_keeps_local_and_paired_groups_on_cholesky,
     devices=get_cuda_test_devices(),
 )
 
