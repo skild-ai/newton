@@ -1499,6 +1499,85 @@ def eval_rigid_fk_kinematics(
 
 
 @wp.kernel(module=_KINEMATICS_KERNEL_MODULE, enable_backward=False)
+def eval_body_relative_poses(
+    articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
+    body_to_articulation: wp.array[int],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    body_q: wp.array[wp.transform],
+    # outputs
+    body_rel: wp.array[wp.transform],
+):
+    """Compose each articulation's body poses relative to its root body position.
+
+    The poses keep world orientation, but their translations are measured from the root body
+    of the articulation's first joint. The forward kinematics composes world poses, so a body
+    far from the world origin carries the float32 rounding of its world position (about
+    ``|x| * 6e-8`` per composition), and the difference of two nearby points, such as a loop
+    closure's gap, inherits it in full. Composing from the root keeps those differences at the
+    precision of the articulation's own size. Joints run in articulation order, parents before
+    children, as in :func:`eval_rigid_fk_kinematics`. One thread per articulation.
+    """
+    art = wp.tid()
+    start = articulation_start[art]
+    end = articulation_joint_end[art]
+    if start >= end:
+        return
+    # The reference point: the root body's position, composed the same way as the forward kinematics.
+    root_t = wp.transform_get_translation(body_q[joint_child[start]])
+    if joint_parent[start] < 0:
+        X_root = (
+            joint_X_p[start]
+            * jcalc_transform(
+                joint_type[start],
+                joint_axis,
+                joint_qd_start[start],
+                joint_dof_dim[start, 0],
+                joint_dof_dim[start, 1],
+                joint_q,
+                joint_q_start[start],
+            )
+            * wp.transform_inverse(joint_X_c[start])
+        )
+        root_t = wp.transform_get_translation(X_root)
+    for i in range(start, end):
+        parent = joint_parent[i]
+        X_wpj = joint_X_p[i]
+        in_tree = False
+        if parent >= 0:
+            in_tree = body_to_articulation[parent] == art
+        if in_tree:
+            X_wpj = body_rel[parent] * X_wpj
+        else:
+            # A root joint: its parent (the world or a body outside the tree) is in world coordinates.
+            if parent >= 0:
+                X_wpj = body_q[parent] * X_wpj
+            X_wpj = wp.transform(wp.transform_get_translation(X_wpj) - root_t, wp.transform_get_rotation(X_wpj))
+        X_j = jcalc_transform(
+            joint_type[i],
+            joint_axis,
+            joint_qd_start[i],
+            joint_dof_dim[i, 0],
+            joint_dof_dim[i, 1],
+            joint_q,
+            joint_q_start[i],
+        )
+        X_wc = X_wpj * X_j * wp.transform_inverse(joint_X_c[i])
+        if i == start:
+            X_wc = wp.transform(wp.vec3(0.0), wp.transform_get_rotation(X_wc))
+        body_rel[joint_child[i]] = X_wc
+
+
+@wp.kernel(module=_KINEMATICS_KERNEL_MODULE, enable_backward=False)
 def finalize_body_dynamics(
     body_to_articulation: wp.array[int],
     body_q: wp.array[wp.transform],
@@ -3888,6 +3967,10 @@ def populate_connect_J_for_size(
     joint_qd_start: wp.array[int],
     joint_S_s: wp.array[wp.spatial_vector],
     articulation_origin: wp.array[wp.vec3],
+    body_rel: wp.array[wp.transform],
+    body_to_articulation: wp.array[int],
+    articulation_start: wp.array[int],
+    joint_child: wp.array[int],
     # outputs
     J_group: wp.array3d[float],
     world_row_type: wp.array2d[int],
@@ -3929,6 +4012,11 @@ def populate_connect_J_for_size(
     error against a near-zero diagonal. Degenerate rows are left inert (zero ``J``,
     ``phi`` and target). ``connect_row_inv_norm`` keeps each row's factor (zero when
     inert) so a solved impulse maps back to a force.
+
+    When both bodies belong to the closure's articulation, the gap and lever arms come from
+    ``body_rel`` (see :func:`eval_body_relative_poses`), not from ``body_q``. The world poses of
+    an articulation far from the origin carry the float32 rounding of its position, which the
+    gap of two nearby anchors would inherit and the normalization above would amplify.
     """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
@@ -3962,6 +4050,19 @@ def populate_connect_J_for_size(
         rel_a = p_a - origin
         rel_b = p_b - origin
         delta = p_a - p_b
+        same_articulation = False
+        if body_p >= 0:
+            same_articulation = body_to_articulation[body_p] == art and body_to_articulation[body_c] == art
+        if same_articulation:
+            # Both sides in the closure's articulation: gap and lever arms from root-relative poses,
+            # which do not carry the float32 rounding of the articulation's world position.
+            root = joint_child[articulation_start[art]]
+            origin_rel = wp.transform_point(body_rel[root], body_com[root])
+            q_a = wp.transform_point(body_rel[body_p], anchor_p)
+            q_b = wp.transform_point(body_rel[body_c], wp.transform_get_translation(joint_X_c[joint]))
+            rel_a = q_a - origin_rel
+            rel_b = q_b - origin_rel
+            delta = q_a - q_b
         at_midpoint = (
             not prescribed
             and _walk_has_free_dof(body_p, body_to_joint, joint_ancestor, joint_qd_start, kinematic_dof_mask)
@@ -3971,7 +4072,7 @@ def populate_connect_J_for_size(
         if at_midpoint:
             # Both walks take their lever arm from the anchors' midpoint, so the impulse pair
             # is not a couple across an open closure.
-            rel_a = (p_a - 0.5 * delta) - origin
+            rel_a = rel_a - 0.5 * delta
             rel_b = rel_a
 
         for axis in range(3):
