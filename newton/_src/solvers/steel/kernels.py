@@ -2649,7 +2649,6 @@ def factor_articulated_body(
     body_I_s: wp.array[wp.spatial_matrix],
     R_group: wp.array2d[float],  # [n_arts, n_dofs] armature
     n_dofs: int,
-    apply_drive_terms: int,
     max_dofs: int,
     drive_row_counts: wp.array[int],
     drive_row_dof_index: wp.array[int],
@@ -2676,13 +2675,13 @@ def factor_articulated_body(
 
     for d in range(n_dofs):
         diag_group[idx, d] = R_group[idx, d]
-    if apply_drive_terms != 0:
-        for i in range(drive_row_counts[art]):
-            row = art * max_dofs + i
-            local = drive_row_dof_index[row] - dof0
-            K = drive_row_K[row]
-            if local >= 0 and local < n_dofs and K > 0.0:
-                diag_group[idx, local] += K
+    # Implicit drive and passive-damping terms, as the Cholesky path adds them to the diagonal.
+    for i in range(drive_row_counts[art]):
+        row = art * max_dofs + i
+        local = drive_row_dof_index[row] - dof0
+        K = drive_row_K[row]
+        if local >= 0 and local < n_dofs and K > 0.0:
+            diag_group[idx, local] += K
 
     zero = wp.spatial_matrix()
     for j in range(start, end):

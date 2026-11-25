@@ -1475,14 +1475,23 @@ def _run_mass_solve(model, mass_solve, steps, dt, **options):
 
 
 def test_articulated_body_solve_matches_cholesky_on_a_mixed_tree(test, device):
-    """Match the Cholesky solve on a floating tree with every joint type, armature, drives and contacts."""
+    """Match the Cholesky solve on a floating tree with every joint type, armature, drives and contacts.
+
+    Both drive modes run with passive joint damping, whose implicit term ``dt * joint_damping`` joins the mass-matrix
+    diagonal in either mode.
+    """
     model = _build_mixed_floating_tree(device)
-    reference, expected = _run_mass_solve(model, "cholesky", 60, 1.0 / 240.0)
-    solver, result = _run_mass_solve(model, "articulated_body", 60, 1.0 / 240.0)
-    test.assertEqual(reference._articulated_body_sizes, frozenset())
-    test.assertTrue(solver._articulated_body_sizes)
-    np.testing.assert_allclose(result.joint_q.numpy(), expected.joint_q.numpy(), rtol=0.0, atol=2.0e-4)
-    np.testing.assert_allclose(result.joint_qd.numpy(), expected.joint_qd.numpy(), rtol=0.0, atol=2.0e-3)
+    damping = np.zeros(model.joint_dof_count, dtype=np.float32)
+    damping[6::10] = 3.0  # the revolute DOF of each world
+    model.joint_damping.assign(damping)
+    for drive_mode in ("augmented", "rows"):
+        with test.subTest(drive_mode=drive_mode):
+            reference, expected = _run_mass_solve(model, "cholesky", 60, 1.0 / 240.0, drive_mode=drive_mode)
+            solver, result = _run_mass_solve(model, "articulated_body", 60, 1.0 / 240.0, drive_mode=drive_mode)
+            test.assertEqual(reference._articulated_body_sizes, frozenset())
+            test.assertTrue(solver._articulated_body_sizes)
+            np.testing.assert_allclose(result.joint_q.numpy(), expected.joint_q.numpy(), rtol=0.0, atol=2.0e-4)
+            np.testing.assert_allclose(result.joint_qd.numpy(), expected.joint_qd.numpy(), rtol=0.0, atol=2.0e-3)
 
 
 def test_articulated_body_solve_matches_cholesky_on_a_four_bar(test, device):

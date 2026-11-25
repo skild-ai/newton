@@ -9591,7 +9591,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 state_aug._body_I_s,
                 self._R_by_size[size],
                 size,
-                int(self._drive_mode == "augmented"),
                 self._articulation_max_dofs,
                 self._aug_row_counts,
                 self._aug_row_dof_index,
