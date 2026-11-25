@@ -5215,7 +5215,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 raise RuntimeError("Steel model plan must be built before articulation metadata")
 
             for i in range(model.articulation_count):
-                first_joint = articulation_start[i]
+                first_joint = int(articulation_start[i])
                 last_joint = int(self._model_plan.articulation_joint_end[i])
 
                 first_coord = joint_q_start[first_joint]
