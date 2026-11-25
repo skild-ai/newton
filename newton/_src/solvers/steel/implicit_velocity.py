@@ -20,10 +20,11 @@ the kernel picks ``s = max|v| / max|x|`` per articulation so neither evaluation 
 import numpy as np
 import warp as wp
 
+from .friction_patches import WARP_DETERMINISM_OFF
 from .kernels import _active_free_root_dof_start, compute_link_kinematics, write_body_dynamics
 from .latency_fused import _block_sync
 
-wp.set_module_options({"enable_backward": False})
+wp.set_module_options({"enable_backward": False, **WARP_DETERMINISM_OFF})
 
 
 @wp.kernel
