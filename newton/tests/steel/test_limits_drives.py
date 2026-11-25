@@ -1804,7 +1804,7 @@ add_function_test(
 )
 
 
-def _build_slider_augmented_drives(device, *, effort_limit=1.0e6, damping=0.0):
+def _build_slider_augmented_drives(device, *, effort_limit=1.0e6, damping=0.0, kd=KD, target_vel=TARGET_VEL):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_link(mass=MASS, inertia=wp.mat33(np.eye(3)))
     joint = builder.add_joint_prismatic(
@@ -1812,9 +1812,9 @@ def _build_slider_augmented_drives(device, *, effort_limit=1.0e6, damping=0.0):
         body,
         axis=newton.Axis.X,
         target_ke=KE,
-        target_kd=KD,
+        target_kd=kd,
         target_q=TARGET_POS,
-        target_qd=TARGET_VEL,
+        target_qd=target_vel,
         armature=ARMATURE,
         effort_limit=effort_limit,
         damping=damping,
@@ -1823,14 +1823,17 @@ def _build_slider_augmented_drives(device, *, effort_limit=1.0e6, damping=0.0):
     return builder.finalize(device=device)
 
 
-def _reference_trajectory(steps, *, effort_limit=1.0e6, damping=0.0):
-    """Backward-Euler drive and damping: ``(m + a + dt (kd + c) + dt^2 ke) qdd = clamp(u0) - c qd``."""
+def _reference_trajectory(steps, *, effort_limit=1.0e6, damping=0.0, theta=1.0):
+    """Theta-weighted drive stiffness, implicit damping: ``(m + a + dt (kd + c) + theta dt^2 ke) qdd = clamp(u0) - c qd``.
+
+    ``u0 = -(ke (q - q* + theta dt qd) + kd (qd - qd*))``; ``theta = 1`` is backward Euler.
+    """
     q = 0.0
     qd = 0.0
     history = []
-    effective_mass = MASS + ARMATURE + DT * (KD + damping) + DT * DT * KE
+    effective_mass = MASS + ARMATURE + DT * (KD + damping) + theta * DT * DT * KE
     for _ in range(steps):
-        u0 = -(KE * (q - TARGET_POS + DT * qd) + KD * (qd - TARGET_VEL))
+        u0 = -(KE * (q - TARGET_POS + theta * DT * qd) + KD * (qd - TARGET_VEL))
         u0 = float(np.clip(u0, -effort_limit, effort_limit))
         qdd = (u0 - damping * qd) / effective_mass
         qd = qd + DT * qdd
@@ -1839,8 +1842,8 @@ def _reference_trajectory(steps, *, effort_limit=1.0e6, damping=0.0):
     return np.asarray(history)
 
 
-def _solver_trajectory(model, steps):
-    solver = SolverSteel(model)
+def _solver_trajectory(model, steps, **solver_options):
+    solver = SolverSteel(model, **solver_options)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     history = []
@@ -1881,6 +1884,55 @@ def test_passive_joint_damping_is_applied(test, device):
         rtol=1.0e-4,
         atol=1.0e-5,
     )
+
+
+def test_drive_stiffness_theta_matches_theta_reference(test, device):
+    """Weight only the drive stiffness by theta; drive and passive damping stay implicit."""
+    for theta in (0.0, 0.5):
+        with test.subTest(theta=theta):
+            np.testing.assert_allclose(
+                _solver_trajectory(
+                    _build_slider_augmented_drives(device, damping=3.0), 120, drive_stiffness_theta=theta
+                ),
+                _reference_trajectory(120, damping=3.0, theta=theta),
+                rtol=1.0e-4,
+                atol=1.0e-5,
+            )
+
+
+def test_undamped_drive_matches_closed_form_discrete_response(test, device):
+    """Follow the closed-form response of an undamped PD drive for every theta.
+
+    With ``x = q - q*``, ``w^2 = ke / (m + a)`` and ``c = 1 + theta (w dt)^2``, one step maps
+    ``(x, v)`` by a matrix of determinant ``1 / c`` and trace ``(2 + (theta - 1) (w dt)^2) / c``, so
+    ``x_n = r^n (x_0 cos(n phi) + b sin(n phi))`` with ``r = c^(-1/2)`` and ``cos(phi) = trace / (2 r)``:
+    the amplitude decays by ``c^(-1/2)`` per step (backward Euler at ``theta = 1``) and stays constant
+    (symplectic Euler) at ``theta = 0``.
+    """
+    steps = 360  # 3 s, 6.6 periods
+    x0 = -TARGET_POS  # the slider starts at rest at q = 0
+    w2dt2 = KE / (MASS + ARMATURE) * DT * DT
+    n = np.arange(1, steps + 1)
+    model = _build_slider_augmented_drives(device, kd=0.0, target_vel=0.0)
+    for theta in (1.0, 0.5, 0.0):
+        with test.subTest(theta=theta):
+            c = 1.0 + theta * w2dt2
+            r = c**-0.5
+            phi = np.arccos((2.0 + (theta - 1.0) * w2dt2) / c / (2.0 * r))
+            x1 = x0 * (1.0 - w2dt2 / c)
+            b = (x1 / r - x0 * np.cos(phi)) / np.sin(phi)
+            expected = TARGET_POS + r**n * (x0 * np.cos(n * phi) + b * np.sin(n * phi))
+            q = _solver_trajectory(model, steps, drive_stiffness_theta=theta)[:, 0]
+            np.testing.assert_allclose(q, expected, rtol=0.0, atol=2.0e-5)
+    test.assertLess((1.0 + w2dt2) ** (-steps / 2), 0.1, "backward Euler must visibly decay over the window")
+
+
+def test_default_drive_stiffness_theta_is_backward_euler(test, device):
+    """Keep backward Euler by default: the default and an explicit ``theta = 1`` step bit-identically."""
+    model = _build_slider_augmented_drives(device, damping=3.0)
+    default = _solver_trajectory(model, 120)
+    np.testing.assert_array_equal(default, _solver_trajectory(model, 120, drive_stiffness_theta=1.0))
+    np.testing.assert_allclose(default, _reference_trajectory(120, damping=3.0), rtol=1.0e-4, atol=1.0e-5)
 
 
 def test_passive_damping_with_changing_timestep(test, device, solve_mode="serial"):
@@ -2034,6 +2086,12 @@ for _name, _func in (
     ("test_implicit_drive_matches_backward_euler_reference", test_implicit_drive_matches_backward_euler_reference),
     ("test_drive_force_is_clamped_to_the_effort_limit", test_drive_force_is_clamped_to_the_effort_limit),
     ("test_passive_joint_damping_is_applied", test_passive_joint_damping_is_applied),
+    ("test_drive_stiffness_theta_matches_theta_reference", test_drive_stiffness_theta_matches_theta_reference),
+    (
+        "test_undamped_drive_matches_closed_form_discrete_response",
+        test_undamped_drive_matches_closed_form_discrete_response,
+    ),
+    ("test_default_drive_stiffness_theta_is_backward_euler", test_default_drive_stiffness_theta_is_backward_euler),
     ("test_near_singular_passive_damping", test_near_singular_passive_damping),
     ("test_passive_damping_with_changing_timestep", test_passive_damping_with_changing_timestep),
 ):

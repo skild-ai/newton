@@ -829,7 +829,7 @@ class TestSteelLaunchConfig(unittest.TestCase):
 
 
 def test_drive_mode_validation(test, device):
-    """Default to the implicit drive and reject unknown drive formulations."""
+    """Default to the implicit drive and reject unknown drive formulations and theta outside [0, 1]."""
     model = _build_chain_model(device, num_links=2, num_worlds=1)
     solver = SolverSteel(model)
     test.assertEqual(solver.drive_mode, "augmented")
@@ -837,6 +837,15 @@ def test_drive_mode_validation(test, device):
     test.assertEqual(SolverSteel(model, drive_mode="rows").drive_mode, "rows")
     with test.assertRaisesRegex(ValueError, "drive_mode"):
         SolverSteel(model, drive_mode="implicit")
+    test.assertEqual(solver.drive_stiffness_theta, 1.0)
+    test.assertEqual(SolverSteel(model, drive_stiffness_theta=0.0).drive_stiffness_theta, 0.0)
+    with test.assertRaises(AttributeError):
+        solver.drive_stiffness_theta = 0.0
+    for theta in (-0.1, 1.5, float("nan")):
+        with test.assertRaisesRegex(ValueError, "drive_stiffness_theta"):
+            SolverSteel(model, drive_stiffness_theta=theta)
+    with test.assertRaisesRegex(ValueError, "drive_stiffness_theta"):
+        SolverSteel(model, drive_mode="rows", drive_stiffness_theta=0.0)
 
 
 def test_fuse_joint_velocity_limits_validation(test, device):

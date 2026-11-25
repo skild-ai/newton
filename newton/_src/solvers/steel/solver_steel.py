@@ -1631,7 +1631,8 @@ class SolverSteel(SolverBase, CouplingInterface):
     - Joint drives: :attr:`~newton.Model.joint_target_ke` and
       :attr:`~newton.Model.joint_target_kd` on PRISMATIC, REVOLUTE and D6 DOFs. By
       default (``drive_mode="augmented"``) they are integrated implicitly by folding
-      ``dt * kd + dt^2 * ke`` into the mass matrix; only the explicit drive force is
+      ``dt * kd + dt^2 * ke`` into the mass matrix (``drive_stiffness_theta`` scales the
+      ``dt^2 * ke`` term down to a symplectic stiffness); only the explicit drive force is
       clamped to :attr:`~newton.Model.joint_effort_limit`, and the implicit stiffness and
       damping response is unbounded, so under a large external load the drive reaction
       can exceed the limit. ``drive_mode="rows"`` instead solves one PGS row per driven DOF with the PhysX articulation force-drive
@@ -1952,6 +1953,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     free_rigid_rolling_friction = _ConstructionOption()
     deterministic = _ConstructionOption()
     nesterov_momentum = _ConstructionOption()
+    drive_stiffness_theta = _ConstructionOption()
 
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
@@ -2251,6 +2253,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         free_rigid_rolling_friction: float | None = None,
         deterministic: wp.DeterministicMode | None = None,
         nesterov_momentum: bool | None = None,
+        drive_stiffness_theta: float = 1.0,
     ):
         """Create a Steel solver for a finalized model.
 
@@ -2851,6 +2854,17 @@ class SolverSteel(SolverBase, CouplingInterface):
                 Defaults to enabled on CUDA. CPU uses plain sweeps, so at a fixed iteration count the
                 device defaults can produce different trajectories. Pass ``False`` for plain Gauss-Seidel
                 sweeps on CUDA. Construction-only.
+            drive_stiffness_theta: Weight ``theta`` in ``[0, 1]`` of the end-of-step position in the
+                spring force of ``drive_mode="augmented"`` drives,
+                ``-ke * (q + theta * dt * qd_next - target)``; damping stays implicit. ``1`` (the
+                default) is backward Euler: unconditionally stable, but each step removes the fraction
+                ``theta * (w * dt)^2 / (1 + theta * (w * dt)^2)`` of the energy of an undamped
+                drive-loaded mode of angular frequency ``w`` [rad/s], so a mechanism that flexes on
+                impact and springs back loses rebound energy in proportion to ``dt``. ``0`` is
+                symplectic Euler, as MuJoCo integrates position actuators: the mode keeps its energy,
+                and the step is stable while ``w * dt < 2``. Values in between scale the loss by
+                ``theta``. Values other than ``1`` require ``drive_mode="augmented"``; other values
+                raise :class:`ValueError`. Construction-only.
 
         Raises:
             ValueError: If the world count and the row capacities would pass the ``2**31 - 1`` elements of a
@@ -2978,6 +2992,12 @@ class SolverSteel(SolverBase, CouplingInterface):
         if drive_mode not in ("augmented", "rows"):
             raise ValueError(f"drive_mode must be 'augmented' or 'rows', got {drive_mode!r}")
         self._drive_mode = drive_mode
+        drive_stiffness_theta = float(drive_stiffness_theta)
+        if not 0.0 <= drive_stiffness_theta <= 1.0:
+            raise ValueError(f"drive_stiffness_theta must be in [0, 1], got {drive_stiffness_theta}")
+        if drive_stiffness_theta != 1.0 and drive_mode != "augmented":
+            raise ValueError("drive_stiffness_theta other than 1 requires drive_mode='augmented'")
+        self._drive_stiffness_theta = drive_stiffness_theta
         self._has_drive_rows = drive_mode == "rows" and model.joint_dof_count > 0
         # The fused clamp replaces the velocity-limit rows of driven DOFs, so it only
         # engages where both exist; an inf activation fraction disables velocity limits.
@@ -9514,6 +9534,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.joint_effort_limit,
                         self._articulation_max_dofs,
                         dt,
+                        self._drive_stiffness_theta,
                         self._dynamics_art_active,
                     ],
                     outputs=[self._aug_row_counts, self._aug_row_dof_index, self._aug_row_K, state_aug._joint_tau],
@@ -9538,6 +9559,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     model.joint_effort_limit,
                     self._articulation_max_dofs,
                     dt,
+                    self._drive_stiffness_theta,
                     self._dynamics_art_active,
                 ],
                 outputs=[
