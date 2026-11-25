@@ -181,12 +181,6 @@ inertia, without joint armature, so a dynamic joint's projected wrench is its ge
 :class:`~newton.solvers.SolverFeatherstone` reports the start-of-step inverse dynamics at zero
 joint acceleration instead.
 
-:class:`~newton.solvers.SolverSteel` reports only the linear part of each rigid
-contact force; the torque part is zero. Contacts without solved rows, such as rows
-dropped for capacity or skipped for sleeping islands, report zero. A sleeping body's
-contacts therefore read as unloaded even though they still support it; use
-``sleep_skip_constraints=False`` or disable sleeping when consumers rely on these forces.
-
 Kamino exports contact points in the step's input body frames and world-frame
 wrenches about the input centers of mass.
 Use the input state when consuming those contacts, including for native contact
