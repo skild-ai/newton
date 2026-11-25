@@ -5,6 +5,7 @@
 
 import ctypes
 import inspect
+import itertools
 import unittest
 import warnings
 from unittest.mock import patch
@@ -2875,6 +2876,62 @@ def _tree_ends(model):
     return model.articulation_start.numpy()[1:]
 
 
+def _build_looped_fingers(device="cpu", *, worlds=2):
+    """Build a palm with four three-link fingers per world, whose fingertips are closed by loop joints.
+
+    Each finger starts with a BALL joint, so the tree has 1- and 3-DOF joints. Neighbouring fingertips are
+    joined by BALL closures and the last tip to the palm by a REVOLUTE closure. The closure anchors need
+    not coincide: the tests compare single passes, not trajectories.
+    """
+    template = newton.ModelBuilder(gravity=(0.7, -1.2, -9.1))
+    inertia = wp.mat33(0.3, 0.02, 0.01, 0.02, 0.4, 0.03, 0.01, 0.03, 0.5)
+    palm = template.add_link(mass=1.0, inertia=inertia, com=wp.vec3(0.03, -0.02, 0.01))
+    joints = [
+        template.add_joint_revolute(
+            parent=-1,
+            child=palm,
+            axis=newton.Axis.Z,
+            parent_xform=wp.transform(wp.vec3(0.0, -0.3, 0.8), wp.quat_rpy(0.2, -0.1, 0.3)),
+            target_ke=40.0,
+            target_kd=2.0,
+        )
+    ]
+    tips = []
+    for finger in range(4):
+        parent = palm
+        for level in range(3):
+            child = template.add_link(mass=0.5 + 0.1 * level, inertia=inertia, com=wp.vec3(0.02, 0.01, -0.03))
+            xform = wp.transform(wp.vec3(0.05, 0.04 * finger, 0.08), wp.quat_rpy(0.1, -0.2, 0.05))
+            if level == 0:
+                joints.append(template.add_joint_ball(parent=parent, child=child, parent_xform=xform))
+            else:
+                joints.append(
+                    template.add_joint_revolute(
+                        parent=parent,
+                        child=child,
+                        axis=newton.Axis.Y if level % 2 else newton.Axis.X,
+                        parent_xform=xform,
+                        child_xform=wp.transform(wp.vec3(-0.01, 0.02, 0.03), wp.quat_identity()),
+                        target_ke=5.0 * level,
+                        target_kd=0.2,
+                        armature=0.001,
+                    )
+                )
+            parent = child
+        tips.append(parent)
+    template.add_articulation(joints)
+    anchor = wp.transform(wp.vec3(0.0, 0.02, 0.05), wp.quat_identity())
+    for left, right in itertools.pairwise(tips):
+        template.add_joint_ball(left, right, parent_xform=anchor, child_xform=anchor)
+    template.add_joint_revolute(tips[-1], palm, axis=newton.Axis.X, parent_xform=anchor, child_xform=anchor)
+    builder = newton.ModelBuilder(gravity=(0.7, -1.2, -9.1))
+    builder.replicate(template, worlds, spacing=(2.0, 0.0, 0.0))
+    model = builder.finalize(device=device)
+    model.joint_q.assign(np.linspace(-0.3, 0.4, model.joint_coord_count, dtype=np.float32))
+    model.joint_qd.assign(np.linspace(-0.7, 0.8, model.joint_dof_count, dtype=np.float32))
+    return model
+
+
 class TestSteelTreePlan(unittest.TestCase):
     def test_parallel_tree_is_keyword_only_and_defaults_to_serial(self):
         """Require an explicit keyword-only opt-in."""
@@ -2963,10 +3020,10 @@ class TestSteelTreePlan(unittest.TestCase):
         self.assertEqual(sorted(group.segment_joints.numpy().tolist()), list(range(model.joint_count)))
 
     def test_serial_and_unsafe_topologies_fall_back(self):
-        """Return no plan for wholly serial, aliased, cross-articulation and loop-trimmed topologies."""
+        """Return no plan for wholly serial, aliased and cross-articulation topologies."""
         model, _, _ = _build_model(chain=True)
         self.assertIsNone(_SteelTreePlan.build(model, _tree_ends(model)))
-        for unsafe in ("alias", "foreign_parent", "loop"):
+        for unsafe in ("alias", "foreign_parent"):
             with self.subTest(unsafe=unsafe):
                 model = _build_fingers(articulations=2)
                 ends = _tree_ends(model).copy()
@@ -2974,13 +3031,59 @@ class TestSteelTreePlan(unittest.TestCase):
                     children = model.joint_child.numpy().copy()
                     children[2] = children[1]
                     model.joint_child.assign(children)
-                elif unsafe == "foreign_parent":
+                else:
                     parents = model.joint_parent.numpy().copy()
                     parents[1] = model.joint_child.numpy()[model.articulation_start.numpy()[1]]
                     model.joint_parent.assign(parents)
-                else:
-                    ends[0] -= 1
                 self.assertIsNone(_SteelTreePlan.build(model, ends))
+
+    def test_loop_closures_keep_the_tree_plan(self):
+        """Schedule the tree joints of looped articulations and leave their loop-closing joints out."""
+        model = _build_looped_fingers()
+        solver = SolverSteel(model)
+        ends = solver._articulation_joint_end.numpy()
+        starts = model.articulation_start.numpy()
+        self.assertTrue(np.any(ends < starts[1:]))
+        plan = _SteelTreePlan.build(model, ends)
+        self.assertIsNotNone(plan)
+        scheduled = np.sort(np.concatenate([group.segment_joints.numpy() for group in plan.groups]))
+        tree = np.concatenate([np.arange(starts[art], ends[art]) for art in range(model.articulation_count)])
+        np.testing.assert_array_equal(scheduled, tree)
+        # A loop-trimmed range of a tree also keeps its plan; the trimmed joint is not scheduled.
+        model = _build_fingers(articulations=2)
+        ends = _tree_ends(model).copy()
+        ends[0] -= 1
+        plan = _SteelTreePlan.build(model, ends)
+        self.assertIsNotNone(plan)
+        scheduled = np.concatenate([group.segment_joints.numpy() for group in plan.groups])
+        self.assertNotIn(int(ends[0]), scheduled.tolist())
+
+    def test_shared_topologies_match_per_articulation_schedules(self):
+        """Give replicated articulations the schedule of one copy, shifted by their first joint."""
+        model = _build_looped_fingers(worlds=3)
+        ends = SolverSteel(model)._articulation_joint_end.numpy()
+        plan = _SteelTreePlan.build(model, ends)
+        starts = model.articulation_start.numpy()
+        group = plan.groups[0]
+        self.assertEqual(group.articulation_count, model.articulation_count)
+        offsets = group.level_offsets.numpy()
+        segment_offsets = group.segment_offsets.numpy()
+        joints = group.segment_joints.numpy()
+        child_offsets = group.child_offsets.numpy()
+        child_segments = group.child_segments.numpy()
+        first = None
+        for row in range(group.articulation_count):
+            lo, hi = offsets[row, 0], offsets[row, -1]
+            layout = (
+                np.diff(offsets[row]),
+                np.diff(segment_offsets[lo : hi + 1]),
+                joints[segment_offsets[lo] : segment_offsets[hi]] - starts[row],
+                child_segments[child_offsets[lo] : child_offsets[hi]] - lo,
+            )
+            if first is None:
+                first = layout
+            for a, b in zip(layout, first, strict=True):
+                np.testing.assert_array_equal(a, b)
 
 
 def test_serial_selection_skips_tree_setup(test, device):
@@ -3171,6 +3274,44 @@ class TestSteelCpuTree(unittest.TestCase):
                 np.testing.assert_allclose(cpu, gpu, rtol=1.0e-4, atol=1.0e-4)
 
 
+def test_stage1_matches_serial_on_loop_closures(test, device):
+    """Match the serial forward kinematics and inverse dynamics of looped articulations."""
+    model = _build_looped_fingers(device)
+    solvers = [_solver(model, enabled=value) for value in (False, True)]
+    test.assertTrue(solvers[1]._connect_count)
+    states = [model.state() for _ in solvers]
+    outputs = [model.state() for _ in solvers]
+    for solver, state, following in zip(solvers, states, outputs, strict=True):
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        _poison(_dynamics_fields(solver, state), keep=("body_q",))
+        _run_stage1(solver, state, following)
+    fields = [_dynamics_fields(solver, state) for solver, state in zip(solvers, states, strict=True)]
+    for name, actual in fields[1].items():
+        np.testing.assert_allclose(actual.numpy(), fields[0][name].numpy(), rtol=3e-6, atol=3e-6, err_msg=name)
+    np.testing.assert_allclose(
+        solvers[1]._body_ft_s.numpy(), solvers[0]._body_ft_s.numpy(), rtol=3e-6, atol=3e-6, err_msg="_body_ft_s"
+    )
+    # Neither pass writes the loop-closing joints' DOF slots.
+    tree_dofs = np.concatenate(
+        [
+            np.arange(start, start + count)
+            for start, count in zip(
+                solvers[0]._articulation_dof_start.numpy(), solvers[0]._model_plan.articulation_dof_count, strict=True
+            )
+        ]
+    )
+    np.testing.assert_allclose(
+        solvers[1]._joint_tau.numpy()[tree_dofs],
+        solvers[0]._joint_tau.numpy()[tree_dofs],
+        rtol=3e-6,
+        atol=3e-6,
+        err_msg="_joint_tau",
+    )
+    # The drive rows depend on the joint state alone, so the cooperative scan reproduces them exactly.
+    for name in ("_aug_row_counts", "_aug_row_dof_index", "_aug_row_K"):
+        np.testing.assert_array_equal(getattr(solvers[1], name).numpy(), getattr(solvers[0], name).numpy(), name)
+
+
 class TestSteelTreeExecution(unittest.TestCase):
     pass
 
@@ -3182,6 +3323,7 @@ for _name in (
     "test_stage1_matches_serial_with_velocity_prescale",
     "test_publication_matches_public_fk",
     "test_contact_trajectory_matches_serial",
+    "test_stage1_matches_serial_on_loop_closures",
 ):
     add_function_test(TestSteelTreeExecution, _name, globals()[_name], devices=devices)
 

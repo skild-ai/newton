@@ -1002,32 +1002,98 @@ class _SteelTreePlan:
         """Return a plan, or ``None`` when no articulation branches or the topology is unsupported."""
         if not model.articulation_count or not model.joint_count:
             return None
-        starts = model.articulation_start.numpy()
-        ends = np.asarray(articulation_joint_end)
+        starts = model.articulation_start.numpy().astype(np.int64)
+        ends = np.asarray(articulation_joint_end, dtype=np.int64)
         parents = model.joint_parent.numpy()
         children = model.joint_child.numpy()
-        if not np.array_equal(ends, starts[1:]):
+        count = model.articulation_count
+        # Loop-closing joints sit between a tree's end and the next articulation's start; the
+        # serial passes skip them and so does the plan. They own no body.
+        if np.any(ends < starts[:count]) or np.any(ends > starts[1 : count + 1]):
             return None
-        if np.any(children < 0):
+        sizes = ends - starts[:count]
+        tree_art = np.repeat(np.arange(count), sizes)
+        tree_joints = (np.arange(int(sizes.sum())) - np.repeat(np.cumsum(sizes) - sizes, sizes)) + starts[tree_art]
+        if np.any(children[tree_joints] < 0):
             return None
-        owners = np.bincount(children, minlength=model.body_count)
+        owners = np.bincount(children[tree_joints], minlength=model.body_count)
         if np.any(owners > 1):
             return None
-        body_owner = np.full(model.body_count, -1, dtype=np.int32)
-        body_owner[children] = np.arange(model.joint_count, dtype=np.int32)
-        joint_children = [[] for _ in range(model.joint_count)]
-        joint_depth = np.zeros(model.joint_count, dtype=np.int32)
-        for art in range(model.articulation_count):
-            start, end = int(starts[art]), int(ends[art])
-            for joint in range(start, end):
-                parent = int(parents[joint])
-                if parent >= 0:
-                    parent_joint = int(body_owner[parent])
-                    # Parents must precede their children within the articulation.
-                    if not start <= parent_joint < joint:
-                        return None
-                    joint_children[parent_joint].append(joint)
-                    joint_depth[joint] = joint_depth[parent_joint] + 1
+        body_owner = np.full(model.body_count, -1, dtype=np.int64)
+        body_owner[children[tree_joints]] = tree_joints
+        # Parents must precede their children within the articulation.
+        tree_parents = parents[tree_joints]
+        rooted = tree_parents < 0
+        parent_joints = np.where(rooted, -1, body_owner[np.maximum(tree_parents, 0)])
+        art_starts = starts[tree_art]
+        if np.any(~rooted & ((parent_joints < art_starts) | (parent_joints >= tree_joints))):
+            return None
+        # Articulations of one topology share a schedule, shifted by their first joint.
+        relative_parents = np.where(rooted, -1, parent_joints - art_starts).astype(np.int32)
+        bounds = np.concatenate(([0], np.cumsum(sizes)))
+        templates = {}
+        grouped = {}
+        has_branches = False
+        for art in range(count):
+            key = relative_parents[bounds[art] : bounds[art + 1]].tobytes()
+            template = templates.get(key)
+            if template is None:
+                template = templates[key] = _SteelTreePlan._template(relative_parents[bounds[art] : bounds[art + 1]])
+            has_branches |= template["lanes"] > 1
+            grouped.setdefault(template["lanes"], []).append((art, template))
+        if not has_branches:
+            return None
+        groups = []
+        for lanes, trees in sorted(grouped.items()):
+            max_levels = max(len(template["level_counts"]) for _, template in trees)
+            offsets = np.empty((len(trees), max_levels + 1), dtype=np.int32)
+            segment_offsets, joints = [np.zeros(1, dtype=np.int64)], []
+            child_offsets, child_segments = [np.zeros(1, dtype=np.int64)], []
+            segment_base = joint_base = child_base = 0
+            for row, (art, template) in enumerate(trees):
+                level_counts = np.zeros(max_levels, dtype=np.int64)
+                level_counts[: len(template["level_counts"])] = template["level_counts"]
+                offsets[row, 0] = segment_base
+                offsets[row, 1:] = segment_base + np.cumsum(level_counts)
+                joints.append(template["segment_joints"] + starts[art])
+                segment_offsets.append(template["segment_offsets"][1:] + joint_base)
+                child_segments.append(template["child_segments"] + segment_base)
+                child_offsets.append(template["child_offsets"][1:] + child_base)
+                segment_base += len(template["segment_offsets"]) - 1
+                joint_base += len(template["segment_joints"])
+                child_base += len(template["child_segments"])
+
+            def device_array(parts):
+                return wp.array(np.concatenate(parts).astype(np.int32), dtype=wp.int32, device=model.device)
+
+            groups.append(
+                _SteelTreeGroup(
+                    lanes=lanes,
+                    articulation_count=len(trees),
+                    max_levels=max_levels,
+                    articulations=wp.array([art for art, _ in trees], dtype=wp.int32, device=model.device),
+                    level_offsets=wp.array(offsets, dtype=wp.int32, device=model.device),
+                    segment_offsets=device_array(segment_offsets),
+                    segment_joints=device_array(joints),
+                    child_offsets=device_array(child_offsets),
+                    child_segments=device_array(child_segments),
+                )
+            )
+        return cls(tuple(groups))
+
+    @staticmethod
+    def _template(relative_parents: np.ndarray) -> dict:
+        """Schedule one articulation topology given each joint's parent joint relative to the first (-1: root).
+
+        Joint and segment indices of the returned arrays are relative to the articulation.
+        """
+        joint_count = len(relative_parents)
+        joint_children = [[] for _ in range(joint_count)]
+        joint_depth = [0] * joint_count
+        for joint, parent_joint in enumerate(relative_parents.tolist()):
+            if parent_joint >= 0:
+                joint_children[parent_joint].append(joint)
+                joint_depth[joint] = joint_depth[parent_joint] + 1
 
         def schedule_cost(levels):
             width = max(map(len, levels), default=1)
@@ -1037,75 +1103,50 @@ class _SteelTreePlan:
             )
             return lanes, rounds
 
-        segment_depth = np.zeros(model.joint_count, dtype=np.int32)
-        grouped = {}
-        has_branches = False
-        for art in range(model.articulation_count):
-            start, end = int(starts[art]), int(ends[art])
-            levels = []
-            joint_levels = []
-            for joint in range(start, end):
-                joint_level = int(joint_depth[joint])
-                if joint_level == len(joint_levels):
-                    joint_levels.append([])
-                joint_levels[joint_level].append([joint])
-                parent = int(parents[joint])
-                level = 0
-                if parent >= 0:
-                    parent_joint = int(body_owner[parent])
-                    if len(joint_children[parent_joint]) == 1:
-                        continue
-                    level = int(segment_depth[parent_joint]) + 1
-                segment = [joint]
-                while len(joint_children[segment[-1]]) == 1:
-                    segment.append(joint_children[segment[-1]][0])
-                segment_depth[segment] = level
-                if level == len(levels):
-                    levels.append([])
-                levels[level].append(segment)
-            lanes, rounds = schedule_cost(levels)
-            joint_lanes, joint_rounds = schedule_cost(joint_levels)
-            # A long chain can hold up the other branches of its level. Keep the schedule with
-            # fewer sequential joint rounds; this is a topology proxy, not a runtime guarantee.
-            if rounds > joint_rounds:
-                levels, lanes = joint_levels, joint_lanes
-            has_branches |= lanes > 1
-            grouped.setdefault(lanes, []).append((art, levels))
-        if not has_branches:
-            return None
-        groups = []
-        for lanes, trees in sorted(grouped.items()):
-            max_levels = max(len(levels) for _, levels in trees)
-            offsets = np.empty((len(trees), max_levels + 1), dtype=np.int32)
-            segments = []
-            for row, (_, levels) in enumerate(trees):
-                offsets[row, 0] = len(segments)
-                for level in range(max_levels):
-                    if level < len(levels):
-                        segments.extend(levels[level])
-                    offsets[row, level + 1] = len(segments)
-            segment_ids = {segment[0]: index for index, segment in enumerate(segments)}
-            segment_offsets, joints = [0], []
-            child_offsets, child_segments = [0], []
-            for segment in segments:
-                joints.extend(segment)
-                segment_offsets.append(len(joints))
-                child_segments.extend(segment_ids[child] for child in reversed(joint_children[segment[-1]]))
-                child_offsets.append(len(child_segments))
-            groups.append(
-                _SteelTreeGroup(
-                    lanes=lanes,
-                    articulation_count=len(trees),
-                    max_levels=max_levels,
-                    articulations=wp.array([art for art, _ in trees], dtype=wp.int32, device=model.device),
-                    level_offsets=wp.array(offsets, dtype=wp.int32, device=model.device),
-                    segment_offsets=wp.array(segment_offsets, dtype=wp.int32, device=model.device),
-                    segment_joints=wp.array(joints, dtype=wp.int32, device=model.device),
-                    child_offsets=wp.array(child_offsets, dtype=wp.int32, device=model.device),
-                    child_segments=wp.array(child_segments, dtype=wp.int32, device=model.device),
-                )
-            )
-        return cls(tuple(groups))
+        segment_depth = [0] * joint_count
+        levels = []
+        joint_levels = []
+        for joint, parent_joint in enumerate(relative_parents.tolist()):
+            joint_level = joint_depth[joint]
+            if joint_level == len(joint_levels):
+                joint_levels.append([])
+            joint_levels[joint_level].append([joint])
+            level = 0
+            if parent_joint >= 0:
+                if len(joint_children[parent_joint]) == 1:
+                    continue
+                level = segment_depth[parent_joint] + 1
+            segment = [joint]
+            while len(joint_children[segment[-1]]) == 1:
+                segment.append(joint_children[segment[-1]][0])
+            for member in segment:
+                segment_depth[member] = level
+            if level == len(levels):
+                levels.append([])
+            levels[level].append(segment)
+        lanes, rounds = schedule_cost(levels)
+        joint_lanes, joint_rounds = schedule_cost(joint_levels)
+        # A long chain can hold up the other branches of its level. Keep the schedule with
+        # fewer sequential joint rounds; this is a topology proxy, not a runtime guarantee.
+        if rounds > joint_rounds:
+            levels, lanes = joint_levels, joint_lanes
+        segments = [segment for level in levels for segment in level]
+        segment_ids = {segment[0]: index for index, segment in enumerate(segments)}
+        segment_offsets, joints = [0], []
+        child_offsets, child_segments = [0], []
+        for segment in segments:
+            joints.extend(segment)
+            segment_offsets.append(len(joints))
+            child_segments.extend(segment_ids[child] for child in reversed(joint_children[segment[-1]]))
+            child_offsets.append(len(child_segments))
+        return {
+            "lanes": lanes,
+            "level_counts": np.array([len(level) for level in levels], dtype=np.int64),
+            "segment_offsets": np.array(segment_offsets, dtype=np.int64),
+            "segment_joints": np.array(joints, dtype=np.int64),
+            "child_offsets": np.array(child_offsets, dtype=np.int64),
+            "child_segments": np.array(child_segments, dtype=np.int64),
+        }
 
 
 _DENSE_META_ROW_TYPE_BITS = 3
