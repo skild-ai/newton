@@ -781,11 +781,14 @@ def test_propagation_tree_dynamics_frees_dense_buffers(test, device):
         test.assertNotIn(size, solver._dense_row_sizes)
         test.assertEqual(solver._H_by_size[size].size, 1)
         test.assertEqual(solver._L_by_size[size].size, 1)
-    freed = _step_from(model, rest, solver).joint_qd.numpy()
+    # A step with contacts runs on the freed buffers; without contacts it matches the dense predictor (the two
+    # contact solves follow different paths, so only the unconstrained step is compared, as above).
+    test.assertTrue(np.all(np.isfinite(_step_from(model, rest, solver).joint_qd.numpy())))
+    freed = _step_from(model, rest, solver, with_contacts=False).joint_qd.numpy()
     with kernel_overrides({"tree_dynamics": False}):
         dense = newton.solvers.SolverSteel(model, articulation_constraint_max=640, iterations=8, **_PROPAGATION)
     test.assertFalse(dense._row_free_sizes)
-    reference = _step_from(model, rest, dense).joint_qd.numpy()
+    reference = _step_from(model, rest, dense, with_contacts=False).joint_qd.numpy()
     np.testing.assert_allclose(freed, reference, atol=1.0e-4, rtol=1.0e-5)
     limited = newton.solvers.SolverSteel(
         model, articulation_constraint_max=640, iterations=8, enable_joint_limits=True, **_PROPAGATION
