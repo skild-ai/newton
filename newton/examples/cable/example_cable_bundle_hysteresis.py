@@ -298,7 +298,7 @@ class Example:
             material.dahl_eps_max.fill_(float(eps_max))
             material.dahl_tau.fill_(float(tau))
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.collision_pipeline = newton.CollisionPipeline(self.model, **cable_solver.pipeline_options(args))
         self.clamps.bind(self.model)
         self.solver = cable_solver.make_solver(
             self.model,

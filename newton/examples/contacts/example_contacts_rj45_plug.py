@@ -396,7 +396,7 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.collision_pipeline = newton.CollisionPipeline(self.model, **cable_solver.pipeline_options(args))
         self.contacts = self.collision_pipeline.contacts()
 
         self._initial_body_q = self.state_0.body_q.numpy().copy()

@@ -197,7 +197,8 @@ class Example:
             builder.color()
         self.model = builder.finalize()
         contact_history = self.contact_mode == "alm-history"
-        contact_matching = "latest" if contact_history else "disabled"
+        # Native Steel warm-starts its contacts, which reads the matching.
+        contact_matching = "latest" if contact_history or self.clamps.steel else "disabled"
         self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching=contact_matching)
         self.contacts = self.collision_pipeline.contacts()
         self.clamps.bind(self.model)

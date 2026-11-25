@@ -164,6 +164,7 @@ class Example:
 
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
+            **cable_solver.pipeline_options(args),
         )
         self.contacts = self.collision_pipeline.contacts()
         if self.native_cable:

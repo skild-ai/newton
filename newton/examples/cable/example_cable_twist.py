@@ -211,7 +211,7 @@ class Example:
         # Finalize model
         self.model = builder.finalize()
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.collision_pipeline = newton.CollisionPipeline(self.model, **cable_solver.pipeline_options(args))
         self.clamps.bind(self.model)
         self.solver = cable_solver.make_solver(
             self.model,

@@ -142,6 +142,7 @@ class Example:
             self.model,
             broad_phase="explicit",
             shape_pairs_filtered=None if self.native_cable else self._ground_shape_pairs(),
+            **cable_solver.pipeline_options(args),
         )
         self.contacts = self.collision_pipeline.contacts()
         if self.native_cable or self.rigid_solver == "steel":

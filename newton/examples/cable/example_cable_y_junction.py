@@ -114,7 +114,7 @@ class Example:
         self.model = builder.finalize(device=sim_device)
         self.model.set_gravity((0.0, 0.0, float(getattr(args, "gravity_z", -9.81))))
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.collision_pipeline = newton.CollisionPipeline(self.model, **cable_solver.pipeline_options(args))
         self.clamps.bind(self.model)
         self.solver = cable_solver.make_solver(
             self.model,
