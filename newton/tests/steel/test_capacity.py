@@ -1180,9 +1180,10 @@ def test_free_body_rows_past_16_bit_parent_index(test, device):
     pipeline = newton.CollisionPipeline(model, broad_phase="sap")
     contacts = pipeline.contacts()
     state_0, state_1 = model.state(), model.state()
-    qd = state_0.body_qd.numpy()
-    qd[:, 0] = 0.5
-    state_0.body_qd.assign(qd)
+    joint_qd = state_0.joint_qd.numpy()
+    joint_qd[0::6] = 0.5
+    state_0.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
     for _ in range(12):
         pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
