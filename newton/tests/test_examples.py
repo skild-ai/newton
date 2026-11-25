@@ -2127,6 +2127,17 @@ for example_name in (
         use_viewer=True,
     )
 
+# Native Steel inserts the RJ45 plug, the latch snaps, and it holds the plug against the pull-back.
+for mode in ("colored", "serial"):
+    add_example_test(
+        TestUSDDependentExamples,
+        name="contacts.example_contacts_rj45_plug",
+        devices=cuda_test_devices,
+        test_options={"usd_required": True, "solver": "steel", "solve-mode": mode, "insert": True, "num-frames": 240},
+        use_viewer=True,
+        test_suffix=f"native_steel_insert_{mode}",
+    )
+
 
 class TestAutoDiscoveredExamples(unittest.TestCase):
     pass

@@ -50,6 +50,12 @@ MESH_SDF_NARROW_BAND_RANGE = (-2.0 * SHAPE_CFG.gap, 2.0 * SHAPE_CFG.gap)
 
 PLUG_Y_OFFSET = -0.025
 
+# --insert: (time [s], gizmo y offset from the start [m]) keyframes. -PLUG_Y_OFFSET is fully inserted, and the push
+# aims past it so the gizmo spring seats the plug and snaps the latch; the last key pulls back against the latch.
+INSERT_PUSH = -PLUG_Y_OFFSET + 0.015
+INSERT_KEYS = ((0.3, 0.0), (1.8, INSERT_PUSH), (2.6, INSERT_PUSH), (3.4, 0.0))
+INSERT_LATCHED_TOL = 0.002  # [m] the plug may back out this far against the latch
+
 CABLE_RADIUS = 0.00325
 CABLE_KINEMATIC_COUNT = 4  # first N rod bodies are inside the plug and follow it
 SOCKET_OPACITY = 0.35
@@ -240,6 +246,9 @@ class Example:
 
         self.clamps = cable_solver.CableClamps(args)
         self.viewer = viewer
+        # Script the gizmo: insert the plug, then pull it back against the latch.
+        self.insert = bool(getattr(args, "insert", False))
+        self._latch_deflection_min = 0.0
         self.pick_stiffness = 50.0
         self.pick_damping = 10.0
 
@@ -488,6 +497,11 @@ class Example:
                 )
 
     def step(self):
+        if self.insert:
+            dy = float(np.interp(self.sim_time, *zip(*INSERT_KEYS, strict=True)))
+            self.gizmo_tf = wp.transform(
+                wp.vec3(self._rest_pos[0], self._rest_pos[1] + dy, self._rest_pos[2]), wp.quat_identity()
+            )
         gp = wp.transform_get_translation(self.gizmo_tf)
 
         picking = getattr(self.viewer, "picking", None)
@@ -511,6 +525,17 @@ class Example:
                 for i in overflow:
                     label = self.model.body_label[i] if hasattr(self.model, "body_label") else i
                     print(f"[contact overflow] body {label} (idx={i}): {counts[i]} contacts (buffer={buf})")
+
+        if self.insert:
+            # Hinge angle about -X from the body poses; the plug cannot rotate.
+            body_q = self.state_0.body_q.numpy()
+            plug_qx, plug_qw = body_q[self._plug_body][3], body_q[self._plug_body][6]
+            latch_qx, latch_qw = body_q[self._latch_body][3], body_q[self._latch_body][6]
+            latch_angle = -2.0 * float(
+                np.arctan2(latch_qx * plug_qw - latch_qw * plug_qx, latch_qw * plug_qw + latch_qx * plug_qx)
+            )
+            self._latch_deflection_min = min(self._latch_deflection_min, latch_angle)
+            return
 
         # Snap gizmo to the plug when the user isn't dragging it.
         gizmo_active = bool(getattr(self.viewer, "gizmo_is_using", False))
@@ -537,8 +562,24 @@ class Example:
             assert np.all(np.isfinite(body_q[i])), f"Body {i} has non-finite transform"
             drift = np.linalg.norm(body_q[i] - initial_q[i])
             assert drift < 1.0, f"Body {i} drifted {drift:.4f} from initial transform"
+        if self.insert and self.sim_time >= INSERT_KEYS[-1][0]:
+            backed_out = -PLUG_Y_OFFSET - (body_q[self._plug_body][1] - self._rest_pos[1])
+            assert backed_out < INSERT_LATCHED_TOL, f"plug backed out {backed_out * 1e3:.1f} mm: the latch did not hold"
+            assert self._latch_deflection_min < -0.05, (
+                f"latch never deflected (min {self._latch_deflection_min:.3f} rad)"
+            )
+
+    @staticmethod
+    def create_parser():
+        parser = cable_solver.create_parser()
+        parser.add_argument(
+            "--insert",
+            action="store_true",
+            help="Script the gizmo: insert the plug, then pull it back against the latch.",
+        )
+        return parser
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init(cable_solver.create_parser())
+    viewer, args = newton.examples.init(Example.create_parser())
     newton.examples.run(Example(viewer, args), args)

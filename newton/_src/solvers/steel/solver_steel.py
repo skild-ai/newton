@@ -2645,10 +2645,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 contact-active bodies of cache-eligible articulations per world; free bodies
                 do not count. At least 1.
             propagation_interval: With ``articulated_contact_response="propagation"``, propagate the impulses of
-                a sweep through the articulation trees every that many iterations, and after the last one. In
-                between, the sweep's own body estimates carry the impulses it keeps summing, so the exact joint
-                velocities arrive less often in exchange for fewer tree passes. 1 (default) propagates every
-                iteration. At least 1.
+                a sweep through the rod trees every that many iterations, and after the last one. In between,
+                the sweep's own body estimates of the rod links carry the impulses it keeps summing, so their exact
+                joint velocities arrive less often in exchange for fewer passes over the long trees. Every other
+                articulation and free body still propagates after each sweep: between passes each sweep moves a
+                body by its own split response, and repeated sweeps of a small articulation whose contacts oppose
+                each other (a latch squeezed in a socket) can build impulses that cancel in that estimate but not
+                in the articulation. 1 (default) propagates every iteration. At least 1.
             propagation_momentum: With ``articulated_contact_response="propagation"``, accelerate the sweeps
                 with Nesterov momentum: at each tree propagation but the last, the row impulses move on by a
                 growing share of their change since the previous one, and that propagation installs the velocity
@@ -2987,6 +2990,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_cached_response = bool(propagation_cached_response)
         self._propagation_cached_response_body_max = int(propagation_cached_response_body_max)
         self._propagation_interval = int(propagation_interval)
+        # Set once the rod trees are known: a pass over everything but them between the interval's full passes.
+        self._propagation_partial_pass = False
         if self._propagation_interval < 1:
             raise ValueError("propagation_interval must be at least 1")
         self._propagation_momentum_option = propagation_momentum
@@ -3363,6 +3368,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 arts = self._propagation_tree_arts[size].numpy()
                 if len(arts) and bool(np.all(has_rod[arts])):
                     self._rod_tree_sizes.add(int(size))
+        # With an interval, articulations other than rod trees (and free bodies, and the cached worlds) still
+        # propagate after every sweep.
+        self._propagation_partial_pass = self._propagation_interval > 1 and (
+            any(size not in self._rod_tree_sizes for size in self._propagation_tree_sizes)
+            or self._has_free_rigid_bodies
+        )
         if self._rod_tree_sizes:
             # The rod-tree factor's propagation maps: per joint B = T (I - U D^-1 S^T), per DOF Q = -D^-1 U^T X.
             # The rod-tree factor's per-lane propagation records: backward [B row, W row], forward [B column,
@@ -13881,8 +13892,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
             )
 
-    def _propagation_propagate_impulses(self, contracted: bool = False) -> None:
+    def _propagation_propagate_impulses(self, contracted: bool = False, rods: bool = True) -> None:
         """Apply the impulses accumulated in a propagation sweep to the joint velocities.
+
+        Without ``rods`` the rod trees keep their impulses for a later pass (``propagation_interval``) and only the
+        other articulations, the cached worlds and the free bodies propagate.
 
         Worlds on the cached path apply the cached responses; the tree walk skips them. With ``contracted`` the
         chains keep their impulses and only update their active links' twists (see rod_tree._CONTRACT_PREP);
@@ -13912,6 +13926,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
             )
         for size in self._propagation_tree_sizes:
+            if not rods and size in self._rod_tree_sizes:
+                continue
             arts = self._propagation_tree_arts[size]
             n_arts = self._propagation_tree_art_count[size]
             tree_inputs = [
@@ -14434,6 +14450,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._apply_propagation_momentum()
             if propagates:
                 self._propagation_propagate_impulses(contracted=contracted)
+            elif self._propagation_partial_pass:
+                # Only the rod trees wait for the block's end: every other articulation propagates each sweep.
+                self._propagation_propagate_impulses(rods=False)
             if has_velocity_limits and not contact_then_internal:
                 phase(5, iteration_offset=iteration)
         if contracted:
