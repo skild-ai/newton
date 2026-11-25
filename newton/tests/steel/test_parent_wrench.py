@@ -585,7 +585,7 @@ def test_closure_force_uses_the_row_builder_norm(test, device):
                     qd_start,
                     motion,
                     origin,
-                    wp.zeros(2, dtype=wp.transform, device=device),  # body_rel
+                    wp.zeros(2, dtype=wp.vec3, device=device),  # body_rel_t
                     wp.array([-1, -1], dtype=wp.int32, device=device),  # body_to_articulation: world-pose geometry
                     wp.zeros(1, dtype=wp.int32, device=device),  # articulation_start
                     wp.zeros(1, dtype=wp.int32, device=device),  # joint_child
@@ -681,7 +681,7 @@ def test_open_closure_force_acts_where_the_rows_do(test, device):
                     ints(qd_start),
                     wp.array([[0.0, 0.0, 0.0, 0.0, 0.0, 1.0]] * n_dofs, dtype=wp.spatial_vector, device=device),
                     wp.zeros(1, dtype=wp.vec3, device=device),
-                    wp.zeros(2, dtype=wp.transform, device=device),  # body_rel
+                    wp.zeros(2, dtype=wp.vec3, device=device),  # body_rel_t
                     ints([-1, -1]),  # body_to_articulation: world-pose geometry
                     ints([0]),  # articulation_start
                     ints([0]),  # joint_child
