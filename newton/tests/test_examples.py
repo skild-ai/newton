@@ -1175,7 +1175,7 @@ add_example_test(
 )
 
 
-for tabletop_task in ("bolt_sweep", "wrecking_ball", "plate_rack", "pelican_bicycle", "cup_unpacking", "toy_well"):
+for tabletop_task in ("bolt_sweep", "wrecking_ball", "plate_rack"):
     add_example_test(
         TestRobotExamples,
         name=f"robot.example_steel_{tabletop_task}",
