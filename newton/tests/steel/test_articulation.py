@@ -8,6 +8,7 @@ import inspect
 import itertools
 import unittest
 import warnings
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -4420,18 +4421,20 @@ def _float64_closure_gaps(model, joint_q):
     return np.array(gaps)
 
 
-def test_closure_rows_are_translation_invariant(test, device):
+def test_closure_rows_are_translation_invariant(test, device, overrides=None, iterations=8):
     """The closure ladder steps alike at the origin and 256 m away: closure gaps, row gaps and velocities.
 
     World 1 is world 0 translated, and every step both start from world 0's state. The rows take the closure gap and
     lever arms from root-relative body poses. From world poses, world 1's gaps carried about 1e-5 m of float32 rounding,
     which the ladder's nearly degenerate (normalized) rows amplified: normalized gaps then differed by up to 0.14,
-    velocities by several times their size and closure gaps by about 0.15 mm.
+    velocities by several times their size and closure gaps by about 0.15 mm. ``overrides`` selects another closure
+    solve (the sparse direct solve builds its own rows).
     """
     model = _build_closure_ladder(device, offsets=[(0.0, 0.0, 0.0), (256.0, 256.0, 0.0)])
-    solver = SolverSteel(
-        model, iterations=8, update_mass_matrix_interval=1, deterministic=wp.DeterministicMode.RUN_TO_RUN
-    )
+    with kernel_overrides(overrides or {}):
+        solver = SolverSteel(
+            model, iterations=iterations, update_mass_matrix_interval=1, deterministic=wp.DeterministicMode.RUN_TO_RUN
+        )
     state, out = model.state(), model.state()
     n_coords, n_dofs = model.joint_coord_count // 2, model.joint_dof_count // 2
     qd = np.random.default_rng(3).uniform(-0.5, 0.5, n_dofs).astype(np.float32)
@@ -4646,6 +4649,147 @@ def test_closure_rows_do_not_depend_on_the_launch_shape(test, device):
             np.testing.assert_array_equal(qd, reference[1])
 
 
+_SPARSE_DIRECT = {"closure_direct_factor": "sparse", "closure_direct_eps": 1.0e-3}
+
+
+def _sparse_ladder_run(device, steps, overrides=None, units=4, iterations=2, capture=None, **solver_kwargs):
+    """Step the closure ladder (two worlds) from a random velocity; ``capture`` records one solve's system."""
+    from newton._src.solvers.steel import closure_direct_sparse  # noqa: PLC0415
+
+    model = _build_closure_ladder(device, offsets=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)], units=units)
+    with kernel_overrides(overrides if overrides is not None else _SPARSE_DIRECT):
+        solver = SolverSteel(
+            model,
+            iterations=iterations,
+            update_mass_matrix_interval=1,
+            deterministic=wp.DeterministicMode.RUN_TO_RUN,
+            **solver_kwargs,
+        )
+    state_0, state_1 = model.state(), model.state()
+    state_0.joint_qd.assign(np.random.default_rng(3).uniform(-0.5, 0.5, model.joint_dof_count).astype(np.float32))
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    control = model.control()
+    original = closure_direct_sparse.launch_solve
+
+    def wrapped(s, rhs, n, dt):
+        if capture is not None:
+            capture["v_hat"] = s._v_out.numpy().copy()
+        original(s, rhs, n, dt)
+        if capture is not None:
+            buf = s._closure_direct_sparse
+            for name in ("Jw", "qrow", "swrow", "Ha"):
+                capture[name] = getattr(buf, name).numpy().copy()
+            capture["v"] = s._v_out.numpy().copy()
+            capture["lam"] = s._impulses.numpy().copy()
+            capture["slot"] = s._connect_slot.numpy().copy()
+            capture["dofidx"] = s._world_dof_indices.numpy().copy()
+
+    with mock.patch.object(closure_direct_sparse, "launch_solve", wrapped):
+        for _ in range(steps):
+            solver.step(state_0, state_1, control, None, 1.0 / 120.0)
+            state_0, state_1 = state_1, state_0
+    return solver, model, state_0
+
+
+def test_sparse_direct_closure_solve_matches_float64(test, device):
+    """One sparse direct solve (factor, refinement, impulses) against a float64 dense solve of the same system.
+
+    The reference assembles ``K = H + J^T W J`` densely from the solve's own rows, row weights and ancestor-layout
+    mass matrix and solves it with NumPy; the GPU result must match it to float32 accuracy in every world.
+    """
+    cap = {}
+    solver, _, _ = _sparse_ladder_run(device, steps=3, capture=cap)
+    buf = solver._closure_direct_sparse
+    plan = buf.plan
+    # Several supernodes on several elimination-tree levels: the factor is not a single dense block.
+    test.assertGreater(plan.S, 3)
+    test.assertGreater(plan.nlev, 2)
+    np.testing.assert_array_equal(buf.status.numpy()[:2], 0)
+    D, KL, MAXR, KJ = buf.D, buf.KL, buf.MAXR, buf.KJ
+    sup_dof = buf.sup_dof.numpy().reshape(KL, KJ)
+    sup_count = buf.sup_count.numpy()
+    rows_local = buf.rows_local.numpy()
+    starts = buf.world_closure_start.numpy()
+    for w in range(buf.W):
+        Ha = cap["Ha"][w].astype(np.float64)
+        H = np.zeros((D, D))
+        for d in range(D):
+            for s in range(int(plan.na[d])):
+                a = int(plan.ancestors[d, s])
+                H[d, a] = H[a, d] = Ha[d, s]
+        Jt = cap["Jw"][w].astype(np.float64).reshape(KL, MAXR, KJ)
+        q = cap["qrow"][w].astype(np.float64).reshape(KL, MAXR)
+        sw = cap["swrow"][w].astype(np.float64).reshape(KL, MAXR)
+        K, g0 = H.copy(), np.zeros(D)
+        rows = []
+        for k in range(KL):
+            sup = sup_dof[k, : sup_count[k]]
+            for r in range(rows_local[k]):
+                j = np.zeros(D)
+                j[sup] = Jt[k, r, : sup_count[k]]
+                K += np.outer(j, j)
+                g0 -= j * q[k, r]
+                rows.append((k, r, j))
+        # One solve and one primal refinement (iterations=2).
+        d1 = np.linalg.solve(K, g0)
+        d2 = np.linalg.solve(K, g0 + H @ d1)
+        dofs = cap["dofidx"][w]
+        v_hat = cap["v_hat"][dofs].astype(np.float64)
+        v_gpu = cap["v"][dofs].astype(np.float64)
+        scale = max(np.linalg.norm(d2), 1.0e-6)
+        test.assertLess(np.linalg.norm(v_gpu - (v_hat + d2)) / scale, 2.0e-3, msg=f"world {w}")
+        lam_ref, lam_gpu = [], []
+        for k, r, j in rows:
+            lam_ref.append(-sw[k, r] * (2.0 * q[k, r] + j @ (d1 + d2)))
+            lam_gpu.append(cap["lam"][w, cap["slot"][starts[w] + k] + r])
+        lam_ref, lam_gpu = np.asarray(lam_ref), np.asarray(lam_gpu, dtype=np.float64)
+        test.assertLess(
+            np.linalg.norm(lam_gpu - lam_ref) / max(np.linalg.norm(lam_ref), 1.0e-6), 2.0e-3, msg=f"world {w}"
+        )
+
+
+def test_sparse_direct_closure_solve_matches_the_serial_sweep(test, device):
+    """Sixty steps of the sparse direct solve track a converged serial sweep and repeat bit for bit.
+
+    The direct solve regularizes each closure row by ``closure_direct_eps``; at 1e-3 the trajectories agree to about
+    1e-4 rad and 1e-2 rad/s on velocities of 0.5 rad/s, and both keep the closure gaps at float32 rounding.
+    """
+    _, model, serial = _sparse_ladder_run(device, steps=60, overrides={}, iterations=256)
+    _, _, sparse = _sparse_ladder_run(device, steps=60)
+    np.testing.assert_allclose(sparse.joint_q.numpy(), serial.joint_q.numpy(), rtol=0.0, atol=5.0e-4)
+    np.testing.assert_allclose(sparse.joint_qd.numpy(), serial.joint_qd.numpy(), rtol=0.0, atol=2.0e-2)
+    gaps = _float64_closure_gaps(model, sparse.joint_q.numpy())
+    test.assertLess(gaps.max(), 1.0e-6)
+    # Deterministic: no atomics on the data path.
+    _, _, again = _sparse_ladder_run(device, steps=60)
+    np.testing.assert_array_equal(again.joint_qd.numpy(), sparse.joint_qd.numpy())
+
+
+def test_sparse_direct_closure_solve_is_independent_of_block_size(test, device):
+    """The per-world solve block gives the same steps at 64, 256 and 512 threads.
+
+    The twelve-unit ladder's root separator is factored by the whole block in 32 x 32 diagonal blocks (528
+    lower-triangle entries). Blocks under 264 threads once left some of those entries unfactored, which returned NaN.
+    """
+    results = {}
+    for threads in (64, 256, 512):
+        solver, _, state = _sparse_ladder_run(
+            device,
+            steps=10,
+            overrides={**_SPARSE_DIRECT, "closure_ds_threads": threads},
+            units=12,
+            articulation_constraint_max=96,
+        )
+        buf = solver._closure_direct_sparse
+        test.assertEqual(buf.threads, threads)
+        test.assertGreater(buf.QW, 1)  # a level runs as one supernode with the whole block
+        qd = state.joint_qd.numpy()
+        test.assertTrue(np.all(np.isfinite(qd)), msg=f"{threads} threads")
+        results[threads] = qd
+    for threads in (64, 256):
+        np.testing.assert_allclose(results[threads], results[512], rtol=0.0, atol=1.0e-5)
+
+
 class TestSteelRevoluteLoop(unittest.TestCase):
     pass
 
@@ -4669,6 +4813,26 @@ for _name in (
     "test_closure_rows_do_not_depend_on_the_launch_shape",
 ):
     add_function_test(TestSteelRevoluteLoop, _name, globals()[_name], devices=get_cuda_test_devices())
+
+
+class TestSteelSparseDirectClosureSolve(unittest.TestCase):
+    pass
+
+
+for _name in (
+    "test_sparse_direct_closure_solve_matches_float64",
+    "test_sparse_direct_closure_solve_matches_the_serial_sweep",
+    "test_sparse_direct_closure_solve_is_independent_of_block_size",
+):
+    add_function_test(TestSteelSparseDirectClosureSolve, _name, globals()[_name], devices=get_cuda_test_devices())
+add_function_test(
+    TestSteelSparseDirectClosureSolve,
+    "test_sparse_direct_closure_rows_are_translation_invariant",
+    test_closure_rows_are_translation_invariant,
+    devices=get_cuda_test_devices(),
+    overrides=_SPARSE_DIRECT,
+    iterations=2,
+)
 
 
 if __name__ == "__main__":

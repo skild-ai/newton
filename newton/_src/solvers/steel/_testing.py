@@ -22,6 +22,13 @@ def kernel_overrides(overrides: Mapping[str, object]) -> Iterator[None]:
     ``sparse_mass_matrix``, ``diagonal_mass``, ``propagation_tree_kernel``, ``mass_solve`` and the
     ``colored_*`` sweep variants. ``mass_solve="articulated_body"`` replaces the dense Cholesky
     factor, solve and ``H^-1 J^T`` of the dense articulation groups with articulated-body passes.
+
+    ``closure_direct_factor="sparse"`` replaces the serial sweep over loop-closure rows by the
+    experimental sparse direct solve (see ``closure_direct_sparse.py``), tuned by
+    ``closure_direct_eps`` (row regularization, default ``1e-3``), ``closure_direct_bias``
+    (``"baumgarte"`` or ``"implicit"`` with ``closure_direct_timeconst`` [s] and
+    ``closure_direct_dampratio``), ``closure_ds_threads`` (threads per world block),
+    ``closure_ds_bc`` (update columns per pass) and ``closure_ds_timing`` (per-world phase times).
     """
     token = _KERNEL_OVERRIDES.set(dict(overrides))
     try:
