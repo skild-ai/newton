@@ -1189,9 +1189,9 @@ class TestSteelSolveModeOptions(unittest.TestCase):
             SolverSteel(model, articulated_contact_response="colored")
 
     def test_nesterov_momentum_is_a_construction_option(self):
-        """Keep Nesterov momentum opt-in and read-only after construction."""
+        """Keep Nesterov momentum device-dependent and read-only after construction."""
         parameter = inspect.signature(SolverSteel.__init__).parameters["nesterov_momentum"]
-        self.assertIs(parameter.default, False)
+        self.assertIsNone(parameter.default)
         self.assertIsInstance(SolverSteel.nesterov_momentum, _ConstructionOption)
         model, _ = _build_plane_model("cpu", separation=0.0, restitution=0.0)
         solver = SolverSteel(model)
@@ -1205,6 +1205,23 @@ class TestSteelSolveModeOptions(unittest.TestCase):
         with warnings.catch_warnings(), self.assertRaisesRegex(NotImplementedError, "requires CUDA"):
             warnings.filterwarnings("ignore", message=_CPU_COLORED_WARNING, category=newton.NewtonWarning)
             SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation", enable_sleeping=True)
+
+
+def test_cuda_momentum_default_and_opt_out(test, device):
+    """Enable momentum on the selected CUDA sweep unless explicitly disabled."""
+    model, _ = _build_plane_model(device, separation=0.0, restitution=0.0)
+    default = SolverSteel(model)
+    plain = SolverSteel(model, nesterov_momentum=False)
+    test.assertTrue(default.nesterov_momentum)
+    test.assertFalse(plain.nesterov_momentum)
+
+
+add_function_test(
+    TestSteelSolveModeOptions,
+    "test_cuda_momentum_default_and_opt_out",
+    test_cuda_momentum_default_and_opt_out,
+    devices=get_cuda_test_devices(),
+)
 
 
 class TestSteelPrivateApi(unittest.TestCase):

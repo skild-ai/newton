@@ -308,7 +308,8 @@ repository examples spend tuning effort, not a shared solver API.
        step can lose its contact matches; ``contact_matching_body_frame=True`` on
        the pipeline also matches contacts in their bodies' frames. ``contact_gap_gate`` and ``contact_speculative_scale`` bound
        the work and the closing allowance of speculative contacts.
-       The opt-in ``nesterov_momentum`` accelerates CUDA sweeps with
+       Steel enables ``nesterov_momentum`` by default on CUDA. Set it to
+       ``False`` for plain Gauss-Seidel sweeps. The accelerated sweeps use
        Nesterov momentum and restart, which can reduce the ``iterations``
        needed on stacks, large mass ratios and long chains. Velocity-limit rows
        are not extrapolated, so measure convergence on the scene before

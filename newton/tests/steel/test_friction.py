@@ -196,12 +196,16 @@ class TestSteelFrictionAnchors(unittest.TestCase):
     def test_anchors_stop_tangential_drift_of_a_held_box(self):
         """Bound tangential drift in a tilted pinch while leaving flat-jaw behavior unaffected."""
         steps = int(3.0 / 0.005)
+        # The plain finite-iteration solve supplies a measurable drift control.
+        # Momentum alone also reduces the drift of the unanchored tilted box.
+        plain_drift, _, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.0, nesterov_momentum=False)
         drift_off, _, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.0)
         drift_on, solver_on, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.05)
         drift_on_02, _, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.2)
         self.assertGreater(
-            abs(drift_off), 5.0e-4, f"tilted pinch should leak drift without anchors, got {drift_off:.2e} m"
+            abs(plain_drift), 5.0e-4, f"plain tilted pinch should leak drift without anchors, got {plain_drift:.2e} m"
         )
+        self.assertLessEqual(abs(drift_off), abs(plain_drift))
         self.assertLess(
             abs(drift_on),
             0.03 * abs(drift_off),
@@ -224,7 +228,7 @@ class TestSteelFrictionAnchors(unittest.TestCase):
             abs(flat_on), 0.03 * abs(drift_off), f"anchored flat pinch drifted {flat_on:.2e} m vs {drift_off:.2e} m"
         )
         self.assertLess(abs(flat_on), 5.0e-5, f"anchored flat pinch drifted {flat_on:.2e} m")
-        self.assertLess(abs(flat_off), 0.25 * abs(drift_off))
+        self.assertLess(abs(flat_off), 0.25 * abs(plain_drift))
 
     def test_anchors_hold_a_pinched_box_at_a_coarse_timestep(self):
         """Hold the tilted pinch at 60 Hz without re-anchoring below the Baumgarte equilibrium separation."""
@@ -880,7 +884,7 @@ def test_modes_select_distinct_kernels(test, device):
     names = set()
     for mode in MODES:
         solver = SolverSteel(model, friction_mode=mode, friction_anchor_beta=0.0)
-        name = solver._pgs_solve_mf_gs_kernel.key
+        name = solver._pgs_solve_mf_gs_kernel.key.removesuffix("_momentum")
         test.assertEqual(mode == "fixed_normal", not name.endswith(mode), name)
         names.add(name)
     test.assertEqual(len(names), len(MODES))
@@ -2861,10 +2865,12 @@ def test_colored_incline_tracks_immediate(test, device):
     articulated box is compared for 6 steps in that mode and 12 in the others.
     """
     for angle in (_MODE_SLIP - 0.05, _MODE_SLIP + 0.05):
-        fixed = _mode_trace(test, device, "immediate", "fixed_normal", 20, angle=angle, iterations=4)
+        fixed = _mode_trace(
+            test, device, "immediate", "fixed_normal", 20, angle=angle, iterations=4, nesterov_momentum=False
+        )
         for mode in _COUPLED_MODES:
             with test.subTest(angle=angle, mode=mode):
-                kwargs = {"angle": angle, "iterations": 4}
+                kwargs = {"angle": angle, "iterations": 4, "nesterov_momentum": False}
                 immediate = _mode_trace(test, device, "immediate", mode, 20, **kwargs)
                 scene = _ModeScene(test, device, "colored", mode, **kwargs)
                 colored = scene.run(20)
@@ -2879,6 +2885,41 @@ def test_colored_incline_tracks_immediate(test, device):
                 if mode == "bisection":
                     dense = _mode_trace(test, device, "immediate", mode, steps, articulated=True, **kwargs)
                     np.testing.assert_allclose(articulated, dense, atol=_MODE_TOLERANCE, rtol=0.0)
+
+
+def test_accelerated_incline_contact_response(test, device):
+    """Compare accelerated impulses' velocity response from the same incident poses and twists.
+
+    Let immediate drive the trajectory through sticking, slipping and recontact.
+    Roundoff in independent six-DOF integrations can select different corners
+    or sides of the slip transition, even when the one-step responses agree.
+    """
+    for angle in (_MODE_SLIP - 0.05, _MODE_SLIP + 0.05):
+        for mode in _COUPLED_MODES:
+            with test.subTest(angle=angle, mode=mode):
+                options = {"angle": angle, "iterations": 4, "nesterov_momentum": True}
+                reference = _ModeScene(test, device, "immediate", mode, **options)
+                free = _ModeScene(test, device, "colored", mode, **options)
+                joint = _ModeScene(test, device, "colored", mode, articulated=True, **options)
+                for _ in range(20):
+                    free.state_in.assign(reference.state_in)
+                    state = joint.state_in
+                    wp.copy(state.body_q, reference.state_in.body_q)
+                    wp.copy(state.body_qd, reference.state_in.body_qd)
+                    newton.eval_ik(joint.model, state, state.joint_q, state.joint_qd)
+                    reference.step()
+                    free.step()
+                    joint.step()
+                    expected = reference.velocity()
+                    np.testing.assert_allclose(free.velocity(), expected, atol=_MODE_TOLERANCE, rtol=0.0)
+                    # Compare the two coordinate systems in m/s. For any point
+                    # on the box, |dv + dw x r| <= |dv| + radius * |dw|.
+                    delta = joint.velocity() - expected
+                    radius = np.linalg.norm([0.1, 0.1, 0.05])
+                    point_speed_error = np.linalg.norm(delta[:, :3], axis=1) + radius * np.linalg.norm(
+                        delta[:, 3:], axis=1
+                    )
+                    test.assertLess(point_speed_error.max(), _MODE_TOLERANCE)
 
 
 def test_colored_locked_tangent_keeps_friction(test, device):
@@ -2996,6 +3037,7 @@ class TestSteelColoredFrictionMode(unittest.TestCase):
 
 for _fn in (
     test_colored_incline_tracks_immediate,
+    test_accelerated_incline_contact_response,
     test_colored_locked_tangent_keeps_friction,
     test_colored_sliding_sphere_rolls_as_on_immediate,
     test_coulomb_newton_keeps_frictionless_contacts_frictionless,

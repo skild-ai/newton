@@ -3230,13 +3230,15 @@ def test_colored_contact_order_changes_the_result_no_more_than_on_immediate(test
 
 def test_colored_serial_tail_hosts_the_group_after_its_members(test, device):
     """Solve a group whose members overflow a two-color cap in the serial tail, host last, on each variant."""
-    uncapped, *_ = fixture(0.01, device=device, spin=10.0, **_COLORED_TORSION)
+    # At 10 rad/s sliding exhausts the shared budget and the correct spin
+    # impulse is zero. At 1 rad/s there is room for a measurable spin impulse.
+    uncapped, *_ = fixture(0.01, device=device, spin=1.0, **_COLORED_TORSION)
     for variant in ("packed", "block"):
         with test.subTest(variant=variant):
             with patch.object(solver_steel, "PROPAGATION_COLOR_TAIL", 2):
                 with _colored_variant(variant):
                     _, solver, model, state, contacts = fixture(
-                        0.01, device=device, spin=10.0, step=False, **_COLORED_TORSION
+                        0.01, device=device, spin=1.0, step=False, **_COLORED_TORSION
                     )
                 output = model.state()
                 solver.step(state, output, model.control(), contacts, 0.0025)
@@ -3252,7 +3254,7 @@ def test_colored_serial_tail_hosts_the_group_after_its_members(test, device):
             test.assertEqual(spin, _spare_rows(solver, count)[host])
             # The tail solves its units in slot order, which places the host's rows after its members'.
             test.assertEqual(int(slots[host]), max(int(slots[c]) for c in tail))
-            test.assertNotEqual(float(solver._propagation_impulses.numpy()[0, spin]), 0.0)
+            test.assertGreater(abs(float(solver._propagation_impulses.numpy()[0, spin])), 1.0e-6)
             np.testing.assert_allclose(output.body_qd.numpy(), uncapped["body_qd"], rtol=0.0, atol=1.0e-5)
 
 

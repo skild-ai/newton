@@ -142,6 +142,40 @@ def test_rocker_follows_crank(test, device):
     test.assertGreater(abs(q[2]), 0.3, "rocker did not move: loop not transmitting")
 
 
+def test_nesterov_closure_velocity_matches_impulses(test, device):
+    """Keep velocity consistent with the reported impulses on redundant bilateral rows."""
+    builder = _build_four_bar()
+    joint = builder.joint_count - 1
+    for _ in range(11):
+        builder.add_joint_ball(
+            parent=builder.joint_parent[joint],
+            child=builder.joint_child[joint],
+            parent_xform=builder.joint_X_p[joint],
+            child_xform=builder.joint_X_c[joint],
+        )
+    model = builder.finalize(device=device)
+    state = model.state()
+    q = state.joint_q.numpy()
+    q[:3] = (0.41, -0.7, 0.23)
+    state.joint_q.assign(q)
+    state.joint_qd.assign(np.linspace(-0.82, 0.87, model.joint_dof_count, dtype=np.float32))
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    control = model.control()
+    target = control.joint_target_q.numpy()
+    target[0] = 0.6
+    control.joint_target_q.assign(target)
+    solver = SolverSteel(model, iterations=2000, articulation_constraint_max=64, nesterov_momentum=True)
+    solver.step(state, model.state(), control, None, 0.01)
+
+    count = int(solver._constraint_count.numpy()[0])
+    test.assertEqual(count, 36)
+    dofs = solver._world_dof_indices.numpy()[0]
+    response = solver._Y_world.numpy()[0, :count].astype(np.float64)
+    impulses = solver._impulses.numpy()[0, :count].astype(np.float64)
+    expected = solver._v_hat.numpy()[dofs].astype(np.float64) + impulses @ response
+    np.testing.assert_array_max_ulp(solver._v_out.numpy()[dofs], expected.astype(np.float32), maxulp=1)
+
+
 def test_four_bar_capture_matches_eager(test, device):
     """Replay the eager four-bar trajectory from a captured step."""
     model = _build_four_bar().finalize(device=device)
@@ -4257,6 +4291,7 @@ class TestSteelRevoluteLoop(unittest.TestCase):
 
 
 for _name in (
+    "test_nesterov_closure_velocity_matches_impulses",
     "test_revolute_loop_world_hinge_holds_its_axis",
     "test_revolute_loop_spatial_loop_stays_rigid",
     "test_revolute_loop_pre_eliminates_five_rows",

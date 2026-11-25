@@ -212,7 +212,9 @@ def test_rotating_color_order_holds_pinch_from_sorted_contacts(test, device):
 
     The fixed contact order over the same sorted stream is the control: it twists the box several times more.
     """
-    unsorted, _ = _twist_deg(device, warmstart=False, lift_speed=0.0, seconds=2.0)
+    # The unsorted contact stream intentionally varies by world. A four-world
+    # median moves the relative bound across the same deterministic result.
+    unsorted, _ = _twist_deg(device, warmstart=False, lift_speed=0.0, seconds=2.0, worlds=32)
     fixed, _ = _twist_deg(device, warmstart=False, lift_speed=0.0, seconds=2.0, deterministic=True)
     rotating, _ = _twist_deg(
         device, warmstart=False, lift_speed=0.0, seconds=2.0, deterministic=True, color_order="rotating"

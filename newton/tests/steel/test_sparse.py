@@ -1100,7 +1100,9 @@ def test_sparse_diagonal_contact_friction_matches_general_owner(test, device):
             general = run(reference)
             test.assertGreater(int(optimized._constraint_count.numpy().max()), 0, "no contact rows were generated")
             test.assertGreater(
-                float(np.abs(sparse[-1][1] - slick[-1][1]).max()), 1.0e-3, "friction did not change the sparse response"
+                max(float(np.abs(a[1] - b[1]).max()) for a, b in zip(sparse, slick, strict=True)),
+                1.0e-3,
+                "friction did not change the sparse response during contact",
             )
             for step, ((sparse_q, sparse_qd), (general_q, general_qd)) in enumerate(zip(sparse, general, strict=True)):
                 np.testing.assert_allclose(

@@ -1,1 +1,1 @@
-Apply Steel’s optional Nesterov momentum within the selected CUDA sweep, including sparse, articulation-local, paired-factor, phased and fused propagation solves.
+Enable Nesterov momentum by default on CUDA in `SolverSteel`. Pass `nesterov_momentum=False` for plain sweeps. Both settings use the same factorization, row schedule and specialized solver.
