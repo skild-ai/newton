@@ -4830,7 +4830,7 @@ _SPARSE_ELIM = {
 }
 
 
-def _build_floating_four_bar(device, worlds=2):
+def _build_landing_four_bar(device, worlds=2):
     """A free-floating four-bar (base, two cranks, coupler, one BALL closure) that lands on four feet.
 
     The cranks carry stiff, damped drives, so the mechanism comes to rest; it starts tilted with its parallelogram
@@ -4894,7 +4894,7 @@ def _build_floating_four_bar(device, worlds=2):
 
 def _four_bar_drop(device, overrides, iterations, steps=240):
     """Drop the floating four-bar; return the solver, the body origins [m] per step and the last normal impulses."""
-    model = _build_floating_four_bar(device)
+    model = _build_landing_four_bar(device)
     with kernel_overrides(overrides):
         solver = SolverSteel(
             model,
