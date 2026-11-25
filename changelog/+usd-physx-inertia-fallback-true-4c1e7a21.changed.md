@@ -1,1 +1,0 @@
-Give USD bodies with an authored mass whose collider mass properties cannot be computed PhysX's small-sphere fallback inertia (radius 0.1 m) in `ModelBuilder.add_usd()`; bodies with computable colliders keep their collider inertia scaled to the authored mass.
