@@ -9047,6 +9047,91 @@ def propagation_contact_row_dot(
 
 
 @wp.kernel
+def accumulate_propagation_body_activity(
+    propagation_constraint_count: wp.array[int],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_row_type: wp.array2d[int],
+    propagation_impulses: wp.array2d[float],
+    propagation_max_constraints: int,
+    # outputs
+    body_activity: wp.array[float],
+):
+    """Each body's summed normal impulse over its contact rows, from the step's warm-started impulses."""
+    tid = wp.tid()
+    world = tid // propagation_max_constraints
+    i = tid - world * propagation_max_constraints
+    if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
+        return
+    if propagation_row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
+        return
+    lam = propagation_impulses[world, i]
+    if lam <= 0.0:
+        return
+    ba = propagation_body_a[world, i]
+    bb = propagation_body_b[world, i]
+    if ba >= 0:
+        wp.atomic_add(body_activity, ba, lam)
+    if bb >= 0:
+        wp.atomic_add(body_activity, bb, lam)
+
+
+@wp.kernel
+def max_propagation_articulation_activity(
+    body_activity: wp.array[float],
+    body_to_articulation: wp.array[int],
+    # outputs
+    articulation_activity: wp.array[float],
+):
+    """Each articulation's largest body activity."""
+    body = wp.tid()
+    art = body_to_articulation[body]
+    if art >= 0 and body_activity[body] > 0.0:
+        wp.atomic_max(articulation_activity, art, body_activity[body])
+
+
+@wp.kernel
+def compute_propagation_body_split_weight(
+    body_activity: wp.array[float],
+    body_to_articulation: wp.array[int],
+    articulation_activity: wp.array[float],
+    is_free_rigid: wp.array[int],
+    levels: int,
+    # outputs
+    body_split_weight: wp.array[int],
+):
+    """A body's integer split weight, ``1 + round(levels * activity / its articulation's largest)``: the bodies whose
+    rows carried the load last step take most of each joint's mobility, and every row-bearing body keeps a share."""
+    body = wp.tid()
+    weight = int(1)
+    art = body_to_articulation[body]
+    # A free body's split response is its own inverse mass, not a share of joints: it keeps weight one.
+    if art >= 0 and is_free_rigid[art] == 0:
+        top = articulation_activity[art]
+        if top > 0.0:
+            weight = 1 + int(wp.round(float(levels) * body_activity[body] / top))
+    body_split_weight[body] = weight
+
+
+@wp.kernel
+def scale_propagation_split_response(
+    body_split_weight: wp.array[int],
+    # in/out
+    propagation_body_response_split: wp.array3d[float],
+):
+    """Divide each body's split response by its weight: with joint weights summing the bodies' weights below them,
+    the body takes the share ``weight / joint weight`` of every joint on its root path (shares still sum to one)."""
+    body = wp.tid()
+    weight = body_split_weight[body]
+    if weight <= 1:
+        return
+    inv = 1.0 / float(weight)
+    for r in range(6):
+        for c in range(6):
+            propagation_body_response_split[body, r, c] = propagation_body_response_split[body, r, c] * inv
+
+
+@wp.kernel
 def count_propagation_joint_split(
     propagation_constraint_count: wp.array[int],
     propagation_body_a: wp.array2d[int],
@@ -9055,11 +9140,13 @@ def count_propagation_joint_split(
     body_to_joint: wp.array[int],
     joint_parent: wp.array[int],
     max_depth: int,
+    body_split_weight: wp.array[int],
     # outputs
     propagation_body_split_seen: wp.array[int],
     propagation_joint_split: wp.array[int],
 ):
-    """Count, per joint, the distinct row-bearing bodies whose root path contains it."""
+    """Sum, per joint, the split weights of the distinct row-bearing bodies whose root path contains it (with unit
+    weights, their count)."""
     tid = wp.tid()
     world = tid // propagation_max_constraints
     i = tid - world * propagation_max_constraints
@@ -9075,7 +9162,7 @@ def count_propagation_joint_split(
         for _depth in range(max_depth):
             if joint < 0:
                 break
-            wp.atomic_add(propagation_joint_split, joint, 1)
+            wp.atomic_add(propagation_joint_split, joint, body_split_weight[body])
             parent = joint_parent[joint]
             joint = -1
             if parent >= 0:

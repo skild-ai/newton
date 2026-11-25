@@ -101,6 +101,7 @@ from .kernels import (
     accumulate_contact_watermark,
     accumulate_contact_wrenches_from_impulses,
     accumulate_group_diag_worlds,
+    accumulate_propagation_body_activity,
     accumulate_propagation_warmstart_body_impulses,
     accumulate_propagation_warmstart_body_impulses_ordered,
     accumulate_row_watermarks,
@@ -154,6 +155,7 @@ from .kernels import (
     compute_mf_world_dof_offsets,
     compute_physx_pgs_drive_desc,
     compute_propagation_body_com_rel,
+    compute_propagation_body_split_weight,
     compute_propagation_cache_world_flag,
     compute_propagation_effective_mass_and_rhs,
     compute_propagation_tree_body_response_for_size,
@@ -200,6 +202,7 @@ from .kernels import (
     local_solve_launch_gate,
     mark_propagation_bodies,
     mask_passive_spring_stiffness,
+    max_propagation_articulation_activity,
     populate_connect_J_for_size,
     populate_joint_velocity_limit_J_for_size,
     populate_mimic_J_for_size,
@@ -238,6 +241,7 @@ from .kernels import (
     rotate_mf_rows_to_free_root_anchor,
     rotate_propagation_rows_to_free_root_anchor,
     scale_array_inplace,
+    scale_propagation_split_response,
     scatter_augmented_drive_dof_K,
     scatter_qdd_from_groups,
     snapshot_contact_warmstart,
@@ -294,6 +298,8 @@ _LEGACY_JOINT_FRICTION_LOAD_COEFFICIENT_USD = "newton:steel:joint_friction_load_
 # Per-world preset of the first rejected row slot: no reservation was rejected.
 _ROW_SLOT_UNBOUNDED = 2**31 - 1
 _CONTACT_BUILD_THREAD_CAP = 65536
+# Resolution of the weighted split's integer body weights (1 .. 1 + levels).
+_SPLIT_WEIGHT_LEVELS = 15
 _CONTACT_JACOBIAN_WORKER_CAP = 4096
 _CONTACT_JACOBIAN_MAX_DOF = 10
 # Coupling endpoints whose point Jacobian is below this fraction of the link Jacobian's scale are immobile.
@@ -1804,6 +1810,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     propagation_color_order = _ConstructionOption()
     propagation_interval = _ConstructionOption()
     propagation_momentum = _ConstructionOption()
+    propagation_weighted_split = _ConstructionOption()
     friction_combine = _ConstructionOption()
     restitution_combine = _ConstructionOption()
     free_rigid_torsional_friction = _ConstructionOption()
@@ -2106,6 +2113,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         propagation_color_order: Literal["contact", "longest_first", "rotating"] = "contact",
         propagation_interval: int = 1,
         propagation_momentum: bool | None = None,
+        propagation_weighted_split: bool | None = None,
         friction_combine: Literal["average", "min", "multiply", "max"] = "average",
         restitution_combine: Literal["average", "min", "multiply", "max"] = "average",
         free_rigid_torsional_friction: float | None = None,
@@ -2651,6 +2659,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 recovers much of that convergence without loosening the split. It keeps rod chains off their
                 contracted iterations.
                 ``None`` (default) turns it on when the model has rod material.
+            propagation_weighted_split: With ``articulated_contact_response="propagation"``, share each joint's
+                mobility among the row-bearing bodies below it in proportion to the normal impulse their rows carry
+                at the start of the step (with contact warm starting, the last step's), instead of evenly; every
+                row-bearing body keeps a share and the shares still sum to one. A cable lying on a surface carries
+                rows on every link, so an even share leaves a grasped link a small fraction of its mobility and the
+                grasp converges slowly; the links carrying the load take most of it. Without warm-started impulses
+                every share is even. ``None`` (default) turns it on when the model has rod material.
             propagation_color_order: Order in which ``solve_mode="colored"`` colors a world's
                 contacts and runs those left without a batch: ``"contact"`` (default) by contact
                 index, or ``"longest_first"`` by row count, longest first, then contact index. A batch takes as long as its longest
@@ -2975,6 +2990,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._propagation_interval < 1:
             raise ValueError("propagation_interval must be at least 1")
         self._propagation_momentum_option = propagation_momentum
+        self._propagation_weighted_split_option = propagation_weighted_split
+        self._propagation_weighted_split = False
         if self._propagation_cached_response_body_max < 1:
             raise ValueError("propagation_cached_response_body_max must be at least 1")
         if propagation_color_order not in ("contact", "longest_first", "rotating"):
@@ -12338,6 +12355,21 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_body_split_seen = wp.zeros((bodies,), dtype=wp.int32, device=device)
         self._propagation_joint_split = wp.zeros((joints,), dtype=wp.int32, device=device)
         self._propagation_split_max_depth = max(int(np.diff(model.articulation_start.numpy()).max(initial=1)), 1)
+        # Weighted split: each row-bearing body's share of its joints follows the impulse its rows carry.
+        weighted = self._propagation_weighted_split_option
+        if weighted is None:
+            weighted = self._rod_material is not None
+        self._propagation_weighted_split = bool(weighted)
+        self._propagation_body_split_weight = wp.ones((bodies,), dtype=wp.int32, device=device)
+        if self._propagation_weighted_split:
+            arts = max(model.articulation_count, 1)
+            self._propagation_body_activity = wp.zeros((bodies,), dtype=wp.float32, device=device)
+            self._propagation_articulation_activity = wp.zeros((arts,), dtype=wp.float32, device=device)
+            self._split_free_rigid = (
+                self._is_free_rigid
+                if self._is_free_rigid is not None
+                else wp.zeros((arts,), dtype=wp.int32, device=device)
+            )
         # Momentum of the sweeps: the previous sweep's impulses, a sweep's starting impulses, the move to install,
         # and each world's Nesterov sequence.
         momentum = self._propagation_momentum_option
@@ -13322,6 +13354,43 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_prefactored = False
         self._propagation_body_split_seen.zero_()
         self._propagation_joint_split.zero_()
+        if self._propagation_weighted_split:
+            self._propagation_body_activity.zero_()
+            self._propagation_articulation_activity.zero_()
+            wp.launch(
+                accumulate_propagation_body_activity,
+                dim=self._world_count * self._propagation_max_constraints,
+                inputs=[
+                    self._propagation_constraint_count,
+                    self._propagation_body_a,
+                    self._propagation_body_b,
+                    self._propagation_row_type,
+                    self._propagation_impulses,
+                    self._propagation_max_constraints,
+                ],
+                outputs=[self._propagation_body_activity],
+                device=model.device,
+            )
+            wp.launch(
+                max_propagation_articulation_activity,
+                dim=model.body_count,
+                inputs=[self._propagation_body_activity, self._body_to_articulation],
+                outputs=[self._propagation_articulation_activity],
+                device=model.device,
+            )
+            wp.launch(
+                compute_propagation_body_split_weight,
+                dim=model.body_count,
+                inputs=[
+                    self._propagation_body_activity,
+                    self._body_to_articulation,
+                    self._propagation_articulation_activity,
+                    self._split_free_rigid,
+                    _SPLIT_WEIGHT_LEVELS,
+                ],
+                outputs=[self._propagation_body_split_weight],
+                device=model.device,
+            )
         wp.launch(
             count_propagation_joint_split,
             dim=self._world_count * self._propagation_max_constraints,
@@ -13333,6 +13402,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._body_to_joint,
                 model.joint_parent,
                 self._propagation_split_max_depth,
+                self._propagation_body_split_weight,
             ],
             outputs=[self._propagation_body_split_seen, self._propagation_joint_split],
             device=model.device,
@@ -13503,6 +13573,14 @@ class SolverSteel(SolverBase, CouplingInterface):
                 dim=self._free_rigid_body_count,
                 inputs=[self._free_rigid_body_indices, self._mf_body_Hinv],
                 outputs=[self._propagation_body_response, self._propagation_body_response_split],
+                device=model.device,
+            )
+        if self._propagation_weighted_split:
+            wp.launch(
+                scale_propagation_split_response,
+                dim=model.body_count,
+                inputs=[self._propagation_body_split_weight],
+                outputs=[self._propagation_body_response_split],
                 device=model.device,
             )
         self._propagation_refresh_twists(force=True)

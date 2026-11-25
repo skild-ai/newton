@@ -611,6 +611,86 @@ def test_propagation_momentum(test, device):
 add_function_test(TestSteelRod, "test_propagation_momentum", test_propagation_momentum, devices=get_cuda_test_devices())
 
 
+def test_propagation_weighted_split_weights(test, device):
+    """Bodies whose rows carry the impulse take most of each joint's mobility; every row-bearing body keeps a share.
+
+    A three-link chain with rows on links 1 and 2: link 2's rows carry ten times link 1's impulse. Each joint's weight
+    sums its row-bearing bodies' weights, so a body's share of a joint (its weight over the joint's) sums to one.
+    """
+    from newton._src.solvers.steel.kernels import (  # noqa: PLC0415
+        accumulate_propagation_body_activity,
+        compute_propagation_body_split_weight,
+        count_propagation_joint_split,
+        max_propagation_articulation_activity,
+    )
+
+    rows = 4
+    count = wp.array([rows], dtype=wp.int32, device=device)
+    body_a = wp.array([[1, 1, 2, 2]], dtype=wp.int32, device=device)
+    body_b = wp.full((1, rows), -1, dtype=wp.int32, device=device)
+    row_type = wp.zeros((1, rows), dtype=wp.int32, device=device)
+    impulses = wp.array([[0.1, 0.0, 1.0, 0.0]], dtype=wp.float32, device=device)
+    body_to_art = wp.zeros(3, dtype=wp.int32, device=device)
+    body_to_joint = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+    joint_parent = wp.array([-1, 0, 1], dtype=wp.int32, device=device)
+    activity = wp.zeros(3, dtype=wp.float32, device=device)
+    art_activity = wp.zeros(1, dtype=wp.float32, device=device)
+    weight = wp.ones(3, dtype=wp.int32, device=device)
+    wp.launch(
+        accumulate_propagation_body_activity,
+        dim=rows,
+        inputs=[count, body_a, body_b, row_type, impulses, rows],
+        outputs=[activity],
+        device=device,
+    )
+    wp.launch(
+        max_propagation_articulation_activity,
+        dim=3,
+        inputs=[activity, body_to_art],
+        outputs=[art_activity],
+        device=device,
+    )
+    no_free = wp.zeros(1, dtype=wp.int32, device=device)
+    wp.launch(
+        compute_propagation_body_split_weight,
+        dim=3,
+        inputs=[activity, body_to_art, art_activity, no_free, 15],
+        outputs=[weight],
+        device=device,
+    )
+    np.testing.assert_array_equal(weight.numpy(), [1, 3, 16])
+    seen = wp.zeros(3, dtype=wp.int32, device=device)
+    split = wp.zeros(3, dtype=wp.int32, device=device)
+    wp.launch(
+        count_propagation_joint_split,
+        dim=rows,
+        inputs=[count, body_a, body_b, rows, body_to_joint, joint_parent, 3, weight],
+        outputs=[seen, split],
+        device=device,
+    )
+    np.testing.assert_array_equal(split.numpy(), [19, 19, 16])
+    w = weight.numpy()
+    test.assertAlmostEqual((w[1] + w[2]) / split.numpy()[1], 1.0)
+    # A free body keeps weight one: its split response is its own inverse mass, not a share of joints.
+    free = wp.ones(1, dtype=wp.int32, device=device)
+    wp.launch(
+        compute_propagation_body_split_weight,
+        dim=3,
+        inputs=[activity, body_to_art, art_activity, free, 15],
+        outputs=[weight],
+        device=device,
+    )
+    np.testing.assert_array_equal(weight.numpy(), [1, 1, 1])
+
+
+add_function_test(
+    TestSteelRod,
+    "test_propagation_weighted_split_weights",
+    test_propagation_weighted_split_weights,
+    devices=get_cuda_test_devices(),
+)
+
+
 def test_propagation_momentum_restarts_on_a_turn(test, device):
     """Momentum restarts when the sweeps reverse its last step, even if they agree with the latest move.
 
