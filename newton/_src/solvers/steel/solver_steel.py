@@ -159,6 +159,7 @@ from .kernels import (
     diag_from_JY_par_art,
     diag_from_JY_world,
     eval_augmented_drives,
+    eval_body_relative_poses,
     eval_joint_friction_load,
     eval_post_solve_parent_wrenches,
     eval_rigid_fk_kinematics,
@@ -3082,6 +3083,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._warn_unsolvable_global_contacts(model)
         self._build_mimic_plan(model)
         self._build_connect_plan(model)
+        # Root-relative body poses for the loop-closure geometry (see _launch_body_relative_poses).
+        self._body_rel = None
+        if self._connect_count > 0:
+            self._body_rel = wp.zeros(model.body_count, dtype=wp.transform, device=model.device)
         self._build_joint_limit_gap(model)
         self._build_distance_limit_plan(model)
         self._warn_persistent_row_capacity(model)
@@ -4931,6 +4936,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 )
 
             self._reserve_rows(self._connect_world_index, self._slot_counter, launch_connect)
+            self._launch_body_relative_poses(state_in)
             for size in self._connect_sizes:
                 wp.launch(
                     populate_connect_J_for_size,
@@ -4959,6 +4965,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.joint_qd_start,
                         state_aug._joint_S_s,
                         self._articulation_origin,
+                        self._body_rel,
+                        self._body_to_articulation,
+                        model.articulation_start,
+                        model.joint_child,
                     ],
                     outputs=[
                         self._J_by_size[size],
@@ -4972,6 +4982,38 @@ class SolverSteel(SolverBase, CouplingInterface):
                     ],
                     device=model.device,
                 )
+
+    def _launch_body_relative_poses(self, state_in: State) -> None:
+        """Compose every articulation's body poses from its root with the root translation removed.
+
+        The loop-closure rows take their gap ``p_A - p_B`` and lever arms from these poses. The
+        world poses of a body far from the origin carry the float32 rounding of its world
+        position, which the gap of two nearby anchors would inherit in full and a nearly
+        degenerate (normalized) closure row would amplify.
+        """
+        model = self.model
+        wp.launch(
+            eval_body_relative_poses,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                self._articulation_joint_end,
+                self._body_to_articulation,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_in.joint_q,
+                model.joint_X_p,
+                model.joint_X_c,
+                model.joint_axis,
+                model.joint_dof_dim,
+                state_in.body_q,
+            ],
+            outputs=[self._body_rel],
+            device=model.device,
+        )
 
     def _stage4_bilateral_preelim(self) -> None:
         """Form and factor each bilateral block and correct the other rows' responses.

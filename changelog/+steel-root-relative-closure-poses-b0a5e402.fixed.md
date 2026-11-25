@@ -1,0 +1,1 @@
+Fix `SolverSteel` loop-closure rows opening with distance from the world origin: closures inside one articulation now take their gap and lever arms from body poses relative to the articulation root, so worlds placed far from the origin no longer amplify float32 position rounding into loop gaps.
