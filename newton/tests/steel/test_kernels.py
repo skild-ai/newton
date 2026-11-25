@@ -99,7 +99,7 @@ def test_serial_launch_block_dim_spreads_threads_over_the_sms(test, device):
     for threads, expected in ((1, 8), (1024, 8), (6015, 8), (6016, 16), (12032, 32), (24064, 64), (10**7, 64)):
         with test.subTest(threads=threads):
             test.assertEqual(_serial_launch_block_dim(threads, sms), expected)
-    # 1024 threads leave at most 128 blocks, all on distinct SMs, instead of the 4 blocks of 256.
+    # 1024 threads make 128 blocks for the 188 SMs instead of the 4 blocks of 256.
     test.assertEqual(-(-1024 // _serial_launch_block_dim(1024, sms)), 128)
 
 

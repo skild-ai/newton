@@ -358,10 +358,11 @@ _SUPPORTED_JOINT_TYPES = (
 def _serial_launch_block_dim(thread_count: int, sm_count: int) -> int:
     """Return the block size of a launch whose threads each run a serial articulation walk.
 
-    Such a launch is latency-bound: a thread's cost is its walk, not its share of a warp, so the
-    threads are spread over every SM before blocks grow. Start at the minimum and double while each
-    SM still gets two blocks of the doubled size, up to the maximum. One block size for all thread
-    counts leaves most SMs idle: 1024 articulations in blocks of 256 occupy 4 SMs.
+    Such a launch is latency-bound: a thread's cost is its walk, not its share of a warp, so small
+    blocks spread the threads over more SMs. Start at the minimum and double only while each SM
+    still gets two blocks of the doubled size, up to the maximum. One block size for all thread
+    counts leaves most SMs idle: 1024 articulations in blocks of 256 occupy 4 SMs, in blocks of 8
+    up to 128.
     """
     block_dim = _SERIAL_KERNEL_MIN_BLOCK_DIM
     while block_dim < _SERIAL_KERNEL_MAX_BLOCK_DIM and thread_count >= 2 * (2 * block_dim) * max(sm_count, 1):
