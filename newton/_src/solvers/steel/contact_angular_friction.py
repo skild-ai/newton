@@ -44,6 +44,7 @@ def configure_free_rigid_angular_friction(solver, model, torsional: float | None
     values = condim.numpy() if condim is not None and model.shape_count else None
     if values is not None:
         _check_condim_values(values)
+        _check_gated_coefficients(model, values)
     overridden = torsional is not None or rolling is not None
     # Kernel argument for a model without steel:condim; the gate kernel ignores it.
     solver._free_rigid_condim_placeholder = wp.zeros(1, dtype=wp.int32, device=model.device)
@@ -66,8 +67,6 @@ def configure_free_rigid_angular_friction(solver, model, torsional: float | None
     solver._free_rigid_angular_rows = bool(overridden or routed)
     if not solver._free_rigid_angular_rows:
         return
-    if values is not None:
-        _check_gated_coefficients(model, values)
     unsupported = [
         name
         for name, requested in (
@@ -108,7 +107,7 @@ def refresh_free_rigid_angular_friction(solver) -> None:
 def validate_free_rigid_angular_friction(solver) -> None:
     """Read ``steel:condim`` and the gated coefficients on the host and raise :class:`ValueError` for invalid values."""
     condim = solver._namespaced_attribute("condim")
-    if solver._free_rigid_angular_rows and condim is not None:
+    if condim is not None:
         values = condim.numpy()
         _check_condim_values(values)
         _check_gated_coefficients(solver.model, values)

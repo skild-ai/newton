@@ -1841,11 +1841,12 @@ class SolverSteel(SolverBase, CouplingInterface):
           condim here gates its own coefficient. Under friction patches, contacts share a patch only if
           their angular coefficients match. A contact with angular rows takes up to 6 free-body rows
           instead of 3; raise ``free_body_constraint_max`` if :attr:`constraint_overflow` reports dropped
-          rows. The solver reads ``steel:condim`` at construction and, on a solver built with the rows, at
+          rows. The rows follow ``steel:condim`` from construction and, on a solver built with them, from
           :meth:`notify_model_changed` with ``SHAPE_PROPERTIES``; a solver built without a condim above 3
           on a shape that a free-body contact can touch ignores the attribute and must be rebuilt to gain
-          the rows. A negative or non-finite coefficient that a shape's condim enables raises
-          :class:`ValueError` at the same points.
+          the rows. Every solver checks each shape's condim and the coefficients it enables per shape, at
+          construction and at every eager notification with ``SHAPE_PROPERTIES``: a negative or non-finite
+          enabled coefficient raises :class:`ValueError`.
 
         One experimental per-shape attribute makes contacts adhesive:
 
@@ -3583,10 +3584,10 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         With ``enable_joint_friction``, an eager joint DOF or DOF force notification also reads
         :attr:`~newton.Model.joint_friction` and ``steel:joint_friction_load_coefficient`` on the host and
-        raises :class:`ValueError` for invalid values, after applying every other update. Likewise, on a
-        solver constructed with free-body angular rows, an eager shape notification reads ``steel:condim`` and the
-        torsional and rolling coefficients it enables on the host and raises :class:`ValueError` for a condim other
-        than 3, 4 or 6 or a negative or non-finite coefficient. With loop-closing REVOLUTE joints, an eager joint,
+        raises :class:`ValueError` for invalid values, after applying every other update. Likewise, on a model
+        with ``steel:condim``, an eager shape notification reads it and the torsional and rolling coefficients
+        each shape's condim enables on the host and raises :class:`ValueError` for a condim other than 3, 4 or 6
+        or a negative or non-finite coefficient. With loop-closing REVOLUTE joints, an eager joint,
         joint DOF, DOF force or DOF inertial notification also reads their DOF inputs and axes on the host to warn
         about the ones a closure ignores. A captured notification skips these checks.
 

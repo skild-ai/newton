@@ -718,13 +718,15 @@ class TestFreeRigidAngularFriction(unittest.TestCase):
         model.shape_material_mu_rolling.fill_(-1.0)
         SolverSteel(model)
         model.shape_material_mu_rolling.fill_(0.0)
-        # A solver built without the rows ignores later condim edits.
+        # A solver built without the rows ignores later condim edits and still rejects an invalid one.
         model.steel.condim.fill_(3)
         solver = SolverSteel(model)
-        for condim in (5, 6):
-            model.steel.condim.fill_(condim)
-            solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+        model.steel.condim.fill_(6)
+        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
         self.assertFalse(solver._free_rigid_angular_rows)
+        model.steel.condim.fill_(5)
+        with self.assertRaisesRegex(ValueError, "3, 4 or 6"):
+            solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Steel matrix-free requires CUDA")
@@ -1805,6 +1807,30 @@ class TestFreeRigidAngularFrictionImport(unittest.TestCase):
         )
         np.testing.assert_array_equal(np.sort(model.steel.condim.numpy()), [3, 3, 6])
         self.assertFalse(SolverSteel(model)._free_rigid_angular_rows)
+
+    def test_coefficient_check_is_per_shape(self):
+        """Reject a noncolliding condim 6 geom's negative ``mu_rolling`` whatever the ground's condim."""
+        for ground in (3, 4):
+            with self.subTest(ground=ground):
+                model = _import_mjcf(
+                    "<mujoco><worldbody>"
+                    f'<geom type="plane" size="1 1 0.1" condim="{ground}"/>'
+                    f'<body pos="0 0 {_RADIUS}"><freejoint/><geom type="sphere" size="{_RADIUS}"/>'
+                    f'<geom type="sphere" size="{_RADIUS}" condim="6" contype="0" conaffinity="0"/></body>'
+                    "</worldbody></mujoco>"
+                )
+                rolling = model.shape_material_mu_rolling.numpy()
+                rolling[model.steel.condim.numpy() == 6] = -1.0
+                model.shape_material_mu_rolling.assign(rolling)
+                with self.assertRaisesRegex(ValueError, "shape_material_mu_rolling"):
+                    SolverSteel(model)
+        # The same check at a notification on a CPU solver, which runs without the rows.
+        model.steel.condim.fill_(3)
+        solver = SolverSteel(model)
+        self.assertFalse(solver._free_rigid_angular_rows)
+        model.steel.condim.assign(np.where(rolling < 0.0, 6, 3).astype(np.int32))
+        with self.assertRaisesRegex(ValueError, "shape_material_mu_rolling"):
+            solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
 
     def test_explicit_pairs_reach_a_noncolliding_condim(self):
         """Enable the rows for a noncolliding condim 6 geom paired explicitly on the model; warn for pipeline-only pairs."""
