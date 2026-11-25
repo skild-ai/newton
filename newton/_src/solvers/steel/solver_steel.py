@@ -63,9 +63,11 @@ from .implicit_velocity import (
     add_free_root_transport_derivative,
     add_lagged_velocity_terms,
     build_level_schedule,
+    drop_velocity_terms_in_contact,
     eval_velocity_derivative_product,
     eval_velocity_derivative_product_levels,
     flag_discontinuous_articulations,
+    flag_worlds_with_active_contacts,
     store_velocity_derivative_correction,
 )
 from .kernels import (
@@ -2899,6 +2901,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             raise ValueError(f"velocity_terms_theta must be in [0, 1], got {velocity_terms_theta}")
         self._velocity_terms_theta = velocity_terms_theta
         self._ivt_buffers = None
+        # Contact gating (override, experimental): "gate" keeps the explicit bias in worlds where a contact row
+        # carries a positive normal impulse, by dropping their delayed correction; "lag" (default) applies it.
+        self._ivt_mode = str(self._kernel_overrides.get("velocity_terms_mode", "lag"))
+        if self._ivt_mode not in ("lag", "gate"):
+            raise ValueError("velocity_terms_mode must be one of ['gate', 'lag']")
         # D x kernel (override): "serial" (one thread per articulation), "levels" (one block per articulation,
         # one barrier per tree level, CUDA only) or "auto", resolved after the world mapping: levels on CUDA when
         # some articulation averages at least two joints per tree level.
@@ -2925,6 +2932,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 # NaN never compares equal, so the first step applies no delayed correction.
                 "qd_published": wp.full(dofs, float("nan"), dtype=wp.float32, device=model.device),
             }
+            if self._ivt_mode == "gate":
+                self._ivt_buffers["world_flag"] = wp.zeros(
+                    max(int(model.world_count), 1), dtype=wp.int32, device=model.device
+                )
         self._has_drive_rows = drive_mode == "rows" and model.joint_dof_count > 0
         # The fused clamp replaces the velocity-limit rows of driven DOFs, so it only
         # engages where both exist; an inf activation fraction disables velocity limits.
@@ -10494,6 +10505,22 @@ class SolverSteel(SolverBase, CouplingInterface):
             outputs=[buf["lag_acc"]],
             device=model.device,
         )
+        if self._ivt_mode == "gate" and self._world_count > 0:
+            buf["world_flag"].zero_()
+            wp.launch(
+                flag_worlds_with_active_contacts,
+                dim=self._impulses.shape,
+                inputs=[self._constraint_count, self._row_type, self._impulses, int(PGS_CONSTRAINT_TYPE_CONTACT)],
+                outputs=[buf["world_flag"]],
+                device=model.device,
+            )
+            wp.launch(
+                drop_velocity_terms_in_contact,
+                dim=model.joint_dof_count,
+                inputs=[buf["dof_art"], self._art_to_world, buf["world_flag"]],
+                outputs=[buf["lag_acc"]],
+                device=model.device,
+            )
 
     def _add_free_root_transport_derivative(self, velocity_start: wp.array, out: wp.array) -> None:
         """Add the free roots' transport derivative along ``v_out - velocity_start`` to ``out`` (accelerations)."""

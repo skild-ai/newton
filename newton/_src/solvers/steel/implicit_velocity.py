@@ -249,6 +249,39 @@ def add_lagged_velocity_terms(
     target[d] = target[d] + scale * lagged[d]
 
 
+@wp.kernel
+def flag_worlds_with_active_contacts(
+    constraint_count: wp.array[int],
+    row_type: wp.array2d[int],
+    impulses: wp.array2d[float],
+    contact_type: int,
+    # outputs
+    world_flag: wp.array[int],
+):
+    """Set ``world_flag[w] = 1`` when a contact row of world ``w`` carries a positive normal impulse."""
+    w, r = wp.tid()
+    if r >= constraint_count[w]:
+        return
+    if row_type[w, r] == contact_type and impulses[w, r] > 0.0:
+        world_flag[w] = 1
+
+
+@wp.kernel
+def drop_velocity_terms_in_contact(
+    dof_articulation: wp.array[int],
+    art_to_world: wp.array[int],
+    world_flag: wp.array[int],
+    # outputs
+    lagged: wp.array[float],
+):
+    """Clear the delayed correction of the articulations in worlds flagged by
+    :func:`flag_worlds_with_active_contacts`."""
+    d = wp.tid()
+    art = dof_articulation[d]
+    if art >= 0 and world_flag[art_to_world[art]] != 0:
+        lagged[d] = 0.0
+
+
 LEVEL_THREADS = 64
 """Threads per articulation block of :func:`eval_velocity_derivative_product_levels`."""
 
