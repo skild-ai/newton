@@ -1195,8 +1195,23 @@ def test_free_body_rows_past_16_bit_parent_index(test, device):
     test.assertTrue((row_parent[row_type == PGS_CONSTRAINT_TYPE_FRICTION] >= 32768).any())
     # Friction of mu 1 over 0.05 s stops every box; a box whose sliding rows were skipped keeps 0.5 m/s.
     np.testing.assert_array_less(np.abs(state_0.body_qd.numpy()[:, 0]), 0.1)
-    with test.assertRaisesRegex(ValueError, "free_body_constraint_max must be at most 8388608"):
+    with test.assertRaisesRegex(ValueError, "free_body_constraint_max must be at most 8388608 on CUDA"):
         SolverSteel(model, free_body_constraint_max=(1 << 23) + 1)
+
+
+def test_cpu_free_body_capacity_past_the_cuda_index_limit(test, device):
+    """Construct and step on CPU with a free-body capacity above the CUDA sweep's 8,388,608-row limit."""
+    builder = newton.ModelBuilder()
+    link = builder.add_link()
+    builder.add_shape_sphere(link, radius=0.1)
+    builder.add_articulation([builder.add_joint_revolute(-1, link, axis=(1.0, 0.0, 0.0))])
+    model = builder.finalize(device=device)
+    solver = SolverSteel(model, free_body_constraint_max=(1 << 23) + 1)
+    state_0, state_1 = model.state(), model.state()
+    for _ in range(3):
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    test.assertTrue(np.isfinite(state_0.joint_q.numpy()).all())
 
 
 class TestSteelSweepSharedMemory(unittest.TestCase):
@@ -1220,6 +1235,12 @@ add_function_test(
     "test_free_body_rows_past_16_bit_parent_index",
     test_free_body_rows_past_16_bit_parent_index,
     devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelSweepSharedMemory,
+    "test_cpu_free_body_capacity_past_the_cuda_index_limit",
+    test_cpu_free_body_capacity_past_the_cuda_index_limit,
+    devices=["cpu"],
 )
 
 

@@ -2218,7 +2218,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 shared memory beside ``articulation_constraint_max`` and the world's response DOFs
                 (about 12,000 in total), the sweep keeps their impulses in global memory: the
                 results are the same, each sweep is slower, and ``solve_mode="colored"`` with the
-                ``"propagation"`` response is usually faster for such large worlds.
+                ``"propagation"`` response is usually faster for such large worlds. The CUDA sweep
+                indexes at most 8,388,608 rows per world; a larger value raises :class:`ValueError` on
+                CUDA.
             propagation_constraint_max: Capacity of the propagation row family per world in the
                 ``"propagation"`` response, which holds every contact
                 row except those between two links of one articulation; these stay dense unless
@@ -2780,9 +2782,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._free_body_constraint_max = int(free_body_constraint_max)
         if self._free_body_constraint_max < 1:
             raise ValueError("free_body_constraint_max must be >= 1")
+        # The CUDA sweep packs each row's parent beside its type; the CPU sweep reads the unpacked rows.
         max_free_parent = (2**31 - 1) >> MF_META_ROW_TYPE_BITS
-        if self._free_body_constraint_max - 1 > max_free_parent:
-            raise ValueError(f"free_body_constraint_max must be at most {max_free_parent + 1}")
+        if model.device.is_cuda and self._free_body_constraint_max - 1 > max_free_parent:
+            raise ValueError(f"free_body_constraint_max must be at most {max_free_parent + 1} on CUDA")
         self.warn_constraint_overflow = warn_constraint_overflow
         self._row_watermark = bool(row_watermark)
         self._row_watermarks = (
