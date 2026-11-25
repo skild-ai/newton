@@ -1238,6 +1238,8 @@ _ROOT_WITHIN_CAP_BLOCKS = {
 _ROOT_PAST_CAP_BLOCKS = {
     "complement_2.5e-5": (-1.0, 0.0, 0.1, 1.000025, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
     "complement_2^-20": (-1.0, 0.0, 0.1, 1.0 + 2.0**-20, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+    # A sticking jam whose linear residual reaches zero near 2.1e5 times the first load.
+    "sticking_complement_2^-21": (-1.0, -0.9, 0.0, 1.0 + 2.0**-21, 1.0, 0.0, 1.0, 0.0, 1.0, 2.0),
 }
 
 
@@ -1261,6 +1263,25 @@ def test_bisection_keeps_the_first_load_past_the_root_cap(test, device):
                 normal, *_ = _mf_block(device, np.array(block, dtype=np.float32), mode)
                 bias = block[9] * float(np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
                 test.assertLessEqual(float(normal), (bias - block[0]) / block[3] * (1.0 + 1.0e-5))
+
+
+# Jams that stick at the first probe with a small positive complement, regular and rank one: on the sticking branch
+# the residual is u_n - u_t1 + (G_nn - 1) n, with its root at 209.75.
+_STICKING_ROOT_BLOCKS = {
+    "regular": (-1.0, -0.9999, 0.0, 1.0 + 2.0**-21, 1.0, 0.0, 1.0, 0.0, 1.0, 2.0),
+    "rank_one": (-1.0, -0.9999, 0.0, 1.0 + 2.0**-21, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+}
+
+
+def test_bisection_solves_a_sticking_jam_on_its_linear_branch(test, device):
+    """Solve the root of a sticking jam whose residual still grows with a small positive Schur complement."""
+    for name, block in _STICKING_ROOT_BLOCKS.items():
+        with test.subTest(block=name):
+            b = np.array(block, dtype=np.float32).astype(np.float64)
+            normal, tangent1, _ = (float(v) for v in _mf_block(device, np.array(block, np.float32), "bisection"))
+            expected = (b[1] - b[0]) / (b[3] - 1.0)
+            test.assertAlmostEqual(normal, expected, delta=1.0e-4 * expected)
+            test.assertLessEqual(abs(b[0] + b[3] * normal + tangent1), 1.0e-6 * normal)
 
 
 # A jam whose sliding direction turns with the load: its residual starts flat but has a root, 0.232005 at rank one
@@ -1405,6 +1426,7 @@ for _fn in (
     test_bisection_keeps_friction_on_a_stiff_slipping_direction,
     test_bisection_solves_a_jammed_root_within_the_cap,
     test_bisection_keeps_the_first_load_past_the_root_cap,
+    test_bisection_solves_a_sticking_jam_on_its_linear_branch,
     test_bisection_finds_the_root_of_a_jam_whose_slip_turns,
     test_bisection_bounds_the_normal_force_on_a_hinged_rod,
     test_bisection_reports_no_friction_without_tangential_mobility,

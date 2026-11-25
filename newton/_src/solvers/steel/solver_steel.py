@@ -24757,7 +24757,17 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                                                 }
                                                 sticks_here = stick_t1 * stick_t1 + stick_t2 * stick_t2 <= mu * mu * x * x * (1.0f + 2.0e-5f);
                                             }
-                                            // No root lies above a sticking probe, and none is pursued past the cap: re-probe the first load and keep it.
+                                            // A jammed probe that sticks keeps sticking at larger loads, where its residual grows linearly with the
+                                            // block's Schur complement: probe that line's root if it lies within the cap.
+                                            if (sticks_here) {
+                                                const float slope = rank_one ? G_nn - axis_nt * axis_nt / axis_tt : det_block / minor_nn;
+                                                if (slope > 0.0f && _it < 63 && x - f_x / slope <= 32768.0f * x_first) {
+                                                    x -= f_x / slope;
+                                                    last_probe = true;
+                                                    continue;
+                                                }
+                                            }
+                                            // Without such a root, and past the cap, re-probe the first load and keep it.
                                             if (sticks_here || (!bracketed && x >= 32768.0f * x_first)) {
                                                 if (_it >= 63 || x <= x_first) break;
                                                 x = x_first;
@@ -25034,7 +25044,17 @@ _MF_BISECTION_FRICTION_SOURCE = """
                                                 }
                                                 sticks_here = stick_t1 * stick_t1 + stick_t2 * stick_t2 <= mu * mu * x * x * (1.0f + 2.0e-5f);
                                             }
-                                            // No root lies above a sticking probe, and none is pursued past the cap: re-probe the first load and keep it.
+                                            // A jammed probe that sticks keeps sticking at larger loads, where its residual grows linearly with the
+                                            // block's Schur complement: probe that line's root if it lies within the cap.
+                                            if (sticks_here) {
+                                                const float slope = rank_one ? G_nn - axis_nt * axis_nt / axis_tt : det_block / minor_nn;
+                                                if (slope > 0.0f && _it < 63 && x - f_x / slope <= 32768.0f * x_first) {
+                                                    x -= f_x / slope;
+                                                    last_probe = true;
+                                                    continue;
+                                                }
+                                            }
+                                            // Without such a root, and past the cap, re-probe the first load and keep it.
                                             if (sticks_here || (!bracketed && x >= 32768.0f * x_first)) {
                                                 if (_it >= 63 || x <= x_first) break;
                                                 x = x_first;
