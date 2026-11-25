@@ -22,8 +22,11 @@ and each world runs one thread block that keeps its whole factor in shared memor
   whole block on single-supernode levels, such as the dense root separator). (4) Forward/backward solves and
   refinements. (5) ``v`` and the impulses.
 
+With ``closure_direct_contacts="elim"`` the same block then forms each contact row's response ``Y = K^-1 J^T``
+through the factor (``closure_direct_compact.py`` builds and sweeps those rows).
+
 Valid with one articulation per world (identical articulations) and loop-closure (connect) rows as the only
-articulation rows. Deterministic (no atomics on the data path).
+articulation rows besides contacts. Deterministic (no atomics on the data path).
 """
 
 from __future__ import annotations
@@ -38,6 +41,8 @@ from .friction_patches import WARP_DETERMINISM_OFF
 from .kernels import (
     CONNECT_MAX_ROWS,
     PGS_CONSTRAINT_TYPE_CONNECT,
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
     _closure_anchor_parts,
     _connect_rotation_rows,
     _walk_has_free_dof,
@@ -215,6 +220,7 @@ class DirectSparseBuffers:
         self.sup_count = i32(sup_count)
         self.rows_local = i32(rows_np[:KL])
         self.ancestors = i32(plan.ancestors)
+        self.ancestors_flat = i32(plan.ancestors.reshape(-1))
         self.na = i32(plan.na)
         self.NA = plan.NA
         self.dof_joint = i32(np.maximum(joint_of - j0, 0))
@@ -297,7 +303,56 @@ class DirectSparseBuffers:
         self.Lg = wp.zeros((1, 1) if self.smem_L else (W, p.nnz), dtype=wp.float32, device=device)
         self.geom_row = wp.zeros((nk * CONNECT_MAX_ROWS, GEOM_FLOATS), dtype=wp.float32, device=device)
         self.geom_closure = wp.zeros((nk, CLOSURE_FLOATS), dtype=wp.float32, device=device)
-        self.status = wp.zeros(4, dtype=wp.int32, device=device)  # [non-positive pivots, ...]
+        # [non-positive pivots, anchor-mode mismatches, unused, unused, contact rows past the capacity, self-contact
+        #  sides dropped, contact-range rows of other types]
+        self.status = wp.zeros(7, dtype=wp.int32, device=device)
+        # Contact rows (closure_direct_contacts="elim"): their responses K^-1 J^T come from the closure factor.
+        self.cmode = 1 if solver._closure_ds_contacts == "elim" else 0
+        # Compact contact rows (closure_direct_compact.py): J by depth along each side's root path (KZ floats per side),
+        # Y dense over the DOFs, both indexed by the contact row past the world's closure rows; capacity: the
+        # contact-row budget M_D minus the closure rows.
+        self.compact = self.cmode == 1
+        self.KZ = int(plan.NA)
+        self.sides = 1
+        self.C = 1
+        if self.compact:
+            from .closure_direct_compact import self_contacts_possible  # noqa: PLC0415
+
+            self.sides = 2 if self_contacts_possible(solver, a0) else 1
+            self.C = max(1, M_D - int(rows_np[:KL].sum()))
+        self.KS = self.KZ * self.sides
+        self.cJ = wp.zeros((W, self.C, self.KS) if self.compact else (1, 1, 1), dtype=wp.float32, device=device)
+        self.cY = wp.zeros((W, self.C, D) if self.compact else (1, 1, 1), dtype=wp.float32, device=device)
+        self.chead = wp.zeros((W, self.C) if self.compact else (1, 1), dtype=wp.int32, device=device)
+        self.cbase = wp.zeros(W if self.compact else 1, dtype=wp.int32, device=device)
+        # Contact responses: one warp per row, each warp keeping its vector in shared memory after the solve's own
+        # storage (column-oriented triangular solves that skip zero entries), when that fits; else the whole block
+        # solves one row at a time.
+        self.yoff = self.smem_bytes // 4
+        self.yw = 0
+        if self.cmode:
+            nw = self.threads // 32
+            yw = min(nw, (SMEM_LIMIT - self.smem_bytes) // (4 * D))
+            yw = min(yw, int(solver._kernel_overrides.get("closure_ds_contact_warps", nw)))
+            if yw >= 2:
+                self.yw = yw
+                self.smem_bytes += yw * D * 4
+        # Compact layout: YR rows per warp share each pass over L (closure_ds_contact_rows_per_warp). Default: 3 when L
+        # is in global memory (its loads dominate), else 2 (more rows raise register pressure in the whole kernel), as
+        # long as 8 warps keep their vectors in shared memory. RTX PRO 6000 / 3090: the response phase falls 31% on
+        # the P38 drop (2 rows) and 53% on the flower (3 rows).
+        self.yr = 1
+        if self.compact and self.yw:
+            nw = self.threads // 32
+            avail = (SMEM_LIMIT - self.yoff * 4) // (4 * D)
+            want = solver._kernel_overrides.get("closure_ds_contact_rows_per_warp")
+            choices = [int(want)] if want is not None else [2 if self.smem_L else 3, 2]
+            for r in choices:
+                yw = min(nw, avail // r)
+                if r > 1 and yw >= (1 if want is not None else 8):
+                    self.yr, self.yw = r, yw
+                    self.smem_bytes = (self.yoff + yw * r * D) * 4
+                    break
         # Per-world phase times [ns] (rows, factor, solves) and world 0's level stamps, with ``closure_ds_timing``.
         self.timing_enabled = bool(solver._kernel_overrides.get("closure_ds_timing", False))
         self.timing = wp.zeros(max(W * 4, 160) if self.timing_enabled else 1, dtype=wp.int64, device=device)
@@ -315,6 +370,10 @@ class DirectSparseBuffers:
             "asm": int(len(p.asm_list)),
             "pairs": int(len(p.pairs)),
             "midpoint": int(self.mid.sum()),
+            "compact_rows": self.C if self.compact else 0,
+            "compact_sides": self.sides if self.compact else 0,
+            "y_warps": self.yw,
+            "y_rows_per_warp": self.yr,
         }
 
 
@@ -842,6 +901,14 @@ def get_ds_solve_kernel(
     BC: int = 4,
     WB_IN_VEC: bool = True,
     TIMING: bool = False,
+    CMODE: int = 0,
+    YW: int = 0,
+    YOFF: int = 0,
+    C: int = 1,
+    KS: int = 1,
+    KZ: int = 1,
+    SIDES: int = 1,
+    YR: int = 1,
 ) -> wp.Kernel:
     TPT = max(1, (TILES + NT - 1) // NT)
     SLOT = NT // BC
@@ -854,6 +921,260 @@ def get_ds_solve_kernel(
 
     def wsum(v):
         return _WARP_SUM.format(v=v)
+
+    CONTACT = int(PGS_CONSTRAINT_TYPE_CONTACT)
+    FRICTION = int(PGS_CONSTRAINT_TYPE_FRICTION)
+    # Contact rows (CMODE 1, "elim"): their responses Y = K^-1 J^T through the closure factor, after the closure solve.
+    contact_common = f"""
+    const int ccnt = min(constraint_count.data[world], {M_D});
+    const float* Jc = &Jg.data[(size_t)world * {C * KS}];
+"""
+    contact_post = ""
+
+    def multi_row_responses(head: str) -> str:
+        """Compact layout, YR rows per warp: every pass over L serves YR rows (one load of L and its row index per
+        entry), the column loops and reductions are shared; YW warps stay in flight to hide latency."""
+        R = YR
+        ks = range(R)
+
+        def each(fmt: str, sep: str = " ") -> str:
+            return sep.join(fmt.format(k=k) for k in ks)
+
+        def sides_k(k: int, body: str) -> str:
+            return "\n".join(
+                f"""                if (ok{k}) {{
+                    const int head = ((hd{k} >> {16 * s}) & 0xFFFF) - 1;
+                    if (head >= 0) {{
+                        const int n = na_arr.data[head];
+                        const int* apath = &ancestors.data[(size_t)head * {NA}];
+                        const float* Js = Jr{k} + {s * KZ};
+{body.replace("xw", f"xw{k}").replace("part", f"part{k}")}
+                    }}
+                }}
+                __syncwarp();"""
+                for s in range(SIDES)
+            )
+
+        scatter = "\n".join(
+            sides_k(k, "                        for (int s = lane; s < n; s += 32) xw[iperm.data[apath[s]]] += Js[s];")
+            for k in ks
+        )
+        dot = "\n".join(
+            sides_k(
+                k,
+                "                        for (int s = lane; s < n; s += 32) part += Js[s] * xw[iperm.data[apath[s]]];",
+            )
+            for k in ks
+        )
+        red = "".join(
+            f"for (int o = 16; o > 0; o >>= 1) {{ {each('acc{k} += __shfl_xor_sync(0xFFFFFFFF, acc{k}, o);')} }}"
+            for _ in [0]
+        )
+        redp = "".join(
+            f"for (int o = 16; o > 0; o >>= 1) {{ {each('part{k} += __shfl_xor_sync(0xFFFFFFFF, part{k}, o);')} }}"
+            for _ in [0]
+        )
+        return f"""
+    {{{head}
+        if (warp < {YW}) {{
+            {each("float* xw{k} = ds_dyn + " + str(YOFF) + " + (warp * " + str(R) + " + {k}) * " + str(D) + ";")}
+            for (int g = warp; g * {R} < nc; g += {YW}) {{
+                {each("const int r{k} = g * " + str(R) + " + {k};")}
+                {each("const int t{k} = r{k} < nc ? row_type.data[wrow + cb + r{k}] : -1;")}
+                {each("const bool ok{k} = t{k} == " + str(CONTACT) + " || t{k} == " + str(FRICTION) + ";")}
+                if (lane == 0) {{ {each("if (r{k} < nc && !ok{k}) atomicAdd(&status.data[6], 1);")} }}
+                {each("const float* Jr{k} = Jc + (size_t)(ok{k} ? r{k} : 0) * " + str(KS) + ";")}
+                {each("const int hd{k} = ok{k} ? Hc[r{k}] : 0;")}
+                for (int d = lane; d < {D}; d += 32) {{ {each("xw{k}[d] = 0.0f;")} }}
+                __syncwarp();
+{scatter}
+                // Forward L z = P J^T for the group's rows at once; columns zero in every row are skipped.
+                for (int j = 0; j < {D}; j++) {{
+                    {each("float x{k} = xw{k}[j];")}
+                    if ({each("x{k} == 0.0f", " && ")}) continue;
+                    const int o = co[j], o1 = co[j + 1];
+                    {each("x{k} = x{k} / L[o];")}
+                    __syncwarp();
+                    if (lane == 0) {{ {each("xw{k}[j] = x{k};")} }}
+                    for (int q = o + 1 + lane; q < o1; q += 32) {{
+                        const float l = L[q];
+                        const int i = ri[q];
+                        {each("xw{k}[i] -= l * x{k};")}
+                    }}
+                    __syncwarp();
+                }}
+                // Backward L^T y = z.
+                for (int j = {D} - 1; j >= 0; j--) {{
+                    const int o = co[j], o1 = co[j + 1];
+                    {each("float acc{k} = 0.0f;")}
+                    for (int q = o + 1 + lane; q < o1; q += 32) {{
+                        const float l = L[q];
+                        const int i = ri[q];
+                        {each("acc{k} += l * xw{k}[i];")}
+                    }}
+                    {red}
+                    if (lane == 0) {{ {each("xw{k}[j] = (xw{k}[j] - acc{k}) / L[o];")} }}
+                    __syncwarp();
+                }}
+                for (int d = lane; d < {D}; d += 32) {{
+                    const int id = iperm.data[d];
+                    {each("if (ok{k}) Yc[(size_t)r{k} * " + str(D) + " + d] = xw{k}[id];")}
+                }}
+                {each("float part{k} = 0.0f;")}
+{dot}
+                {redp}
+                if (lane == 0) {{ {each("if (ok{k}) cdiag.data[wrow + cb + r{k}] += part{k};")} }}
+                __syncwarp();
+            }}
+        }}
+        __syncthreads();
+    }}
+"""
+
+    def compact_responses() -> str:
+        """Compact layout: Y_r = K^-1 J_r^T and diag_r += J_r Y_r for the world's contact and friction rows.
+
+        J_r is scattered from its support (by depth along each side's root path) and J_r Y_r runs on the support.
+        """
+
+        def sides(body: str) -> str:
+            return "\n".join(
+                f"""                {{
+                    const int head = ((hd >> {16 * k}) & 0xFFFF) - 1;
+                    if (head >= 0) {{
+                        const int n = na_arr.data[head];
+                        const int* apath = &ancestors.data[(size_t)head * {NA}];
+                        const float* Js = Jr + {k * KZ};
+{body}
+                    }}
+                    __syncwarp();
+                }}"""
+                for k in range(SIDES)
+            )
+
+        scatter_warp = sides(
+            "                        for (int s = lane; s < n; s += 32) xw[iperm.data[apath[s]]] += Js[s];"
+        )
+        dot_warp = sides(
+            "                        for (int s = lane; s < n; s += 32) part += Js[s] * xw[iperm.data[apath[s]]];"
+        )
+        head = f"""
+    const int cb = cbase.data[world];
+    int nc = ccnt - cb;
+    if (nc > {C}) nc = {C};
+    float* Yc = &Yg.data[(size_t)world * {C} * {D}];
+    const int* Hc = &chead.data[(size_t)world * {C}];
+"""
+        if YW > 0 and YR > 1:
+            return multi_row_responses(head)
+        if YW > 0:
+            return f"""
+    {{{head}
+        float* xw = ds_dyn + {YOFF} + warp * {D};
+        if (warp < {YW}) {{
+            for (int r = warp; r < nc; r += {YW}) {{
+                const int t = row_type.data[wrow + cb + r];
+                if (t != {CONTACT} && t != {FRICTION}) {{
+                    if (lane == 0) atomicAdd(&status.data[6], 1);
+                    continue;
+                }}
+                const float* Jr = Jc + (size_t)r * {KS};
+                const int hd = Hc[r];
+                for (int d = lane; d < {D}; d += 32) xw[d] = 0.0f;
+                __syncwarp();
+{scatter_warp}
+                // Forward L z = P J^T, column by column; columns still zero are skipped.
+                for (int j = 0; j < {D}; j++) {{
+                    float xj = xw[j];
+                    if (xj == 0.0f) continue;
+                    const int o = co[j], o1 = co[j + 1];
+                    xj /= L[o];
+                    __syncwarp();
+                    if (lane == 0) xw[j] = xj;
+                    for (int q = o + 1 + lane; q < o1; q += 32) xw[ri[q]] -= L[q] * xj;
+                    __syncwarp();
+                }}
+                // Backward L^T y = z.
+                for (int j = {D} - 1; j >= 0; j--) {{
+                    const int o = co[j], o1 = co[j + 1];
+                    float acc = 0.0f;
+                    for (int q = o + 1 + lane; q < o1; q += 32) acc += L[q] * xw[ri[q]];
+                    {wsum("acc")}
+                    if (lane == 0) xw[j] = (xw[j] - acc) / L[o];
+                    __syncwarp();
+                }}
+                for (int d = lane; d < {D}; d += 32) Yc[(size_t)r * {D} + d] = xw[iperm.data[d]];
+                float part = 0.0f;
+{dot_warp}
+                {wsum("part")}
+                if (lane == 0) cdiag.data[wrow + cb + r] += part;
+                __syncwarp();
+            }}
+        }}
+        __syncthreads();
+    }}
+"""
+        scatter_block = "\n".join(
+            f"""            {{
+                const int head = ((hd >> {16 * k}) & 0xFFFF) - 1;
+                if (head >= 0) {{
+                    const int n = na_arr.data[head];
+                    const int* apath = &ancestors.data[(size_t)head * {NA}];
+                    for (int s = tid; s < n; s += {NT}) x[iperm.data[apath[s]]] += Jr[{k * KZ} + s];
+                }}
+                __syncthreads();
+            }}"""
+            for k in range(SIDES)
+        )
+        dot_block = "\n".join(
+            f"""            {{
+                const int head = ((hd >> {16 * k}) & 0xFFFF) - 1;
+                if (head >= 0) {{
+                    const int n = na_arr.data[head];
+                    const int* apath = &ancestors.data[(size_t)head * {NA}];
+                    for (int s = tid; s < n; s += {NT}) part += Jr[{k * KZ} + s] * x[iperm.data[apath[s]]];
+                }}
+            }}"""
+            for k in range(SIDES)
+        )
+        return f"""
+    {{{head}
+        for (int r = 0; r < nc; r++) {{
+            const int t = row_type.data[wrow + cb + r];
+            if (t != {CONTACT} && t != {FRICTION}) {{
+                if (tid == 0) atomicAdd(&status.data[6], 1);
+                continue;
+            }}
+            const float* Jr = Jc + (size_t)r * {KS};
+            const int hd = Hc[r];
+            for (int i = tid; i < {D}; i += {NT}) x[i] = 0.0f;
+            __syncthreads();
+{scatter_block}
+            trisolve();
+            for (int i = tid; i < {D}; i += {NT}) Yc[(size_t)r * {D} + perm.data[i]] = x[i];
+            float part = 0.0f;
+{dot_block}
+            {wsum("part")}
+            if (lane == 0) sInv[warp] = part;
+            __syncthreads();
+            if (tid == 0) {{
+                float sum = 0.0f;
+                for (int z = 0; z < {NW}; z++) sum += sInv[z];
+                cdiag.data[wrow + cb + r] += sum;
+            }}
+            __syncthreads();
+        }}
+    }}
+"""
+
+    if CMODE == 1:
+        contact_post = (
+            contact_common
+            + """
+    // Contact responses through the closure factor: Y_r = K^-1 J_r^T, diag_r += J_r Y_r (the factor stays in L).
+"""
+            + compact_responses()
+        )
 
     snippet = f"""
 #undef DS_TIMING
@@ -964,6 +1285,95 @@ def get_ds_solve_kernel(
     if (tid == 0 && world == 0) {{ unsigned long long tq; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tq)); timing.data[100] = (long long)(tq - t0); }}
 #endif
 
+    // Forward and backward solves with L (new order), in place on x; every thread of the block calls it.
+    auto trisolve = [&]() {{
+        // Forward L y = b: per supernode, gather the descendants' terms, then its own triangle.
+        for (int lev = 0; lev < {NLEV}; lev++) {{
+            const int l0 = lvl_start.data[lev], l1 = lvl_start.data[lev + 1];
+            const bool whole = l1 - l0 <= {SOLVE_WHOLE};
+            for (int li = l0 + (whole ? 0 : warp); li < l1; li += (whole ? 1 : {NW})) {{
+                const int s = lvl_sn.data[li];
+                const int c0 = sn[5 * s], w = sn[5 * s + 1];
+                for (int tt = (whole ? warp : 0); tt < w; tt += (whole ? {NW} : 1)) {{
+                    const int col = c0 + tt;
+                    float acc = 0.0f;
+                    const int e1 = row_split.data[col];
+                    for (int e = row_ptr.data[col] + lane; e < e1; e += 32) acc += L[row_ent.data[e]] * x[row_col.data[e]];
+                    {wsum("acc")}
+                    if (lane == 0) x[col] -= acc;
+                }}
+                if (whole) __syncthreads(); else __syncwarp();
+                for (int kb = 0; kb < w; kb += 32) {{
+                    const int nb = min(32, w - kb);
+                    if (!whole || warp == 0) {{
+                        float xr = lane < nb ? x[c0 + kb + lane] : 0.0f;
+                        for (int j = 0; j < nb; j++) {{
+                            const int oj = co[c0 + kb + j] - j;
+                            if (lane == j) xr /= L[oj + j];
+                            const float xj = __shfl_sync(0xFFFFFFFF, xr, j);
+                            if (lane > j && lane < nb) xr -= L[oj + lane] * xj;
+                        }}
+                        if (lane < nb) x[c0 + kb + lane] = xr;
+                    }}
+                    if (whole) __syncthreads(); else __syncwarp();
+                    if (kb + nb < w) {{
+                        const int first = kb + nb + (whole ? tid : lane);
+                        for (int u = first; u < w; u += (whole ? {NT} : 32)) {{
+                            float acc = 0.0f;
+                            for (int j = 0; j < nb; j++) acc += L[co[c0 + kb + j] + u - (kb + j)] * x[c0 + kb + j];
+                            x[c0 + u] -= acc;
+                        }}
+                        if (whole) __syncthreads(); else __syncwarp();
+                    }}
+                }}
+            }}
+            __syncthreads();
+        }}
+        // Backward L^T x = y: per supernode, gather the ancestors' terms, then its own triangle from the bottom.
+        for (int lev = {NLEV} - 1; lev >= 0; lev--) {{
+            const int l0 = lvl_start.data[lev], l1 = lvl_start.data[lev + 1];
+            const bool whole = l1 - l0 <= {SOLVE_WHOLE};
+            for (int li = l0 + (whole ? 0 : warp); li < l1; li += (whole ? 1 : {NW})) {{
+                const int s = lvl_sn.data[li];
+                const int c0 = sn[5 * s], w = sn[5 * s + 1], q = sn[5 * s + 2];
+                const int rbase = co[c0] + w;  // the rows below the supernode, R_s[w:], as stored in column c0
+                for (int tt = (whole ? warp : 0); tt < w; tt += (whole ? {NW} : 1)) {{
+                    const int o = co[c0 + tt] + (w - tt);
+                    float acc = 0.0f;
+                    for (int e = lane; e < q - w; e += 32) acc += L[o + e] * x[ri[rbase + e]];
+                    {wsum("acc")}
+                    if (lane == 0) x[c0 + tt] -= acc;
+                }}
+                if (whole) __syncthreads(); else __syncwarp();
+                for (int kb = ((w - 1) / 32) * 32; kb >= 0; kb -= 32) {{
+                    const int nb = min(32, w - kb);
+                    if (!whole || warp == 0) {{
+                        float xr = lane < nb ? x[c0 + kb + lane] : 0.0f;
+                        const int ol = co[c0 + kb + (lane < nb ? lane : 0)] - (lane < nb ? lane : 0);
+                        for (int j = nb - 1; j >= 0; j--) {{
+                            if (lane == j) xr /= L[ol + j];
+                            const float xj = __shfl_sync(0xFFFFFFFF, xr, j);
+                            if (lane < j) xr -= L[ol + j] * xj;
+                        }}
+                        if (lane < nb) x[c0 + kb + lane] = xr;
+                    }}
+                    if (whole) __syncthreads(); else __syncwarp();
+                    if (kb > 0) {{
+                        const int first = whole ? tid : lane;
+                        for (int t = first; t < kb; t += (whole ? {NT} : 32)) {{
+                            float acc = 0.0f;
+                            const int obase = co[c0 + t] - t;
+                            for (int j = 0; j < nb; j++) acc += L[obase + kb + j] * x[c0 + kb + j];
+                            x[c0 + t] -= acc;
+                        }}
+                        if (whole) __syncthreads(); else __syncwarp();
+                    }}
+                }}
+            }}
+            __syncthreads();
+        }}
+    }};
+    const int nsolve = iterations > 0 ? iterations : 1;
     // 2. Assembly of P K P^T into L's storage, and g0.
     {{
         // Record per entry: (H index or -1, first two contributions, (start << 8) | count); two entries in flight.
@@ -1312,7 +1722,6 @@ def get_ds_solve_kernel(
 #endif
 
     // 4. Solves: the first gives the regularized solution, each further one is a primal refinement.
-    const int nsolve = iterations > 0 ? iterations : 1;
     for (int i = tid; i < {D}; i += {NT}) {{ x[i] = g[i]; sm[i] = 0.0f; }}
     __syncthreads();
     for (int it = 0; it < nsolve; it++) {{
@@ -1327,91 +1736,7 @@ def get_ds_solve_kernel(
             for (int i = tid; i < {D}; i += {NT}) x[i] = tv[i];
             __syncthreads();
         }}
-        // Forward L y = b: per supernode, gather the descendants' terms, then its own triangle.
-        for (int lev = 0; lev < {NLEV}; lev++) {{
-            const int l0 = lvl_start.data[lev], l1 = lvl_start.data[lev + 1];
-            const bool whole = l1 - l0 <= {SOLVE_WHOLE};
-            for (int li = l0 + (whole ? 0 : warp); li < l1; li += (whole ? 1 : {NW})) {{
-                const int s = lvl_sn.data[li];
-                const int c0 = sn[5 * s], w = sn[5 * s + 1];
-                for (int tt = (whole ? warp : 0); tt < w; tt += (whole ? {NW} : 1)) {{
-                    const int col = c0 + tt;
-                    float acc = 0.0f;
-                    const int e1 = row_split.data[col];
-                    for (int e = row_ptr.data[col] + lane; e < e1; e += 32) acc += L[row_ent.data[e]] * x[row_col.data[e]];
-                    {wsum("acc")}
-                    if (lane == 0) x[col] -= acc;
-                }}
-                if (whole) __syncthreads(); else __syncwarp();
-                for (int kb = 0; kb < w; kb += 32) {{
-                    const int nb = min(32, w - kb);
-                    if (!whole || warp == 0) {{
-                        float xr = lane < nb ? x[c0 + kb + lane] : 0.0f;
-                        for (int j = 0; j < nb; j++) {{
-                            const int oj = co[c0 + kb + j] - j;
-                            if (lane == j) xr /= L[oj + j];
-                            const float xj = __shfl_sync(0xFFFFFFFF, xr, j);
-                            if (lane > j && lane < nb) xr -= L[oj + lane] * xj;
-                        }}
-                        if (lane < nb) x[c0 + kb + lane] = xr;
-                    }}
-                    if (whole) __syncthreads(); else __syncwarp();
-                    if (kb + nb < w) {{
-                        const int first = kb + nb + (whole ? tid : lane);
-                        for (int u = first; u < w; u += (whole ? {NT} : 32)) {{
-                            float acc = 0.0f;
-                            for (int j = 0; j < nb; j++) acc += L[co[c0 + kb + j] + u - (kb + j)] * x[c0 + kb + j];
-                            x[c0 + u] -= acc;
-                        }}
-                        if (whole) __syncthreads(); else __syncwarp();
-                    }}
-                }}
-            }}
-            __syncthreads();
-        }}
-        // Backward L^T x = y: per supernode, gather the ancestors' terms, then its own triangle from the bottom.
-        for (int lev = {NLEV} - 1; lev >= 0; lev--) {{
-            const int l0 = lvl_start.data[lev], l1 = lvl_start.data[lev + 1];
-            const bool whole = l1 - l0 <= {SOLVE_WHOLE};
-            for (int li = l0 + (whole ? 0 : warp); li < l1; li += (whole ? 1 : {NW})) {{
-                const int s = lvl_sn.data[li];
-                const int c0 = sn[5 * s], w = sn[5 * s + 1], q = sn[5 * s + 2];
-                const int rbase = co[c0] + w;  // the rows below the supernode, R_s[w:], as stored in column c0
-                for (int tt = (whole ? warp : 0); tt < w; tt += (whole ? {NW} : 1)) {{
-                    const int o = co[c0 + tt] + (w - tt);
-                    float acc = 0.0f;
-                    for (int e = lane; e < q - w; e += 32) acc += L[o + e] * x[ri[rbase + e]];
-                    {wsum("acc")}
-                    if (lane == 0) x[c0 + tt] -= acc;
-                }}
-                if (whole) __syncthreads(); else __syncwarp();
-                for (int kb = ((w - 1) / 32) * 32; kb >= 0; kb -= 32) {{
-                    const int nb = min(32, w - kb);
-                    if (!whole || warp == 0) {{
-                        float xr = lane < nb ? x[c0 + kb + lane] : 0.0f;
-                        const int ol = co[c0 + kb + (lane < nb ? lane : 0)] - (lane < nb ? lane : 0);
-                        for (int j = nb - 1; j >= 0; j--) {{
-                            if (lane == j) xr /= L[ol + j];
-                            const float xj = __shfl_sync(0xFFFFFFFF, xr, j);
-                            if (lane < j) xr -= L[ol + j] * xj;
-                        }}
-                        if (lane < nb) x[c0 + kb + lane] = xr;
-                    }}
-                    if (whole) __syncthreads(); else __syncwarp();
-                    if (kb > 0) {{
-                        const int first = whole ? tid : lane;
-                        for (int t = first; t < kb; t += (whole ? {NT} : 32)) {{
-                            float acc = 0.0f;
-                            const int obase = co[c0 + t] - t;
-                            for (int j = 0; j < nb; j++) acc += L[obase + kb + j] * x[c0 + kb + j];
-                            x[c0 + t] -= acc;
-                        }}
-                        if (whole) __syncthreads(); else __syncwarp();
-                    }}
-                }}
-            }}
-            __syncthreads();
-        }}
+        trisolve();
         for (int i = tid; i < {D}; i += {NT}) sm[i] += x[i];
         __syncthreads();
     }}
@@ -1448,11 +1773,17 @@ def get_ds_solve_kernel(
         }}
     }}
 #if DS_TIMING
+    unsigned long long tc;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tc));
+#endif
+{contact_post}
+#if DS_TIMING
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t3));
     if (tid == 0 && world > 0) {{
         timing.data[world * 4 + 0] = (long long)(t1 - t0);
         timing.data[world * 4 + 1] = (long long)(t2 - t1);
         timing.data[world * 4 + 2] = (long long)(t3 - t2);
+        timing.data[world * 4 + 3] = (long long)(t3 - tc);  // contact responses
     }}
     if (tid == 0 && world == 0) {{
         timing.data[0] = (long long)(t1 - t0);
@@ -1517,6 +1848,17 @@ def get_ds_solve_kernel(
         Lg: wp.array2d[float],
         status: wp.array[int],
         timing: wp.array[wp.int64],
+        constraint_count: wp.array[int],
+        row_type: wp.array2d[int],
+        row_parent: wp.array2d[int],
+        row_mu: wp.array2d[float],
+        Jg: wp.array3d[float],
+        Yg: wp.array3d[float],
+        cbase: wp.array[int],
+        chead: wp.array2d[int],
+        cdiag: wp.array2d[float],
+        ancestors: wp.array[int],
+        na_arr: wp.array[int],
         v_out: wp.array[float],
         impulses: wp.array2d[float],
     ): ...
@@ -1572,6 +1914,17 @@ def get_ds_solve_kernel(
         Lg: wp.array2d[float],
         status: wp.array[int],
         timing: wp.array[wp.int64],
+        constraint_count: wp.array[int],
+        row_type: wp.array2d[int],
+        row_parent: wp.array2d[int],
+        row_mu: wp.array2d[float],
+        Jg: wp.array3d[float],
+        Yg: wp.array3d[float],
+        cbase: wp.array[int],
+        chead: wp.array2d[int],
+        cdiag: wp.array2d[float],
+        ancestors: wp.array[int],
+        na_arr: wp.array[int],
         v_out: wp.array[float],
         impulses: wp.array2d[float],
     ):
@@ -1628,11 +1981,26 @@ def get_ds_solve_kernel(
             Lg,
             status,
             timing,
+            constraint_count,
+            row_type,
+            row_parent,
+            row_mu,
+            Jg,
+            Yg,
+            cbase,
+            chead,
+            cdiag,
+            ancestors,
+            na_arr,
             v_out,
             impulses,
         )
 
-    name = f"closure_ds_solve_{D}_{NNZ}_{KL}_{KJ}_{MAXR}_{'s' if USE_SMEM else 'g'}_{NT}_{BC}{'_t' if TIMING else ''}"
+    name = (
+        f"closure_ds_solve_{D}_{NNZ}_{KL}_{KJ}_{MAXR}_{'s' if USE_SMEM else 'g'}_{NT}_{BC}_c{CMODE}w{YW}"
+        + (f"_cc{C}_{KS}_{SIDES}_r{YR}" if CMODE == 1 else "")
+        + ("_t" if TIMING else "")
+    )
     ds_solve.__name__ = name
     ds_solve.__qualname__ = name
     # One block per SM (shared memory bound), so the block may use the whole register file.
@@ -1675,6 +2043,14 @@ def launch_solve(solver, rhs: wp.array, iterations: int, dt: float) -> None:
             buf.BC,
             buf.wb_in_vec,
             buf.timing_enabled,
+            buf.cmode,
+            buf.yw,
+            buf.yoff,
+            buf.C,
+            buf.KS,
+            buf.KZ,
+            buf.sides,
+            buf.yr,
         ),
         buf.smem_bytes,
     )
@@ -1732,6 +2108,17 @@ def launch_solve(solver, rhs: wp.array, iterations: int, dt: float) -> None:
             buf.Lg,
             buf.status,
             buf.timing,
+            solver._constraint_count,
+            solver._row_type,
+            solver._row_parent,
+            solver._row_mu,
+            buf.cJ,
+            buf.cY,
+            buf.cbase,
+            buf.chead,
+            solver._diag,
+            buf.ancestors_flat,
+            buf.na,
         ],
         outputs=[solver._v_out, solver._impulses],
         block_dim=buf.threads,

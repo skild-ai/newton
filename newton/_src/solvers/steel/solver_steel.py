@@ -26,7 +26,7 @@ from ...utils.deprecation import warn_deprecation
 from ..coupled.interface import CouplingInterface
 from ..coupled.model_view import ModelView
 from ..solver import SolverBase
-from . import closure_direct_sparse, latency_fused
+from . import closure_direct_compact, closure_direct_sparse, latency_fused
 from . import contact_compliance as _contact_compliance
 from ._testing import current_kernel_overrides
 from .contact_adhesion import (
@@ -2992,6 +2992,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             raise ValueError("SolverSteel supports deterministic=RUN_TO_RUN or NOT_GUARANTEED, not GPU_TO_GPU")
         self._deterministic = deterministic
         self._ordered_rows = deterministic == wp.DeterministicMode.RUN_TO_RUN
+        if self._kernel_overrides.get("closure_direct_contacts", "off") == "elim":
+            # The compact contact rows of the sparse direct solve are reserved in sorted (deterministic) order.
+            self._ordered_rows = True
         self._propagation_same_articulation_rows = bool(propagation_same_articulation_rows)
         self._propagation_cached_response = bool(propagation_cached_response)
         self._propagation_cached_response_body_max = int(propagation_cached_response_body_max)
@@ -3114,6 +3117,16 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._closure_direct_sparse = None
         self._closure_direct_qd0 = None
         self._closure_direct_dt = 0.0
+        # Contact rows with the sparse direct closure solve: "off" rejects them; "elim" forms their responses
+        # K^-1 J^T through the closure factor and sweeps them after the closure solve (closure_direct_compact.py).
+        self._closure_ds_contacts = self._kernel_overrides.get("closure_direct_contacts", "off")
+        if self._closure_ds_contacts not in ("off", "elim"):
+            raise ValueError("closure_direct_contacts must be one of ['elim', 'off']")
+        if self._closure_ds_contacts != "off" and not self._closure_ds_active:
+            raise ValueError("closure_direct_contacts requires closure_direct_factor='sparse'")
+        self._closure_ds_contact_sweeps = int(self._kernel_overrides.get("closure_direct_contact_sweeps", 16))
+        self._closure_ds_compact = self._closure_ds_contacts == "elim"
+        self._ds_contacts_present = False
         if not model.device.is_cuda:
             # The tiled and native kernels are CUDA-only; CPU runs the scalar Warp kernels.
             self._cholesky_kernel = "loop"
@@ -7285,6 +7298,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             return
         if self._closure_ds_active:
             closure_direct_sparse.launch_solve(self, rhs, iterations, self._closure_direct_dt)
+            if self._ds_contacts_present and self._closure_ds_contact_sweeps > 0:
+                # The contact rows' responses come from the closure factor; sweep them after the closure solve.
+                closure_direct_compact.launch_sweeps(
+                    self, rhs, self._closure_ds_contact_sweeps, friction_start_iteration
+                )
             return
         if iterations <= 0 or self._pgs_solve_mf_gs_kernel is None:
             return
@@ -8847,8 +8865,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[self._rhs],
                 device=model.device,
             )
+        elif self._closure_ds_compact:
+            if contacts is not None:
+                closure_direct_compact.launch_restitution(self, dt)
         elif not self._closure_ds_active:
-            # Only contact rows carry a rebound; the sparse direct solve's worlds have none.
+            # Only contact rows carry a rebound; the sparse direct solve's worlds have none without contacts.
             wp.launch(
                 apply_world_contact_restitution,
                 dim=self._world_count * self._articulation_constraint_max,
@@ -10770,8 +10791,13 @@ class SolverSteel(SolverBase, CouplingInterface):
         if sparse_size is None and not self._double_buffered and not self._closure_ds_active:
             for size in self._size_groups:
                 self._J_by_size[size].zero_()
-        if self._closure_ds_active and contacts is not None and contacts.rigid_contact_max > 0:
-            raise NotImplementedError("closure_direct_factor='sparse' does not build contact rows")
+        if self._closure_ds_active:
+            has_contact_rows = contacts is not None and contacts.rigid_contact_max > 0
+            if has_contact_rows and not self._closure_ds_compact:
+                raise NotImplementedError(
+                    "closure_direct_factor='sparse' builds contact rows only with closure_direct_contacts='elim'"
+                )
+            self._ds_contacts_present = has_contact_rows
 
         if self._has_drive_rows:
             for size in self._size_groups:
@@ -11118,6 +11144,17 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
             )
             self._sparse_diagonal_row_dof.fill_(-1)
+        if self._closure_ds_compact:
+            # Compact contact rows are indexed from the first slot past the world's closure rows.
+            if contacts is not None and contacts.rigid_contact_max > 0:
+                self._check_ds_compact_support(contacts)
+            wp.launch(
+                snapshot_dense_contact_row_start,
+                dim=self._world_count,
+                inputs=[self._slot_counter, max_constraints],
+                outputs=[self._closure_direct_sparse.cbase],
+                device=model.device,
+            )
 
         if contacts is not None and contacts.rigid_contact_max > 0:
             recovery = contacts._mesh_recovery_contacts
@@ -11312,6 +11349,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                     block_dim=128,
                     device=model.device,
                 )
+            elif self._closure_ds_compact:
+                # The sparse direct solve's compact contact rows: J on each row's support only.
+                closure_direct_compact.launch_rows(self, state_in, state_aug, contacts, contact_build_threads)
             elif self._compact_contact_jacobian or self._sparse_diagonal_contact_solve:
                 # Small articulations: one lane per (row, DOF) of each contact.
                 contact_jacobian_workers = min(contacts.rigid_contact_max, _CONTACT_JACOBIAN_WORKER_CAP)
@@ -13295,6 +13335,28 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[self._propagation_body_qd, self._propagation_body_impulses, self._v_out],
                 device=model.device,
             )
+
+    def _check_ds_compact_support(self, contacts: Contacts) -> None:
+        """Reject the contact options the sparse direct solve's compact contact rows do not implement."""
+        if getattr(self, "_ds_compact_checked", False):
+            return
+        unsupported = [
+            name
+            for name, enabled in (
+                ("friction_mode other than 'fixed_normal'", self._friction_mode != "fixed_normal"),
+                ("contact torsion", self._contact_torsion_enabled),
+                ("contact_compliance", self._contact_compliance),
+                ("steel:adhesion", self._adhesion_enabled),
+                ("nesterov_momentum", self._nesterov_momentum),
+                ("joint friction rows", bool(self._joint_friction_warp_kernels)),
+                ("joint velocity limits", self._enable_joint_velocity_limits),
+                ("mesh recovery contacts", contacts._mesh_recovery_contacts is not None),
+            )
+            if enabled
+        ]
+        if unsupported:
+            raise NotImplementedError(f"closure_direct_contacts='elim' does not support {', '.join(unsupported)}")
+        self._ds_compact_checked = True
 
     def _launch_mf_gs_phase(
         self,

@@ -4304,16 +4304,17 @@ def test_revolute_loop_from_fixed_root_matches_world_parent(test, device):
     np.testing.assert_allclose(run(parent=0), run(parent=-1), atol=1.0e-6)
 
 
-def _build_closure_ladder(device, offsets, units=4, world_closure=False):
+def _build_closure_ladder(device, offsets, units=4, world_closure=False, ground=False):
     """A hinged spine whose links each carry two two-link leaf chains, closed tip to tip by loop joints.
 
     Each unit's tips are closed to each other (REVOLUTE on even units, BALL on odd ones), and the left tips of
     neighbouring units by BALL closures. One fixed-base copy per entry of ``offsets`` [m]. The planar layout leaves
     several closure rows nearly degenerate (``|J|`` around ``1e-4`` before normalization). ``world_closure`` also
-    pins the last unit's right tip to the world with a BALL closure, at an anchor that ``offsets`` move exactly.
+    pins the last unit's right tip to the world with a BALL closure, at an anchor that ``offsets`` move exactly. With
+    ``ground``, every tip carries a sphere that collides with a ground plane 1 cm below the lowest tips' spheres.
     """
     template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-    tips = _add_closure_ladder(template, units)
+    tips = _add_closure_ladder(template, units, ground)
     if world_closure:
         # The right tip of the last unit rests at (-0.2, 0, 1.9 - 0.3 * (units - 1)); its anchor 0.2 m along x sits on
         # the spine axis, at a point float32 holds exactly after any of the test offsets.
@@ -4326,10 +4327,15 @@ def _build_closure_ladder(device, offsets, units=4, world_closure=False):
         )
     builder = newton.ModelBuilder()
     builder.replicate(template, len(offsets), xforms=[wp.transform(wp.vec3(*o), wp.quat_identity()) for o in offsets])
+    if ground:
+        # The lowest tips sit 0.1 m below the last spine link, 2.0 - 0.3 (units - 1) m up.
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.01)
+        cfg.collision_group = 1
+        builder.add_ground_plane(height=2.0 - 0.3 * (units - 1) - 0.1 - 0.05 + 0.01, cfg=cfg)
     return builder.finalize(device=device)
 
 
-def _add_closure_ladder(template, units):
+def _add_closure_ladder(template, units, ground=False):
     """Add one closure ladder (see :func:`_build_closure_ladder`) to ``template``; return each unit's two tip bodies."""
     joints, tips, parent = [], [], -1
     for u in range(units):
@@ -4363,6 +4369,13 @@ def _add_closure_ladder(template, units):
                     )
                 )
                 prev = link
+            if ground:
+                cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.5, gap=0.01)
+                cfg.collision_group = -1  # the tips collide with the ground only
+                # Off the hinge axes: a sphere straight below the hinges could not move vertically (zero normal row).
+                template.add_shape_sphere(
+                    prev, xform=wp.transform(wp.vec3(0.05, 0.05, 0.0), wp.quat_identity()), radius=0.05, cfg=cfg
+                )
             pair.append(prev)
         tips.append(pair)
         parent = spine
@@ -4809,6 +4822,268 @@ def test_sparse_direct_closure_solve_is_independent_of_block_size(test, device):
         np.testing.assert_allclose(results[threads], results[512], rtol=0.0, atol=1.0e-5)
 
 
+_SPARSE_ELIM = {
+    **_SPARSE_DIRECT,
+    "closure_direct_eps": 1.0e-4,
+    "closure_direct_contacts": "elim",
+    "closure_direct_contact_sweeps": 64,
+}
+
+
+def _build_floating_four_bar(device, worlds=2):
+    """A free-floating four-bar (base, two cranks, coupler, one BALL closure) that lands on four feet.
+
+    The cranks carry stiff, damped drives, so the mechanism comes to rest; it starts tilted with its parallelogram
+    sheared, so the feet touch down one after another.
+    """
+    template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    base = template.add_link(mass=1.0, inertia=wp.mat33(np.diag([0.002, 0.014, 0.014])))
+    joints = [template.add_joint_free(base, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity()))]
+    cranks = []
+    for x in (-0.15, 0.15):
+        crank = template.add_link(mass=0.2, inertia=wp.mat33(np.eye(3) * 1.0e-3))
+        joints.append(
+            template.add_joint_revolute(
+                base,
+                crank,
+                axis=wp.vec3(0.0, 1.0, 0.0),
+                parent_xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()),
+                target_ke=20.0,
+                target_kd=2.0,
+            )
+        )
+        cranks.append(crank)
+    coupler = template.add_link(mass=0.3, inertia=wp.mat33(np.eye(3) * 2.0e-3))
+    joints.append(
+        template.add_joint_revolute(
+            cranks[0],
+            coupler,
+            axis=wp.vec3(0.0, 1.0, 0.0),
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, -0.1), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(-0.15, 0.0, 0.0), wp.quat_identity()),
+        )
+    )
+    template.add_articulation(joints)
+    template.add_joint_ball(
+        coupler,
+        cranks[1],
+        parent_xform=wp.transform(wp.vec3(0.15, 0.0, 0.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(0.0, 0.0, -0.1), wp.quat_identity()),
+    )
+    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.5, gap=0.01)
+    for x in (-0.15, 0.15):
+        for y in (-0.05, 0.05):
+            template.add_shape_sphere(
+                coupler, xform=wp.transform(wp.vec3(x, y, -0.02), wp.quat_identity()), radius=0.03, cfg=cfg
+            )
+    builder = newton.ModelBuilder()
+    builder.replicate(template, worlds, spacing=(1.0, 0.0, 0.0))
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.01))
+    model = builder.finalize(device=device)
+    # Tilt each base and shear its parallelogram (joint coordinates are relative to the free joint's parent frame).
+    q, q_start = model.joint_q.numpy(), model.joint_q_start.numpy()
+    tilt = np.array(wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.4, 1.0, 0.0)), 0.35))
+    for j in np.flatnonzero(model.joint_type.numpy() == newton.JointType.FREE):
+        q[q_start[j] : q_start[j] + 3] = 0.0
+        q[q_start[j] + 3 : q_start[j] + 7] = tilt
+        q[q_start[j] + 7 : q_start[j] + 9] = 0.4
+    model.joint_q.assign(q)
+    return model
+
+
+def _four_bar_drop(device, overrides, iterations, steps=240):
+    """Drop the floating four-bar; return the solver, the body origins [m] per step and the last normal impulses."""
+    model = _build_floating_four_bar(device)
+    with kernel_overrides(overrides):
+        solver = SolverSteel(
+            model,
+            iterations=iterations,
+            update_mass_matrix_interval=1,
+            articulation_constraint_max=256,
+            deterministic=wp.DeterministicMode.RUN_TO_RUN,
+        )
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    control = model.control()
+    pipe = newton.CollisionPipeline(model)
+    contacts = pipe.contacts()
+    trajectory = []
+    for _ in range(steps):
+        state_0.clear_forces()
+        pipe.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
+        state_0, state_1 = state_1, state_0
+        trajectory.append(state_0.body_q.numpy()[:, :3].copy())
+    rows = solver._constraint_count.numpy()
+    normals = solver._row_type.numpy() == PGS_CONSTRAINT_TYPE_CONTACT
+    impulses = [solver._impulses.numpy()[w, : rows[w]][normals[w, : rows[w]]] for w in range(len(rows))]
+    return solver, np.asarray(trajectory), impulses
+
+
+def test_sparse_direct_contact_elim_matches_the_serial_sweep(test, device):
+    """elim: a looped mechanism landing on the ground follows the converged serial sweep and rests on every foot.
+
+    The serial sweep at 256 iterations solves closure and contact rows together; elim solves the closures directly and
+    sweeps the contact rows with responses through the closure factor. Through the landing the body origins agree to
+    2 mm (the serial sweep at 64 iterations is 0.5 mm off) and at rest to 0.1 mm. The four feet share the weight
+    indeterminately, so only their total impulse is compared (to 2%), and every foot must carry load: every contact
+    row of every world is solved, including the first one past the closure rows.
+    """
+    _, serial, serial_impulses = _four_bar_drop(device, {}, iterations=256)
+    solver, elim, elim_impulses = _four_bar_drop(device, _SPARSE_ELIM, iterations=2)
+    buf = solver._closure_direct_sparse
+    np.testing.assert_array_equal(buf.status.numpy(), 0)
+    deviation = np.linalg.norm(elim - serial, axis=2).max(axis=1)
+    test.assertLess(deviation.max(), 2.0e-3)
+    test.assertLess(deviation[-1], 1.0e-4)
+    for w, (a, b) in enumerate(zip(elim_impulses, serial_impulses, strict=True)):
+        test.assertEqual(len(a), 4, msg=f"world {w}")
+        test.assertTrue(np.all(a > 0.0), msg=f"world {w}: {a}")
+        test.assertAlmostEqual(a.sum(), b.sum(), delta=2.0e-2 * b.sum(), msg=f"world {w}")
+
+
+def _contact_ladder(device, offsets, constraint_max=128):
+    """The closure ladder on the ground (its lowest tips start 1 cm into it) with the elim contact solve."""
+    model = _build_closure_ladder(device, offsets=offsets, ground=True)
+    with kernel_overrides({**_SPARSE_DIRECT, "closure_direct_contacts": "elim", "closure_direct_contact_sweeps": 8}):
+        solver = SolverSteel(
+            model,
+            iterations=2,
+            update_mass_matrix_interval=1,
+            articulation_constraint_max=constraint_max,
+            deterministic=wp.DeterministicMode.RUN_TO_RUN,
+        )
+    return model, solver
+
+
+def _compact_rows_JY(buf, count, w):
+    """World ``w``'s contact rows as {slot: (J, Y)} over its DOFs, unpacked from the compact layout."""
+    apath, na = buf.ancestors.numpy(), buf.na.numpy()
+    cJ, cY, chead, base = (getattr(buf, n).numpy() for n in ("cJ", "cY", "chead", "cbase"))
+    rows = {}
+    for rc in range(min(int(count[w]) - int(base[w]), buf.C)):
+        packed = int(chead[w, rc])
+        j = np.zeros(buf.D)
+        for side in range(buf.sides):
+            head = ((packed >> (16 * side)) & 0xFFFF) - 1
+            if head >= 0:
+                for s in range(int(na[head])):
+                    j[apath[head, s]] += cJ[w, rc, side * buf.KZ + s]
+        rows[int(base[w]) + rc] = (j, cY[w, rc].astype(np.float64))
+    return rows
+
+
+def test_sparse_direct_contact_responses_match_float64(test, device):
+    """elim: each contact row's response Y = K^-1 J^T and diagonal J Y through the closure factor, against float64.
+
+    ``K`` is assembled densely in float64 from the solve's own closure rows, weights and mass matrix; the contact rows
+    are unpacked from the compact layout (J by depth along the contact body's root path).
+    """
+    from newton._src.solvers.steel import closure_direct_sparse  # noqa: PLC0415
+
+    model, solver = _contact_ladder(device, offsets=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)])
+    buf = solver._closure_direct_sparse
+    test.assertEqual(buf.sides, 1)  # the tips collide with the ground only
+    state, out = model.state(), model.state()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    control = model.control()
+    pipe = newton.CollisionPipeline(model)
+    contacts = pipe.contacts()
+    cap = {}
+    original = closure_direct_sparse.launch_solve
+
+    def wrapped(s, rhs, n, dt):
+        original(s, rhs, n, dt)
+        for name in ("Jw", "qrow", "Ha"):
+            cap[name] = getattr(buf, name).numpy().copy()
+        cap["diag"] = s._diag.numpy().copy()
+        cap["count"] = s._constraint_count.numpy().copy()
+
+    with mock.patch.object(closure_direct_sparse, "launch_solve", wrapped):
+        for _ in range(3):
+            state.clear_forces()
+            pipe.collide(state, contacts)
+            solver.step(state, out, control, contacts, 1.0 / 120.0)
+            state, out = out, state
+    np.testing.assert_array_equal(buf.status.numpy(), 0)
+    plan, D, KL, MAXR, KJ = buf.plan, buf.D, buf.KL, buf.MAXR, buf.KJ
+    sup_dof, sup_count = buf.sup_dof.numpy().reshape(KL, KJ), buf.sup_count.numpy()
+    checked = 0
+    for w in range(buf.W):
+        Ha = cap["Ha"][w].astype(np.float64)
+        K = np.zeros((D, D))
+        for d in range(D):
+            for s in range(int(plan.na[d])):
+                a = int(plan.ancestors[d, s])
+                K[d, a] = K[a, d] = Ha[d, s]
+        Jt = cap["Jw"][w].astype(np.float64).reshape(KL, MAXR, KJ)
+        for k in range(KL):
+            for r in range(buf.rows_local.numpy()[k]):
+                j = np.zeros(D)
+                j[sup_dof[k, : sup_count[k]]] = Jt[k, r, : sup_count[k]]
+                K += np.outer(j, j)
+        for r, (j, y_gpu) in _compact_rows_JY(buf, cap["count"], w).items():
+            if not j.any():
+                continue
+            y = np.linalg.solve(K, j)
+            test.assertLess(np.linalg.norm(y_gpu - y) / np.linalg.norm(y), 2.0e-3, msg=f"world {w} row {r}")
+            test.assertAlmostEqual(cap["diag"][w, r] - solver._cfm, j @ y, delta=2.0e-3 * (j @ y))
+            checked += 1
+    test.assertGreater(checked, 4)
+
+
+def test_sparse_direct_contact_elim_is_translation_invariant(test, device):
+    """elim: the ladder on the ground steps alike at the origin and 256 m away (gaps, impulses, velocities).
+
+    World 1 is world 0 translated, and every step both start from world 0's state. World poses 256 m out carry about
+    1.5e-5 m of float32 rounding; closure gaps taken from them would carry it too, and the closure bias would turn it
+    into impulses world 0 does not see. The remaining differences come from the lever arms of the motion subspaces,
+    which still round at the world position: O(1e-5) relative per row.
+    """
+    shift = 256.0
+    model, solver = _contact_ladder(device, offsets=[(0.0, 0.0, 0.0), (shift, shift, 0.0)])
+    state, out = model.state(), model.state()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    control = model.control()
+    pipe = newton.CollisionPipeline(model)
+    contacts = pipe.contacts()
+    n_coords, n_dofs = model.joint_coord_count // 2, model.joint_dof_count // 2
+    loaded = 0
+    for _ in range(8):
+        q, qd = state.joint_q.numpy(), state.joint_qd.numpy()
+        q[n_coords:], qd[n_dofs:] = (
+            q[:n_coords],
+            qd[:n_dofs],
+        )  # fixed-base trees: the joint coordinates do not see the translation
+        state.joint_q.assign(q)
+        state.joint_qd.assign(qd)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        state.clear_forces()
+        pipe.collide(state, contacts)
+        solver.step(state, out, control, contacts, 1.0 / 120.0)
+        count = solver._constraint_count.numpy()
+        test.assertEqual(count[1], count[0])
+        rows = int(count[0])
+        types, imp = solver._row_type.numpy(), solver._impulses.numpy()
+        np.testing.assert_array_equal(types[1, :rows], types[0, :rows])
+        # The closures' raw gaps [m] before row normalization: world 1's closures follow world 0's.
+        raw = solver._closure_direct_sparse.geom_row.numpy()[:, 3].reshape(2, -1)
+        np.testing.assert_allclose(raw[1], raw[0], rtol=0.0, atol=1.0e-7)
+        scale = np.abs(imp[0, :rows]).max()
+        np.testing.assert_allclose(imp[1, :rows], imp[0, :rows], rtol=0.0, atol=3.0e-2 * scale)
+        loaded += int((imp[0, :rows][types[0, :rows] == PGS_CONSTRAINT_TYPE_CONTACT] > 0).any())
+        qd_out = out.joint_qd.numpy()
+        np.testing.assert_allclose(
+            qd_out[n_dofs:], qd_out[:n_dofs], rtol=0.0, atol=2.0e-2 * np.abs(qd_out[:n_dofs]).max()
+        )
+        # Closure gaps after the step [m], from float64 forward kinematics of each world's joint coordinates.
+        gaps = _float64_closure_gaps(model, out.joint_q.numpy()).reshape(2, -1)
+        np.testing.assert_allclose(gaps[1], gaps[0], rtol=0.0, atol=5.0e-5)
+        state.assign(out)
+    test.assertGreater(loaded, 0)
+
+
 class TestSteelRevoluteLoop(unittest.TestCase):
     pass
 
@@ -4843,6 +5118,9 @@ for _name in (
     "test_sparse_direct_closure_solve_matches_the_serial_sweep",
     "test_sparse_direct_closure_solve_matches_with_the_articulated_body_solve",
     "test_sparse_direct_closure_solve_is_independent_of_block_size",
+    "test_sparse_direct_contact_elim_matches_the_serial_sweep",
+    "test_sparse_direct_contact_responses_match_float64",
+    "test_sparse_direct_contact_elim_is_translation_invariant",
 ):
     add_function_test(TestSteelSparseDirectClosureSolve, _name, globals()[_name], devices=get_cuda_test_devices())
 for _name, _func in (
