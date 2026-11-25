@@ -19,12 +19,17 @@ from newton._src.solvers.steel.friction_patches import FrictionPatches
 from newton._src.solvers.steel.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     allocate_world_contact_slots,
     apply_world_contact_restitution,
     compute_mf_effective_mass_and_rhs,
     compute_mf_velocity_rhs,
     compute_world_contact_bias,
+    compute_world_contact_bias_warp,
+    finalize_world_diag_cfm,
+    finalize_world_diag_cfm_warp,
     populate_world_J_for_compact_size,
     populate_world_J_for_size,
     prepare_world_contact_rows,
@@ -744,6 +749,51 @@ def test_speculative_scale_controls_every_position_rhs_family(test, device):
             test.assertAlmostEqual(compute_rhs(device, 1.0), 2.0, places=6)
 
 
+def test_warp_row_bias_and_cfm_match_the_per_world_kernels(test, device):
+    """Split a world's rows over a warp with the per-world kernels' bias, weights and CFM, bit for bit."""
+    rng = np.random.default_rng(7)
+    worlds, capacity = 5, 77
+    counts = np.array([0, 1, 31, 33, 77], dtype=np.int32)
+    row_types = rng.choice(
+        [
+            PGS_CONSTRAINT_TYPE_CONTACT,
+            PGS_CONSTRAINT_TYPE_FRICTION,
+            PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+            PGS_CONSTRAINT_TYPE_JOINT_TARGET,
+            PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+        ],
+        size=(worlds, capacity),
+    ).astype(np.int32)
+    phi = rng.uniform(-0.01, 0.01, size=(worlds, capacity)).astype(np.float32)
+    target = rng.uniform(-1.0, 1.0, size=(worlds, capacity)).astype(np.float32)
+    diag = rng.uniform(0.1, 2.0, size=(worlds, capacity)).astype(np.float32)
+    inputs = [
+        wp.array(counts, dtype=wp.int32, device=device),
+        wp.array(phi, dtype=wp.float32, device=device),
+        wp.array(row_types, dtype=wp.int32, device=device),
+        wp.array(target, dtype=wp.float32, device=device),
+        0.2,
+        0.1,
+        0.5,
+        0.25,
+        1.0 / 240.0,
+    ]
+    results = []
+    for kernel, dim in ((compute_world_contact_bias, worlds), (compute_world_contact_bias_warp, (worlds, 32))):
+        rhs = wp.full((worlds, capacity), -7.0, dtype=wp.float32, device=device)
+        row_w = wp.full((worlds, capacity), -7.0, dtype=wp.float32, device=device)
+        wp.launch(kernel, dim=dim, inputs=inputs, outputs=[rhs, row_w], device=device)
+        results.append((rhs.numpy(), row_w.numpy()))
+    for kernel, dim in ((finalize_world_diag_cfm, worlds), (finalize_world_diag_cfm_warp, (worlds, 32))):
+        out = wp.array(diag, dtype=wp.float32, device=device)
+        wp.launch(kernel, dim=dim, inputs=[inputs[0], inputs[2], 1.0e-3], outputs=[out], device=device)
+        results.append(out.numpy())
+    for expected, actual in zip(results[0], results[1], strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(results[3], results[2])
+    test.assertTrue(np.any(results[2] != diag))
+
+
 def test_dense_restitution_removes_the_scaled_position_bias(test, device):
     """Replace the position bias with the rebound target, independently of the speculative scale."""
     test.assertAlmostEqual(_dense_restitution_rhs(device, 0.0), -1.5, places=6)
@@ -985,6 +1035,7 @@ for _fn in (
     test_friction_gap_max_applies_to_every_route,
     test_speculative_scale_controls_every_position_rhs_family,
     test_dense_restitution_removes_the_scaled_position_bias,
+    test_warp_row_bias_and_cfm_match_the_per_world_kernels,
     test_gap_gate_prevents_all_route_allocations,
     test_gap_gate_keeps_contacts_at_threshold,
     test_allocator_skips_contacts_without_response_dofs,

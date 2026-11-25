@@ -160,7 +160,7 @@ from .kernels import (
     compute_propagation_velocity_rhs,
     compute_spatial_inertia,
     compute_velocity_predictor,
-    compute_world_contact_bias,
+    compute_world_contact_bias_warp,
     compute_world_contact_velocity_bias,
     copy_free_rigid_propagation_body_response,
     copy_unarticulated_body_state,
@@ -181,7 +181,7 @@ from .kernels import (
     finalize_body_dynamics,
     finalize_mf_constraint_counts,
     finalize_world_constraint_counts,
-    finalize_world_diag_cfm,
+    finalize_world_diag_cfm_warp,
     find_contact_family_segments,
     flag_invalid_joint_friction,
     flatten_propagation_joint_S,
@@ -8681,9 +8681,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._stage4_bilateral_preelim()
             self._stage4_compute_matrix_free_diag()
         # Sparse row builders write the response diagonals directly.
+        # A world's rows are independent: a warp per world splits them.
         wp.launch(
-            finalize_world_diag_cfm,
-            dim=self._world_count,
+            finalize_world_diag_cfm_warp,
+            dim=(self._world_count, 32),
             inputs=[self._constraint_count, self._row_type, self._cfm],
             outputs=[self._diag],
             device=model.device,
@@ -8713,8 +8714,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
         # The right-hand side holds only the bias; J v is recomputed every iteration.
         wp.launch(
-            compute_world_contact_bias,
-            dim=self._world_count,
+            compute_world_contact_bias_warp,
+            dim=(self._world_count, 32),
             inputs=[
                 self._constraint_count,
                 self._phi,

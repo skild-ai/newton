@@ -7555,6 +7555,47 @@ def update_body_qd_from_featherstone(
 # =============================================================================
 
 
+@wp.func
+def _world_row_bias(
+    world: int,
+    i: int,
+    world_phi: wp.array2d[float],
+    world_row_type: wp.array2d[int],
+    world_target_velocity: wp.array2d[float],
+    pgs_beta: float,
+    friction_anchor_beta: float,
+    contact_speculative_scale: float,
+    contact_w: float,
+    inv_dt: float,
+    world_rhs: wp.array2d[float],
+    world_row_w: wp.array2d[float],
+):
+    """Write the bias of dense row ``i`` of ``world`` (see :func:`compute_world_contact_bias`)."""
+    phi = world_phi[world, i]
+    row_type = world_row_type[world, i]
+    rhs = -world_target_velocity[world, i]
+    row_w = float(1.0)
+    if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+        if phi <= 0.0:
+            rhs += pgs_beta * phi * inv_dt
+            row_w = contact_w
+        else:
+            rhs += contact_speculative_scale * phi * inv_dt
+    elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
+        rhs += friction_anchor_beta * phi * inv_dt
+    elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
+        if phi < 0.0:
+            rhs += pgs_beta * phi * inv_dt
+        else:
+            rhs += phi * inv_dt
+    elif row_type == PGS_CONSTRAINT_TYPE_MIMIC or row_type == PGS_CONSTRAINT_TYPE_CONNECT:
+        # Equality rows correct the violation in both directions.
+        rhs += pgs_beta * phi * inv_dt
+    world_rhs[world, i] = rhs
+    if contact_w < 1.0:
+        world_row_w[world, i] = row_w
+
+
 @wp.kernel
 def compute_world_contact_bias(
     world_constraint_count: wp.array[int],
@@ -7587,29 +7628,55 @@ def compute_world_contact_bias(
     world = wp.tid()
     inv_dt = 1.0 / dt
     for i in range(world_constraint_count[world]):
-        phi = world_phi[world, i]
-        row_type = world_row_type[world, i]
-        rhs = -world_target_velocity[world, i]
-        row_w = float(1.0)
-        if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-            if phi <= 0.0:
-                rhs += pgs_beta * phi * inv_dt
-                row_w = contact_w
-            else:
-                rhs += contact_speculative_scale * phi * inv_dt
-        elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
-            rhs += friction_anchor_beta * phi * inv_dt
-        elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
-            if phi < 0.0:
-                rhs += pgs_beta * phi * inv_dt
-            else:
-                rhs += phi * inv_dt
-        elif row_type == PGS_CONSTRAINT_TYPE_MIMIC or row_type == PGS_CONSTRAINT_TYPE_CONNECT:
-            # Equality rows correct the violation in both directions.
-            rhs += pgs_beta * phi * inv_dt
-        world_rhs[world, i] = rhs
-        if contact_w < 1.0:
-            world_row_w[world, i] = row_w
+        _world_row_bias(
+            world,
+            i,
+            world_phi,
+            world_row_type,
+            world_target_velocity,
+            pgs_beta,
+            friction_anchor_beta,
+            contact_speculative_scale,
+            contact_w,
+            inv_dt,
+            world_rhs,
+            world_row_w,
+        )
+
+
+@wp.kernel
+def compute_world_contact_bias_warp(
+    world_constraint_count: wp.array[int],
+    world_phi: wp.array2d[float],
+    world_row_type: wp.array2d[int],
+    world_target_velocity: wp.array2d[float],
+    pgs_beta: float,
+    friction_anchor_beta: float,
+    contact_speculative_scale: float,
+    contact_w: float,
+    dt: float,
+    # outputs
+    world_rhs: wp.array2d[float],
+    world_row_w: wp.array2d[float],
+):
+    """:func:`compute_world_contact_bias` with a world's rows split over 32 lanes; launch ``(worlds, 32)``."""
+    world, lane = wp.tid()
+    inv_dt = 1.0 / dt
+    for i in range(lane, world_constraint_count[world], 32):
+        _world_row_bias(
+            world,
+            i,
+            world_phi,
+            world_row_type,
+            world_target_velocity,
+            pgs_beta,
+            friction_anchor_beta,
+            contact_speculative_scale,
+            contact_w,
+            inv_dt,
+            world_rhs,
+            world_row_w,
+        )
 
 
 @wp.kernel
@@ -9505,6 +9572,21 @@ def finalize_world_diag_cfm(
     """
     world = wp.tid()
     for i in range(world_constraint_count[world]):
+        if world_row_type[world, i] != PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+            world_diag[world, i] += pgs_cfm
+
+
+@wp.kernel
+def finalize_world_diag_cfm_warp(
+    world_constraint_count: wp.array[int],
+    world_row_type: wp.array2d[int],
+    pgs_cfm: float,
+    # in/out
+    world_diag: wp.array2d[float],
+):
+    """:func:`finalize_world_diag_cfm` with a world's rows split over 32 lanes; launch ``(worlds, 32)``."""
+    world, lane = wp.tid()
+    for i in range(lane, world_constraint_count[world], 32):
         if world_row_type[world, i] != PGS_CONSTRAINT_TYPE_JOINT_TARGET:
             world_diag[world, i] += pgs_cfm
 
