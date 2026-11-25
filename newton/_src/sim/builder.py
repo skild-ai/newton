@@ -6307,14 +6307,15 @@ class ModelBuilder:
         if joint_type == JointType.ROD:
             # Rod material coordinates use canonical XYZ linear and angular ordering,
             # so the axis set is fixed rather than free-form.
-            if len(linear_axes) != 3 or len(angular_axes) != 3:
+            # Three linear and three angular axes, or three angular axes alone for an inextensible rod joint.
+            if len(linear_axes) not in (0, 3) or len(angular_axes) != 3:
                 raise ValueError(
-                    "JointType.ROD requires exactly three linear and three angular axes; "
+                    "JointType.ROD requires three angular axes and either three or no linear axes; "
                     "use ModelBuilder.add_joint_rod() to construct the canonical layout."
                 )
             expected_axes = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
             for configured, expected in zip(
-                (*linear_axes, *angular_axes), (*expected_axes, *expected_axes), strict=True
+                (*linear_axes, *angular_axes), (*expected_axes[: len(linear_axes)], *expected_axes), strict=True
             ):
                 axis = configured.axis
                 components = (float(axis[0]), float(axis[1]), float(axis[2]))
@@ -6498,7 +6499,7 @@ class ModelBuilder:
             or joint_type == JointType.DISTANCE
             or joint_type == JointType.ROD
         ):
-            if joint_type == JointType.BALL:
+            if joint_type == JointType.BALL or not linear_axes:
                 quat_offset = target_q_offset
             else:
                 for i, dim in enumerate(linear_axes):
@@ -6931,7 +6932,9 @@ class ModelBuilder:
         return joint_index
 
     def _init_joint_q_from_body_poses(self, joint_id: int, parent: int, child: int) -> None:
-        """Initialize q7 from body poses so FK preserves the authored child pose."""
+        """Initialize a rod joint's coordinates from body poses so FK preserves the authored child pose.
+
+        An inextensible rod joint keeps only the rotation: its anchors coincide by construction."""
         q_start = self.joint_q_start[joint_id]
         parent_body_xform = wp.transform_identity() if parent == -1 else self.body_q[parent]
         # Compute inverse(parent_body * parent_anchor) * child_body * child_anchor.
@@ -6939,7 +6942,10 @@ class ModelBuilder:
         joint_q = transform_multiply(
             transform_multiply(transform_inverse(anchor), self.body_q[child]), self.joint_X_c[joint_id]
         )
-        self.joint_q[q_start : q_start + 7] = list(joint_q)
+        if self.joint_dof_dim[joint_id][0] == 0:
+            self.joint_q[q_start : q_start + 4] = list(joint_q)[3:]
+        else:
+            self.joint_q[q_start : q_start + 7] = list(joint_q)
 
     def add_joint_free(
         self,
@@ -7129,6 +7135,7 @@ class ModelBuilder:
         bend_damping: float | None = None,
         twist_stiffness: float | None = None,
         twist_damping: float | None = None,
+        inextensible: bool = False,
         label: str | None = None,
         collision_filter_parent: bool | None = None,
         enabled: bool = True,
@@ -7190,6 +7197,10 @@ class ModelBuilder:
                 defaults to ``bend_stiffness``.
             twist_damping: Optional twist damping [N·m·s/rad]. If None, defaults to ``bend_damping`` only when
                 both ``twist_stiffness`` and ``twist_damping`` are None. Otherwise defaults to 0.0.
+            inextensible: If True, the joint has no linear degrees of freedom: its anchors stay coincident, so
+                the rod neither stretches nor shears, and these are not solved for. The joint then carries a
+                4-coordinate quaternion in ``joint_q`` and a 3-DoF relative angular velocity in ``joint_qd``, as a
+                ball joint does, with bend and twist response. ``stretch_*`` and ``shear_*`` must then be None.
             label: The label of the joint.
             collision_filter_parent: Whether to filter collisions between shapes of the parent and child bodies. Defaults to ``False`` for joints to world, ``True`` otherwise.
             enabled: Whether the joint is enabled.
@@ -7204,6 +7215,10 @@ class ModelBuilder:
                 norm, or if any material stiffness is negative.
 
         """
+        if inextensible and any(
+            value is not None for value in (stretch_stiffness, stretch_damping, shear_stiffness, shear_damping)
+        ):
+            raise ValueError("add_joint_rod: an inextensible rod joint has no stretch or shear response to set")
         rest_rotation_value = None
         if rest_rotation is not None:
             components = tuple(float(value) for value in rest_rotation)
@@ -7242,11 +7257,15 @@ class ModelBuilder:
             ModelBuilder.JointDofConfig,
             actuator_mode=JointTargetMode.NONE,
         )
-        linear_axes = [
-            material_axis(axis=Axis.X, target_ke=shear_ke, target_kd=shear_kd),
-            material_axis(axis=Axis.Y, target_ke=shear_ke, target_kd=shear_kd),
-            material_axis(axis=Axis.Z, target_ke=stretch_ke, target_kd=stretch_kd),
-        ]
+        linear_axes = (
+            []
+            if inextensible
+            else [
+                material_axis(axis=Axis.X, target_ke=shear_ke, target_kd=shear_kd),
+                material_axis(axis=Axis.Y, target_ke=shear_ke, target_kd=shear_kd),
+                material_axis(axis=Axis.Z, target_ke=stretch_ke, target_kd=stretch_kd),
+            ]
+        )
         angular_axes = [
             material_axis(axis=Axis.X, target_ke=bend_ke, target_kd=bend_kd),
             material_axis(axis=Axis.Y, target_ke=bend_ke, target_kd=bend_kd),
@@ -7268,10 +7287,12 @@ class ModelBuilder:
             **kwargs,
         )
         q_start = self.joint_q_start[joint_id]
+        rot = q_start if inextensible else q_start + 3  # the rotation's coordinates
         if rest_rotation_value is None:
-            rest_rotation_value = wp.quat(*self.joint_q[q_start + 3 : q_start + 7])
-        self.joint_rest_q[q_start : q_start + 3] = [0.0, 0.0, 0.0]
-        self.joint_rest_q[q_start + 3 : q_start + 7] = list(rest_rotation_value)
+            rest_rotation_value = wp.quat(*self.joint_q[rot : rot + 4])
+        if not inextensible:
+            self.joint_rest_q[q_start : q_start + 3] = [0.0, 0.0, 0.0]
+        self.joint_rest_q[rot : rot + 4] = list(rest_rotation_value)
         return joint_id
 
     def add_tendon(
@@ -7472,13 +7493,18 @@ class ModelBuilder:
         """
         joint_type = self.joint_type[joint]
         joint_dof_dim = self.joint_dof_dim[joint]
-        if joint_type != JointType.ROD or joint_dof_dim != (3, 3):
+        if joint_type != JointType.ROD or tuple(joint_dof_dim) not in ((3, 3), (0, 3)):
             raise ValueError(
-                "_set_joint_rod_material_gains() expected the six-DOF ROD layout "
-                f"(3 linear, 3 angular); got joint type {JointType(joint_type).name} with dimensions "
-                f"{joint_dof_dim}. Update the ROD material-axis mapping when changing its DOF layout."
+                "_set_joint_rod_material_gains() expected a ROD layout (3 or 0 linear, 3 angular); got joint type "
+                f"{JointType(joint_type).name} with dimensions {joint_dof_dim}. "
+                "Update the ROD material-axis mapping when changing its DOF layout."
             )
         dof_start = self.joint_qd_start[joint]
+        if joint_dof_dim[0] == 0:
+            # Inextensible: no stretch or shear axes. Their gains have nowhere to go.
+            if any(v is not None for v in (stretch_stiffness, stretch_damping, shear_stiffness, shear_damping)):
+                raise ValueError("an inextensible rod joint has no stretch or shear response to set")
+            dof_start -= 3  # the angular axes sit at offsets 3..5 below
         axis_stiffnesses = (
             shear_stiffness,
             shear_stiffness,
@@ -7496,6 +7522,8 @@ class ModelBuilder:
             twist_damping,
         )
         for offset, (stiffness, damping) in enumerate(zip(axis_stiffnesses, axis_dampings, strict=True)):
+            if offset < 3 and joint_dof_dim[0] == 0:
+                continue
             if stiffness is not None or damping is not None:
                 dof = dof_start + offset
                 if stiffness is not None:
@@ -10435,6 +10463,7 @@ class ModelBuilder:
         bend_damping: float | None,
         twist_stiffness: float | None,
         twist_damping: float | None,
+        inextensible: bool = False,
         label: str | None,
         wrap_in_articulation: bool,
         junction_collision_filter: bool,
@@ -10466,6 +10495,8 @@ class ModelBuilder:
         section_rigidities = rod._resolve_section_rigidities()
         if section_rigidities is not None:
             stretch_rigidity, shear_rigidity, bend_rigidity, twist_rigidity = section_rigidities
+            if inextensible:
+                stretch_rigidity = shear_rigidity = None
             if stretch_stiffness is not None:
                 stretch_rigidity = None
             if shear_stiffness is not None:
@@ -10507,6 +10538,7 @@ class ModelBuilder:
                 bend_damping=bend_damping,
                 twist_stiffness=twist_stiffness,
                 twist_damping=twist_damping,
+                inextensible=inextensible,
                 closed=rod.closed,
                 label=label,
                 wrap_in_articulation=wrap_in_articulation,
@@ -10529,6 +10561,7 @@ class ModelBuilder:
                 bend_damping=bend_damping,
                 twist_stiffness=twist_stiffness,
                 twist_damping=twist_damping,
+                inextensible=inextensible,
                 label=label,
                 wrap_in_articulation=wrap_in_articulation,
                 quaternions=rod_quaternions,
@@ -10573,6 +10606,7 @@ class ModelBuilder:
         bend_damping: float | None,
         twist_stiffness: float | None,
         twist_damping: float | None,
+        inextensible: bool = False,
         closed: bool,
         label: str | None,
         wrap_in_articulation: bool,
@@ -10586,6 +10620,9 @@ class ModelBuilder:
         # Stretch defaults to the cable/rod axial stiffness used by VBD examples.
         stretch_stiffness = 1.0e5 if stretch_stiffness is None else stretch_stiffness
         stretch_damping = 0.0 if stretch_damping is None else stretch_damping
+        if inextensible:
+            # No stretch or shear degrees of freedom to give a response.
+            stretch_stiffness = stretch_damping = shear_stiffness = shear_damping = None
 
         # Bend defaults: 0.0 (users must explicitly set for bending resistance)
         bend_stiffness = 0.0 if bend_stiffness is None else bend_stiffness
@@ -10619,6 +10656,7 @@ class ModelBuilder:
             bend_damping=bend_damping,
             twist_stiffness=twist_stiffness,
             twist_damping=twist_damping,
+            inextensible=inextensible,
             label=label,
             wrap_in_articulation=wrap_in_articulation,
             quaternions=quaternions,
@@ -10703,6 +10741,7 @@ class ModelBuilder:
                     bend_damping=bend_damping,
                     twist_stiffness=twist_stiffness,
                     twist_damping=twist_damping,
+                    inextensible=inextensible,
                     stretch_stiffness=stretch_stiffness,
                     stretch_damping=stretch_damping,
                     shear_stiffness=shear_stiffness,
@@ -10716,8 +10755,8 @@ class ModelBuilder:
         if rest_straight:
             # Straight rest uses the identity quaternion in each joint's rest coordinates.
             for joint in link_joints:
-                q_start = self.joint_q_start[joint]
-                self.joint_rest_q[q_start + 3 : q_start + 7] = [0.0, 0.0, 0.0, 1.0]
+                rot = self.joint_q_start[joint] + self.joint_dof_dim[joint][0]  # the rotation's coordinates
+                self.joint_rest_q[rot : rot + 4] = [0.0, 0.0, 0.0, 1.0]
 
         return link_bodies, link_joints
 
@@ -10734,6 +10773,7 @@ class ModelBuilder:
         bend_damping: float | None = None,
         twist_stiffness: float | None = None,
         twist_damping: float | None = None,
+        inextensible: bool = False,
         label: str | None = None,
         wrap_in_articulation: bool = True,
         color: Vec3 | None = None,
@@ -10777,6 +10817,10 @@ class ModelBuilder:
                 ``bend_stiffness`` otherwise.
             twist_damping: Optional per-joint rod twist damping [N·m·s/rad]. If None, defaults to ``bend_damping``
                 only when both ``twist_stiffness`` and ``twist_damping`` are None. Otherwise defaults to 0.0.
+            inextensible: If True, every generated rod joint has no linear degrees of freedom: neighboring
+                segments stay joined at their shared node, so the rod neither stretches nor shears and those are
+                not solved for. Each joint carries a quaternion (4 coordinates) and a 3-DoF relative angular
+                velocity with bend and twist response. ``stretch_*`` and ``shear_*`` must then be None.
             label: Optional label prefix for bodies, shapes, joints, and articulations.
                 The same name is appended to :attr:`curve_label` for this rod; if None,
                 a generated ``curve_N`` label is used. See :ref:`deformable-objects`.
@@ -10851,6 +10895,10 @@ class ModelBuilder:
               midpoint, and centerline endpoints are at local ``(0, 0, -half_height)`` and
               ``(0, 0, half_height)``.
         """
+        if inextensible and any(
+            value is not None for value in (stretch_stiffness, stretch_damping, shear_stiffness, shear_damping)
+        ):
+            raise ValueError("add_rod: an inextensible rod has no stretch or shear response to set")
         if not isinstance(rod, Rod):
             raise TypeError(f"add_rod: rod must be a Rod, got {type(rod).__name__}")
 
@@ -10867,6 +10915,7 @@ class ModelBuilder:
             bend_damping=bend_damping,
             twist_stiffness=twist_stiffness,
             twist_damping=twist_damping,
+            inextensible=inextensible,
             label=label,
             wrap_in_articulation=wrap_in_articulation,
             junction_collision_filter=junction_collision_filter,
@@ -10893,6 +10942,7 @@ class ModelBuilder:
         bend_damping: float | None,
         twist_stiffness: float | None,
         twist_damping: float | None,
+        inextensible: bool = False,
         label: str | None,
         wrap_in_articulation: bool,
         quaternions: list[Quat] | None,
@@ -10909,6 +10959,9 @@ class ModelBuilder:
         # Stretch defaults to the cable/rod axial stiffness used by VBD examples.
         stretch_stiffness = 1.0e5 if stretch_stiffness is None else stretch_stiffness
         stretch_damping = 0.0 if stretch_damping is None else stretch_damping
+        if inextensible:
+            # No stretch or shear degrees of freedom to give a response.
+            stretch_stiffness = stretch_damping = shear_stiffness = shear_damping = None
 
         # Bend defaults: 0.0 (users must explicitly set for bending resistance)
         bend_stiffness = 0.0 if bend_stiffness is None else bend_stiffness
@@ -11171,6 +11224,7 @@ class ModelBuilder:
                         bend_damping=bend_damping,
                         twist_stiffness=twist_stiffness,
                         twist_damping=twist_damping,
+                        inextensible=inextensible,
                         stretch_stiffness=stretch_stiffness,
                         stretch_damping=stretch_damping,
                         shear_stiffness=shear_stiffness,
@@ -11270,6 +11324,7 @@ class ModelBuilder:
                                 bend_damping=bend_damping,
                                 twist_stiffness=twist_stiffness,
                                 twist_damping=twist_damping,
+                                inextensible=inextensible,
                                 stretch_stiffness=stretch_stiffness,
                                 stretch_damping=stretch_damping,
                                 shear_stiffness=shear_stiffness,

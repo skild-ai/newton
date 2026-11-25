@@ -7677,7 +7677,7 @@ class TestCable(unittest.TestCase):
         builder = newton.ModelBuilder()
         child = builder.add_link()
 
-        with self.assertRaisesRegex(ValueError, "exactly three linear and three angular axes"):
+        with self.assertRaisesRegex(ValueError, "three angular axes and either three or no linear axes"):
             builder.add_joint(
                 newton.JointType.ROD,
                 -1,

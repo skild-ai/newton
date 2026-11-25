@@ -11,6 +11,7 @@ from ...sim.articulation import (
     compute_2d_rotational_dofs,
     compute_3d_rotational_dofs,
     eval_single_articulation_fk,
+    rod_as_ball,
     write_free_distance_motion_subspace,
 )
 from ...sim.contacts import GENERATION_SENTINEL
@@ -674,6 +675,7 @@ def jcalc_transform(
     joint_q: wp.array[float],
     q_start: int,
 ):
+    type = rod_as_ball(type, lin_axis_count)  # an inextensible ROD moves as a BALL
     if type == JointType.PRISMATIC:
         q = joint_q[q_start]
         axis = joint_axis[axis_start]
@@ -783,6 +785,7 @@ def jcalc_tau(
     # outputs
     tau: wp.array[float],
 ):
+    type = rod_as_ball(type, lin_axis_count)  # an inextensible ROD moves as a BALL
     if type == JointType.BALL:
         for i in range(3):
             j = dof_start + i
@@ -862,6 +865,7 @@ def jcalc_integrate(
     joint_q_new: wp.array[float],
     joint_qd_new: wp.array[float],
 ):
+    type = rod_as_ball(type, lin_axis_count)  # an inextensible ROD moves as a BALL
     if type == JointType.FIXED:
         return
 
@@ -1134,6 +1138,7 @@ def link_joint_motion(
     # compute motion subspace and velocity across the joint (also stores S_s to global memory)
     lin_axis_count = joint_dof_dim[i, 0]
     ang_axis_count = joint_dof_dim[i, 1]
+    type = rod_as_ball(type, lin_axis_count)  # an inextensible ROD moves as a BALL
     # FREE/DISTANCE twists are referenced at the root COM, so their motion subspace takes only the rotation.
     X_sc = X_wpj_local
     if type == JointType.FREE or type == JointType.DISTANCE:

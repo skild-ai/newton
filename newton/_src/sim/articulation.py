@@ -248,6 +248,17 @@ def eval_angular_coordinates(
 
 
 @wp.func
+def rod_as_ball(type: int, lin_axis_count: int):
+    """The joint type that governs a joint's kinematics: an inextensible ROD (no linear axes) moves as a BALL.
+
+    Its coordinates are the rest-relative-free quaternion of a ball joint at the shared junction; only its
+    material (bend and twist) differs, and solvers that model rod material read it from the ROD type."""
+    if type == JointType.ROD and lin_axis_count == 0:
+        return int(JointType.BALL)
+    return type
+
+
+@wp.func
 def eval_joint_motion(
     type: int,
     q_start: int,
@@ -449,6 +460,7 @@ def eval_single_articulation_fk(
         qd_start = joint_qd_start[i]
         lin_axis_count = joint_dof_dim[i, 0]
         ang_axis_count = joint_dof_dim[i, 1]
+        type = rod_as_ball(type, lin_axis_count)
 
         X_j, v_j = eval_joint_motion(
             type,
@@ -894,6 +906,7 @@ def eval_articulation_ik(
     qd_start = joint_qd_start[joint_idx]
     lin_axis_count = joint_dof_dim[joint_idx, 0]
     ang_axis_count = joint_dof_dim[joint_idx, 1]
+    type = rod_as_ball(type, lin_axis_count)
 
     if type == JointType.PRISMATIC:
         axis = joint_axis[qd_start]
@@ -1257,7 +1270,7 @@ def eval_joint_motion_subspace(
         X_wpj = body_q[parent] * X_wpj
 
     jcalc_motion_subspace(
-        joint_type[j],
+        rod_as_ball(joint_type[j], joint_dof_dim[j, 0]),
         joint_axis,
         joint_q,
         joint_dof_dim[j, 0],

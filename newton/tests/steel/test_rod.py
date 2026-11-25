@@ -803,3 +803,155 @@ add_function_test(
     test_propagation_tree_dynamics_frees_dense_buffers,
     devices=get_cuda_test_devices(),
 )
+
+
+def _hanging_rod(device, inextensible, ground=True):
+    """An 8-link rod held at its root link, falling as a pendulum onto the ground."""
+    builder = newton.ModelBuilder()
+    rod = newton.Rod.create_straight(
+        start=(0.0, 0.0, 0.3), direction=(1.0, 0.0, 0.0), length=0.4, segment_count=8, radius=0.01
+    )
+    stretch = {} if inextensible else {"stretch_stiffness": 1.0e9, "shear_stiffness": 1.0e9}
+    bodies, _joints = builder.add_rod(
+        rod=rod, bend_stiffness=0.05, twist_stiffness=0.05, inextensible=inextensible, **stretch
+    )
+    builder.body_flags[int(bodies[0])] = int(newton.BodyFlags.KINEMATIC)
+    if ground:
+        builder.add_ground_plane()
+    return builder.finalize(device=device), bodies
+
+
+def _junction_gaps(model, state):
+    """Distance between each rod joint's parent and child anchors [m]."""
+    q = state.body_q.numpy()
+    parent, child = model.joint_parent.numpy(), model.joint_child.numpy()
+    X_p, X_c = model.joint_X_p.numpy(), model.joint_X_c.numpy()
+
+    def point(pose, local):
+        return np.asarray(wp.transform_point(wp.transform(wp.vec3(*pose[:3]), wp.quat(*pose[3:])), wp.vec3(*local[:3])))
+
+    rods = np.flatnonzero((model.joint_type.numpy() == int(newton.JointType.ROD)) & (parent >= 0))
+    return np.array([np.linalg.norm(point(q[parent[j]], X_p[j]) - point(q[child[j]], X_c[j])) for j in rods])
+
+
+def test_inextensible_layout(test, device):
+    """An inextensible rod joint has three angular DOFs and a quaternion, and keeps only bend and twist gains."""
+    model, _ = _hanging_rod(device, inextensible=True, ground=False)
+    rods = model.joint_type.numpy() == int(newton.JointType.ROD)
+    test.assertTrue(np.all(model.joint_dof_dim.numpy()[rods] == (0, 3)))
+    q_start, qd_start = model.joint_q_start.numpy(), model.joint_qd_start.numpy()  # each with an end sentinel
+    test.assertTrue(np.all(np.diff(q_start)[rods] == 4))
+    test.assertTrue(np.all(np.diff(qd_start)[rods] == 3))
+    ke = model.joint_target_ke.numpy()
+    for j in np.flatnonzero(rods):
+        np.testing.assert_allclose(ke[qd_start[j] : qd_start[j] + 3], 0.05)
+    with test.assertRaises(ValueError):
+        newton.ModelBuilder().add_rod(
+            rod=newton.Rod.create_straight(start=(0, 0, 0), direction=(1, 0, 0), length=0.2, segment_count=2),
+            stretch_stiffness=1.0,
+            inextensible=True,
+        )
+    with test.assertRaises(ValueError):
+        newton.solvers.SolverVBD(model)
+
+
+def test_inextensible_pendulum(test, device, mode, response):
+    """A falling inextensible rod keeps its links joined, reaches the ground, and in free swing tracks a very
+    stiff six-DOF rod."""
+    model, bodies = _hanging_rod(device, inextensible=True)
+    pipeline = newton.CollisionPipeline(model)
+    solver = newton.solvers.SolverSteel(
+        model, solve_mode=mode, articulated_contact_response=response, articulation_constraint_max=256, iterations=16
+    )
+    a, b, control, contacts = model.state(), model.state(), model.control(), pipeline.contacts()
+    for _ in range(180):
+        pipeline.collide(a, contacts)
+        solver.step(a, b, control, contacts, 1.0 / 240.0)
+        a, b = b, a
+    positions = a.body_q.numpy()[:, :3]
+    test.assertTrue(np.all(np.isfinite(positions)))
+    # Reduced coordinates: the links cannot part, whatever the load.
+    test.assertLess(float(_junction_gaps(model, a).max()), 1.0e-5)
+    test.assertLess(float(positions[int(bodies[-1]), 2]), 0.05)  # it swung down onto the ground
+
+    # In free swing it converges to a very stiff six-DOF rod (stepped with the immediate response, which resolves
+    # that stiffness exactly). Stepping from the carried body momenta dissipates a little per step, so the gap is
+    # first order in the step: it halves with the step.
+    gaps = []
+    for dt in (1.0 / 240.0, 1.0 / 480.0):
+        tips = {}
+        for inextensible, rod_response in ((True, response), (False, "immediate")):
+            model, bodies = _hanging_rod(device, inextensible, ground=False)
+            solver = newton.solvers.SolverSteel(
+                model,
+                solve_mode=mode,
+                articulated_contact_response=rod_response,
+                articulation_constraint_max=256,
+                iterations=16,
+            )
+            a, b, control = model.state(), model.state(), model.control()
+            for _ in range(round(0.25 / dt)):  # mid swing
+                solver.step(a, b, control, None, dt)
+                a, b = b, a
+            tips[inextensible] = a.body_q.numpy()[int(bodies[-1]), :3]
+        gaps.append(float(np.linalg.norm(tips[True] - tips[False])))
+    test.assertLess(gaps[0], 0.004)
+    test.assertLess(gaps[1], 0.65 * gaps[0])
+
+
+add_function_test(TestSteelRod, "test_inextensible_layout", test_inextensible_layout, devices=get_cuda_test_devices())
+for mode in ("serial", "colored"):
+    for response in ("immediate", "propagation"):
+        add_function_test(
+            TestSteelRod,
+            f"test_inextensible_pendulum_{mode}_{response}",
+            test_inextensible_pendulum,
+            devices=get_cuda_test_devices(),
+            mode=mode,
+            response=response,
+        )
+
+
+def test_inextensible_long_chain_whip(test, device):
+    """A long, light inextensible rod whipping under gravity stays bounded, as a stiff six-DOF rod does.
+
+    The joint-space velocity-product terms of such a chain feed energy into a semi-implicit step and it diverges;
+    stepping from the carried body momenta (a projection) does not add energy.
+    """
+    peaks = {}
+    for inextensible in (True, False):
+        builder = newton.ModelBuilder()
+        rod = newton.Rod.create_straight(
+            start=(0.0, 0.0, 1.5), direction=(1.0, 0.0, 0.0), length=1.2, segment_count=54, radius=0.004
+        )
+        stretch = {} if inextensible else {"stretch_stiffness": 1.0e7, "stretch_damping": 0.1}
+        bodies, _ = builder.add_rod(
+            rod=rod,
+            cfg=newton.ModelBuilder.ShapeConfig(density=200.0),
+            bend_stiffness=3.0e-3,
+            twist_stiffness=3.0e-3,
+            inextensible=inextensible,
+            **stretch,
+        )
+        builder.body_flags[int(bodies[0])] = int(newton.BodyFlags.KINEMATIC)
+        model = builder.finalize(device=device)
+        solver = newton.solvers.SolverSteel(model, iterations=8, articulation_constraint_max=64)
+        a, b, control = model.state(), model.state(), model.control()
+        peak = 0.0
+        for step in range(960):  # 2 s; the uncorrected step diverged at 1.5 s
+            solver.step(a, b, control, None, 1.0 / 480.0)
+            a, b = b, a
+            if step % 48 == 0:
+                qd = a.body_qd.numpy()
+                test.assertTrue(np.all(np.isfinite(qd)))
+                peak = max(peak, float(np.abs(qd[:, 3:]).max()))
+        peaks[inextensible] = peak
+    test.assertLess(peaks[True], 1.5 * peaks[False])
+
+
+add_function_test(
+    TestSteelRod,
+    "test_inextensible_long_chain_whip",
+    test_inextensible_long_chain_whip,
+    devices=get_cuda_test_devices(),
+)

@@ -3331,6 +3331,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             and not self._contact_torsion_enabled
             and self._friction_mode == "fixed_normal"
             and bool(np.all(np.isin(model.joint_type.numpy(), (int(JointType.FREE), int(JointType.ROD)))))
+            # The packed kernels hold six DOFs per joint; an inextensible rod joint has three.
+            and bool(np.all(model.joint_dof_dim.numpy()[:, 0] == 3))
         ):
             self._packed_rod_size = self._size_groups[0]
 
@@ -8143,6 +8145,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         computed_parent_f = self._sleeping.parent_wrenches if self._sleeping is not None else body_parent_f
         if self._rod_material is not None and self._rod_material.world_twists:
             self._rod_material.inertial_bias(self, state_in, state_aug)
+        if self._rod_material is not None and self._rod_material.carried:
+            self._rod_material.carried_bias(self, state_in, state_aug, dt)
         self._stage1_joint_tau(state_in, state_aug, state_out, control, dt)
         if self._rod_material is not None:
             self._rod_material.linearize(model, state_in, state_aug, self._articulation_origin, dt)
@@ -8335,6 +8339,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             wp.copy(state_out.joint_qd, self._v_out)
         else:
             self._integrate(state_in, state_aug, state_out, dt, self._v_out)
+        if self._rod_material is not None and self._rod_material.carried:
+            # Before stage 7 replaces the start-of-step motion subspaces.
+            self._rod_material.carry(self, state_in, state_aug, state_out)
         if computed_parent_f is not None:
             # Stage 7 replaces the start-of-step motion subspaces this reads.
             articulation_active = self._dynamics_art_active

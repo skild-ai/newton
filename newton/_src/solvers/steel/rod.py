@@ -85,6 +85,7 @@ def _commit_history(
     rods: wp.array[int],
     q_start: wp.array[int],
     v_start: wp.array[int],
+    dof_dim: wp.array2d[int],
     q: wp.array[float],
     rest: wp.array[float],
     ke: wp.array[float],
@@ -92,13 +93,15 @@ def _commit_history(
     history: DahlHistory,
 ):
     j = rods[wp.tid()]
-    _, strain, _jac = _strain(q, rest, q_start[j])
+    # The rotation and angular DOFs follow the linear ones; an inextensible rod joint has none.
+    lin = dof_dim[j, 0]
+    _, strain, _jac = _strain(q, rest, q_start[j] + lin - 3)
     delta = _angle_delta(strain, history.strain[j])
     stress = wp.vec3()
     decay = history.decay[j]
     if enabled[j] and history.initialized[j] and decay > 0.0 and history.limit[j] > 0.0:
         for i in range(3):
-            bound = history.limit[j] * ke[v_start[j] + 3 + i]
+            bound = history.limit[j] * ke[v_start[j] + lin + i]
             stress[i] = wp.clamp(_advance_stress(history.stress[j][i], delta[i], bound, decay), -bound, bound)
     history.strain[j] = strain
     history.stress[j] = stress
@@ -120,6 +123,7 @@ def _linearize(
     joints: wp.array[int],
     q_start: wp.array[int],
     qd_start: wp.array[int],
+    dof_dim: wp.array2d[int],
     child: wp.array[int],
     body_com: wp.array[wp.vec3],
     X_c: wp.array[wp.transform],
@@ -139,8 +143,9 @@ def _linearize(
     r = wp.tid()
     joint = joints[r]
     block = wp.spatial_matrix()
+    lin = dof_dim[joint, 0]
     if owners[joint] < 0:
-        for i in range(6):
+        for i in range(lin + 3):
             tau[qd_start[joint] + i] = 0.0
     if not enabled[joint]:
         blocks[r] = block
@@ -149,6 +154,39 @@ def _linearize(
         return
     iq = q_start[joint]
     iv = qd_start[joint]
+    if lin == 0:
+        # Inextensible: bend and twist only. The block's top-left 3x3 is the joint's own three DOFs.
+        _rotation0, a0, Jw0 = _strain(q, rest, iq - 3)
+        if history.initialized and not history.initialized[joint]:
+            history.strain[joint] = a0
+            history.initialized[joint] = True
+        w = wp.vec3(qd[iv], qd[iv + 1], qd[iv + 2])
+        rate0 = Jw0 * w
+        force0 = wp.vec3()
+        for i in range(3):
+            k = ke[iv + i]
+            d = kd[iv + i] + h * k
+            force0[i] = -(k * a0[i] + d * rate0[i])
+            if history.initialized:
+                bound = history.limit[joint] * k
+                decay = history.decay[joint]
+                if bound > 0.0 and decay > 0.0:
+                    delta = _angle_delta(a0, history.strain[joint])
+                    stress = _advance_stress(history.stress[joint][i], delta[i], bound, decay)
+                    direction = wp.sign(rate0[i])
+                    tangent = wp.max(0.0, (bound - direction * stress) / decay)
+                    force0[i] -= stress + h * tangent * rate0[i]
+                    d += h * tangent
+            for j in range(3):
+                for l in range(3):
+                    block[j, l] += Jw0[i, j] * (h * d) * Jw0[i, l]
+        load0 = wp.transpose(Jw0) * force0
+        for i in range(3):
+            tau[iv + i] += load0[i]
+        blocks[r] = block
+        if owners[joint] >= 0:
+            joint_blocks[joint] = block
+        return
     rotation, a, Jw = _strain(q, rest, iq)
     if history.initialized and not history.initialized[joint]:
         history.strain[joint] = a
@@ -206,7 +244,8 @@ def _augment(
     rod = layout[r, 0]
     group = layout[r, 1]
     start = layout[r, 2]
-    H[group, start + i, start + j] += blocks[rod][i, j]
+    if i < layout[r, 3] and j < layout[r, 3]:  # the joint's own DOFs: 3 for an inextensible rod joint
+        H[group, start + i, start + j] += blocks[rod][i, j]
 
 
 @wp.kernel
@@ -373,6 +412,94 @@ def _world_twists(
         w = wp.spatial_bottom(v)
         linear = wp.spatial_top(v) + wp.cross(w, cx - orig[art])
         next_twist[b] = wp.spatial_vector(linear, w)
+
+
+@wp.kernel
+def _carry_twists(
+    carried: wp.array[int],
+    active: wp.array[int],
+    order: wp.array[int],
+    starts: wp.array[int],
+    ends: wp.array[int],
+    parent: wp.array[int],
+    child: wp.array[int],
+    v_start: wp.array[int],
+    com: wp.array[wp.vec3],
+    orig: wp.array[wp.vec3],
+    S: wp.array[wp.spatial_vector],
+    speed: wp.array[float],
+    pose: wp.array[wp.transform],
+    accumulated: wp.array[wp.spatial_vector],
+    twist: wp.array[wp.spatial_vector],
+):
+    """Each body's COM twist from the step's motion basis (start-of-step pose) and its new joint velocities."""
+    art = carried[wp.tid()]
+    if active[art] == 0:
+        return
+    for slot in range(starts[art], ends[art]):
+        j = slot
+        if order:
+            j = order[slot]
+        p = parent[j]
+        b = child[j]
+        v = wp.spatial_vector()
+        if p >= 0:
+            v = accumulated[p]
+        for k in range(v_start[j], v_start[j + 1]):
+            v += S[k] * speed[k]
+        accumulated[b] = v
+        w = wp.spatial_bottom(v)
+        cx = wp.transform_point(pose[b], com[b])
+        twist[b] = wp.spatial_vector(wp.spatial_top(v) + wp.cross(w, cx - orig[art]), w)
+
+
+@wp.kernel
+def _momentum_correction(
+    carried: wp.array[bool],
+    children: wp.array[int],
+    owners: wp.array[int],
+    flags: wp.array[int],
+    q_start: wp.array[int],
+    q: wp.array[float],
+    carried_q: wp.array[float],
+    mass: wp.array[float],
+    inertia: wp.array[wp.mat33],
+    com: wp.array[wp.vec3],
+    pose: wp.array[wp.transform],
+    body_v: wp.array[wp.spatial_vector],
+    origin: wp.array[wp.vec3],
+    carried_twist: wp.array[wp.spatial_vector],
+    inv_dt: float,
+    wrench: wp.array[wp.spatial_vector],
+):
+    """Start the step from the carried body momenta instead of the joint velocities at the new pose.
+
+    Adds the wrench M (V_carried - V) / dt, so the joint-space momentum the solve starts from is J^T M V_carried:
+    the previous step's body velocities projected onto the joints at the new pose. A projection never adds
+    kinetic energy, where the joint-space velocity-product terms of a long chain do.
+    """
+    j = wp.tid()
+    art = owners[j]
+    if art < 0 or not carried[art]:
+        return
+    b = children[j]
+    if (flags[b] & BodyFlags.KINEMATIC) != 0:
+        return
+    # Only a state this solver produced carries its twists: any edit to the joint's coordinates drops them.
+    for k in range(q_start[j], q_start[j + 1]):
+        if q[k] != carried_q[k]:
+            return
+    cx = wp.transform_point(pose[b], com[b])
+    arm = cx - origin[art]
+    v = body_v[b]
+    w = wp.spatial_bottom(v)
+    now = wp.spatial_vector(wp.spatial_top(v) + wp.cross(w, arm), w)
+    dv = carried_twist[b] - now
+    rot = wp.transform_get_rotation(pose[b])
+    f = mass[b] * wp.spatial_top(dv) * inv_dt
+    tau = wp.quat_rotate(rot, inertia[b] * wp.quat_rotate_inv(rot, wp.spatial_bottom(dv))) * inv_dt
+    # The wrench array holds the bias, the negative of an applied wrench, about the articulation origin.
+    wrench[b] = wrench[b] - wp.spatial_vector(f, wp.cross(arm, f) + tau)
 
 
 @wp.func
@@ -621,6 +748,8 @@ class RodMaterial:
         rows = {}
         self.loop_groups = {}
         loops = rods[joint_art[rods] < 0]
+        if np.any(model.joint_dof_dim.numpy()[loops, 0] == 0):
+            raise NotImplementedError("Steel does not yet support a loop-closing inextensible rod joint.")
         if loops_as_rows:
             # The solver enforces loop-closing rods as rows; the mass matrix keeps only the tree rods.
             loops = loops[:0]
@@ -632,7 +761,20 @@ class RodMaterial:
         spatial = np.zeros(model.articulation_count, dtype=bool)
         spatial[joint_art[tree & (kinds == JointType.ROD)]] = True
         spatial[joint_art[tree & ~np.isin(kinds, (JointType.FREE, JointType.ROD))]] = False
+        # An inextensible rod joint has three velocities, too few to span its link's COM twist.
+        inextensible = model.joint_dof_dim.numpy()[:, 0] == 0
+        spatial[joint_art[tree & (kinds == JointType.ROD) & inextensible]] = False
         self.world_twists = bool(np.any(spatial))
+        # Articulations with inextensible rod joints step from carried body momenta (see _momentum_correction).
+        carried = np.zeros(model.articulation_count, dtype=bool)
+        carried[joint_art[tree & (kinds == JointType.ROD) & inextensible]] = True
+        self.carried = bool(np.any(carried))
+        if self.carried:
+            self.carried_mask = wp.array(carried, dtype=bool, device=model.device)
+            self.carried_articulations = wp.array(np.flatnonzero(carried), dtype=int, device=model.device)
+            self.carried_twist = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
+            self.carried_accumulated = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
+            self.carried_q = wp.full(model.joint_coord_count, float("nan"), dtype=float, device=model.device)
         self.all_spatial = bool(np.all(spatial))
         self.spatial_mask = spatial
         if self.world_twists:
@@ -679,7 +821,9 @@ class RodMaterial:
                 continue
             size = int(sizes[art])
             if size:
-                rows.setdefault(size, []).append((r, groups[art], dof_start[j] - plan.articulation_dof_start[art]))
+                rows.setdefault(size, []).append(
+                    (r, groups[art], dof_start[j] - plan.articulation_dof_start[art], dof_start[j + 1] - dof_start[j])
+                )
         self.layout = {size: wp.array(layout, dtype=int, device=model.device) for size, layout in rows.items()}
 
     def write_loop_state(self, model, state, q, qd, joints=None):
@@ -719,6 +863,7 @@ class RodMaterial:
                 self.joints,
                 model.joint_q_start,
                 model.joint_qd_start,
+                model.joint_dof_dim,
                 model.joint_child,
                 model.body_com,
                 model.joint_X_c,
@@ -798,6 +943,79 @@ class RodMaterial:
             outputs=[augmented._body_f_s],
             device=m.device,
         )
+
+    def carried_bias(self, solver, state, augmented, dt):
+        """The bias of the carried articulations: gyroscopic and gravity only, plus the momentum correction."""
+        m = solver.model
+        wp.launch(
+            _cartesian_inertial_wrench,
+            dim=m.joint_count,
+            inputs=[
+                self.carried_mask,
+                m.joint_child,
+                m.joint_articulation,
+                m.body_mass,
+                m.body_inertia,
+                m.body_com,
+                state.body_q,
+                augmented._body_v_s,
+                solver._articulation_origin,
+                m.body_world,
+                m.gravity,
+                m.body_disable_gravity,
+            ],
+            outputs=[augmented._body_f_s],
+            device=m.device,
+        )
+        wp.launch(
+            _momentum_correction,
+            dim=m.joint_count,
+            inputs=[
+                self.carried_mask,
+                m.joint_child,
+                m.joint_articulation,
+                m.body_flags,
+                m.joint_q_start,
+                state.joint_q,
+                self.carried_q,
+                m.body_mass,
+                m.body_inertia,
+                m.body_com,
+                state.body_q,
+                augmented._body_v_s,
+                solver._articulation_origin,
+                self.carried_twist,
+                1.0 / dt,
+            ],
+            outputs=[augmented._body_f_s],
+            device=m.device,
+        )
+
+    def carry(self, solver, state, augmented, result):
+        """Record the step's body twists (start-of-step basis, new joint velocities) and the state they go with."""
+        m = solver.model
+        wp.launch(
+            _carry_twists,
+            dim=len(self.carried_articulations),
+            inputs=[
+                self.carried_articulations,
+                solver._dynamics_art_active,
+                m._fk_joint_order,
+                m.articulation_start,
+                solver._articulation_joint_end,
+                m.joint_parent,
+                m.joint_child,
+                m.joint_qd_start,
+                m.body_com,
+                solver._articulation_origin,
+                augmented._joint_S_s,
+                result.joint_qd,
+                state.body_q,
+            ],
+            outputs=[self.carried_accumulated, self.carried_twist],
+            device=m.device,
+        )
+        wp.copy(self.carried_q, result.joint_q)
 
     def integrate(self, solver, state, augmented, result, velocity, dt):
         m = solver.model
@@ -892,6 +1110,7 @@ class RodMaterial:
                     self.joints,
                     model.joint_q_start,
                     model.joint_qd_start,
+                    model.joint_dof_dim,
                     state.joint_q,
                     model.joint_rest_q,
                     model.joint_target_ke,
