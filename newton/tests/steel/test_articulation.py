@@ -1222,6 +1222,7 @@ class TestPreeliminationKernels(unittest.TestCase):
                 arr([[0.0, 0.0, 0.0, 0.0, 0.0, 1.0]], wp.spatial_vector),
                 wp.zeros(1, dtype=wp.vec3, device=device),
                 wp.zeros(2, dtype=wp.vec3, device=device),  # body_rel_t
+                wp.zeros(1, dtype=wp.vec3, device=device),  # articulation_ref_t
                 arr([-1, -1]),  # body_to_articulation: world-pose geometry
                 arr([0]),  # articulation_start
                 arr([0]),  # joint_child
@@ -4253,17 +4254,17 @@ def test_revolute_loop_from_fixed_root_matches_world_parent(test, device):
             joint = add_loop_joint()
         return _run_closure(b, joint, device, steps=50, solve_mode="serial")[2]
 
-    # The fixed-root closure takes its gap from root-relative poses and the world-parent one from world poses: the two
-    # agree to float32 rounding, which this out-of-reach closure amplifies to a few 1e-5 m over 50 steps.
-    np.testing.assert_allclose(run(parent=0), run(parent=-1), atol=1.0e-4)
+    # Both closures measure their gap from the articulation's reference point (the fixed root's joint_X_p).
+    np.testing.assert_allclose(run(parent=0), run(parent=-1), atol=1.0e-6)
 
 
-def _build_closure_ladder(device, offsets, units=4):
+def _build_closure_ladder(device, offsets, units=4, world_closure=False):
     """A hinged spine whose links each carry two two-link leaf chains, closed tip to tip by loop joints.
 
     Each unit's tips are closed to each other (REVOLUTE on even units, BALL on odd ones), and the left tips of
     neighbouring units by BALL closures. One fixed-base copy per entry of ``offsets`` [m]. The planar layout leaves
-    several closure rows nearly degenerate (``|J|`` around ``1e-4`` before normalization).
+    several closure rows nearly degenerate (``|J|`` around ``1e-4`` before normalization). ``world_closure`` also
+    pins the last unit's right tip to the world with a BALL closure, at an anchor that ``offsets`` move exactly.
     """
     template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     joints, tips, parent = [], [], -1
@@ -4313,6 +4314,16 @@ def _build_closure_ladder(device, offsets, units=4):
             template.add_joint_revolute(left, right, axis=wp.vec3(1.0, 0.0, 0.0), parent_xform=xa, child_xform=xb)
         if u + 1 < units:
             template.add_joint_ball(left, tips[u + 1][0], parent_xform=xa, child_xform=xn)
+    if world_closure:
+        # The right tip of the last unit rests at (-0.2, 0, 1.9 - 0.3 * (units - 1)); its anchor 0.2 m along x sits on
+        # the spine axis, at a point float32 holds exactly after any of the test offsets.
+        tip_z = 1.9 - 0.3 * (units - 1)
+        template.add_joint_ball(
+            -1,
+            tips[-1][1],
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, round(tip_z * 64.0) / 64.0), wp.quat_identity()),
+            child_xform=xb,
+        )
     builder = newton.ModelBuilder()
     builder.replicate(template, len(offsets), xforms=[wp.transform(wp.vec3(*o), wp.quat_identity()) for o in offsets])
     return builder.finalize(device=device)
@@ -4349,6 +4360,7 @@ def _float64_closure_gaps(model, joint_q):
         jt = rot(axis[qd_start[j]].astype(np.float64), q[q_start[j]])
         body[child[j]] = X_wp @ tf(X_p[j]) @ jt @ np.linalg.inv(tf(X_c[j]))
     gaps = []
+    body[-1] = np.eye(4)
     for j in range(model.joint_count):
         if art[j] < 0:
             a = (body[parent[j]] @ tf(X_p[j]))[:3, 3]
@@ -4397,6 +4409,51 @@ def test_closure_rows_are_translation_invariant(test, device):
         state.assign(out)
 
 
+def test_world_parent_closure_rows_are_translation_invariant(test, device):
+    """A closure to the world steps alike at the origin and far from it.
+
+    The ladder's last tip is pinned to a world anchor that the world offset moves exactly. Its rows measure the gap
+    and lever arms from the articulation's reference point, the fixed root's ``joint_X_p``, so the world anchor and
+    the tip both lose the offset before any rounding. From world poses, the tip's position 256 m out carried up to
+    3e-5 m of float32 rounding (one ulp of 256 m) into the closure gap, several times the gap the closure holds.
+    """
+    offset = (256.0, 256.0, 0.0)
+    model = _build_closure_ladder(device, offsets=[(0.0, 0.0, 0.0), offset], world_closure=True)
+    solver = SolverSteel(
+        model, iterations=8, update_mass_matrix_interval=1, deterministic=wp.DeterministicMode.RUN_TO_RUN
+    )
+    state, out = model.state(), model.state()
+    n_coords, n_dofs = model.joint_coord_count // 2, model.joint_dof_count // 2
+    qd = np.random.default_rng(5).uniform(-0.5, 0.5, n_dofs).astype(np.float32)
+    state.joint_qd.assign(np.concatenate([qd, qd]))
+    control = model.control()
+    world_closures = np.flatnonzero(solver._connect_body_p_np < 0)
+    test.assertEqual(len(world_closures), 2)
+    largest_gap = 0.0
+    for _ in range(6):
+        q, v = state.joint_q.numpy(), state.joint_qd.numpy()
+        q[n_coords:], v[n_dofs:] = q[:n_coords], v[:n_dofs]
+        state.joint_q.assign(q)
+        state.joint_qd.assign(v)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        solver.step(state, out, control, None, 1.0 / 120.0)
+        slots = solver._connect_slot.numpy()[world_closures]
+        inv_norm = solver._connect_row_inv_norm.numpy()[world_closures, :3]
+        phi = solver._phi.numpy()
+        # The rows store the gap divided by |J|; |J| itself carries the world position's rounding, so compare the gap.
+        gap = [phi[w, slots[w] : slots[w] + 3] / inv_norm[w] for w in range(2)]
+        largest_gap = max(largest_gap, float(np.abs(gap[0]).max()))
+        np.testing.assert_allclose(gap[1], gap[0], rtol=0.0, atol=1.0e-6)
+        qd_out = out.joint_qd.numpy()
+        np.testing.assert_allclose(
+            qd_out[n_dofs:], qd_out[:n_dofs], rtol=0.0, atol=2.0e-2 * np.abs(qd_out[:n_dofs]).max()
+        )
+        gaps = _float64_closure_gaps(model, out.joint_q.numpy()).reshape(2, -1)
+        np.testing.assert_allclose(gaps[1], gaps[0], rtol=0.0, atol=1.0e-6)
+        state.assign(out)
+    test.assertGreater(largest_gap, 1.0e-6)  # the closure opened, so the rows compared real gaps
+
+
 class TestSteelRevoluteLoop(unittest.TestCase):
     pass
 
@@ -4414,6 +4471,7 @@ for _name in (
     "test_revolute_loop_realigns_to_the_nearer_axis_direction",
     "test_revolute_loop_from_fixed_root_matches_world_parent",
     "test_closure_rows_are_translation_invariant",
+    "test_world_parent_closure_rows_are_translation_invariant",
 ):
     add_function_test(TestSteelRevoluteLoop, _name, globals()[_name], devices=get_cuda_test_devices())
 

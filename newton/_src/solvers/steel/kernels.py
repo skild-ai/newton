@@ -1513,42 +1513,58 @@ def eval_body_relative_poses(
     body_q: wp.array[wp.transform],
     # outputs
     body_rel_t: wp.array[wp.vec3],
+    articulation_ref_t: wp.array[wp.vec3],
 ):
-    """Compose each articulation's body positions relative to its root body position.
+    """Compose each articulation's body positions relative to a reference point of its root joint.
 
-    ``body_rel_t[b]`` is body ``b``'s origin measured from the root body of the articulation's
-    first joint, in world orientation. The forward kinematics composes world poses, so a body
-    far from the world origin carries the float32 rounding of its world position (about
-    ``|x| * 6e-8`` per composition), and the difference of two nearby points, such as a loop
-    closure's gap, inherits it in full. Composing from the root keeps those differences at the
-    precision of the articulation's own size. Rotations do not depend on the world position, so
-    the chain takes them from ``body_q`` and only the translations are stored. Joints run in
-    articulation order, parents before children, as in :func:`eval_rigid_fk_kinematics`. One
-    thread per articulation.
+    ``body_rel_t[b]`` is body ``b``'s origin measured from ``articulation_ref_t[art]`` [m], in world
+    orientation. The forward kinematics composes world poses, so a body far from the world origin
+    carries the float32 rounding of its world position (about ``|x| * 6e-8`` per composition), and
+    the difference of two nearby points, such as a loop closure's gap, inherits it in full.
+    Composing from the reference keeps those differences at the precision of the articulation's
+    own size. The reference is a point the model or state holds exactly: for a root joint to the
+    world, its parent frame origin moved by the joint's own translation (``joint_X_p`` for a fixed
+    or hinged base, the free joint's position for a floating base); for a root joint to a body
+    outside the tree, that body's position. World anchors and other articulations' bodies then
+    subtract it without rounding a far-away position. Rotations do not depend on the world
+    position, so the chain takes them from ``body_q`` and only the translations are stored. Joints
+    run in articulation order, parents before children, as in :func:`eval_rigid_fk_kinematics`.
+    One thread per articulation.
     """
     art = wp.tid()
     start = articulation_start[art]
     end = articulation_joint_end[art]
     if start >= end:
         return
-    # The reference point: the root body's position, composed the same way as the forward kinematics.
-    root_t = wp.transform_get_translation(body_q[joint_child[start]])
-    if joint_parent[start] < 0:
-        X_root = (
-            joint_X_p[start]
-            * jcalc_transform(
-                joint_type[start],
-                joint_axis,
-                joint_qd_start[start],
-                joint_dof_dim[start, 0],
-                joint_dof_dim[start, 1],
-                joint_q,
-                joint_q_start[start],
-            )
-            * wp.transform_inverse(joint_X_c[start])
+    root_parent = joint_parent[start]
+    X_j = jcalc_transform(
+        joint_type[start],
+        joint_axis,
+        joint_qd_start[start],
+        joint_dof_dim[start, 0],
+        joint_dof_dim[start, 1],
+        joint_q,
+        joint_q_start[start],
+    )
+    X_pj = joint_X_p[start]
+    X_cinv = wp.transform_inverse(joint_X_c[start])
+    if root_parent < 0:
+        ref_t = wp.transform_get_translation(X_pj) + wp.quat_rotate(
+            wp.transform_get_rotation(X_pj), wp.transform_get_translation(X_j)
         )
-        root_t = wp.transform_get_translation(X_root)
-    for i in range(start, end):
+        # The root body's offset from the reference: only the child-frame lever, rotated by the parent frame and joint.
+        root_rel = wp.quat_rotate(
+            wp.transform_get_rotation(X_pj) * wp.transform_get_rotation(X_j), wp.transform_get_translation(X_cinv)
+        )
+    else:
+        X_parent = body_q[root_parent]
+        ref_t = wp.transform_get_translation(X_parent)
+        root_rel = wp.quat_rotate(
+            wp.transform_get_rotation(X_parent), wp.transform_get_translation(X_pj * X_j * X_cinv)
+        )
+    articulation_ref_t[art] = ref_t
+    body_rel_t[joint_child[start]] = root_rel
+    for i in range(start + 1, end):
         parent = joint_parent[i]
         X_wpj = joint_X_p[i]
         in_tree = False
@@ -1557,10 +1573,10 @@ def eval_body_relative_poses(
         if in_tree:
             X_wpj = wp.transform(body_rel_t[parent], wp.transform_get_rotation(body_q[parent])) * X_wpj
         else:
-            # A root joint: its parent (the world or a body outside the tree) is in world coordinates.
+            # Another root joint: its parent (the world or a body outside the tree) is in world coordinates.
             if parent >= 0:
                 X_wpj = body_q[parent] * X_wpj
-            X_wpj = wp.transform(wp.transform_get_translation(X_wpj) - root_t, wp.transform_get_rotation(X_wpj))
+            X_wpj = wp.transform(wp.transform_get_translation(X_wpj) - ref_t, wp.transform_get_rotation(X_wpj))
         X_j = jcalc_transform(
             joint_type[i],
             joint_axis,
@@ -1570,10 +1586,7 @@ def eval_body_relative_poses(
             joint_q,
             joint_q_start[i],
         )
-        if i == start:
-            body_rel_t[joint_child[i]] = wp.vec3(0.0)
-        else:
-            body_rel_t[joint_child[i]] = wp.transform_get_translation(X_wpj * X_j * wp.transform_inverse(joint_X_c[i]))
+        body_rel_t[joint_child[i]] = wp.transform_get_translation(X_wpj * X_j * wp.transform_inverse(joint_X_c[i]))
 
 
 @wp.kernel(module=_KINEMATICS_KERNEL_MODULE, enable_backward=False)
@@ -3941,6 +3954,31 @@ def _walk_has_free_dof(
     return False
 
 
+@wp.func
+def _closure_anchor_parts(
+    art: int,
+    body: int,
+    anchor: wp.vec3,
+    body_q: wp.array[wp.transform],
+    body_rel_t: wp.array[wp.vec3],
+    articulation_ref_t: wp.array[wp.vec3],
+    body_to_articulation: wp.array[int],
+):
+    """Split a closure anchor's world position [m] into a reference point and a small offset.
+
+    A body of articulation ``art`` takes the articulation's reference and its root-relative
+    position (:func:`eval_body_relative_poses`); the world (``body < 0``) takes the anchor
+    itself; any other body takes its ``body_q`` position. The offset is the rest.
+    """
+    if body < 0:
+        return anchor, wp.vec3(0.0, 0.0, 0.0)
+    X = body_q[body]
+    offset = wp.quat_rotate(wp.transform_get_rotation(X), anchor)
+    if body_to_articulation[body] == art:
+        return articulation_ref_t[art], body_rel_t[body] + offset
+    return wp.transform_get_translation(X), offset
+
+
 @wp.kernel
 def populate_connect_J_for_size(
     articulation_dof_start: wp.array[int],
@@ -3967,6 +4005,7 @@ def populate_connect_J_for_size(
     joint_S_s: wp.array[wp.spatial_vector],
     articulation_origin: wp.array[wp.vec3],
     body_rel_t: wp.array[wp.vec3],
+    articulation_ref_t: wp.array[wp.vec3],
     body_to_articulation: wp.array[int],
     articulation_start: wp.array[int],
     joint_child: wp.array[int],
@@ -4012,11 +4051,15 @@ def populate_connect_J_for_size(
     ``phi`` and target). ``connect_row_inv_norm`` keeps each row's factor (zero when
     inert) so a solved impulse maps back to a force.
 
-    When both bodies belong to the closure's articulation, the gap and lever arms come from the
-    root-relative positions ``body_rel_t`` (see :func:`eval_body_relative_poses`), not from
-    ``body_q`` translations. The world poses of
-    an articulation far from the origin carry the float32 rounding of its position, which the
-    gap of two nearby anchors would inherit and the normalization above would amplify.
+    The gap and lever arms are measured from the articulation's reference point
+    ``articulation_ref_t`` (see :func:`eval_body_relative_poses`), not from world positions.
+    Each anchor is a reference plus a small offset: a body of the closure's articulation takes
+    the articulation reference and its root-relative position ``body_rel_t``; the world anchor
+    of a world-parent closure is its own reference; a body outside the articulation takes its
+    ``body_q`` position. The large parts are subtracted first, which is exact for nearby points,
+    and only then the offsets are added. The world poses of an articulation far from the origin
+    carry the float32 rounding of its position, which the gap of two nearby anchors would
+    inherit and the normalization above would amplify.
     """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
@@ -4036,35 +4079,35 @@ def populate_connect_J_for_size(
         prescribed = connect_parent_prescribed[k] != 0
         joint = connect_joint[k]
         anchor_p = wp.transform_get_translation(joint_X_p[joint])
-        p_a = anchor_p
         v_a = wp.vec3(0.0, 0.0, 0.0)
-        if body_p >= 0:
-            p_a = wp.transform_point(body_q[body_p], anchor_p)
-            if prescribed:
-                # The anchor velocity of a prescribed parent comes from its body twist.
-                twist = body_qd[body_p]
-                x_com = wp.transform_point(body_q[body_p], body_com[body_p])
-                v_a = wp.spatial_top(twist) + wp.cross(wp.spatial_bottom(twist), p_a - x_com)
-        p_b = wp.transform_point(body_q[body_c], wp.transform_get_translation(joint_X_c[joint]))
+        if body_p >= 0 and prescribed:
+            # The anchor velocity of a prescribed parent comes from its body twist.
+            twist = body_qd[body_p]
+            lever = wp.quat_rotate(wp.transform_get_rotation(body_q[body_p]), anchor_p - body_com[body_p])
+            v_a = wp.spatial_top(twist) + wp.cross(wp.spatial_bottom(twist), lever)
+        # Each anchor as a large reference part plus a small offset; the closure's articulation
+        # frame is its reference point (world positions when the child is not in it).
+        frame_t = wp.vec3(0.0, 0.0, 0.0)
         origin = articulation_origin[art]
-        rel_a = p_a - origin
-        rel_b = p_b - origin
-        delta = p_a - p_b
-        same_articulation = False
-        if body_p >= 0:
-            same_articulation = body_to_articulation[body_p] == art and body_to_articulation[body_c] == art
-        if same_articulation:
-            # Both sides in the closure's articulation: gap and lever arms from root-relative poses,
-            # which do not carry the float32 rounding of the articulation's world position.
+        if body_to_articulation[body_c] == art:
+            frame_t = articulation_ref_t[art]
             root = joint_child[articulation_start[art]]
-            origin_rel = body_rel_t[root] + wp.quat_rotate(wp.transform_get_rotation(body_q[root]), body_com[root])
-            q_a = body_rel_t[body_p] + wp.quat_rotate(wp.transform_get_rotation(body_q[body_p]), anchor_p)
-            q_b = body_rel_t[body_c] + wp.quat_rotate(
-                wp.transform_get_rotation(body_q[body_c]), wp.transform_get_translation(joint_X_c[joint])
-            )
-            rel_a = q_a - origin_rel
-            rel_b = q_b - origin_rel
-            delta = q_a - q_b
+            origin = body_rel_t[root] + wp.quat_rotate(wp.transform_get_rotation(body_q[root]), body_com[root])
+        big_a, small_a = _closure_anchor_parts(
+            art, body_p, anchor_p, body_q, body_rel_t, articulation_ref_t, body_to_articulation
+        )
+        big_b, small_b = _closure_anchor_parts(
+            art,
+            body_c,
+            wp.transform_get_translation(joint_X_c[joint]),
+            body_q,
+            body_rel_t,
+            articulation_ref_t,
+            body_to_articulation,
+        )
+        rel_a = (big_a - frame_t) + small_a - origin
+        rel_b = (big_b - frame_t) + small_b - origin
+        delta = (big_a - big_b) + (small_a - small_b)
         at_midpoint = (
             not prescribed
             and _walk_has_free_dof(body_p, body_to_joint, joint_ancestor, joint_qd_start, kinematic_dof_mask)
