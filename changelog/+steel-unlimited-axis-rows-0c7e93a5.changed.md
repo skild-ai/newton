@@ -1,0 +1,1 @@
+Skip `SolverSteel` joint-limit rows for axes at the builder's unlimited bounds (`|limit| >= MAXVAL`) and joint velocity-limit rows for limits at or above the builder default of 1e6, which cost a row pair per DOF every substep. The pre-solve velocity prescale and the fused velocity clamp of driven DOFs still apply such a limit.

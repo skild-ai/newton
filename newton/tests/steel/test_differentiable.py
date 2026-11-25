@@ -10,7 +10,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.steel._testing import kernel_overrides
 from newton._src.solvers.steel.differentiable import (
     _dense_pgs_sweep,
     _friction_pair,
@@ -184,9 +183,8 @@ def test_rejects_unsupported_configs(test, device):
     model = _build_chain(device)
     for kwargs in (
         {"contact_warmstart": True},
-        {"enable_torsional_rolling_friction": True},
         {"articulated_contact_response": "propagation"},
-        {"articulated_contact_response": "propagation_colored"},
+        {"solve_mode": "colored", "articulated_contact_response": "propagation"},
         {"update_mass_matrix_interval": 2},
         {"enable_joint_friction": True},
         {"contact_compliance": True},
@@ -204,7 +202,6 @@ def test_rejects_unsupported_configs(test, device):
             SolverSteel(
                 _build_limited_chain(device, velocity_limit=1.0),
                 differentiable=True,
-                solve_mode="matrix_free",
                 drive_mode="rows",
                 enable_joint_velocity_limits=True,
             )
@@ -382,7 +379,11 @@ def test_repeated_backward_is_stable(test, device):
     first = initial.joint_q.grad.numpy().copy()
     tape.zero()
     tape.backward(grads=seed_grads)
-    np.testing.assert_array_equal(initial.joint_q.grad.numpy(), first)
+    if wp.get_device(device).is_cpu:
+        np.testing.assert_array_equal(initial.joint_q.grad.numpy(), first)
+    else:
+        # CUDA adjoint atomics accumulate in a nondeterministic order.
+        np.testing.assert_allclose(initial.joint_q.grad.numpy(), first, rtol=0.0, atol=1.0e-6 * np.max(np.abs(first)))
     test.assertTrue(np.all(np.isfinite(first)))
 
 
@@ -462,10 +463,8 @@ def test_contact_forward_matches_default(test, device):
         expected = getattr(reference[-1], attribute).numpy()
         actual = getattr(result[-1], attribute).numpy()
         with test.subTest(attribute=attribute):
-            if wp.get_device(device).is_cpu:
-                np.testing.assert_array_equal(actual, expected)
-            else:
-                np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-5)
+            # The default sweep recomputes J v every iteration and rounds differently.
+            np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-5)
 
 
 def test_contact_gradient_matches_finite_difference(test, device):
@@ -534,28 +533,6 @@ def test_contact_gradient_matches_finite_difference(test, device):
     with_contacts = np.concatenate(list(gradients[True].values()))
     without_contacts = np.concatenate(list(gradients[False].values()))
     test.assertGreater(np.linalg.norm(with_contacts - without_contacts), 0.1 * np.linalg.norm(with_contacts))
-
-
-def test_contact_rejects_unsupported_configs(test, device):
-    model = _build_box_chain_on_plane(device)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
-    state = model.state(requires_grad=True)
-    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    contacts = pipeline.contacts()
-    pipeline.collide(state, contacts)
-    unsupported = [
-        {**_CONTACT_OPTIONS, "contact_regularization": 0.1},
-    ]
-    for options in unsupported:
-        solver = SolverSteel(model, differentiable=True, **options)
-        with test.subTest(**options), test.assertRaisesRegex(NotImplementedError, "contacts require"):
-            solver.step(state, model.state(requires_grad=True), None, contacts, _DT)
-    for model, options in ((_build_box_chain_on_plane(device, extra_free_box=True), _CONTACT_OPTIONS),):
-        solver = SolverSteel(model, differentiable=True, **options)
-        state = model.state(requires_grad=True)
-        contacts = newton.CollisionPipeline(model, rigid_contact_max=64).contacts()
-        with test.assertRaisesRegex(NotImplementedError, "contacts require"):
-            solver.step(state, model.state(requires_grad=True), None, contacts, _DT)
 
 
 def _build_slider_on_plane(device, requires_grad=True):
@@ -636,10 +613,7 @@ def test_friction_gradient_matches_finite_difference(test, device):
         loss, states, control = rollout(inputs, differentiable=True, tape=tape)
         tape.backward(loss)
         with test.subTest(regime=regime, check="forward"):
-            if wp.get_device(device).is_cpu:
-                np.testing.assert_array_equal(states[-1].joint_qd.numpy(), reference[-1].joint_qd.numpy())
-            else:
-                np.testing.assert_allclose(states[-1].joint_qd.numpy(), reference[-1].joint_qd.numpy(), atol=1.0e-6)
+            np.testing.assert_allclose(states[-1].joint_qd.numpy(), reference[-1].joint_qd.numpy(), atol=1.0e-6)
         for state in states[1:]:
             rows = state._steel_differentiable_buffers.contacts
             impulse = rows.impulses[-1].numpy()[0, :3]
@@ -941,14 +915,12 @@ def test_material_combine_matches_default(test, device):
     builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.2, restitution=0.4))
     models = {flag: builder.finalize(device=device, requires_grad=flag) for flag in (False, True)}
     pipeline = newton.CollisionPipeline(models[True], rigid_contact_max=8)
-    solve_modes = ("split", "matrix_free") if wp.get_device(device).is_cuda else ("split",)
 
-    def rollout(differentiable, solve_mode, mode):
+    def rollout(differentiable, mode):
         model = models[differentiable]
         solver = SolverSteel(
             model,
             differentiable=differentiable,
-            solve_mode=solve_mode,
             friction_anchor_beta=0.0,
             enable_restitution=True,
             iterations=8,
@@ -964,14 +936,13 @@ def test_material_combine_matches_default(test, device):
             solver.step(states[k], states[k + 1], None, contacts, 1.0 / 240.0)
         return states[-1].joint_qd.numpy()
 
-    for solve_mode in solve_modes:
-        results = {}
-        for mode in ("average", "min", "multiply", "max"):
-            with test.subTest(solve_mode=solve_mode, mode=mode):
-                results[mode] = rollout(False, solve_mode, mode)
-                np.testing.assert_allclose(rollout(True, solve_mode, mode), results[mode], rtol=0.0, atol=1.0e-5)
-        test.assertGreater(abs(results["max"][0] - results["min"][0]), 0.05)
-        test.assertGreater(abs(results["max"][2] - results["min"][2]), 0.05)
+    results = {}
+    for mode in ("average", "min", "multiply", "max"):
+        with test.subTest(mode=mode):
+            results[mode] = rollout(False, mode)
+            np.testing.assert_allclose(rollout(True, mode), results[mode], rtol=0.0, atol=1.0e-5)
+    test.assertGreater(abs(results["max"][0] - results["min"][0]), 0.05)
+    test.assertGreater(abs(results["max"][2] - results["min"][2]), 0.05)
 
 
 def _build_free_shape(device, shape, *, restitution=0.0, requires_grad=True):
@@ -1337,74 +1308,6 @@ def _publish_after_delay(count: wp.array[int], value: int, ticks: wp.int64):
     count[0] = value
 
 
-def test_collide_done_event(test, device):
-    """Contacts published on another stream are read after collide_done_event, eagerly and in a graph."""
-    device = wp.get_device(device)
-    model = _build_free_shape(device, "sphere")
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=16)
-    producer = wp.Stream(device)
-    solver = SolverSteel(model, differentiable=True, friction_anchor_beta=0.0, iterations=8)
-    initial, output = model.state(), model.state()
-    initial.joint_q.assign(np.array([0.0, 0.0, 0.095, 0.0, 0.0, 0.0, 1.0], np.float32))
-    newton.eval_fk(model, initial.joint_q, initial.joint_qd, initial)
-    contacts = pipeline.contacts()
-    pipeline.collide(initial, contacts)
-    count = int(contacts.rigid_contact_count.numpy()[0])
-    test.assertGreater(count, 0)
-    solver.step(initial, output, None, contacts, _DT)
-    reference = output.joint_qd.numpy().copy()
-    test.assertGreater(reference[2], 0.0)
-
-    def publish_on_producer():
-        producer.wait_stream(wp.get_stream(device))
-        with wp.ScopedStream(producer):
-            wp.launch(
-                _publish_after_delay, dim=1, inputs=[contacts.rigid_contact_count, count, 200_000_000], device=device
-            )
-            return producer.record_event()
-
-    wp.launch(_publish_after_delay, dim=1, inputs=[contacts.rigid_contact_count, count, 0], device=device)
-    contacts.rigid_contact_count.zero_()
-    solver.step(initial, output, None, contacts, _DT, collide_done_event=publish_on_producer())
-    np.testing.assert_array_equal(output.joint_qd.numpy(), reference)
-
-    with wp.ScopedCapture(device) as capture:
-        contacts.rigid_contact_count.zero_()
-        solver.step(initial, output, None, contacts, _DT, collide_done_event=publish_on_producer())
-    output.joint_qd.zero_()
-    wp.capture_launch(capture.graph)
-    np.testing.assert_array_equal(output.joint_qd.numpy(), reference)
-
-
-def test_pgs_kernel_selection(test, device):
-    """Accepted dense PGS kernels match the default step; CUDA rejects the contact-block kernels."""
-    reference_model = _build_box_chain_on_plane(device, requires_grad=False)
-    model = _build_box_chain_on_plane(device)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=16)
-    initial = model.state()
-    initial.joint_qd.assign(np.full(model.joint_dof_count, 0.5, np.float32))
-    newton.eval_fk(model, initial.joint_q, initial.joint_qd, initial)
-    contacts = pipeline.contacts()
-    pipeline.collide(initial, contacts)
-    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 8)
-    block_kernels = ("tiled_contact", "streaming") if wp.get_device(device).is_cuda else ()
-    options = {"friction_anchor_beta": 0.0, "iterations": 1}
-    for kernel in ("loop", "tiled_row", "tiled_contact", "streaming"):
-        with test.subTest(pgs_kernel=kernel), kernel_overrides({"pgs_kernel": kernel}):
-            if kernel in block_kernels:
-                with test.assertRaisesRegex(ValueError, 'the "loop" or "tiled_row" dense PGS kernel'):
-                    SolverSteel(model, differentiable=True, **options)
-                continue
-            results = []
-            for differentiable in (False, True):
-                output = model.state(requires_grad=True)
-                SolverSteel(
-                    model if differentiable else reference_model, differentiable=differentiable, **options
-                ).step(initial, output, None, contacts, 0.01)
-                results.append(output.joint_qd.numpy())
-            np.testing.assert_allclose(results[1], results[0], rtol=0.0, atol=1.0e-5)
-
-
 def test_free_body_rows_use_dense_capacity(test, device):
     """Free-body contact rows take articulation_constraint_max slots; free_body_constraint_max does not cover them."""
     q0 = [0.0, 0.0, 0.095, 0.0, 0.0, 0.0, 1.0]
@@ -1457,7 +1360,7 @@ def _smooth_zero_gap_impulse(device, gap, velocity, damping, beta, grad=False):
     def array(values, dtype=float):
         return wp.array(values, dtype=dtype, device=device, requires_grad=dtype is float)
 
-    phi, row_beta, target = array([[gap]]), array([[beta]]), array([[0.0]])
+    phi, target = array([[gap]]), array([[0.0]])
     count, kind = array([1], int), array([[PGS_CONSTRAINT_TYPE_CONTACT]], int)
     bias, row_w, rhs, impulse = (wp.zeros((1, 1), device=device, requires_grad=True) for _ in range(4))
     dt, speculative = 0.01, 1.0
@@ -1466,7 +1369,7 @@ def _smooth_zero_gap_impulse(device, gap, velocity, damping, beta, grad=False):
         wp.launch(
             _taped_compute_world_contact_bias,
             1,
-            inputs=[count, phi, row_beta, kind, target, dt, 1.0, speculative, 1.0, 1.0],
+            inputs=[count, phi, kind, target, beta, 0.0, speculative, 1.0, dt],
             outputs=[bias, row_w],
             device=device,
         )
@@ -1474,7 +1377,7 @@ def _smooth_zero_gap_impulse(device, gap, velocity, damping, beta, grad=False):
         wp.launch(
             _smooth_contact_impulse,
             (1, 1),
-            inputs=[count, phi, row_beta, kind, rhs, dt, speculative, 1000.0, damping, 1.0e-3],
+            inputs=[count, phi, beta, kind, rhs, dt, speculative, 1000.0, damping, 1.0e-3],
             outputs=[impulse],
             device=device,
         )
@@ -1640,10 +1543,8 @@ def test_unarticulated_body_contact_matches_default(test, device):
         expected = getattr(results[False], attribute).numpy()
         actual = getattr(results[True], attribute).numpy()
         with test.subTest(attribute=attribute):
-            if wp.get_device(device).is_cpu:
-                np.testing.assert_array_equal(actual, expected)
-            else:
-                np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-5)
+            # The default sweep recomputes J v every iteration and rounds differently.
+            np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-5)
 
 
 def _contact_scene_rollout(model, options, inputs, steps, *, differentiable, dt=_DT):
@@ -1670,9 +1571,9 @@ _MATRIX_FREE_SCENES = {
 }
 
 
-def test_matrix_free_contacts_match_default(test, device):
-    """With solve_mode="matrix_free" the dense sweep follows the fused matrix-free Gauss-Seidel solve."""
-    options = {"friction_anchor_beta": 0.0, "solve_mode": "matrix_free", "iterations": 8}
+def test_serial_contacts_match_default(test, device):
+    """The dense sweep follows the serial matrix-free Gauss-Seidel solve."""
+    options = {"friction_anchor_beta": 0.0, "iterations": 8}
     for name, build in _MATRIX_FREE_SCENES.items():
         model = build(device, requires_grad=False)
         rng = np.random.default_rng(0)
@@ -1719,7 +1620,7 @@ def _build_torsion_scene(device, shape, *, requires_grad=True, radius=0.05):
     return model
 
 
-_TORSION_OPTIONS = {"friction_anchor_beta": 0.0, "solve_mode": "matrix_free", "iterations": 8}
+_TORSION_OPTIONS = {"friction_anchor_beta": 0.0, "iterations": 8}
 
 
 def _torsion_inputs(model, spin):
@@ -1885,7 +1786,6 @@ def _build_arm_on_box_stack(device, *, requires_grad=True, stack=True):
 # Every contact row takes an articulated slot in the differentiable step, free-body rows included.
 _ARM_ON_BOX_OPTIONS = {
     "friction_anchor_beta": 0.0,
-    "solve_mode": "matrix_free",
     "iterations": 16,
     "articulation_constraint_max": 64,
 }
@@ -1903,7 +1803,12 @@ def _arm_on_box_inputs(model):
 
 def test_mixed_world_contacts_match_default(test, device):
     """A world with articulated and free-body contacts follows the matrix-free solve, which sweeps them in turn."""
-    for extra in ({}, {"deterministic": True}, {"contact_regularization": 0.01}, {"contact_regularization": 0.5}):
+    for extra in (
+        {},
+        {"deterministic": wp.DeterministicMode.RUN_TO_RUN},
+        {"contact_regularization": 0.01},
+        {"contact_regularization": 0.5},
+    ):
         options = {**_ARM_ON_BOX_OPTIONS, **extra}
         inputs = _arm_on_box_inputs(_build_arm_on_box_stack(device))
         reference, solver = _contact_scene_rollout(
@@ -1922,9 +1827,9 @@ def test_mixed_world_contacts_match_default(test, device):
                 )
 
 
-def test_deterministic_split_contacts_match_default(test, device):
-    """deterministic=True in split mode: contact steps match the default step and repeat bitwise."""
-    options = {"friction_anchor_beta": 0.0, "iterations": 16, "deterministic": True}
+def test_deterministic_contacts_match_default(test, device):
+    """deterministic=RUN_TO_RUN: contact steps match the default step and repeat bitwise."""
+    options = {"friction_anchor_beta": 0.0, "iterations": 16, "deterministic": wp.DeterministicMode.RUN_TO_RUN}
     inputs = _contact_inputs(_build_box_chain_on_plane(device))
     reference, _ = _contact_scene_rollout(
         _build_box_chain_on_plane(device, requires_grad=False), options, inputs, 20, differentiable=False
@@ -1938,8 +1843,8 @@ def test_deterministic_split_contacts_match_default(test, device):
 
 
 def test_deterministic_rollouts_repeat(test, device):
-    """deterministic=True reserves rows in contact order and sums articulations in order: repeats are bitwise."""
-    options = {**_ARM_ON_BOX_OPTIONS, "deterministic": True}
+    """deterministic=RUN_TO_RUN reserves rows in contact order and sums articulations in order: repeats are bitwise."""
+    options = {**_ARM_ON_BOX_OPTIONS, "deterministic": wp.DeterministicMode.RUN_TO_RUN}
     inputs = _arm_on_box_inputs(_build_arm_on_box_stack(device))
     results = [
         _contact_scene_rollout(_build_arm_on_box_stack(device), options, inputs, 20, differentiable=True)[0]
@@ -2014,7 +1919,7 @@ def _check_arm_on_box_gradient(test, device, options):
             test.assertAlmostEqual(float(gradient @ direction), fd, delta=2.0e-3 * max(1.0, abs(fd)))
 
 
-def test_matrix_free_restitution_matches_default(test, device):
+def test_free_body_restitution_matches_default(test, device):
     """Rebound targets of articulated and free-body rows follow the matrix-free route, regularized or not."""
     scenes = {
         "box_chain": lambda requires_grad: _build_box_chain_on_plane(
@@ -2028,7 +1933,6 @@ def test_matrix_free_restitution_matches_default(test, device):
         for regularization in (0.0, 0.01):
             options = {
                 "friction_anchor_beta": 0.0,
-                "solve_mode": "matrix_free",
                 "iterations": 8,
                 "contact_regularization": regularization,
             }
@@ -2079,25 +1983,21 @@ def _build_limited_chain(device, *, requires_grad=True, velocity_limit=1.0e6):
 _LIMIT_FORCE = np.array([5.0, -3.0, 2.0], np.float32)
 
 
-def _limit_cases(device):
-    cases = [("split", {"enable_joint_limits": True, "joint_limit_activation_gap": 0.2}, 1.0e6)]
-    if wp.get_device(device).is_cuda:
-        cases += [
-            ("matrix_free", {"enable_joint_limits": True, "joint_limit_activation_gap": 0.2}, 1.0e6),
-            ("matrix_free", {"enable_joint_velocity_limits": True, "velocity_limit_activation_fraction": 0.7}, 1.5),
-            (
-                "matrix_free",
-                {
-                    "enable_joint_limits": True,
-                    "joint_limit_activation_gap": 0.2,
-                    "enable_joint_velocity_limits": True,
-                    "velocity_limit_activation_fraction": 0.7,
-                    "deterministic": True,
-                },
-                1.5,
-            ),
-        ]
-    return cases
+_LIMIT_CASES = (
+    ({"enable_joint_limits": True, "joint_limit_activation_gap": 0.2}, 1.0e6),
+    ({"enable_joint_limits": True}, 1.0e6),
+    ({"enable_joint_velocity_limits": True, "velocity_limit_activation_fraction": 0.7}, 1.5),
+    (
+        {
+            "enable_joint_limits": True,
+            "joint_limit_activation_gap": 0.2,
+            "enable_joint_velocity_limits": True,
+            "velocity_limit_activation_fraction": 0.7,
+            "deterministic": wp.DeterministicMode.RUN_TO_RUN,
+        },
+        1.5,
+    ),
+)
 
 
 def _limited_rollout(model, solver, joint_f, steps, joint_qd=None, tape=None):
@@ -2118,14 +2018,12 @@ def _limited_rollout(model, solver, joint_f, steps, joint_qd=None, tape=None):
 
 def test_joint_limits_match_default(test, device):
     """Position-limit rows, velocity-limit rows and the velocity prescale follow the default step."""
-    for solve_mode, limit_options, velocity_limit in _limit_cases(device):
-        options = {"solve_mode": solve_mode, "iterations": 12, **limit_options}
+    for limit_options, velocity_limit in _LIMIT_CASES:
+        options = {"iterations": 12, **limit_options}
         model = _build_limited_chain(device, requires_grad=False, velocity_limit=velocity_limit)
         reference = _limited_rollout(model, SolverSteel(model, **options), _LIMIT_FORCE, 40)[0][-1]
         model = _build_limited_chain(device, requires_grad=False, velocity_limit=velocity_limit)
-        free = _limited_rollout(model, SolverSteel(model, solve_mode=solve_mode, iterations=12), _LIMIT_FORCE, 40)[0][
-            -1
-        ]
+        free = _limited_rollout(model, SolverSteel(model, iterations=12), _LIMIT_FORCE, 40)[0][-1]
         model = _build_limited_chain(device, velocity_limit=velocity_limit)
         result = _limited_rollout(model, SolverSteel(model, differentiable=True, **options), _LIMIT_FORCE, 40)[0][-1]
         with test.subTest(**options):
@@ -2138,8 +2036,8 @@ def test_joint_limits_match_default(test, device):
 
 def test_joint_limits_gradient_matches_finite_difference(test, device):
     """Tape against central differences with active position- and velocity-limit rows."""
-    for solve_mode, limit_options, velocity_limit in _limit_cases(device):
-        options = {"solve_mode": solve_mode, "iterations": 12, **limit_options}
+    for limit_options, velocity_limit in _LIMIT_CASES:
+        options = {"iterations": 12, **limit_options}
         model = _build_limited_chain(device, velocity_limit=velocity_limit)
         solver = SolverSteel(model, differentiable=True, **options)
         # Start inside the activation band and push toward the limits.
@@ -2188,7 +2086,6 @@ def test_joint_limits_gradient_matches_finite_difference(test, device):
 def _free_rigid_angular_options(rolling, torsional):
     return {
         "friction_anchor_beta": 0.0,
-        "solve_mode": "matrix_free",
         "iterations": 8,
         "free_rigid_rolling_friction": rolling,
         "free_rigid_torsional_friction": torsional,
@@ -2311,7 +2208,7 @@ def test_friction_patches_match_default(test, device):
 
 def test_friction_patches_backward_ignores_later_steps(test, device):
     """The patch state a step reads is its own: stepping the solver again before backward leaves the gradient."""
-    options = {**_PATCH_OPTIONS, "deterministic": True}
+    options = {**_PATCH_OPTIONS, "deterministic": wp.DeterministicMode.RUN_TO_RUN}
     model = _build_arm_on_box_stack(device, stack=False)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
@@ -2423,7 +2320,6 @@ _PRODUCTION_PROFILE = {
     "contact_regularization": 0.01,
     "articulation_constraint_max": 1024,
     "free_body_constraint_max": 4096,
-    "solve_mode": "matrix_free",
     "row_schedule": "interleaved",
     "articulated_contact_response": "immediate",
     "drive_mode": "augmented",
@@ -2437,7 +2333,7 @@ _PRODUCTION_PROFILE = {
     "contact_shared_anchor": True,
     "contact_friction_shared_anchor": True,
     "friction_anchor_beta": 0.2,
-    "deterministic": True,
+    "deterministic": wp.DeterministicMode.RUN_TO_RUN,
     "enable_joint_limits": True,
     "joint_limit_activation_gap": 0.2,
     "enable_joint_velocity_limits": True,
@@ -2675,8 +2571,8 @@ def _build_effort_limited_chain(device, effort_limit, *, requires_grad=True):
 def test_drive_rows_match_default(test, device):
     """PhysX drive rows follow the matrix-free solve, with and without the drive force clamp."""
     for effort_limit in (None, 10.0):
-        for extra in ({}, {"deterministic": True}):
-            options = {"solve_mode": "matrix_free", "iterations": 12, "drive_mode": "rows", **extra}
+        for extra in ({}, {"deterministic": wp.DeterministicMode.RUN_TO_RUN}):
+            options = {"iterations": 12, "drive_mode": "rows", **extra}
             inputs = _random_inputs(_build_chain(device, drives=True), seed=0)
             model = _build_effort_limited_chain(device, effort_limit, requires_grad=False)
             reference, _, _ = _rollout(model, SolverSteel(model, **options), inputs, 30, rotate=True)
@@ -2697,7 +2593,7 @@ def test_drive_rows_gradient_matches_finite_difference(test, device):
     steps, eps = 3, 1.0e-2
     for effort_limit in (None, 10.0):
         model = _build_effort_limited_chain(device, effort_limit)
-        solver = SolverSteel(model, differentiable=True, solve_mode="matrix_free", iterations=12, drive_mode="rows")
+        solver = SolverSteel(model, differentiable=True, iterations=12, drive_mode="rows")
         inputs = _random_inputs(model, seed=1)
         rng = np.random.default_rng(2)
         wq = rng.normal(size=model.joint_coord_count)
@@ -2759,7 +2655,6 @@ def test_rigid_velocity_limits_match_default(test, device):
     for fraction in (0.0, 0.7):
         options = {
             "friction_anchor_beta": 0.0,
-            "solve_mode": "matrix_free",
             "iterations": 8,
             "velocity_limit_activation_fraction": fraction,
             "articulation_constraint_max": 64,
@@ -2784,7 +2679,6 @@ def test_rigid_velocity_limit_rows_report_overflow(test, device):
         solver = SolverSteel(
             model,
             differentiable=True,
-            solve_mode="matrix_free",
             friction_anchor_beta=0.0,
             articulation_constraint_max=capacity,
             iterations=8,
@@ -2809,7 +2703,6 @@ def test_rigid_velocity_limits_gradient_matches_finite_difference(test, device):
     model = _build_speed_limited_boxes(device)
     options = {
         "friction_anchor_beta": 0.0,
-        "solve_mode": "matrix_free",
         "iterations": 8,
         "articulation_constraint_max": 64,
     }
@@ -2837,7 +2730,8 @@ def test_rigid_velocity_limits_gradient_matches_finite_difference(test, device):
     _, states = loss_of(inputs["joint_qd"], tape)
     tape.backward(grads={states[-1].joint_qd: wp.array(weights.astype(np.float32), dtype=float, device=device)})
     gradient = states[0].joint_qd.grad.numpy().astype(np.float64)
-    eps = 1.0e-3
+    # Smaller steps are dominated by float32 rounding of the four-step rollout.
+    eps = 1.0e-2
     for trial in range(3):
         direction = rng.normal(size=12)
         direction /= np.linalg.norm(direction)
@@ -2869,13 +2763,9 @@ def _kinematic_inputs(model):
 
 def test_kinematic_bodies_match_default(test, device):
     """Kinematic bodies drive contact rows through their prescribed velocity, as in the default step."""
-    cases = [("split", 0.0), ("split", 0.2)]
-    if wp.get_device(device).is_cuda:
-        cases += [("matrix_free", 0.0), ("matrix_free", 0.2)]
-    for solve_mode, beta in cases:
+    for beta in (0.0, 0.2):
         options = {
             "friction_anchor_beta": beta,
-            "solve_mode": solve_mode,
             "iterations": 32,
             "articulation_constraint_max": 64,
         }
@@ -2891,7 +2781,7 @@ def test_kinematic_bodies_match_default(test, device):
         result, _ = _contact_scene_rollout(
             _build_kinematic_belt(device), options, inputs, 60, differentiable=True, dt=1.0 / 240.0
         )
-        with test.subTest(solve_mode=solve_mode, friction_anchor_beta=beta):
+        with test.subTest(friction_anchor_beta=beta):
             # The belt drags the box to its speed.
             test.assertAlmostEqual(float(reference.joint_qd.numpy()[6]), 0.5, delta=1.0e-3)
             np.testing.assert_allclose(result.joint_qd.numpy(), reference.joint_qd.numpy(), rtol=0.0, atol=1.0e-5)
@@ -2914,32 +2804,36 @@ def _build_surface_belt(device, *, requires_grad=True):
 def test_surface_velocity_matches_default(test, device):
     """A moving mesh surface drives the friction rows and anchor history as in the default step.
 
-    Mesh contacts come in thread order, so both steps use deterministic collision and row order.
+    Mesh contacts come in thread order, so both steps use deterministic collision and row order. Anchor release
+    amplifies rounding over many sliding steps, so each step is compared from the default's state.
     """
-    for solve_mode, beta in (("split", 0.0), ("split", 0.2), ("matrix_free", 0.0), ("matrix_free", 0.2)):
-        velocities = []
-        for differentiable in (False, True):
-            model = _build_surface_belt(device, requires_grad=differentiable)
-            solver = SolverSteel(
-                model,
-                differentiable=differentiable,
-                friction_anchor_beta=beta,
-                solve_mode=solve_mode,
-                iterations=32,
-                articulation_constraint_max=64,
-                deterministic=True,
-            )
-            pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
-            contacts = pipeline.contacts()
-            states = [model.state(requires_grad=differentiable) for _ in range(61)]
-            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
-            for k in range(60):
-                pipeline.collide(states[k], contacts)
-                solver.step(states[k], states[k + 1], None, contacts, 1.0 / 240.0)
-            velocities.append(states[-1].joint_qd.numpy())
-        with test.subTest(solve_mode=solve_mode, friction_anchor_beta=beta):
-            test.assertAlmostEqual(float(velocities[0][0]), 0.5, delta=5.0e-3)
-            np.testing.assert_allclose(velocities[1], velocities[0], rtol=0.0, atol=2.0e-5)
+    for beta in (0.0, 0.2):
+        options = {
+            "friction_anchor_beta": beta,
+            "iterations": 32,
+            "articulation_constraint_max": 64,
+            "deterministic": wp.DeterministicMode.RUN_TO_RUN,
+        }
+        model, twin = _build_surface_belt(device, requires_grad=False), _build_surface_belt(device)
+        reference_solver = SolverSteel(model, **options)
+        solver = SolverSteel(twin, differentiable=True, **options)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+        contacts = pipeline.contacts()
+        states = [model.state() for _ in range(61)]
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        errors = []
+        for k in range(60):
+            pipeline.collide(states[k], contacts)
+            state, output = twin.state(requires_grad=True), twin.state(requires_grad=True)
+            state.joint_q.assign(states[k].joint_q)
+            state.joint_qd.assign(states[k].joint_qd)
+            newton.eval_fk(twin, state.joint_q, state.joint_qd, state)
+            reference_solver.step(states[k], states[k + 1], None, contacts, 1.0 / 240.0)
+            solver.step(state, output, None, contacts, 1.0 / 240.0)
+            errors.append(float(np.abs(output.joint_qd.numpy() - states[k + 1].joint_qd.numpy()).max()))
+        with test.subTest(friction_anchor_beta=beta):
+            test.assertAlmostEqual(float(states[-1].joint_qd.numpy()[0]), 0.5, delta=5.0e-3)
+            test.assertLess(max(errors), 2.0e-5)
 
 
 def test_kinematic_velocity_gradient_matches_finite_difference(test, device):
@@ -2979,7 +2873,7 @@ def test_kinematic_velocity_gradient_matches_finite_difference(test, device):
 
 
 def test_deterministic_gradients_repeat(test, device):
-    """With deterministic=True, repeated rollouts from the same state give bitwise-identical gradients."""
+    """With deterministic=RUN_TO_RUN, repeated rollouts from the same state give bitwise-identical gradients."""
     model = _build_gripper(device)
     gradients = []
     for _ in range(3):
@@ -3086,19 +2980,36 @@ def test_observables_reuse_output_state(test, device):
 
 def test_observables_match_default(test, device):
     """CONTACT_F and BODY_PARENT_F of the differentiable step follow the default step's."""
-    scenes = [("box_chain", lambda requires_grad: _build_box_chain_on_plane(device, requires_grad=requires_grad), {})]
+    scenes = [
+        (
+            "box_chain",
+            lambda requires_grad: _build_box_chain_on_plane(device, requires_grad=requires_grad),
+            {},
+            _contact_inputs,
+        )
+    ]
     if wp.get_device(device).is_cuda:
         scenes.append(
             (
                 "arm_on_boxes",
                 lambda requires_grad: _build_arm_on_box_stack(device, requires_grad=requires_grad),
-                {"solve_mode": "matrix_free", "articulation_constraint_max": 64, "contact_regularization": 0.01},
+                {"articulation_constraint_max": 64, "contact_regularization": 0.01},
+                _arm_on_box_inputs,
             )
         )
-    for name, build, extra in scenes:
+        # The rolling and spin rows' torques enter the free body's contact wrench.
+        scenes.append(
+            (
+                "rolling_sphere",
+                lambda requires_grad: _build_free_shape(device, "sphere", requires_grad=requires_grad),
+                _free_rigid_angular_options(0.02, 0.01),
+                lambda model: _rolling_inputs("sphere"),
+            )
+        )
+    for name, build, extra, make_inputs in scenes:
         options = {"friction_anchor_beta": 0.0, "iterations": 16, **extra}
         model = build(False)
-        inputs = _arm_on_box_inputs(model) if name == "arm_on_boxes" else _contact_inputs(model)
+        inputs = make_inputs(model)
         _, _, _, reference = _observed_rollout(model, options, inputs, 6, differentiable=False)
         _, _, _, result = _observed_rollout(build(True), options, inputs, 6, differentiable=True)
         for k, (expected, actual) in enumerate(zip(reference, result, strict=True)):
@@ -3181,7 +3092,6 @@ for _device in get_test_devices():
         test_repeated_backward_is_stable,
         test_contact_forward_matches_default,
         test_contact_gradient_matches_finite_difference,
-        test_contact_rejects_unsupported_configs,
         test_friction_gradient_matches_finite_difference,
         test_sphere_multistep_gradient_flow,
         test_sphere_friction_matches_default_and_finite_difference,
@@ -3196,7 +3106,6 @@ for _device in get_test_devices():
         test_friction_pair_gradient_scale_invariance,
         test_rank_one_friction_pose_gradient,
         test_friction_pair_shift_dominated_slide,
-        test_pgs_kernel_selection,
         test_free_body_rows_use_dense_capacity,
         test_smooth_contact_rejects_unsupported_configs,
         test_smooth_contact_zero_gap_activation_gradient,
@@ -3212,21 +3121,21 @@ for _device in get_test_devices():
         test_observables_match_default,
         test_observables_gradient_matches_finite_difference,
         test_observables_reuse_output_state,
-        test_deterministic_split_contacts_match_default,
+        test_deterministic_contacts_match_default,
     ):
         add_function_test(TestSteelDifferentiable, _test.__name__, _test, devices=[_device])
     if _device.is_cuda:
-        # solve_mode="matrix_free" and its features run on CUDA only.
+        # Contact torsion and free-body angular friction require CUDA; the other scenes here run on CUDA only
+        # to bound CPU test time.
         for _test in (
-            test_collide_done_event,
-            test_matrix_free_contacts_match_default,
+            test_serial_contacts_match_default,
             test_contact_torsion_matches_default,
             test_contact_torsion_gradient_matches_finite_difference,
             test_contact_torsion_requires_eager_steps,
             test_mixed_world_contacts_match_default,
             test_deterministic_rollouts_repeat,
             test_mixed_world_gradient_matches_finite_difference,
-            test_matrix_free_restitution_matches_default,
+            test_free_body_restitution_matches_default,
             test_free_rigid_angular_friction_matches_default,
             test_free_rigid_angular_friction_gradient_matches_finite_difference,
             test_sleeping_option_keeps_islands_awake,

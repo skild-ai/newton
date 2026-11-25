@@ -1,15 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Rigid Soft Contact
-#
-# Shows how to set up a rigid sphere colliding with a soft FEM beam.
-#
-# Command: uv run -m newton.examples rigid_soft_contact
-#          uv run -m newton.examples rigid_soft_contact --solver coupled --rigid-solver steel
-#
-###########################################################################
+"""Example Rigid Soft Contact
+
+Shows how to set up a rigid sphere colliding with a soft FEM beam.
+
+Success criteria:
+- An orange ball falls on a deformable cuboid
+- The deformable cuboid is vibrating/oscillating before the ball hits it.
+- The ball bounces off the cuboid and rolls off screen.
+- The cuboid approaches rest over time.
+
+Runs:
+- `python -m newton.examples rigid_soft_contact`
+- `python -m newton.examples rigid_soft_contact --solver coupled --rigid-solver steel`
+"""
 
 import numpy as np
 import warp as wp
@@ -75,7 +80,7 @@ def _rigid_solver_entry_args(rigid_solver: str):
     if rigid_solver == "mjc":
         return "mjc", SolverMuJoCo, {"use_mujoco_contacts": False, "njmax": 64}
     if rigid_solver == "steel":
-        return "steel", SolverSteel, {"solve_mode": "matrix_free"}
+        return "steel", SolverSteel, {}
     raise ValueError(f"Unsupported rigid solver {rigid_solver!r}")
 
 

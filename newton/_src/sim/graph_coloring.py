@@ -8,6 +8,8 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
+from ..exceptions import NewtonWarning
+
 
 class ColoringAlgorithm(Enum):
     MCS = 0
@@ -303,6 +305,7 @@ def color_graph(
                 f"Color balancing terminated early: max/min ratio {max_min_ratio:.3f} "
                 f"exceeds target {target_max_min_color_ratio:.3f}. "
                 "The graph may not be further optimizable.",
+                NewtonWarning,
                 stacklevel=2,
             )
 
@@ -408,27 +411,6 @@ def combine_independent_coloring_plan(sized_groups_1, sized_groups_2) -> list:
         else:
             combined.append((size_1, chunks_1))
     return combined
-
-
-def combine_independent_particle_coloring(color_groups_1, color_groups_2) -> list:
-    """
-    A function that combines 2 independent coloring groups. Note that color_groups_1 and color_groups_2 must be from 2 independent
-    graphs so that there is no connection between them. This algorithm will sort color_groups_1 in ascending order and
-    sort color_groups_2 in descending order, and combine each group with the same index, this way we are always combining
-    the smaller group with the larger group.
-
-    Args:
-        color_groups_1: A list of `np.array` with `dtype`=`int`. The length of the list is the number of colors
-            and each `np.array` contains the indices of vertices with this color.
-        color_groups_2: A list of `np.array` with `dtype`=`int`. The length of the list is the number of colors
-            and each `np.array` contains the indices of vertices with this color.
-
-    """
-    plan = combine_independent_coloring_plan(
-        [(len(group), [group]) for group in color_groups_1],
-        [(len(group), [group]) for group in color_groups_2],
-    )
-    return [chunks[0] if len(chunks) == 1 else np.concatenate(chunks) for _, chunks in plan]
 
 
 def color_rigid_bodies(

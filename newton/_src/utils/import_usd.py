@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import itertools
 import logging
 import math
@@ -11,6 +12,8 @@ import re
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
+
+from ..exceptions import NewtonWarning
 
 if TYPE_CHECKING:
     from pxr import Usd
@@ -50,6 +53,7 @@ from ..usd.particles import find_particle_prims, import_particles
 from ..usd.schema_resolver import PrimType, SchemaResolver, SchemaResolverManager
 from ..usd.schemas import SchemaResolverNewton
 from .color import color_linear_to_srgb
+from .deprecation import warn_deprecation
 from .import_usd_deformable_attachments import (
     _deformable_import_attachments,
     _deformable_import_element_collision_filters,
@@ -67,16 +71,13 @@ from .import_usd_deformable_utils import (
     _DeformableImportContext,
     _scout_deformable_prims,
 )
+from .import_usd_deformable_visual import _deformable_import_visual
 from .import_usd_deformable_volume import _deformable_import_volume
 
-logger = logging.getLogger("newton")
+logger = logging.getLogger(__name__)
 
 AttributeFrequency = Model.AttributeFrequency
 
-_PHYSX_MISSING_INERTIA_FALLBACK_DEPRECATION_MSG = (
-    "add_usd(physx_missing_inertia_fallback=...) is deprecated in Newton 1.7 and has no effect; "
-    "it will be removed in a future release, so drop the argument."
-)
 
 # `UsdPreviewSurface`'s schema default for `diffuseColor`. A visual shape whose prim binds no
 # material is given this rather than left for ModelBuilder's per-shape debug palette, which
@@ -117,6 +118,7 @@ def _warn_mirrored_body_transform(usd_prim, key: str, xform_cache) -> None:
             "spurious rotation. Bake the reflection into the mesh geometry "
             "(negate vertices, flip triangle winding) and re-author the body "
             "with a proper transform before import.",
+            NewtonWarning,
             stacklevel=_external_warning_stacklevel(),
         )
 
@@ -163,10 +165,7 @@ def parse_usd(
     force_position_velocity_actuation: bool = False,
     convert_mjc_equality_constraints: bool = True,
     override_root_xform: bool = False,
-    physx_missing_inertia_fallback: bool | None = None,
     legacy_margin_gap: bool = False,
-    legacy_angular_velocity_units: bool = False,
-    legacy_springref_units: bool = False,
     return_deformable_results: bool = False,
     allow_unsafe_torch_checkpoints: bool = False,
 ) -> dict[str, Any]:
@@ -180,6 +179,8 @@ def parse_usd(
         builder: The :class:`ModelBuilder` to add the bodies and joints to.
         source: The file path to the USD file, or an existing USD stage instance.
         xform: The transform to apply to the entire scene.
+            If ``parent_body`` is set, imported bodies are placed relative to that
+            body's frame; static shapes still use ``xform`` in the world frame.
         override_root_xform: If ``True``, the articulation root's world-space
             transform is replaced by ``xform`` instead of being composed with it,
             preserving only the internal structure (relative body positions). Useful
@@ -252,13 +253,13 @@ def parse_usd(
                     - ``body_idx``
                     - ❌ Error: FREE joints require world frame
 
-        only_load_enabled_rigid_bodies: If True, only rigid bodies which do not have `physics:rigidBodyEnabled` set to False are loaded.
+        only_load_enabled_rigid_bodies: If True, only rigid bodies which do not have `physics:rigidBodyEnabled` set to False are loaded. With OpenUSD 26.11 or newer, disabled rigid bodies are never loaded, since OpenUSD assigns their colliders and joints to the nearest enabled ancestor body.
         only_load_enabled_joints: If True, only joints which do not have `physics:jointEnabled` set to False are loaded.
         joint_drive_gains_scaling: The default scaling of the PD control gains (stiffness and damping), if not set in the PhysicsScene with as "newton:joint_drive_gains_scaling".
-        verbose: If True, print additional information about the parsed USD file. Default is False.
+        verbose: If True, log additional information about the parsed USD file. Default is False.
         ignore_paths: A list of regular expressions matching prim paths to ignore.
         collapse_fixed_joints: If True, fixed joints are removed and the respective bodies are merged. Only considered if not set on the PhysicsScene as "newton:collapse_fixed_joints".
-        enable_self_collisions: Default for whether self-collisions are enabled for all shapes within an articulation. Resolved via the schema resolver from ``newton:selfCollisionEnabled`` (NewtonArticulationRootAPI) or ``physxArticulation:enabledSelfCollisions``; if neither is authored, this value takes precedence.
+        enable_self_collisions: Default for whether self-collisions are enabled for all shapes within an articulation. Resolved via the schema resolver from ``newton:selfCollisionEnabled`` (NewtonArticulationRootAPI) or ``physxArticulation:enabledSelfCollisions`` on the articulation root, or on the cable ``BasisCurves`` prim for cable-owned articulations; if neither is authored, this value takes precedence.
         apply_up_axis_from_stage: If True, the up axis of the stage will be used to set :attr:`newton.ModelBuilder.up_axis`. Otherwise, the stage will be rotated such that its up axis aligns with the builder's up axis. Default is False.
         root_path: The USD path to import, defaults to "/". Bound physics materials
             outside this subtree are resolved without importing unrelated bodies
@@ -268,6 +269,7 @@ def parse_usd(
         skip_mesh_approximation: If True, mesh approximation is skipped. Otherwise, meshes are approximated according to the ``physics:approximation`` attribute defined on the UsdPhysicsMeshCollisionAPI (if it is defined), using the settings from :attr:`~newton.ModelBuilder.default_mesh_approximation_cfg`. Default is False.
         load_sites: If True, sites (prims with ``NewtonSiteAPI`` or ``MjcSiteAPI``) are loaded as non-colliding reference points. If False, sites are ignored. Default is True.
         load_visual_shapes: If True, non-physics visual geometry is loaded. If False, visual-only shapes are ignored (sites are still controlled by ``load_sites``). Default is True.
+            Also imports experimental deformable visual meshes; see :ref:`usd-deformable-visual-import`.
         load_static_visual_shapes: If True, supported visual-only geometry outside
             rigid-body hierarchies is loaded as static shapes when
             ``load_visual_shapes`` is also True. Default is True.
@@ -278,11 +280,13 @@ def parse_usd(
             regardless of whether visual shapes exist on the same body. Note that
             ``hide_collision_shapes=True`` still suppresses the VISIBLE flag for
             colliders on bodies with visual-only geometry. Default is False.
-        parse_mujoco_options: Whether MuJoCo solver options from the PhysicsScene should be parsed. If False, solver options are not loaded and custom attributes retain their default values. Default is True.
+        parse_mujoco_options: Whether MuJoCo solver options from the PhysicsScene should be parsed. If False, solver options are not loaded and custom attributes retain their default values; the scene's ``mjc:flag:filterparent``, which sets ``collision_filter_parent`` on imported joints that do not author ``physics:collisionEnabled``, is then ignored as well. Default is True.
         convert_mjc_equality_constraints: Whether MuJoCo equality schemas should be converted to Newton loop
-            joints or mimic constraints while preserving MuJoCo equality metadata for SolverMuJoCo. If False,
-            equality constraints are preserved in the ``mujoco:equality_constraint`` custom-attribute namespace
-            and finalize under ``model.mujoco.equality_constraint_*``.
+            joints or mimic constraints while preserving MuJoCo equality metadata for SolverMuJoCo. A weld
+            becomes a FIXED loop joint, or a BALL loop joint when its ``torquescale`` is 0 (see "Link-break welds
+            and MuJoCo welds" in the articulation docs). If False, equality constraints are preserved in the
+            ``mujoco:equality_constraint`` custom-attribute namespace and finalize under
+            ``model.mujoco.equality_constraint_*``.
         mesh_maxhullvert: Maximum vertices for convex hull approximation of meshes. Note that an authored ``newton:maxHullVertices`` attribute on any shape with a ``NewtonMeshCollisionAPI`` will take priority over this value.
         schema_resolvers: Resolver instances in priority order. Default is to only parse Newton-specific attributes.
             Schema resolvers collect per-prim "solver-specific" attributes, see :ref:`schema_resolvers` for more information.
@@ -301,48 +305,23 @@ def parse_usd(
             :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
             damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
             (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
-        physx_missing_inertia_fallback: Ignored.
-
-            .. deprecated:: 1.7
-                Has no effect and will be removed; drop the argument.
+            A USD ``MjcActuator`` in MuJoCo's position or velocity shape on a DOF whose drive has both gains zero sets
+            the mode from its own gains instead of :attr:`~newton.JointTargetMode.EFFORT`, and a warning is logged.
         legacy_margin_gap: If True, restore pre-MuJoCo-3.9 import behavior
             where ``shape_margin`` is computed as ``mjc_margin - mjc_gap``.
             Use for USD files authored against MuJoCo <= 3.8. Defaults to
             False (identity translation matching MuJoCo 3.9 semantics).
-        legacy_angular_velocity_units: If True, restore Newton 1.6 joint-state angular velocity handling:
-            resolved ``state:angular:physics:velocity``
-            and D6 ``state:rot*:physics:velocity`` values are copied into
-            ``joint_qd`` without converting degrees/s to radians/s. Applies
-            to revolute, native D6, and merged joints. Rigid-body velocities,
-            linear joint velocities, positions, and drive targets retain their
-            usual unit conversion. Defaults to False.
-
-            .. deprecated:: 1.7
-                This temporary flag will be removed in Newton 1.8. Enabling
-                it emits a :class:`DeprecationWarning`. Migrate authored
-                asset values to their documented units and leave it False.
-
-        legacy_springref_units: If True, restore Newton 1.6 handling of ``mjc:springref`` as an
-            already converted Newton value, ignoring
-            ``mjc:compiler:angle`` for spring references only. ``mjc:ref``
-            conversion is unchanged. Requires registered MuJoCo custom
-            attributes to load spring references. Defaults to False, which
-            interprets revolute spring references using the compiler's angle
-            units (degrees if unauthored) and converts them to radians.
-
-            .. deprecated:: 1.7
-                This temporary flag will be removed in Newton 1.8. Enabling
-                it emits a :class:`DeprecationWarning`. Migrate authored
-                asset values to their documented units and leave it False.
-
         return_deformable_results: If True, include the experimental deformable entries in the
-            returned mapping (``path_cable_map`` / ``path_cloth_map`` / ``path_soft_map`` /
+            returned mapping (``path_cable_map`` / ``path_cloth_map`` / ``path_soft_map`` / ``path_deformable_visual_map`` /
             ``path_attachment_map`` and the matching ``path_*_attrs``). Off by default, so the
             default return shape carries no deformable additions.
         allow_unsafe_torch_checkpoints: Allow USD neural actuators to reference
             Torch checkpoints. Only use this for trusted USD assets and
             checkpoints: loading a Torch checkpoint may execute code during
             :meth:`newton.ModelBuilder.finalize`. Defaults to ``False``.
+
+            .. deprecated:: 1.8
+                Torch checkpoints are deprecated; export the network to ONNX.
 
     Returns:
         .. experimental::
@@ -384,8 +363,10 @@ def parse_usd(
         Particle widths are diameters. Newton converts each radius as
         ``width / 2`` after applying stage units and the prim's uniform world
         scale; converted widths and radii are in meters. Authored
-        ``physics:masses`` take precedence over body mass or density, then
-        material density. Density-derived mass uses
+        ``newton:masses`` take precedence over body mass or density, then
+        material density. The deprecated ``physics:masses`` name is read,
+        with a deprecation warning, when ``newton:masses`` is unauthored.
+        Density-derived mass uses
         ``physics:density * width**3``; converted masses are in kilograms.
         Without widths, it uses ``ModelBuilder.default_particle_radius`` and a
         support width of twice that radius. Non-uniform scale or shear is
@@ -426,6 +407,8 @@ def parse_usd(
               - Mapping from prim path (str) of a surface deformable (cloth) to its ``[start, end)`` index ranges, keyed ``"particle"`` / ``"tri"`` / ``"edge"``. Present only with ``return_deformable_results=True``.
             * - ``"path_soft_map"``
               - Mapping from prim path (str) of a soft body (a volume deformable, or a legacy bare TetMesh) to its ``[start, end)`` index ranges, keyed ``"particle"`` / ``"tet"``. Present only with ``return_deformable_results=True``.
+            * - ``"path_deformable_visual_map"``
+              - Mapping from graphics Mesh prim path (str) to its index in :attr:`Model.deformable_visual_meshes`. Includes only successfully imported visual meshes. Present only with ``return_deformable_results=True``. The indices describe this import, not copies created by later builder composition or replication.
             * - ``"path_cable_attrs"``
               - Mapping from prim path (str) of a curve deformable (cable) to its validated, solver-neutral cable import metadata (``material``, ``resolved_density``, ``closed``). ``material`` contains supported per-mode structural values before per-joint discretization: stretch/shear stiffness [N] and damping [N·s]; bend/twist stiffness [N·m²] and damping [N·m²·s]. ``graph_component`` is present only for curves successfully welded into the same rod graph; curves in one graph share the identifier. Present only with ``return_deformable_results=True``.
             * - ``"path_cloth_attrs"``
@@ -433,9 +416,9 @@ def parse_usd(
             * - ``"path_soft_attrs"``
               - Mapping from prim path (str) of a soft body (a volume deformable, or a legacy bare TetMesh) to its as-authored, solver-neutral attributes (``resolved_density``). Present only with ``return_deformable_results=True``.
             * - ``"path_attachment_map"``
-              - Mapping from prim path (str) of a supported ``PhysicsAttachment`` prim to the created joint indices. Curve-to-curve ``point``->``point`` junctions are consumed as rod-graph topology and are absent from this mapping. Present only with ``return_deformable_results=True``.
+              - Mapping from prim path (str) of a supported cable ``PhysicsAttachment`` prim to the created joint indices. Cloth/volume particle-body attachments are not joints and are listed only in ``path_attachment_attrs``. Curve-to-curve ``point``->``point`` junctions are consumed as rod-graph topology and are absent from this mapping. Present only with ``return_deformable_results=True``.
             * - ``"path_attachment_attrs"``
-              - Mapping from prim path (str) of a ``PhysicsAttachment`` prim to its parsed, solver-neutral attributes and any unsupported reason. Junctions consumed as rod-graph topology are absent here as well. Present only with ``return_deformable_results=True``.
+              - Mapping from prim path (str) of a ``PhysicsAttachment`` prim to its parsed, solver-neutral attributes and any unsupported reason. Imported cloth/volume attachments list their particle-body attachment indices under ``"attachment_particle_body_indices"``. Junctions consumed as rod-graph topology are absent here as well. Present only with ``return_deformable_results=True``.
             * - ``"mass_unit"``
               - The stage's Kilograms Per Unit (KGPU) definition (1.0 by default)
             * - ``"linear_unit"``
@@ -461,19 +444,10 @@ def parse_usd(
             * - ``"actuator_count"``
               - Number of external actuators parsed from the USD stage
     """
-    if physx_missing_inertia_fallback is not None:
-        warnings.warn(_PHYSX_MISSING_INERTIA_FALLBACK_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
-    for name, enabled in (
-        ("legacy_angular_velocity_units", legacy_angular_velocity_units),
-        ("legacy_springref_units", legacy_springref_units),
-    ):
-        if enabled:
-            warnings.warn(
-                f"{name}=True is deprecated and will be removed in Newton 1.8. "
-                "Migrate authored asset values to their documented units and leave this option False.",
-                DeprecationWarning,
-                stacklevel=_external_warning_stacklevel(),
-            )
+    if allow_unsafe_torch_checkpoints:
+        from ..actuators.utils import _ALLOW_UNSAFE_TORCH_CHECKPOINTS_DEPRECATION_MSG  # noqa: PLC0415
+
+        warn_deprecation(_ALLOW_UNSAFE_TORCH_CHECKPOINTS_DEPRECATION_MSG)
 
     # Early validation of base joint parameters
     builder._validate_base_joint_params(floating, base_joint, parent_body)
@@ -491,6 +465,7 @@ def parse_usd(
     except ImportError as e:
         raise ImportError("Failed to import pxr. Please install USD (e.g. via `pip install usd-core`).") from e
     require_newton_usd_schemas(Usd)
+    skip_disabled_rigid_bodies = only_load_enabled_rigid_bodies or usd.physics_parser_skips_disabled_bodies()
 
     from ..usd import _joints  # noqa: PLC0415
     from ..usd._articulations import _parse_articulations  # noqa: PLC0415
@@ -500,12 +475,21 @@ def parse_usd(
         _apply_filtered_pairs,
         _collect_filtered_pairs,
     )
-    from ..usd._mass_properties import _is_enabled_collider, _UsdMassProperties  # noqa: PLC0415
+    from ..usd._mass_properties import (  # noqa: PLC0415
+        _is_enabled_collider,
+        _owns_descendants,
+        _UsdMassProperties,
+    )
     from ..usd._visuals import _UsdVisuals  # noqa: PLC0415
 
     # Capture material defaults at the start of this import.
     default_material = _PhysicsMaterial(
-        staticFriction=builder.default_shape_cfg.mu,
+        # an unset default mu_static keeps a single coefficient (staticFriction == dynamicFriction)
+        staticFriction=(
+            builder.default_shape_cfg.mu
+            if builder.default_shape_cfg.mu_static is None
+            else builder.default_shape_cfg.mu_static
+        ),
         dynamicFriction=builder.default_shape_cfg.mu,
         torsionalFriction=builder.default_shape_cfg.mu_torsional,
         rollingFriction=builder.default_shape_cfg.mu_rolling,
@@ -552,14 +536,14 @@ def parse_usd(
             mass_unit = UsdPhysics.GetStageKilogramsPerUnit(stage)
     except Exception as e:
         if verbose:
-            print(f"Failed to get mass unit: {e}")
+            logger.warning("Failed to get mass unit: %s", e)
     linear_unit = 1.0
     try:
         if UsdGeom.StageHasAuthoredMetersPerUnit(stage):
             linear_unit = UsdGeom.GetStageMetersPerUnit(stage)
     except Exception as e:
         if verbose:
-            print(f"Failed to get linear unit: {e}")
+            logger.warning("Failed to get linear unit: %s", e)
     has_nonunit_linear_units = not math.isclose(linear_unit, 1.0)
     has_nonunit_mass_units = not math.isclose(mass_unit, 1.0)
     non_regex_ignore_paths = [path for path in ignore_paths if ".*" not in path]
@@ -601,6 +585,7 @@ def parse_usd(
             "different conversion paths: particles are converted to SI, while the legacy rigid/collider importer "
             "still expects unit stage metadata. Author mixed stages with both units set to 1.0 until rigid import "
             "gains complete unit conversion.",
+            NewtonWarning,
             stacklevel=_external_warning_stacklevel(),
         )
     elif particle_prims and has_other_import_candidates and (has_nonunit_linear_units or has_nonunit_mass_units):
@@ -608,6 +593,7 @@ def parse_usd(
             "Mixed particles and other imported USD content with non-unit metersPerUnit or kilogramsPerUnit may "
             "use different conversion paths: particles are converted to SI, while other import paths may still "
             "expect unit stage metadata. Author mixed stages with both units set to 1.0.",
+            NewtonWarning,
             stacklevel=_external_warning_stacklevel(),
         )
     elif not particle_prims:
@@ -615,12 +601,14 @@ def parse_usd(
             warnings.warn(
                 "USD stages with non-unit mass units are not supported. "
                 f"Set kilogramsPerUnit to 1.0 before import. Found kilogramsPerUnit={mass_unit}.",
+                NewtonWarning,
                 stacklevel=_external_warning_stacklevel(),
             )
         if has_nonunit_linear_units:
             warnings.warn(
                 "USD stages with non-unit linear units are not supported. "
                 f"Set metersPerUnit to 1.0 before import. Found metersPerUnit={linear_unit}.",
+                NewtonWarning,
                 stacklevel=_external_warning_stacklevel(),
             )
 
@@ -649,10 +637,7 @@ def parse_usd(
         default_limit_kd=default_joint_limit_kd,
         limit_gains_configured=default_joint_limit_gains_configured,
         mjc_resolver=mjc_resolver,
-        mjc_angle_scale=usd._mjc_angle_scale(physics_scene_prim),
         verbose=verbose,
-        legacy_angular_velocity_units=legacy_angular_velocity_units,
-        legacy_springref_units=legacy_springref_units,
     )
     solreflimit_mode_key = "mujoco:solreflimit_mode"
     solreflimit_gain_baseline_key = "mujoco:solreflimit_gain_baseline"
@@ -790,6 +775,7 @@ def parse_usd(
         if target0 == "" and target1 == "":
             warnings.warn(
                 f"{schema_name} on '{joint_path}' has no physics:body0 or physics:body1 targets; skipping.",
+                NewtonWarning,
                 stacklevel=3,
             )
             return None, None
@@ -807,6 +793,7 @@ def parse_usd(
             warnings.warn(
                 f"{schema_name} on '{joint_path}' references unresolved body target(s) "
                 f"{', '.join(failed_targets)}; skipping.",
+                NewtonWarning,
                 stacklevel=3,
             )
             return None, None
@@ -817,26 +804,22 @@ def parse_usd(
         """Load and cache TetMesh data to avoid repeated USD extraction."""
         prim_path = str(prim.GetPath())
         if prim_path not in tetmesh_cache:
-            # Pass the resolver-declared namespaces explicitly (never None), so the importer keeps the
-            # canonical physics: default and does not trip get_tetmesh()'s legacy-default deprecation.
-            compat_ns = deformable_compat_ns
-            if not compat_ns and usd._material_authors_legacy_deformable_attrs(prim):
-                # Without this deprecation window, a vendor-only material would silently
-                # import with default stiffness/density instead of its authored values.
+            # Vendor attributes used to lift the material API gate for the canonical ones too.
+            if (
+                not deformable_compat_ns
+                and usd._material_authors_legacy_deformable_attrs(prim)
+                and (ignored := usd._ignored_tetmesh_material_attrs(prim))
+            ):
                 warnings.warn(
-                    f"{prim_path}: the bound material authors legacy vendor-namespaced deformable "
-                    f"material attributes (omniphysics: / physxDeformableBody:) without "
-                    f"PhysicsVolumeDeformableMaterialAPI. add_usd() still reads them, but this is "
-                    f"deprecated: author the canonical physics: attributes with the material API, or "
-                    f"pass schema_resolvers=[..., SchemaResolverPhysx()] to keep vendor namespaces "
-                    f"explicitly.",
-                    DeprecationWarning,
-                    stacklevel=2,
+                    f"{prim_path}: ignoring {', '.join(ignored)} on the bound material. Author "
+                    "canonical physics: attributes with PhysicsVolumeDeformableMaterialAPI, or pass "
+                    "schema_resolvers=[..., SchemaResolverPhysx()] to read them.",
+                    NewtonWarning,
+                    stacklevel=_external_warning_stacklevel(),
                 )
-                compat_ns = usd.DEFORMABLE_LEGACY_NAMESPACES
             tetmesh_cache[prim_path] = usd._get_tetmesh(
                 prim,
-                compat_namespaces=compat_ns,
+                compat_namespaces=deformable_compat_ns,
                 load_custom_attributes=False,
                 # The marked-volume pass owns current proposal material lowering. Avoid
                 # reading it here too, which would duplicate validation warnings. Keep
@@ -891,7 +874,7 @@ def parse_usd(
             allow_visual_shapes: Whether non-site geometry may be loaded from this subtree.
             recurse: Whether to inspect child prims after processing ``prim``.
         """
-        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        if _owns_descendants(prim):
             return
         path_name = str(prim.GetPath())
         if any(re.match(path, path_name) for path in ignore_paths):
@@ -901,11 +884,18 @@ def parse_usd(
                 _load_visual_shape_children(parent_body_id, prim, body_xform, articulation_root_xform, False)
             return
 
+        is_site = usd.has_applied_api_schema(prim, "NewtonSiteAPI") or usd.has_applied_api_schema(prim, "MjcSiteAPI")
+        if not is_site and path_name in deformable_visual_exclude_paths:
+            if recurse:
+                _load_visual_shape_children(
+                    parent_body_id, prim, body_xform, articulation_root_xform, allow_visual_shapes
+                )
+            return
+
         type_name = str(prim.GetTypeName()).lower()
         if type_name.endswith("joint"):
             return
 
-        is_site = usd.has_applied_api_schema(prim, "NewtonSiteAPI") or usd.has_applied_api_schema(prim, "MjcSiteAPI")
         if is_site and not load_sites:
             return
         if not is_site and not allow_visual_shapes:
@@ -922,7 +912,7 @@ def parse_usd(
                 and path_name not in path_shape_map
                 and verbose
             ):
-                print(f"Warning: Unsupported geometry type {type_name} at {path_name} while loading visual shapes.")
+                logger.warning("Unsupported geometry type %s at %s while loading visual shapes.", type_name, path_name)
             if recurse:
                 _load_visual_shape_children(
                     parent_body_id, prim, body_xform, articulation_root_xform, allow_visual_shapes
@@ -978,7 +968,7 @@ def parse_usd(
                 )
             elif type_name == "sphere":
                 if not _is_uniform_scale(scale):
-                    print(f"Warning: Non-uniform scaling of spheres is not supported, at {path_name}.")
+                    logger.warning("Non-uniform scaling of spheres is not supported, at %s.", path_name)
                 radius = usd.get_float(prim, "radius", 1.0) * max(scale)
                 shape_id = builder.add_shape_sphere(
                     parent_body_id,
@@ -1077,9 +1067,11 @@ def parse_usd(
                         if shape_id < 0:
                             shape_id = subset_shape_id
                         if verbose:
-                            print(
-                                f"Added visual shape {subset_path} ({type_name} material subset) "
-                                f"with id {subset_shape_id}."
+                            logger.info(
+                                "Added visual shape %s (%s material subset) with id %s.",
+                                subset_path,
+                                type_name,
+                                subset_shape_id,
                             )
                 else:
                     mesh = visuals.get_mesh_with_visual_material(prim, path_name=path_name)
@@ -1111,7 +1103,7 @@ def parse_usd(
                 if not is_site and visual_shape_cfg_for_prim.is_visible:
                     bodies_with_visual_shapes.add(parent_body_id)
                 if verbose:
-                    print(f"Added visual shape {path_name} ({type_name}) with id {shape_id}.")
+                    logger.info("Added visual shape %s (%s) with id %s.", path_name, type_name, shape_id)
 
         if recurse:
             _load_visual_shape_children(parent_body_id, prim, body_xform, articulation_root_xform, allow_visual_shapes)
@@ -1158,7 +1150,7 @@ def parse_usd(
         nonlocal path_body_map
         nonlocal physics_scene_prim
 
-        if not rigid_body_desc.rigidBodyEnabled and only_load_enabled_rigid_bodies:
+        if not rigid_body_desc.rigidBodyEnabled and skip_disabled_rigid_bodies:
             return -1
 
         if origin is None:
@@ -1213,6 +1205,9 @@ def parse_usd(
             verbose=verbose,
         )
 
+    # PhysicsScene ``mjc:flag:filterparent``; resolved below once the scene prim is known.
+    scene_filter_parent = True
+
     def parse_joint(
         joint_desc: UsdPhysics.JointDesc,
         incoming_xform: wp.transform | None = None,
@@ -1246,6 +1241,7 @@ def parse_usd(
             _should_write_solreflimit_mode=_should_write_solreflimit_mode,
             _should_write_solreflimit_gain_baseline=_should_write_solreflimit_gain_baseline,
             resolve_joint_parent_child=resolve_joint_parent_child,
+            scene_filter_parent=scene_filter_parent,
         )
 
     def parse_merged_joints(
@@ -1278,6 +1274,7 @@ def parse_usd(
             _should_write_solreflimit_mode=_should_write_solreflimit_mode,
             _should_write_solreflimit_gain_baseline=_should_write_solreflimit_gain_baseline,
             resolve_joint_parent_child=resolve_joint_parent_child,
+            scene_filter_parent=scene_filter_parent,
         )
 
     # Looking for and parsing the attributes on PhysicsScene prims
@@ -1288,19 +1285,29 @@ def parse_usd(
     if physics_scene_prim is not None:
         paths, scene_descs = ret_dict[UsdPhysics.ObjectType.Scene]
         if len(paths) > 1 and verbose:
-            print("Only the first PhysicsScene is considered")
+            logger.info("Only the first PhysicsScene is considered")
         scene_path = physics_scene_prim.GetPath()
         scene_desc = next(desc for path, desc in zip(paths, scene_descs, strict=True) if path == scene_path)
         if verbose:
-            print("Found PhysicsScene:", scene_path)
-            print("Gravity direction:", scene_desc.gravityDirection)
-            print("Gravity magnitude:", scene_desc.gravityMagnitude)
+            logger.info(
+                "Found PhysicsScene: %s\nGravity direction: %s\nGravity magnitude: %s",
+                scene_path,
+                scene_desc.gravityDirection,
+                scene_desc.gravityMagnitude,
+            )
         scene_gravity_direction = scene_desc.gravityDirection
         scene_gravity_magnitude = scene_desc.gravityMagnitude
 
         # Storing Physics Scene attributes
         for a in physics_scene_prim.GetAttributes():
             scene_attributes[a.GetName()] = a.Get()
+
+        # Like the MJCF flag, mjc:flag:filterparent changes the Newton model (the joints' parent
+        # filter) rather than a solver option, and follows the same parse_mujoco_options gate.
+        if parse_mujoco_options:
+            filter_parent_attr = physics_scene_prim.GetAttribute("mjc:flag:filterparent")
+            if filter_parent_attr and filter_parent_attr.HasAuthoredValue():
+                scene_filter_parent = bool(filter_parent_attr.Get())
 
         # Parse custom attribute declarations from PhysicsScene prim
         # This must happen before processing any other prims
@@ -1331,11 +1338,13 @@ def parse_usd(
         builder.up_axis = stage_up_axis
         axis_xform = wp.transform_identity()
         if verbose:
-            print(f"Using stage up axis {stage_up_axis} as builder up axis")
+            logger.info("Using stage up axis %s as builder up axis", stage_up_axis)
     else:
         axis_xform = wp.transform(wp.vec3(0.0), quat_between_axes(stage_up_axis, builder.up_axis))
         if verbose:
-            print(f"Rotating stage to align its up axis {stage_up_axis} with builder up axis {builder.up_axis}")
+            logger.info(
+                "Rotating stage to align its up axis %s with builder up axis %s", stage_up_axis, builder.up_axis
+            )
     if override_root_xform and xform is None:
         raise ValueError("override_root_xform=True requires xform to be set")
 
@@ -1430,8 +1439,11 @@ def parse_usd(
         else:
             builder.gravity = resolved_mpm_gravity
     if verbose:
-        print(
-            f"Scaling PD gains by (joint_drive_gains_scaling / DegreesToRadian) = {joint_drive_gains_scaling / DegreesToRadian}, default scale for joint_drive_gains_scaling=1 is 1.0/DegreesToRadian = {1.0 / DegreesToRadian}"
+        logger.info(
+            "Scaling PD gains by (joint_drive_gains_scaling / DegreesToRadian) = %s, default "
+            "scale for joint_drive_gains_scaling=1 is 1.0/DegreesToRadian = %s",
+            joint_drive_gains_scaling / DegreesToRadian,
+            1.0 / DegreesToRadian,
         )
 
     # Process custom attributes defined for different kinds of prim.
@@ -1460,7 +1472,8 @@ def parse_usd(
             R.collect_prim_attrs(physics_scene_prim)
 
         # Extract custom attributes for model (ONCE and WORLD frequency) from the PhysicsScene prim
-        # WORLD frequency attributes use index 0 here; they get remapped during add_world()
+        # WORLD frequency attributes use the current world, -1 outside a world context;
+        # add_world() remaps them to the destination world.
         builder_custom_attr_model: list[ModelBuilder.CustomAttribute] = [
             attr
             for attr in builder.custom_attributes.values()
@@ -1480,7 +1493,8 @@ def parse_usd(
         # Set values on builder's custom attributes
         for key, value in scene_custom_attrs.items():
             if key in builder.custom_attributes:
-                builder.custom_attributes[key].values[0] = value
+                attribute = builder.custom_attributes[key]
+                attribute.values[builder._model_value_key(attribute)] = value
 
     joint_descriptions = {}
     # stores physics spec for every RigidBody in the selected range
@@ -1495,7 +1509,7 @@ def parse_usd(
         if key not in physics_utils_results:
             return
         if verbose:
-            print(physics_utils_results[key])
+            logger.info("%s", physics_utils_results[key])
 
         yield from zip(*physics_utils_results[key], strict=False)
 
@@ -1505,24 +1519,22 @@ def parse_usd(
     def warn_invalid_desc(path, descriptor) -> bool:
         if not descriptor.isValid:
             warnings.warn(
-                f'Warning: Invalid {type(descriptor).__name__} descriptor for prim at path "{path}".',
+                f'Invalid {type(descriptor).__name__} descriptor for prim at path "{path}".',
+                NewtonWarning,
                 stacklevel=2,
             )
             return True
         return False
 
-    def _physics_material_from_desc(sdf_path, desc):
-        """Convert one native USD material descriptor into Newton's shape material."""
-        prim = stage.GetPrimAtPath(sdf_path)
-        return _resolve_physics_material(
-            prim, desc, R, builder.default_shape_cfg, default_shape_density=default_shape_density, verbose=verbose
-        )
-
-    # Parsing physics materials from the selected import subtree.
+    # Parsing physics materials from the stage
     for sdf_path, desc in data_for_key(ret_dict, UsdPhysics.ObjectType.RigidBodyMaterial):
         if warn_invalid_desc(sdf_path, desc):
             continue
-        material_specs[str(sdf_path)] = _physics_material_from_desc(sdf_path, desc)
+        prim = stage.GetPrimAtPath(sdf_path)
+
+        material_specs[str(sdf_path)] = _resolve_physics_material(
+            prim, desc, R, builder.default_shape_cfg, default_shape_density=default_shape_density, verbose=verbose
+        )
 
     if UsdPhysics.ObjectType.RigidBody in ret_dict:
         prim_paths, rigid_body_descs = ret_dict[UsdPhysics.ObjectType.RigidBody]
@@ -1554,7 +1566,7 @@ def parse_usd(
                 # This fallback is only needed for enabled descendant MassAPI overrides.
                 descendants = iter(Usd.PrimRange(prim, Usd.TraverseInstanceProxies()))
                 for descendant in descendants:
-                    if descendant != prim and descendant.HasAPI(UsdPhysics.RigidBodyAPI):
+                    if descendant != prim and _owns_descendants(descendant):
                         descendants.PruneChildren()
                         continue
                     if _is_enabled_collider(descendant) and descendant.HasAPI(UsdPhysics.MassAPI):
@@ -1670,6 +1682,8 @@ def parse_usd(
                     break
                 current_prim = current_prim.GetParent()
 
+    articulation_has_self_collision = {}
+
     _deformable_ctx = _DeformableImportContext(
         builder=builder,
         stage=stage,
@@ -1682,6 +1696,9 @@ def parse_usd(
         get_rigid_body_ancestor_path=_get_rigid_body_ancestor_path,
         get_first_target=_get_first_target,
         get_tetmesh_cached=_get_tetmesh_cached,
+        is_viewport_drawn=visuals.is_viewport_drawn,
+        load_visual_shapes=load_visual_shapes,
+        hide_collision_shapes=hide_collision_shapes,
         incoming_world_xform=incoming_world_xform,
         linear_unit=linear_unit,
         ignore_paths=ignore_paths,
@@ -1698,7 +1715,13 @@ def parse_usd(
         path_soft_attrs=path_soft_attrs,
         path_attachment_map=path_attachment_map,
         path_attachment_attrs=path_attachment_attrs,
+        articulation_has_self_collision=articulation_has_self_collision,
         prims=_deformable_prims,
+        cable_visual_sim_paths={
+            sim_path
+            for body_path, sim_path in _deformable_prims.body_owner.items()
+            if any(visuals.is_viewport_drawn(prim) for prim in _deformable_prims.visual_meshes.get(body_path, ()))
+        },
     )
 
     def import_attached_cables(body_paths) -> None:
@@ -1742,9 +1765,6 @@ def parse_usd(
         if prim.HasAPI(UsdPhysics.ArticulationRootAPI)
     ]
     authored_articulation_root_paths.sort(key=len, reverse=True)
-
-    # maps from articulation_id to bool indicating if self-collisions are enabled
-    articulation_has_self_collision = {}
 
     if UsdPhysics.ObjectType.Articulation in ret_dict:
         paths, articulation_descs = ret_dict[UsdPhysics.ObjectType.Articulation]
@@ -1819,7 +1839,7 @@ def parse_usd(
             continue
         if joint_path in mjc_equality_connect_or_weld_paths:
             if verbose:
-                print(f"Skipping equality connect/weld joint '{joint_path}' from orphan joint parsing")
+                logger.info("Skipping equality connect/weld joint '%s' from orphan joint parsing", joint_path)
             continue
 
         # Apply the importer filters before grouping the remaining candidates.
@@ -1886,7 +1906,7 @@ def parse_usd(
                 parse_joint(joint_desc, incoming_xform=orphan_incoming_xform)
         except ValueError as exc:
             if verbose:
-                print(f"Skipping joint group {joint_group}: {exc}")
+                logger.info("Skipping joint group %s: %s", joint_group, exc)
 
     # parse shapes attached to the rigid bodies
     # Canonicalized (sorted) USD path pairs from physics:filteredPairs. Collected from native
@@ -1898,7 +1918,11 @@ def parse_usd(
     # instance-proxy walk. Body visuals were already loaded by add_body(), so only untouched
     # static candidates need geometry/material work here.
     if load_visual_shapes and load_static_visual_shapes:
-        rigid_body_paths = {str(path) for path in ret_dict.get(UsdPhysics.ObjectType.RigidBody, ((), ()))[0]}
+        rigid_body_paths = {
+            str(path)
+            for path in ret_dict.get(UsdPhysics.ObjectType.RigidBody, ((), ()))[0]
+            if _owns_descendants(stage.GetPrimAtPath(path))
+        }
 
         def _is_in_rigid_body_hierarchy(path: str) -> bool:
             while path:
@@ -1981,23 +2005,26 @@ def parse_usd(
             inertia_tensor_val = (
                 usd.get_attribute(prim, "newton:inertia") if usd.has_applied_api_schema(prim, "NewtonMassAPI") else None
             )
-            has_inertia_tensor = inertia_tensor_val is not None
+            has_inertia_tensor = inertia_tensor_val is not None and len(inertia_tensor_val) > 0
             if has_inertia_tensor:
                 if len(inertia_tensor_val) != 6:
                     warnings.warn(
                         f"Body {body_path}: newton:inertia has {len(inertia_tensor_val)} elements, expected 6. Ignoring.",
+                        NewtonWarning,
                         stacklevel=2,
                     )
                     has_inertia_tensor = False
                 elif not all(math.isfinite(v) for v in inertia_tensor_val):
                     warnings.warn(
                         f"Body {body_path}: newton:inertia contains non-finite values. Ignoring.",
+                        NewtonWarning,
                         stacklevel=2,
                     )
                     has_inertia_tensor = False
                 elif any(v < 0.0 for v in inertia_tensor_val[:3]):
                     warnings.warn(
                         f"Body {body_path}: newton:inertia has negative diagonal elements. Ignoring.",
+                        NewtonWarning,
                         stacklevel=2,
                     )
                     has_inertia_tensor = False
@@ -2007,6 +2034,7 @@ def parse_usd(
                     if np.any(np.linalg.eigvalsh(inertia_np) < 0.0):
                         warnings.warn(
                             f"Body {body_path}: newton:inertia is not positive semidefinite. Ignoring.",
+                            NewtonWarning,
                             stacklevel=2,
                         )
                         has_inertia_tensor = False
@@ -2015,6 +2043,8 @@ def parse_usd(
                         inertia_tensor = wp.mat33(ixx, ixy, ixz, ixy, iyy, iyz, ixz, iyz, izz)
             mass_compute_failed = False
 
+            # Mass that the body's current inertia corresponds to.
+            inertia_mass_basis = builder.body_mass[body_id]
             # Compute baseline mass properties via mass computer when at least one property needs resolving.
             if not (has_effective_mass and has_effective_inertia and has_effective_com):
                 rigid_body_api = UsdPhysics.RigidBodyAPI(prim)
@@ -2044,6 +2074,7 @@ def parse_usd(
                     )
                     if recorded_properties is not None:
                         cmp_mass, recorded_inertia, cmp_com = recorded_properties
+                        inertia_mass_basis = cmp_mass
                         builder.body_inertia[body_id] = recorded_inertia
                         if np.array(recorded_inertia).any():
                             builder.body_inv_inertia[body_id] = wp.inverse(recorded_inertia)
@@ -2115,11 +2146,11 @@ def parse_usd(
             # Mass: effective authored value takes precedence over mass computer.
             if has_effective_mass:
                 mass = effective_mass
-                shape_accumulated_mass = builder.body_mass[body_id]
                 if not has_effective_inertia and effective_density is not None:
                     warnings.warn(
                         f"Body {body_path}: authored mass and density without authored diagonalInertia. "
                         f"Ignoring body-level density.",
+                        NewtonWarning,
                         stacklevel=2,
                     )
                 # When mass is authored but inertia is not, scale the accumulated
@@ -2131,12 +2162,13 @@ def parse_usd(
                     builder.body_inertia[body_id] = inertia
                     builder.body_inv_inertia[body_id] = wp.inverse(inertia)
                     if verbose:
-                        print(
-                            f"Applied PhysX small-sphere fallback inertia for body {body_path}: "
-                            f"diagonal elements = [{inertia_val}, {inertia_val}, {inertia_val}]"
+                        logger.info(
+                            "Applied PhysX small-sphere fallback inertia for body %s: diagonal elements = %s.",
+                            body_path,
+                            inertia_val,
                         )
-                elif not has_effective_inertia and shape_accumulated_mass > 0.0 and mass > 0.0:
-                    scale = mass / shape_accumulated_mass
+                elif not has_effective_inertia and inertia_mass_basis > 0.0 and mass > 0.0:
+                    scale = mass / inertia_mass_basis
                     builder.body_inertia[body_id] = wp.mat33(np.array(builder.body_inertia[body_id]) * scale)
                     builder.body_inv_inertia[body_id] = wp.inverse(builder.body_inertia[body_id])
             else:
@@ -2145,6 +2177,7 @@ def parse_usd(
                     warnings.warn(
                         f"Body {body_path}: authored mass is not positive and finite. "
                         "Falling back to mass-computer result.",
+                        NewtonWarning,
                         stacklevel=2,
                     )
                 mass = cmp_mass
@@ -2178,12 +2211,17 @@ def parse_usd(
                     builder.body_inv_inertia[body_id] = wp.inverse(I_default)
 
                     if verbose:
-                        print(
-                            f"Applied default inertia matrix for body {body_path}: diagonal elements = [{I_default[0, 0]}, {I_default[1, 1]}, {I_default[2, 2]}]"
+                        logger.info(
+                            "Applied default inertia matrix for body %s: diagonal elements = [%s, %s, %s]",
+                            body_path,
+                            I_default[0, 0],
+                            I_default[1, 1],
+                            I_default[2, 2],
                         )
                 elif mass_api:
                     warnings.warn(
                         f"Body {body_path} has zero mass and zero inertia despite having the MassAPI USD schema applied.",
+                        NewtonWarning,
                         stacklevel=2,
                     )
 
@@ -2312,6 +2350,12 @@ def parse_usd(
             _deformable_import_cloth(_deformable_ctx)
         if _deformable_prims.tetmeshes:
             _deformable_import_volume(_deformable_ctx)
+
+        # Proposal graphics geometry: untagged Meshes under each imported deformable body
+        # become visual meshes skinned from that body's simulation elements. Runs after the
+        # family passes so ownership (tet/tri ranges, cable body lists) is realized.
+        if load_visual_shapes and _deformable_prims.body_owner:
+            _deformable_import_visual(_deformable_ctx)
 
         # PhysicsAttachment prims from the AOUSD deformables proposal. The current
         # builder can faithfully lower the cable/rod subset because imported cables
@@ -2446,6 +2490,7 @@ def parse_usd(
             custom_attrs: dict[str, Any],
         ) -> None:
             try:
+                # A world-side weld anchor or relpose is in stage coordinates, which incoming_world_xform places.
                 _, joint_idx = mjc_add_equality_loop_joint(
                     builder,
                     eq_type,
@@ -2457,10 +2502,12 @@ def parse_usd(
                     joint_path,
                     enabled,
                     custom_attrs,
+                    world_xform=incoming_world_xform,
                 )
             except ValueError:
                 warnings.warn(
                     f"MuJoCo equality '{joint_path}' has no valid body reference; skipping.",
+                    NewtonWarning,
                     stacklevel=2,
                 )
                 return
@@ -2547,7 +2594,9 @@ def parse_usd(
                         else site1_local_pos
                     )
                     relpose_rot = local_rot0 * wp.quat_inverse(local_rot1)
-                    relpose_pos = local_pos0 - wp.quat_rotate(relpose_rot, local_pos1)
+                    # MuJoCo's weld holds the anchor at relpose's position in body0's frame (not body1's origin
+                    # there), so use where the anchor sits when the joint's two frames coincide.
+                    relpose_pos = local_pos0 + wp.quat_rotate(relpose_rot, anchor - local_pos1)
                     torquescale_attr = joint_prim.GetAttribute("mjc:torqueScale")
                     torquescale = (
                         float(torquescale_attr.Get()) if torquescale_attr and torquescale_attr.HasValue() else 1.0
@@ -2585,6 +2634,7 @@ def parse_usd(
                 if joint1_idx is None:
                     warnings.warn(
                         f"MjcEqualityJointAPI on '{joint_path}' was not found in path_joint_map; skipping.",
+                        NewtonWarning,
                         stacklevel=2,
                     )
                     continue
@@ -2593,6 +2643,7 @@ def parse_usd(
                 if leader_path is None:
                     warnings.warn(
                         f"MjcEqualityJointAPI on '{joint_path}' has no newton:mimicJoint relationship; skipping.",
+                        NewtonWarning,
                         stacklevel=2,
                     )
                     continue
@@ -2602,6 +2653,7 @@ def parse_usd(
                 if joint2_idx is None:
                     warnings.warn(
                         f"MjcEqualityJointAPI on '{joint_path}' references '{target_path}' which was not found in path_joint_map; skipping.",
+                        NewtonWarning,
                         stacklevel=2,
                     )
                     continue
@@ -2620,9 +2672,10 @@ def parse_usd(
                 if convert_mjc_equality_constraints:
                     if mjc_polycoef_has_higher_order(polycoef):
                         warnings.warn(
-                            f"Warning: Joint equality '{joint_path}' uses higher-order polycoef terms. "
+                            f"Joint equality '{joint_path}' uses higher-order polycoef terms. "
                             "They are preserved for SolverMuJoCo, but generic Newton mimic constraints use "
                             "only coef0/coef1.",
+                            NewtonWarning,
                             stacklevel=2,
                         )
                     mjc_add_equality_mimic(
@@ -2772,6 +2825,7 @@ def parse_usd(
                 warnings.warn(
                     f"PhysxMimicJointAPI on '{joint_path}' references '{leader_path}' "
                     f"but leader joint was not found, skipping mimic constraint",
+                    NewtonWarning,
                     stacklevel=2,
                 )
                 continue
@@ -2785,9 +2839,13 @@ def parse_usd(
             _set_imported_mimic(joint_idx, leader_idx, -offset, -gearing)
 
             if verbose:
-                print(
-                    f"Added PhysxMimicJointAPI constraint: '{joint_path}' follows '{leader_path}' "
-                    f"(gearing={gearing}, offset={offset}, axis={axis_instance})"
+                logger.info(
+                    "Added PhysxMimicJointAPI constraint: '%s' follows '%s' (gearing=%s, offset=%s, axis=%s)",
+                    joint_path,
+                    leader_path,
+                    gearing,
+                    offset,
+                    axis_instance,
                 )
 
     # Mimic constraints from NewtonMimicAPI (run after collapse so joint indices are final).
@@ -2803,12 +2861,13 @@ def parse_usd(
         leader_path, coef0, coef1 = _resolve_newton_mimic(joint_prim)
         if leader_path is None:
             if verbose:
-                print(f"NewtonMimicAPI on {joint_path} has no newton:mimicJoint target; skipping")
+                logger.info("NewtonMimicAPI on %s has no newton:mimicJoint target; skipping", joint_path)
             continue
         leader_path_str = str(leader_path)
         if leader_path_str not in path_joint_map:
             warnings.warn(
                 f"NewtonMimicAPI on {joint_path}: leader {leader_path_str} not in path_joint_map; skipping mimic constraint.",
+                NewtonWarning,
                 stacklevel=2,
             )
             continue
@@ -2826,6 +2885,7 @@ def parse_usd(
                 f"NewtonMimicAPI on {joint_path}: newton:mimicCoef0 has no defined unit for a "
                 f"{joint_prim.GetTypeName()} follower, which is not a single-DOF joint. Using the "
                 f"authored value unconverted; the offset is applied to every coordinate.",
+                NewtonWarning,
                 stacklevel=2,
             )
         # Independent of units: a single-DOF prim merged into a D6 is constrained on every
@@ -2834,16 +2894,21 @@ def parse_usd(
             warnings.warn(
                 f"NewtonMimicAPI on {joint_path}: follower was merged into a multi-DOF joint, so the "
                 f"mimic relationship applies to every coordinate of that joint, not only the authored axis.",
+                NewtonWarning,
                 stacklevel=2,
             )
         leader_idx = path_joint_map[leader_path_str]
         _set_imported_mimic(joint_idx, leader_idx, coef0, coef1)
 
     # Parse Newton actuator prims from the USD stage.
-    from ..actuators.delay import Delay  # noqa: PLC0415
-    from ..actuators.usd_parser import parse_actuator_prim  # noqa: PLC0415
+    from ..actuators.input_processors.base import InputProcessorBase  # noqa: PLC0415
+    from ..actuators.motor_dc import MotorDC  # noqa: PLC0415
+    from ..actuators.usd_parser import BatteryParsed, _parse_actuator_prim, parse_battery_prim  # noqa: PLC0415
 
+    batteries: dict[str, BatteryParsed] = {}
+    battery_actuators: dict[str, list[int]] = {}
     actuator_count = 0
+    add_actuator_params = set(inspect.signature(builder.add_actuator).parameters) - {"kwargs"}
     path_to_dof = {
         path: builder.joint_qd_start[idx] + merged_dof_offset.get(path, 0)
         for path, idx in path_joint_map.items()
@@ -2858,7 +2923,11 @@ def parse_usd(
         prim_path = str(prim.GetPath())
         if any(re.match(pattern, prim_path) for pattern in ignore_paths):
             continue
-        parsed = parse_actuator_prim(prim, allow_unsafe_torch_checkpoints=allow_unsafe_torch_checkpoints)
+        battery = parse_battery_prim(prim)
+        if battery is not None:
+            batteries[prim_path] = battery
+            continue
+        parsed = _parse_actuator_prim(prim, allow_unsafe_torch_checkpoints)
         if parsed is None:
             continue
         target_path = parsed.target_path
@@ -2882,25 +2951,65 @@ def parse_usd(
         coord_index = path_to_coord.get(target_path)
         pos_index = coord_index if coord_index is not None and coord_index != dof_index else None
 
-        delay_val = None
+        input_processor_specs = []
         clamping_specs = []
+        motor_spec = None
         for comp_class, comp_kwargs in parsed.component_specs:
-            if comp_class is Delay:
-                delay_val = comp_kwargs.get("delay_steps")
+            if issubclass(comp_class, InputProcessorBase):
+                proc_kwargs = dict(comp_kwargs)
+                for name in comp_class.JOINT_PARAMS:
+                    path = proc_kwargs.get(name)
+                    if isinstance(path, str):
+                        if path not in path_joint_map:
+                            raise ValueError(
+                                f"Actuator prim {prim.GetPath()}: '{name}' references '{path}', "
+                                "which is not a known joint"
+                            )
+                        proc_kwargs[name] = path_joint_map[path]
+                input_processor_specs.append((comp_class, proc_kwargs))
+            elif issubclass(comp_class, MotorDC):
+                motor_spec = (comp_class, dict(comp_kwargs))
             else:
                 clamping_specs.append((comp_class, comp_kwargs))
 
-        builder.add_actuator(
+        drive_kwargs = {name: value for name, value in parsed.drive_kwargs.items() if name not in add_actuator_params}
+        battery_path = parsed.battery_path
+        if battery_path is not None:
+            if motor_spec is None:
+                raise ValueError(
+                    f"Actuator prim {prim.GetPath()} draws from battery '{battery_path}' but has no motor; "
+                    "apply a motor schema such as NewtonDCMotorAPI"
+                )
+            motor_spec[1]["supply_from_battery"] = True
+        if motor_spec is not None:
+            motor_class, motor_kwargs = motor_spec
+            resolved_motor = motor_class.resolve_arguments(motor_kwargs)
+            motor_spec = (motor_class, {k: v for k, v in motor_kwargs.items() if k in resolved_motor})
+        actuator = builder.add_actuator(
             parsed.drive_class,
             index=dof_index,
             clamping=clamping_specs if clamping_specs else None,
-            delay_steps=delay_val,
             pos_index=pos_index,
-            **parsed.drive_kwargs,
+            input_processors=input_processor_specs,
+            motor=motor_spec,
+            **drive_kwargs,
         )
+        if battery_path is not None:
+            battery_actuators.setdefault(battery_path, []).append(actuator)
         actuator_count += 1
     if verbose and actuator_count > 0:
-        print(f"Added {actuator_count} actuator(s) from USD")
+        logger.info("Added %s actuator(s) from USD", actuator_count)
+    for battery_path in battery_actuators.keys() - batteries.keys():
+        # A battery may sit outside root_path, e.g. shared by several robots.
+        battery = None
+        if not any(re.match(pattern, battery_path) for pattern in ignore_paths):
+            battery = parse_battery_prim(stage.GetPrimAtPath(battery_path))
+        if battery is None:
+            raise ValueError(f"Actuators reference '{battery_path}' in 'newton:battery', which is not a battery prim")
+        batteries[battery_path] = battery
+    for path, battery in batteries.items():
+        if path in battery_actuators:
+            builder.add_battery(battery.battery_class, battery_actuators[path], **battery.battery_kwargs)
 
     result = {
         "fps": stage.GetFramesPerSecond(),
@@ -2967,8 +3076,11 @@ def parse_usd(
                     values_rows = [{attr.key: row.get(attr.key, None) for attr in freq_attrs} for row in expanded_rows]
                     builder.add_custom_values_batch(values_rows)
                     if verbose and len(expanded_rows) > 0:
-                        print(
-                            f"Parsed custom frequency '{freq_key}' from prim {prim.GetPath()} with {len(expanded_rows)} rows"
+                        logger.info(
+                            "Parsed custom frequency '%s' from prim %s with %s rows",
+                            freq_key,
+                            prim.GetPath(),
+                            len(expanded_rows),
                         )
                     continue
 
@@ -2989,7 +3101,7 @@ def parse_usd(
                 # even if all values are None (defaults will be applied during finalization)
                 builder.add_custom_values(**values_dict)
                 if verbose:
-                    print(f"Parsed custom frequency '{freq_key}' from prim {prim.GetPath()}")
+                    logger.info("Parsed custom frequency '%s' from prim %s", freq_key, prim.GetPath())
 
     # USD MjcActuator does not preserve the original MJCF authoring tag:
     # MuJoCo's compiler expands <position>/<velocity> shortcuts into raw
@@ -3030,6 +3142,13 @@ def parse_usd(
             return attr.default if value is None else value
 
         converted = 0
+        # DOFs whose target mode was already set by an MjcActuator row in this
+        # loop, so a position + velocity pair on one DOF is not mistaken for a
+        # UsdPhysics drive.
+        mjc_target_dofs: set[int] = set()
+        # DOFs whose MjcActuator gains were merged into a UsdPhysics drive's,
+        # reported once after all rows are merged.
+        drive_merged_dofs: dict[int, str] = {}
 
         for row in range(mjc_actuator_count):
             target_path = _row("mujoco:actuator_target_label", row)
@@ -3071,6 +3190,24 @@ def parse_usd(
                 continue
 
             current_mode = builder.joint_target_mode[dof]
+            if current_mode == int(JointTargetMode.EFFORT):
+                # A UsdPhysics drive with zero stiffness and damping set EFFORT.
+                # SolverMuJoCo builds no joint-target actuator for EFFORT, so
+                # keeping it would drop the authored MjcActuator. The drive adds
+                # no gains, so the MjcActuator's gains define the target mode.
+                # The drive's targets and maxForce were already applied to the
+                # DOF and are kept, as for a drive with gains.
+                logger.warning(
+                    "Joint '%s' has a UsdPhysics drive with zero stiffness and damping and an MjcActuator; "
+                    "the MjcActuator's gains are used instead of EFFORT mode. The drive's targets and "
+                    "maxForce still apply.",
+                    target_path,
+                )
+                builder.joint_target_mode[dof] = int(JointTargetMode.NONE)
+                current_mode = int(JointTargetMode.NONE)
+            if dof not in mjc_target_dofs and current_mode != int(JointTargetMode.NONE):
+                drive_merged_dofs[dof] = target_path
+            mjc_target_dofs.add(dof)
             if is_position:
                 builder.joint_target_ke[dof] = kp
                 if current_mode == int(JointTargetMode.VELOCITY):
@@ -3096,8 +3233,18 @@ def parse_usd(
 
             converted += 1
 
+        for dof, joint_path in drive_merged_dofs.items():
+            logger.warning(
+                "Joint '%s' has both a UsdPhysics drive and an MjcActuator; using mode %s, ke=%g, kd=%g. "
+                "Remove one of them to use the other alone.",
+                joint_path,
+                JointTargetMode(builder.joint_target_mode[dof]).name,
+                builder.joint_target_ke[dof],
+                builder.joint_target_kd[dof],
+            )
+
         if verbose and converted > 0:
-            print(f"Mapped {converted} MuJoCo USD actuator(s) to joint targets")
+            logger.info("Mapped %s MuJoCo USD actuator(s) to joint targets", converted)
     if return_deformable_results:
         # The deformable results are opt-in so the default return shape carries no
         # deformable additions and stays isolated from changes to this experimental contract.
@@ -3106,6 +3253,7 @@ def parse_usd(
                 "path_cable_map": path_cable_map,
                 "path_cloth_map": path_cloth_map,
                 "path_soft_map": path_soft_map,
+                "path_deformable_visual_map": _deformable_ctx.path_deformable_visual_map,
                 "path_cable_attrs": path_cable_attrs,
                 "path_cloth_attrs": path_cloth_attrs,
                 "path_soft_attrs": path_soft_attrs,

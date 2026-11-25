@@ -40,7 +40,7 @@ Most Newton sensors follow a common pattern:
    model = builder.finalize()
 
    # 1. Create sensor and specify what to measure
-   imu = SensorIMU(model, sites="imu_*", request_state_attributes=False)
+   imu = SensorIMU(model, sites="imu_*")
 
    # Create solver and state
    solver = newton.solvers.SolverMuJoCo(model)
@@ -92,10 +92,10 @@ link filters are matched against the final path component of each label.
    import re
 
    # single pattern: all shapes whose label starts with "foot_"
-   SensorIMU(model, sites="foot_*", request_state_attributes=False)
+   SensorIMU(model, sites="foot_*")
 
    # compiled regular expression: full-match an environment and object label
-   SensorIMU(model, sites=re.compile(r"/World/envs/env_[0-9]+/imu_(left|right)"), request_state_attributes=False)
+   SensorIMU(model, sites=re.compile(r"/World/envs/env_[0-9]+/imu_(left|right)"))
 
    # list of patterns: union of two groups
    SensorContact(model, sensing_shapes=["*Plate*", "*Flap*"])
@@ -106,7 +106,7 @@ link filters are matched against the final path component of each label.
 Available Sensors
 -----------------
 
-Newton provides five sensor types. See the
+Newton provides four sensor types. See the
 :doc:`API reference <../api/newton_sensors>` for constructor arguments,
 attributes, and usage examples.
 
@@ -115,8 +115,11 @@ attributes, and usage examples.
 * :class:`~newton.sensors.SensorFrameTransform` -- relative transforms of shapes/sites with respect to reference sites.
 * :class:`~newton.sensors.SensorIMU` -- linear acceleration and angular velocity at site frames.
 * :class:`~newton.sensors.SensorCamera` -- raytraced color, HDR color, depth, forward-depth, normal, albedo, and
-  shape-index rendering; one view per camera transform, mapped to worlds via a per-view selector.
-* :class:`~newton.sensors.SensorTiledCamera` -- deprecated; superseded by :class:`~newton.sensors.SensorCamera`.
+  shape-index rendering; one view per camera transform, mapped to worlds via a per-view selector. Deformable
+  visual meshes render too; see :ref:`deformable-visual-camera-output`. Installing ``newton[optix]`` enables
+  experimental OptiX ray tracing with ``backend="optix"``; build its shapes with
+  ``model.bvh_build_shapes(state, backend="optix")`` and refit them with
+  ``model.bvh_refit_shapes(state, backend="optix")``.
 
 Camera Rays from USD and Calibration Data
 -----------------------------------------
@@ -189,9 +192,8 @@ requires ``SolverBase.ObservableKind.CONTACT_F``. ``SensorContact`` uses only th
 linear part of each ``CONTACT_F`` wrench (force [N]); the torque part is ignored.
 Each sensor's ``solver_observable_kinds`` property provides its requirements
 without mutating the model. Union the sets when both sensors are present.
-Construct the collision pipeline before requesting contact-indexed observables,
-then pass its contacts buffer to the factory to bind the observable container.
-Reuse that same buffer for the solver step and sensor:
+Pass a contacts buffer to the factory when requesting contact-indexed
+observables, and pass each solver step's buffer to the sensor:
 
 .. code-block:: python
 
@@ -202,8 +204,8 @@ Reuse that same buffer for the solver step and sensor:
    imu.update(state_out, observables=observables)
    contact_sensor.update(state_out, contacts, observables=observables)
 
-Contact observables are allocated from the model's resolved rigid and soft contact
-capacities, not the current number of contacts. See :ref:`solver_observables` for
+Contact observables are sized from the supplied contacts' capacities, not the
+current number of contacts. See :ref:`solver_observables` for
 pipeline setup with native collision backends and graph capture.
 
 Both :class:`~newton.solvers.SolverKamino` and

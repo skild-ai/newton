@@ -2,7 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Grasp and slew a passive toy crane to demolish a dry-stacked miniature building.
 
-Command: python -m newton.examples steel_wrecking_ball
+Success criteria:
+- The robot grasps the crane and slews it so the ball strikes the building.
+- The ball stays attached to the crane and the upper floors collapse; the building does not collapse before the impact.
+
+Runs:
+- `python -m newton.examples steel_wrecking_ball`
 """
 
 import numpy as np
@@ -20,7 +25,7 @@ class Example(TabletopDemo):
     @staticmethod
     def create_parser():
         parser = TabletopDemo.create_parser()
-        parser.set_defaults(substeps=4, iterations=16, contact_response="propagation_colored")
+        parser.set_defaults(substeps=4, iterations=16, solve_mode="colored", contact_response="propagation")
         return parser
 
     def populate(self, builder, info, ee, down, fingers):

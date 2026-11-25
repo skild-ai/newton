@@ -52,6 +52,18 @@ def _increment_counter(counter: wp.array[wp.int32]):
 
 
 @wp.kernel
+def _measure_rod_clearance(body_q: wp.array[wp.transform], minimum: wp.array[float]):
+    corner = wp.tid()
+    point = wp.vec3(
+        0.5 if (corner & 1) != 0 else -0.5,
+        0.04 if (corner & 2) != 0 else -0.04,
+        0.04 if (corner & 4) != 0 else -0.04,
+    )
+    height = wp.transform_point(body_q[0], point)[2]
+    wp.atomic_min(minimum, 0, height - 0.02)
+
+
+@wp.kernel
 def _extract_speculative_plane_proxy_scale(
     shape_types: wp.array[wp.int32],
     shape_data: wp.array[wp.vec4],
@@ -459,11 +471,13 @@ def _replace_validated_predictive_claims(
 @wp.kernel
 def _reclaim_and_allocate_contact_ids(
     reducer_data: GlobalContactReducerData,
+    stride: int,
     allocated_ids: wp.array[wp.int32],
 ):
-    """Reclaim one ID per thread and immediately contend for the available IDs."""
+    """Reclaim one ID per ``stride`` threads while every thread contends for one."""
     tid = wp.tid()
-    reclaim_contact_id(tid + 1, reducer_data)
+    if tid % stride == 0:
+        reclaim_contact_id(tid / stride + 1, reducer_data)
     allocated_ids[tid] = export_contact_to_buffer(
         0,
         1,
@@ -1034,7 +1048,7 @@ def test_adaptive_collision_schedule_reacts_to_acceleration(test, device):
     builder.add_shape_sphere(body, radius=0.1)
     model = builder.finalize(device=device)
     states = (model.state(), model.state())
-    pipeline = newton.CollisionPipeline(model, speculative_contact_gap_max=travel_budget)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", speculative_contact_gap_max=travel_budget)
     solver = newton.solvers.SolverXPBD(model, iterations=1)
     collision_calls = wp.zeros(1, dtype=wp.int32, device=device)
 
@@ -1348,7 +1362,7 @@ def test_speculative_mesh_sdf_manifold_is_bounded(test, device):
     test.assertLessEqual(count, 7)
 
 
-def test_speculative_mesh_sdf_retains_rotating_leading_feature(test, device):
+def test_speculative_mesh_sdf_retains_rotating_leading_feature(test, device, scheduled=False):
     """Verify an inner SDF contact cannot hide the rod end rotating toward the board."""
     rod = newton.Mesh.create_box(0.5, 0.04, 0.04, compute_normals=False, compute_uvs=False)
     rod.build_sdf(device=device, max_resolution=64)
@@ -1359,8 +1373,8 @@ def test_speculative_mesh_sdf_retains_rotating_leading_feature(test, device):
     builder.rigid_gap = 0.0
     rod_body = builder.add_body(
         xform=wp.transform(
-            wp.vec3(0.0, 0.0, 0.095),
-            wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), -0.1),
+            wp.vec3(0.0, 0.0, 0.09 if scheduled else 0.095),
+            wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), -0.05 if scheduled else -0.1),
         )
     )
     builder.add_shape_mesh(rod_body, mesh=rod)
@@ -1374,12 +1388,46 @@ def test_speculative_mesh_sdf_retains_rotating_leading_feature(test, device):
         speculative_contact_gap_max=0.15,
     )
     contacts = pipeline.contacts()
-    pipeline.collide(model.state(), contacts, dt=0.03)
+    states = (model.state(), model.state())
+    first_points = []
+    if scheduled:
+        solver = newton.solvers.SolverXPBD(model, iterations=20)
+        minimum = wp.full(1, 1.0, dtype=float, device=device)
 
-    count = int(contacts.rigid_contact_count.numpy()[0])
-    test.assertGreater(count, 1)
-    rod_points = contacts.rigid_contact_point0.numpy()[:count]
-    test.assertLess(float(rod_points[:, 0].min()), -0.3)
+        def collide(state, horizon):
+            pipeline.collide(state, contacts, dt=horizon)
+            if not first_points:
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                # A one-substep horizon may initially admit no contacts while
+                # the rod is separated. Inspect the first admitted manifold.
+                if count > 0:
+                    first_points.append(contacts.rigid_contact_point0.numpy()[:count])
+
+        def step(state_in, state_out, dt):
+            solver.step(state_in, state_out, None, contacts, dt)
+            wp.launch(_measure_rod_clearance, dim=8, inputs=[state_out.body_q, minimum], device=device)
+
+        schedule = newton.CollisionSubstepScheduler(
+            pipeline, states, collision_callback=collide, substep_callback=step, frame_dt=0.03, substeps=30
+        )
+        schedule.step()
+        test.assertEqual(int(schedule.interval_overflow.numpy()[0]), 0)
+        # Millimeter-scale SDF error is acceptable; losing the leading end
+        # allows centimeter-scale penetration even with 1 ms substeps.
+        test.assertGreater(float(minimum.numpy()[0]), -0.002)
+        test.assertTrue(first_points, "The rotating rod must generate contacts")
+        rod_points = first_points[0]
+    else:
+        pipeline.collide(states[0], contacts, dt=0.03)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        rod_points = contacts.rigid_contact_point0.numpy()[:count]
+
+    test.assertGreater(len(rod_points), 1)
+    if not scheduled:
+        # This fixture starts with the negative end penetrating the board.
+        # In the scheduled fixture that end is separated by about 5 mm and
+        # receding, so velocity-guided admission may correctly omit it.
+        test.assertLess(float(rod_points[:, 0].min()), -0.3)
     test.assertGreater(float(rod_points[:, 0].max()), 0.3)
 
 
@@ -1644,27 +1692,40 @@ def test_predictive_reducer_reclamation_storage_is_opt_in(test, device):
     """Avoid allocating predictive reservation storage in the default reducer."""
     reducer = GlobalContactReducer(capacity=32, device=device)
     test.assertEqual(reducer.reclaimed_contact_bits.shape[0], 0)
-    test.assertEqual(reducer.reclaimed_contact_cursor.shape[0], 0)
+    test.assertEqual(reducer.reclaimed_contact_count.shape[0], 0)
 
 
 def test_predictive_reducer_reclaims_ids_without_duplicates(test, device):
-    """Allocate each concurrently reclaimed contact ID exactly once."""
-    capacity = 1024
-    reducer = _make_predictive_reducer(capacity, device, deterministic=False)
-    reducer.contact_count.fill_(capacity)
-    allocated_ids = wp.full(capacity, -1, dtype=wp.int32, device=device)
+    """Reuse every concurrently reclaimed contact ID exactly once."""
+    # Enough threads to outlast one resident wave, so pops race later reclaims.
+    is_cuda = wp.get_device(device).is_cuda
+    num_threads = 1 << 17 if is_cuda else 1024
+    allocated_ids = wp.empty(num_threads, dtype=wp.int32, device=device)
 
-    wp.launch(
-        _reclaim_and_allocate_contact_ids,
-        dim=capacity,
-        inputs=[reducer.get_data_struct(), allocated_ids],
-        device=device,
-    )
+    # Stride 1 races pops against reclaims behind their scan; stride 8 keeps
+    # the pool near empty so failed pops race the few reclaims.
+    for stride in (1, 8):
+        capacity = num_threads // stride
+        reducer = _make_predictive_reducer(capacity, device, deterministic=False)
+        for trial in range(4 if is_cuda else 1):
+            with test.subTest(stride=stride, trial=trial):
+                reducer.clear()
+                reducer.contact_count.fill_(capacity)
+                allocated_ids.fill_(-2)
+                wp.launch(
+                    _reclaim_and_allocate_contact_ids,
+                    dim=num_threads,
+                    inputs=[reducer.get_data_struct(), stride, allocated_ids],
+                    device=device,
+                )
 
-    ids = np.sort(allocated_ids.numpy())
-    np.testing.assert_array_equal(ids, np.arange(1, capacity + 1, dtype=np.int32))
-    test.assertEqual(int(reducer.contact_count.numpy()[0]), capacity)
-    test.assertEqual(int(np.count_nonzero(reducer.reclaimed_contact_bits.numpy())), 0)
+                # Each reclaim precedes a pop on the same thread, so none may remain.
+                ids = allocated_ids.numpy()
+                np.testing.assert_array_equal(np.sort(ids[ids > 0]), np.arange(1, capacity + 1, dtype=np.int32))
+                test.assertEqual(int(np.count_nonzero(ids == -1)), num_threads - capacity)
+                test.assertEqual(int(reducer.contact_count.numpy()[0]), capacity)
+                test.assertEqual(int(np.count_nonzero(reducer.reclaimed_contact_bits.numpy())), 0)
+                test.assertEqual(int(reducer.reclaimed_contact_count.numpy()[0]), 0)
 
 
 class TestSpeculativeContacts(unittest.TestCase):
@@ -1833,6 +1894,13 @@ add_function_test(
     "test_speculative_mesh_sdf_retains_rotating_leading_feature",
     test_speculative_mesh_sdf_retains_rotating_leading_feature,
     devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSpeculativeMeshContacts,
+    "test_scheduled_mesh_sdf_retains_rotating_leading_feature",
+    test_speculative_mesh_sdf_retains_rotating_leading_feature,
+    devices=get_cuda_test_devices(),
+    scheduled=True,
 )
 
 

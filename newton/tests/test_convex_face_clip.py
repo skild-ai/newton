@@ -12,7 +12,7 @@ import warp as wp
 
 import newton
 from newton._src.geometry.utils import remesh_convex_hull
-from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices, requires
 
 SHAPE_GAP = 0.0015
 
@@ -176,10 +176,16 @@ def _contact_arrays(contacts):
 
 
 # Tilts at which the support-mapping manifold already spans three contacts on these supports.
-_LEGACY_SPANNING = {("plane", (20.0, 0.0, 10.0)), ("box", (20.0, 0.0, 10.0))}
+_LEGACY_SPANNING = {
+    ("plane", (20.0, 0.0, 10.0)),
+    ("box", (20.0, 0.0, 10.0)),
+    ("plane", (7.0, 3.0, 0.0)),
+    ("box", (7.0, 3.0, 0.0)),
+}
 
 
 def test_rounded_hull_rests_on_face(test, device):
+    """Check that a rounded hull resting on a face keeps a spanning manifold of hull vertices."""
     vertices, indices = _rounded_hull((0.012, 0.009, 0.008))
     for support in ("plane", "box", "finite_plane"):
         for euler in ((0.0, 0.0, 0.0), (7.0, 3.0, 0.0), (20.0, 0.0, 10.0), (90.0, 0.0, 30.0)):
@@ -379,6 +385,7 @@ def test_rounded_hull_settles(test, device):
         test.assertLess(speed, 0.15, f"{euler}: face-clipped hull still rotates at {speed:.3f} rad/s")
 
 
+@requires("scipy")
 class TestConvexFaceClip(unittest.TestCase):
     pass
 

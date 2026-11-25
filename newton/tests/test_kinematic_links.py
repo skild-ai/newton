@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import unittest
 
 import numpy as np
@@ -8,7 +9,7 @@ import warp as wp
 
 import newton
 from newton import BodyFlags, ModelBuilder
-from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton.tests.unittest_utils import MUJOCO_MODULES, add_function_test, get_test_devices, requires
 
 
 class TestKinematicLinks(unittest.TestCase):
@@ -255,7 +256,13 @@ KINEMATIC_TEST_WRENCH = np.array([20.0, -15.0, 10.0, 0.5, -0.4, 0.3], dtype=np.f
 
 
 def _uses_maximal_coordinates(solver) -> bool:
-    return isinstance(solver, newton.solvers.SolverXPBD | newton.solvers.SolverSemiImplicit | newton.solvers.SolverVBD)
+    return isinstance(
+        solver,
+        newton.solvers.SolverKamino
+        | newton.solvers.SolverXPBD
+        | newton.solvers.SolverSemiImplicit
+        | newton.solvers.SolverVBD,
+    )
 
 
 def _create_contacts(model: newton.Model, solver):
@@ -391,6 +398,33 @@ def _build_free_root_to_prismatic_scene(device):
     return model, kinematic_body, probe_body, _find_joint_for_child(model, kinematic_body), probe_joint
 
 
+def _build_free_root_to_prismatic_scene(device):
+    builder = ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    _configure_contact_defaults(builder)
+
+    kinematic_body = builder.add_body(
+        xform=wp.transform(wp.vec3(-0.1, 0.0, 0.0), wp.quat_identity()),
+        mass=1.0,
+        is_kinematic=True,
+        label="kinematic_free",
+    )
+    builder.add_shape_box(kinematic_body, hx=0.25, hy=0.15, hz=0.15)
+
+    probe_body = builder.add_link(mass=1.0, label="prismatic_probe")
+    builder.add_shape_sphere(probe_body, radius=0.1)
+    probe_joint = builder.add_joint_prismatic(
+        parent=-1,
+        child=probe_body,
+        axis=newton.Axis.X,
+        parent_xform=wp.transform(wp.vec3(0.45, 0.0, 0.0), wp.quat_identity()),
+    )
+    builder.add_articulation([probe_joint])
+
+    builder.color()
+    model = builder.finalize(device=device)
+    return model, kinematic_body, probe_body, _find_joint_for_child(model, kinematic_body), probe_joint
+
+
 def _build_revolute_root_pendulum_scene(device):
     builder = ModelBuilder(gravity=(0.0, 0.0, 0.0))
     _configure_contact_defaults(builder)
@@ -478,11 +512,7 @@ def test_kinematic_free_base_prescribed_motion(
             device, kinematic_first=kinematic_first
         )
         solver = solver_fn(model)
-        if (
-            isinstance(solver, newton.solvers.SolverSteel)
-            and solver._solve_mode == "matrix_free"
-            and solver._articulated_contact_response == "immediate"
-        ):
+        if isinstance(solver, newton.solvers.SolverSteel) and solver._articulated_contact_response == "immediate":
             body_to_articulation = solver._body_to_articulation.numpy()
             kinematic_articulation = int(body_to_articulation[kinematic_body])
             probe_articulation = int(body_to_articulation[probe_body])
@@ -587,7 +617,8 @@ def test_kinematic_free_base_drives_dense_articulation(
     device,
     solver_fn,
 ):
-    model, _kinematic_body, _probe_body, kinematic_joint, probe_joint = _build_free_root_to_prismatic_scene(device)
+    """Check that a prescribed kinematic free base pushes a dense articulation's probe without sinking into it."""
+    model, kinematic_body, probe_body, kinematic_joint, probe_joint = _build_free_root_to_prismatic_scene(device)
     solver = solver_fn(model)
     collision_pipeline, contacts = _create_contacts(model, solver)
     state_0, state_1 = model.state(), model.state()
@@ -595,15 +626,16 @@ def test_kinematic_free_base_drives_dense_articulation(
     qd_start = int(model.joint_qd_start.numpy()[kinematic_joint])
     probe_qd_start = int(model.joint_qd_start.numpy()[probe_joint])
     sim_dt = 1.0 / 240.0
-    max_probe_velocity = 0.0
+    speed = 1.0
 
-    for step in range(120):
+    # The 0.2 m start gap closes at step 48, so the last 12 steps push the probe.
+    for step in range(60):
         joint_q = state_0.joint_q.numpy()
         joint_qd = state_0.joint_qd.numpy()
         joint_q[q_start : q_start + 7] = np.array(
-            [-0.2 + step * sim_dt, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32
+            [-0.1 + step * speed * sim_dt, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32
         )
-        joint_qd[qd_start : qd_start + 6] = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        joint_qd[qd_start : qd_start + 6] = np.array([speed, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
         state_0.joint_q.assign(joint_q)
         state_0.joint_qd.assign(joint_qd)
         newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0, body_flag_filter=newton.BodyFlags.KINEMATIC)
@@ -611,10 +643,12 @@ def test_kinematic_free_base_drives_dense_articulation(
         collision_pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, None, contacts, sim_dt)
         state_0, state_1 = state_1, state_0
-        max_probe_velocity = max(max_probe_velocity, float(state_0.joint_qd.numpy()[probe_qd_start]))
 
-    test.assertEqual(int(solver._articulation_response_dof_count.numpy()[0]), 0)
-    test.assertGreater(max_probe_velocity, 3.0e-2)
+    # The probe keeps pace with the box (half-width 0.25 m) without the box entering the sphere (radius 0.1 m).
+    body_q = state_0.body_q.numpy()
+    gap = float(body_q[probe_body, 0] - 0.1 - (body_q[kinematic_body, 0] + 0.25))
+    test.assertGreater(gap, -1.0e-3)
+    test.assertAlmostEqual(float(state_0.joint_qd.numpy()[probe_qd_start]), speed, delta=0.05)
 
 
 def test_kinematic_revolute_root_pendulum_prescribed_motion(
@@ -798,6 +832,12 @@ def test_kinematic_runtime_toggle(
         solver._update_mass_matrix_interval = 100
     collision_pipeline, contacts = _create_contacts(model, solver)
 
+    def toggle_warning():
+        # Colored Steel asks for a recapture when a kinematic articulation root appears or disappears.
+        if isinstance(solver, newton.solvers.SolverSteel) and solver._propagation_colored:
+            return test.assertWarnsRegex(newton.NewtonWarning, "recapture graphs")
+        return contextlib.nullcontext()
+
     state_0, state_1 = model.state(), model.state()
     applied_wrench = np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
@@ -817,7 +857,8 @@ def test_kinematic_runtime_toggle(
     flags = model.body_flags.numpy()
     flags[body] = int(BodyFlags.DYNAMIC)
     model.body_flags.assign(flags)
-    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+    with toggle_warning():
+        solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
 
     # Phase 2: body is now dynamic — should move under applied force.
     for _ in range(phase_steps):
@@ -835,7 +876,8 @@ def test_kinematic_runtime_toggle(
     flags = model.body_flags.numpy()
     flags[body] = int(BodyFlags.KINEMATIC)
     model.body_flags.assign(flags)
-    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+    with toggle_warning():
+        solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
 
     pos_before_rekinematic = state_0.body_q.numpy()[body, :3].copy()
 
@@ -879,37 +921,30 @@ def test_kinematic_prescribed_response_lifetime(
         solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
 
 
-def _undamped(solver):
-    """Turn off the default angular damping of the free roots."""
-    solver._rigid_body_angular_damping.zero_()
-    return solver
-
-
 devices = get_test_devices()
 solvers = {
     "featherstone": lambda model: newton.solvers.SolverFeatherstone(model, angular_damping=0.0),
-    "steel_split": lambda model: _undamped(newton.solvers.SolverSteel(model, solve_mode="split")),
-    "steel_matrix_free": lambda model: _undamped(newton.solvers.SolverSteel(model, solve_mode="matrix_free")),
-    "steel_propagation": lambda model: _undamped(
-        newton.solvers.SolverSteel(model, solve_mode="matrix_free", articulated_contact_response="propagation")
+    "steel_serial": newton.solvers.SolverSteel,
+    "steel_propagation": lambda model: newton.solvers.SolverSteel(model, articulated_contact_response="propagation"),
+    "steel_colored": lambda model: newton.solvers.SolverSteel(
+        model, solve_mode="colored", articulated_contact_response="propagation"
     ),
-    "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True),
-    "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False),
+    "mujoco_cpu": requires(*MUJOCO_MODULES)(lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True)),
+    "mujoco_warp": requires(*MUJOCO_MODULES)(lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False)),
     "xpbd": lambda model: newton.solvers.SolverXPBD(model, iterations=5, angular_damping=0.0),
     "semi_implicit": lambda model: newton.solvers.SolverSemiImplicit(model, angular_damping=0.0),
-    "vbd": lambda model: newton.solvers.SolverVBD(model, rigid_compliant_alm=True),
+    "vbd": newton.solvers.SolverVBD,
+    "lox": lambda model: newton.solvers.SolverKamino(
+        model,
+        config=newton.solvers.SolverKamino.Config.from_model(model, dynamics_solver="lox"),
+    ),
 }
 for device in devices:
     for solver_name, solver_fn in solvers.items():
         if device.is_cuda and solver_name == "mujoco_cpu":
             continue
-        if device.is_cpu and solver_name in (
-            "mujoco_warp",
-            "steel_matrix_free",
-            "steel_propagation",
-        ):
-            continue
-        if device.is_cpu and solver_name == "steel_matrix_free":
+        if device.is_cpu and solver_name in ("mujoco_warp", "steel_colored"):
+            # On CPU the colored mode runs the serial propagation sweep.
             continue
 
         add_function_test(
@@ -918,20 +953,20 @@ for device in devices:
             test_kinematic_free_base_prescribed_motion,
             devices=[device],
             solver_fn=solver_fn,
-            check_reversed_order=solver_name == "steel_matrix_free",
+            check_reversed_order=solver_name == "steel_serial",
         )
-        if solver_name == "steel_matrix_free":
-            # Steel elides prescribed free bodies only with the matrix-free immediate response.
+        if solver_name.startswith("steel"):
             add_function_test(
                 TestKinematicLinksCanonical,
-                "test_kinematic_prescribed_response_lifetime_steel_matrix_free",
+                f"test_kinematic_prescribed_response_lifetime_{solver_name}",
                 test_kinematic_prescribed_response_lifetime,
                 devices=[device],
                 solver_fn=solver_fn,
             )
+        if solver_name == "steel_serial":
             add_function_test(
                 TestKinematicLinksCanonical,
-                "test_kinematic_free_base_drives_dense_articulation_steel_matrix_free",
+                "test_kinematic_free_base_drives_dense_articulation_steel_serial",
                 test_kinematic_free_base_drives_dense_articulation,
                 devices=[device],
                 solver_fn=solver_fn,
@@ -950,13 +985,15 @@ for device in devices:
             devices=[device],
             solver_fn=solver_fn,
         )
-        add_function_test(
-            TestKinematicLinksCanonical,
-            f"test_kinematic_runtime_toggle_{solver_name}",
-            test_kinematic_runtime_toggle,
-            devices=[device],
-            solver_fn=solver_fn,
-        )
+        # Kamino freezes body immovability when constructing the solver.
+        if solver_name != "lox":
+            add_function_test(
+                TestKinematicLinksCanonical,
+                f"test_kinematic_runtime_toggle_{solver_name}",
+                test_kinematic_runtime_toggle,
+                devices=[device],
+                solver_fn=solver_fn,
+            )
 
 
 if __name__ == "__main__":

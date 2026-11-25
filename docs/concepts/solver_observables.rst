@@ -43,10 +43,9 @@ the supported set varies by backend and can grow as solvers gain capabilities.
 Supply ``contacts=contacts`` whenever the requested set includes contact-indexed fields.
 
 Allocate an observable container once and reuse it across steps. The container is
-owned by the solver instance that allocated it. For contact-indexed observables,
-construct a :class:`~newton.CollisionPipeline` first. It publishes the resolved
-rigid and soft contact capacities on the model; the solver allocates from those
-capacities. Create its :class:`~newton.Contacts` instance and pass it to the factory:
+owned by the solver instance that allocated it. Contact-indexed observables are
+sized from the rigid and soft capacities of the :class:`~newton.Contacts` passed to
+the factory, typically created by a :class:`~newton.CollisionPipeline`:
 
 .. code-block:: python
 
@@ -61,34 +60,31 @@ capacities. Create its :class:`~newton.Contacts` instance and pass it to the fac
 
 All requested arrays are allocated when ``observables()`` returns. An unrequested
 field is ``None``; a requested field with zero capacity is an empty array.
-``Model.rigid_contact_max`` and ``Model.soft_contact_max`` use ``None`` for
-uninitialized capacities and nonnegative integers for resolved capacities.
-Requesting contact observables before pipeline construction raises an error.
 Contact-indexed requests require contacts even when their capacity is zero.
 Body- and joint-only observables need neither a pipeline nor contacts; if contacts
 are supplied for such requests or an empty request, they are ignored and
 ``observables.contacts`` is ``None``.
 
 The live contact counts do not determine allocation sizes. ``contact_f`` has
-``model.rigid_contact_max + model.soft_contact_max`` entries, with rigid slots
+``contacts.rigid_contact_max + contacts.soft_contact_max`` entries, with rigid slots
 followed by soft slots. Kernels use the contact counts to process valid entries.
-Allocation freezes the model's contact capacities: later changes, including a
-replacement pipeline with different capacities, are rejected. Configure or
-rebuild pipelines before requesting contact-indexed observables.
+If the solver owns a collision pipeline, ``contacts`` defaults to ``solver.contacts``.
 
-The factory validates the contact device and both capacities once, then stores
-that instance as ``observables.contacts``. Steps and consumers check ownership and
-contact identity, so they must use the same storage. Custom consumers should check
-``observables.model is model`` and, when reading contact fields,
-``observables.contacts is contacts`` before reading the arrays. Newly allocated
-forces are zero and can be read by a sensor or viewer before the first step.
-Allocate observables and contacts before graph capture; neither ordinary nor
-conditional graph execution needs deferred observable allocation. Other solver
-scratch buffers may still need their usual warmup.
-
-If the solver owns a collision pipeline, bind its existing storage with
-``solver.observables(contacts=solver.contacts, kinds=...)``. The solver resolves
-that storage internally when ``step()`` receives ``contacts=None``.
+A step may use any buffer accepted by
+:meth:`~newton.solvers.SolverBase.validate_observables`, so allocate from the
+largest buffer the container will be used with. Rows follow the step's buffer:
+its contact counts give the valid rows, and the soft segment begins at its
+``rigid_contact_max``. ``observables.contacts_for_kind(kind)`` reports the buffer
+each contact-indexed array was last produced with (``observables.contacts`` for
+``contact_f``).
+:class:`~newton.sensors.SensorContact` and the viewer require that buffer, and
+custom consumers should check it together with ``observables.model is model``.
+Newly allocated forces are zero and can be read by a sensor or viewer before the
+first step. Allocate observables and contacts before graph capture; neither
+ordinary nor conditional graph execution needs deferred observable allocation.
+Other solver scratch buffers may still need their usual warmup. Graph replays do
+not update the buffer record; call ``validate_observables()`` with a replayed
+graph's buffer before consuming its outputs.
 
 Native collision backends
 -------------------------
@@ -108,15 +104,15 @@ the pipeline for the backend's export capacity:
 
 There is no ``pipeline.collide()`` call in this mode: the solver fills contact
 geometry and forces. Native Kamino similarly seeds the model's rigid capacity
-when constructed before the pipeline. Both backends reject insufficient
-pipeline capacity during contact-observable allocation instead of resizing arrays
-inside a step.
+when constructed before the pipeline. Both MuJoCo backends and Kamino reject
+observable storage smaller than their configured export capacity.
+With ``use_mujoco_cpu=True``, ``nconmax`` bounds contact export, not simulation;
+excess contacts are omitted with a warning.
 
 A solver advertises available entries through
 :attr:`~newton.solvers.SolverBase.supported_observables` and rejects an
 unsupported request during allocation. Passing an observable container to a
-different solver, or using contact observables with different contact storage, is
-also rejected.
+different solver, or contacts that exceed its contact arrays, is also rejected.
 
 Standard observables
 --------------------
@@ -130,33 +126,48 @@ Standard observables
      - Solvers
    * - ``BODY_QDD`` / ``observables.body_qdd``
      - Rigid-body center-of-mass spatial accelerations in the world frame
-     - :class:`~newton.solvers.SolverMuJoCo` with MuJoCo Warp or native MuJoCo CPU, and
+     - :class:`~newton.solvers.SolverMuJoCo` and
        :class:`~newton.solvers.SolverKamino`
    * - ``BODY_PARENT_F`` / ``observables.body_parent_f``
      - Incoming parent-joint wrenches on rigid bodies
-     - :class:`~newton.solvers.SolverMuJoCo` with MuJoCo Warp or native MuJoCo CPU,
+     - :class:`~newton.solvers.SolverMuJoCo`,
        :class:`~newton.solvers.SolverFeatherstone`,
        :class:`~newton.solvers.SolverSteel`, and
        :class:`~newton.solvers.SolverXPBD`
    * - ``CONTACT_F`` / ``observables.contact_f``
-     - Contact spatial forces aligned with the bound contacts
-     - :class:`~newton.solvers.SolverMuJoCo` with MuJoCo Warp,
+     - Contact spatial forces in the row layout of the step's contacts
+     - :class:`~newton.solvers.SolverMuJoCo`,
        :class:`~newton.solvers.SolverXPBD`, :class:`~newton.solvers.SolverVBD`,
        :class:`~newton.solvers.SolverKamino`, and :class:`~newton.solvers.SolverSteel`
+   * - ``SOLVER_RESIDUAL`` / ``observables.solver_residual``
+     - Per-world convergence residual of the step; see :ref:`solver_residual_observable`
+     - :class:`~newton.solvers.SolverKamino` and :class:`~newton.solvers.SolverVBD`
 
 :class:`~newton.solvers.SolverKamino` computes acceleration as the discrete
 step-average ``(body_qd_out - body_qd_in) / dt``. Across an impact, this includes
-the velocity impulse divided by ``dt``. MuJoCo Warp computes ``BODY_QDD`` and
+the velocity impulse divided by ``dt``. MuJoCo computes ``BODY_QDD`` and
 ``BODY_PARENT_F`` even with ``disable_sensors=True`` by enabling the
 post-constraint RNE stage independently of sensors.
-The native MuJoCo CPU backend (``use_mujoco_cpu=True``) supports ``BODY_QDD``,
-``BODY_PARENT_F``, and ``SolverMuJoCo.ObservableKind.QFRC_ACTUATOR``. It runs
-the post-constraint RNE stage for requested body observables before integration,
-using the step's input dynamics, including with RK4. Contact and overflow
-observable requests are rejected. Native body observables require Euler, RK4,
-implicit, or implicitfast integration; discrete integration supports only
-``QFRC_ACTUATOR``. MuJoCo Warp supports body
-observables on both CPU and GPU.
+With ``use_mujoco_cpu=True``, body and contact observables are exported
+from the step's input dynamics, including with RK4; use the input state for
+contact positions. Body observables require Euler, RK4, implicit, or implicitfast
+integration. ``CONTACT_F``, like the ``SolverMuJoCo.ObservableKind.QFRC_*`` kinds,
+supports any integrator; overflow observable requests are rejected.
+
+:class:`~newton.solvers.SolverSteel` accounts ``BODY_PARENT_F`` from the step's solved
+motion, including its contact, friction, spin and loop-closure impulses, so loads carried by a
+subtree reach the joints that support it; see the solver's documentation for the cases it leaves
+out. Like :class:`~newton.solvers.SolverMuJoCo`, it reconstructs the wrench from the bodies' rigid
+inertia, without joint armature, so a dynamic joint's projected wrench is its generalized load
+(``joint_f``, explicit passive spring and damping forces, and joint-space rows) less
+``armature * qdd``. :class:`~newton.solvers.SolverFeatherstone` reports the start-of-step inverse
+dynamics at zero joint acceleration instead.
+
+:class:`~newton.solvers.SolverSteel` reports only the linear part of each rigid
+contact force; the torque part is zero. Contacts without solved rows, such as rows
+dropped for capacity or skipped for sleeping islands, report zero. A sleeping body's
+contacts therefore read as unloaded even though they still support it; use
+``sleep_skip_constraints=False`` or disable sleeping when consumers rely on these forces.
 
 :class:`~newton.solvers.SolverSteel` accounts ``BODY_PARENT_F`` from the step's solved
 motion, including its contact, friction and loop-closure impulses, so loads carried by a subtree
@@ -187,6 +198,105 @@ entry-local container for each sub-solver and gathers owned rows into parent
 model order. Contact observables are not exposed by the coupled wrapper because
 filtered entry contacts require an explicit contact-index remapping contract.
 
+.. _solver_residual_observable:
+
+Solver residuals
+^^^^^^^^^^^^^^^^
+
+``SOLVER_RESIDUAL`` exposes one ``float32`` value per world through
+``observables.solver_residual``, shape ``(model.world_count + 1,)``. As in
+:ref:`per-world reset masks <Per-world reset masks>`, entries
+``[0, world_count)`` are local worlds and the final entry is global world
+``-1``. It is a nonnegative measure of how far the most recent step's solve is from
+convergence; smaller is better. Iterative solvers measure convergence
+differently, so each solver defines the value below. Compare values within one
+solver configuration, for example to monitor convergence across steps, flag
+worlds for reset, or tune iteration budgets, but not across solvers.
+
+.. code-block:: python
+
+   solver = newton.solvers.SolverKamino(model)
+   observables = solver.observables({solver.ObservableKind.SOLVER_RESIDUAL})
+   solver.step(state_in, state_out, control, contacts, dt, observables=observables)
+   unconverged = observables.solver_residual.numpy() > 1.0
+   worst = observables.solver_residual.numpy().max()
+
+The maximum over all entries is the residual of the whole model. Entries for
+worlds a solver does not simulate stay zero.
+
+A step that receives the container overwrites the array on the device without
+host synchronization, including during graph replay. Other steps and
+:meth:`~newton.solvers.SolverBase.reset` leave it unchanged.
+
+:class:`~newton.solvers.SolverKamino` reports the largest terminal residual of
+each world relative to its stopping tolerance, so the value is dimensionless
+and at most one when the world satisfies every tolerance:
+
+- PADMM: ``max(r_p / primal_tolerance, r_d / dual_tolerance, r_c / compl_tolerance)``.
+  PADMM additionally requires more than one iteration before it reports
+  ``converged``.
+- SCC: ``max(r_p, r_d, r_c) / tolerance``, where ``r_d`` includes the bilateral
+  residual ``r_b``. A failed APGD line search reports infinity.
+- LOX: the largest tolerance-scaled residual of its last convergence check,
+  including terms not reported in :attr:`~newton.solvers.SolverKamino.status`.
+  Failed worlds report infinity. With ``fixed_iterations=True`` LOX skips the
+  convergence check and does not support this observable.
+
+With a zero PADMM or SCC tolerance, a zero residual reports zero and any other
+residual infinity. Non-finite residuals in
+:attr:`~newton.solvers.SolverKamino.status` report infinity. Kamino does not simulate global
+dynamic entities, so the global entry stays zero.
+
+The residual components ``r_p``, ``r_d``, and ``r_c`` and the iteration counts
+remain available through :attr:`~newton.solvers.SolverKamino.status`.
+
+For :class:`~newton.solvers.SolverVBD`, each particle or rigid body is one block
+of the implicit Euler equations. A block's residual is
+
+.. math::
+
+   r(x) = \frac{M}{\Delta t^2}\,(x - x_{\mathrm{pred}}) - f(x),
+
+where :math:`x_{\mathrm{pred}}` is the inertial prediction and :math:`f`
+contains the remaining elastic, contact, joint, and attachment forces. For a
+rigid body, :math:`r` stacks the force and torque residuals and :math:`M` is
+its mass and rotational inertia. VBD reports, for each world, the largest
+stationarity residual
+
+.. math::
+
+   r_i^{\mathsf{T}} H_{ii}^{-1} r_i
+
+over its blocks :math:`i`, where :math:`H_{ii}` is the block's Hessian
+(3x3 for particles, 6x6 for bodies). Inertia is included in both :math:`r_i` and
+:math:`H_{ii}`. The value is the squared :math:`H^{-1}`-norm of the residual: zero
+exactly when the block is stationary, and in energy units [J], which puts
+translational and rotational residuals on one scale. It is twice the energy decrease
+that a full local Newton step would predict. VBD has no convergence tolerance, so
+the value is absolute.
+
+Each block is sampled in the final sweep, just before its own update. It therefore
+sees the current sweep's positions for blocks of earlier colors and the previous
+sweep's positions for blocks of later colors, so the value trails the final iterate
+by part of a sweep.
+
+Constraints that use augmented-Lagrangian (AVBD) handling, such as hard joints,
+contacts, and particle-body attachments, contribute both their penalty term
+:math:`k\,C` and their multiplier term :math:`\lambda` to :math:`f`. The value
+therefore measures stationarity of the current AVBD subproblem, whose multipliers
+and penalties VBD updates during the step. A small value alone does not establish
+that the constraints are satisfied; measure the constraint violation separately when
+that matters.
+
+Particles whose Hessian is nearly singular skip their update and do not
+contribute; rigid bodies regularize their angular Hessian and always contribute.
+Non-finite residuals or particle Hessians report infinity. Global particles and
+bodies, including every entity of a model built without
+:meth:`~newton.ModelBuilder.begin_world`, report in the final entry. With
+``iterations=0`` the array is zero, and with
+``integrate_with_external_rigid_solver=True`` only particles contribute. VBD also
+records this value for every iteration; see :ref:`vbd_residual_history`.
+
 Solver-specific observables
 ---------------------------
 
@@ -204,6 +314,15 @@ example, MuJoCo adds ``QFRC_ACTUATOR`` and returns a
        }
    )
 
+MuJoCo also exports ``QFRC_BIAS``, ``QFRC_CONSTRAINT``, and
+``QFRC_FRICTIONLOSS`` on both backends. ``qfrc_frictionloss`` is the part of
+``qfrc_constraint`` that comes from each DOF's own friction loss, so
+``qfrc_constraint - qfrc_frictionloss`` is the constraint load on a DOF without
+it. All three come from MuJoCo's last force evaluation of the step: the start of
+the step, or the last stage with RK4. The solver writes observables only during :meth:`~newton.solvers.SolverBase.step`
+and :meth:`~newton.solvers.SolverMuJoCo.reset` leaves them unchanged, so zero
+them for reset worlds if a consumer reads them before the next step.
+
 The constants are strings, so literal names work too:
 
 .. code-block:: python
@@ -215,6 +334,53 @@ unknown names are rejected. ``ObservableKind`` is not iterable; query
 ``solver.supported_observables`` for the names accepted by the configured backend.
 An inherited name does not imply support for that observable.
 
+.. _vbd_residual_history:
+
+VBD residual history
+^^^^^^^^^^^^^^^^^^^^
+
+:class:`~newton.solvers.SolverVBD` exposes
+:attr:`~newton.solvers.SolverVBD.ObservableKind.SOLVER_RESIDUAL_HISTORY` through
+``observables.solver_residual_history``, a ``float32`` array with shape
+``(solver.iterations, model.world_count + 1)``. Row ``k`` holds the
+:ref:`stationarity residual <solver_residual_observable>` of each world sampled
+during iteration ``k``, so ``history[:, w]`` is world ``w``'s convergence curve and
+the last row equals ``SOLVER_RESIDUAL``:
+
+.. code-block:: python
+
+   solver = newton.solvers.SolverVBD(model, iterations=10)
+   observables = solver.observables({solver.ObservableKind.SOLVER_RESIDUAL_HISTORY})
+   solver.step(state_in, state_out, control, contacts, dt, observables=observables)
+   history = observables.solver_residual_history.numpy()  # (10, world_count + 1)
+
+Each row measures the subproblem of its own iteration. VBD updates AVBD
+multipliers and penalties during the step and may rerun collision detection
+between iterations, so the curve need not decrease monotonically.
+
+A step that receives the container overwrites every row, including during graph
+replay. Allocate the container after setting ``solver.iterations``; a step raises
+``ValueError`` if the row count no longer matches. Recording every iteration adds
+one atomic maximum per particle and body per iteration.
+
+.. _steel_sleep_observable:
+
+Steel sleep flags
+^^^^^^^^^^^^^^^^^
+
+With ``enable_sleeping=True``, :class:`~newton.solvers.SolverSteel` exposes
+:attr:`~newton.solvers.SolverSteel.ObservableKind.BODY_AWAKE` through
+``observables.body_awake``, a ``bool`` array with shape ``(model.body_count,)``.
+A step that receives the container overwrites it with ``True`` for awake bodies and
+``False`` for sleeping ones as of the end of that step, also during graph replay;
+other steps leave it unchanged. A new container holds the solver's current flags.
+:meth:`~newton.solvers.SolverSteel.reset` and
+:meth:`~newton.solvers.SolverSteel.notify_model_changed` wake islands according to
+the sleeping rules but do not write existing containers; the next step that
+receives one reports the result. Bodies of articulations with no responding
+degrees of freedom, such as a body welded to the world, always read ``True``.
+Without sleeping the kind is unsupported and requesting it raises.
+
 .. _mujoco_overflow_observable:
 
 MuJoCo overflow diagnostics
@@ -222,10 +388,14 @@ MuJoCo overflow diagnostics
 
 :class:`~newton.solvers.SolverMuJoCo` exposes
 :attr:`~newton.solvers.SolverMuJoCo.ObservableKind.OVERFLOW` through
-``observables.overflow``, an ``int32`` array with shape ``(model.world_count,)``.
+``observables.overflow``, an ``int32`` array with shape ``(model.world_count + 1,)``.
+Entries follow the Newton world whose options each MuJoCo world uses. A single
+MuJoCo world reports in entry ``0`` when world ``0`` owns bodies, also if it
+simulates global bodies too, and otherwise in the final entry for global world
+``-1``, as in models built without :meth:`~newton.ModelBuilder.begin_world`.
+Separate MuJoCo worlds leave the final entry zero.
 It reports capacity overflow after a step without synchronizing the device in
-the solver. Requesting it requires the MuJoCo Warp backend
-(``use_mujoco_cpu=False``); the native MuJoCo CPU backend rejects the request.
+the solver. Requesting it requires ``use_mujoco_cpu=False``.
 
 Use :class:`~newton.solvers.SolverMuJoCo.OverflowBits` to interpret Newton's
 flags, and ``mujoco_warp.OverflowType`` for MuJoCo Warp's flags. For example,
@@ -281,8 +451,9 @@ The bit layout is:
      - Newton generated more rigid contacts than ``contacts.rigid_contact_max``.
    * - 17
      - :attr:`~newton.solvers.SolverMuJoCo.OverflowBits.SOLVER_NCONMAX`
-     - Newton generated more rigid contacts than the solver's shared
-       ``naconmax`` buffer can consume.
+     - Newton contacts exceeded the solver's shared ``naconmax`` capacity.
+       When the solver packs eligible rows, expired thin-wall recovery
+       contacts do not count toward this limit.
 
 The Newton flags describe shared contact buffers and are repeated in every
 world's mask when the global count exceeds capacity. They do not identify which
@@ -336,10 +507,8 @@ container, and pass it through the step:
 
 .. code-block:: python
 
-   imu = newton.sensors.SensorIMU(model, sites="imu_*", request_state_attributes=False)
-   contact_sensor = newton.sensors.SensorContact(
-       model, sensing_shapes="foot_*", request_contact_attributes=False
-   )
+   imu = newton.sensors.SensorIMU(model, sites="imu_*")
+   contact_sensor = newton.sensors.SensorContact(model, sensing_shapes="foot_*")
 
    kinds = imu.solver_observable_kinds | contact_sensor.solver_observable_kinds
    # Use contacts from a pipeline configured with a compatible capacity.
@@ -393,7 +562,7 @@ Selecting a field absent from the source raises :class:`ValueError`; selecting
 an existing subset can only narrow it. Select from the original container to
 create a different combination. Do not temporarily replace fields with ``None``.
 
-Contact-indexed subsets share the contacts supplied at allocation with their source
+Contact-indexed subsets share their contact-buffer record with their source
 and siblings. A body-only or empty subset has ``contacts=None`` even when the
 original container includes contact fields.
 
@@ -424,7 +593,7 @@ Contact forces from SolverVBD
 contacts, and rigid-soft particle, edge, and face records against rigid shapes -- through
 :attr:`~newton.solvers.SolverBase.Observables.contact_f`:
 
-1. Create the :class:`~newton.CollisionPipeline` to establish contact capacities, create its contacts, then request
+1. Create the :class:`~newton.CollisionPipeline` and its contacts, then request
    ``SolverBase.ObservableKind.CONTACT_F`` with ``solver.observables(contacts=contacts, kinds=...)``. This allocates the entire
    force array before stepping or graph capture; no contact attributes need to be requested.
 2. Each frame, run collision detection and pass the container to ``solver.step(...,
@@ -433,7 +602,8 @@ contacts, and rigid-soft particle, edge, and face records against rigid shapes -
    or pass a selection without ``CONTACT_F`` to skip reporting on earlier substeps.
 3. Rows ``[0, rigid_contact_max)`` hold the body-body contacts (``i < rigid_contact_count``) when
    VBD integrates the rigid bodies: the force on body 0 by body 1 with its torque about body 0's
-   center of mass, the convention shared by every solver writing ``contact_f``. With
+   center of mass, the convention shared by every solver writing ``contact_f``. The torque
+   includes any torsional and rolling friction couple. With
    ``integrate_with_external_rigid_solver=True``, VBD's rigid rows are zero: request and consume
    the external solver's forces through its own observable container. Rows
    ``rigid_contact_max + i`` for ``i < soft_contact_count`` hold the rigid-soft records. Rows
@@ -449,16 +619,16 @@ the force on the soft contact point, and distribute it to the record's particles
 final configuration of the step -- the forces the last iteration balanced -- not time-step
 averages; records without penetration are zero.
 
-For soft contacts this is the penalty law at the final per-contact stiffness, damping while
-the contact point approaches the surface, and regularized Coulomb friction on the step's slip,
-bounded by the elastic normal load. Body-body contacts use the compliant ALM or legacy AVBD
-contact law with its multipliers. Both evaluations retain the step-start pose history used
+For soft contacts this is the penalty law at the contact's mixed material stiffness, damping
+on the normal gap rate (while the contact point approaches the surface and, with the default
+``soft_contact_damping_bidirectional=True``, while it separates), and regularized Coulomb
+friction on the step's slip, bounded by the elastic normal load. Body-body contacts use the
+compliant ALM contact law with its multipliers. Both evaluations retain the step-start pose history used
 by the iterations.
 
 Soft self-contact forces are not exported. :class:`~newton.sensors.SensorContact` reads the
 rigid-contact rows, so it reports VBD's body-body contacts, but it does not read the soft rows.
-Construct it with ``request_contact_attributes=False`` and pass the container as
-``sensor.update(state_out, contacts, observables=observables)``.
+Pass the container as ``sensor.update(state_out, contacts, observables=observables)``.
 
 .. testcode::
 
@@ -550,12 +720,10 @@ The following compatibility paths remain available for a deprecation period:
 The request methods and legacy force export via ``update_contacts()`` emit
 :class:`DeprecationWarning`. MuJoCo and Kamino keep geometry-only ``update_contacts()``
 supported without a warning when ``contacts.force`` is ``None``.
-``SensorIMU`` and ``SensorContact`` retain their legacy
-``request_state_attributes=True`` and ``request_contact_attributes=True`` defaults
-during the deprecation period; explicitly pass ``False`` when using solver observables.
-Setting either option to ``True`` is deprecated in Newton 1.7 and emits one
-sensor-specific warning at the caller's location. Passing ``False`` does not
-emit a warning or request legacy fields.
+``SensorIMU`` and ``SensorContact`` read solver observables by default.
+Setting ``request_state_attributes=True`` or ``request_contact_attributes=True``
+is deprecated in Newton 1.7 and emits one sensor-specific warning at the caller's
+location. Omit both arguments; they will be removed together with the legacy fields.
 
 ``Contacts.EXTENDED_ATTRIBUTES`` and direct ``requested_attributes={"force"}``
 remain compatibility APIs. New integrations should not allocate
@@ -625,16 +793,15 @@ fields and may redeclare a field's dtype or frequency without changing their
 parents or siblings. Missing declarations, duplicate kinds, and missing
 dataclass decorators are rejected before allocation.
 
-Contact dependencies follow the field's frequency. The base solver requires
-pipeline initialization and a compatible ``contacts=`` argument for any requested
-contact frequency, including custom fields requested without ``CONTACT_F``. It binds
-that storage and freezes capacities after successful allocation. Body- and
-joint-indexed fields do not require a collision pipeline or contact storage.
+Contact dependencies follow the field's frequency. Any requested contact frequency,
+including custom fields requested without ``CONTACT_F``, is sized from
+``contacts=`` or the solver-owned pipeline. Body- and joint-indexed fields do not
+require a collision pipeline or contact storage.
 
 In ``step()``, call :meth:`~newton.solvers.SolverBase.validate_observables` before
-launching work or modifying outputs. This checks the container type, solver owner,
-and contact identity without repeating allocation-time layout validation. Compute
-diagnostics only when requested:
+launching work or modifying outputs. It checks the container and the step's
+contacts and records those contacts for the requested fields. Compute diagnostics
+only when requested:
 
 .. code-block:: python
 

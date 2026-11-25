@@ -64,20 +64,8 @@ class TabletopDemo:
         b.default_shape_cfg.gap = 0.001
         b.default_shape_cfg.restitution = 0.02
         b.default_shape_cfg.density = 600
-        assets = {
-            "franka_emika_panda": str(
-                newton.utils.download_asset("franka_emika_panda", ref="f8fb7abcbeba2318814a74f3eeb02780ad7925d6")
-            )
-        }
         robot = "franka" if self.task == "plates" else "ur10"
-        if robot == "ur10":
-            assets["ur10_menagerie"] = str(
-                newton.examples.download_external_git_folder(
-                    "https://github.com/google-deepmind/mujoco_menagerie.git",
-                    "universal_robots_ur10e",
-                    ref="f054586a8e90465d49ee5be15335c4a0c7f57caf",
-                )
-            )
+        assets = download_robot_assets(robot)
         ee, down, fingers = make_arm(
             b,
             assets,
@@ -115,17 +103,15 @@ class TabletopDemo:
             deterministic=deterministic,
             broad_phase="sap",
             rigid_contact_max=16384,
-            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(
-                body_pairs=True, body_pair_cell_size=0.06, body_pair_hysteresis=0.0
-            ),
+            body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig(cell_size=0.06),
             contact_matching="disabled",
         )
         self.contacts = self.pipeline.contacts()
         self.solver = SolverSteel(
             self.model,
-            solve_mode="matrix_free",
+            solve_mode=args.solve_mode,
             articulated_contact_response=args.contact_response,
-            deterministic=deterministic,
+            deterministic=wp.DeterministicMode.RUN_TO_RUN if deterministic else wp.DeterministicMode.NOT_GUARANTEED,
             iterations=args.iterations,
             enable_joint_limits=True,
             enable_joint_velocity_limits=True,
@@ -155,10 +141,16 @@ class TabletopDemo:
         parser.add_argument("--substeps", type=int, default=4, help="Physics substeps per 60 Hz frame")
         parser.add_argument("--iterations", type=int, default=12, help="Steel sweeps per substep")
         parser.add_argument(
+            "--solve-mode",
+            choices=("serial", "colored"),
+            default="serial",
+            help="Steel Gauss-Seidel sweep order; 'colored' requires --contact-response propagation",
+        )
+        parser.add_argument(
             "--contact-response",
-            choices=("immediate", "propagation", "propagation_colored"),
+            choices=("immediate", "propagation"),
             default="immediate",
-            help="Steel matrix-free articulated contact response",
+            help="Steel articulated contact response",
         )
         return parser
 
@@ -241,3 +233,21 @@ class TabletopDemo:
         """Reject solver rows lost to insufficient contact capacity."""
         stats = self.solver.constraint_row_watermarks()
         assert all(v == 0 for k, v in stats.items() if "overflow" in k or "dropped" in k), stats
+
+
+def download_robot_assets(robot: str) -> dict[str, str]:
+    """Download the robot description folders a tabletop demo loads, and return their paths by name."""
+    assets = {
+        "franka_emika_panda": str(
+            newton.utils.download_asset("franka_emika_panda", ref="f8fb7abcbeba2318814a74f3eeb02780ad7925d6")
+        )
+    }
+    if robot == "ur10":
+        assets["ur10_menagerie"] = str(
+            newton.examples.download_external_git_folder(
+                "https://github.com/google-deepmind/mujoco_menagerie.git",
+                "universal_robots_ur10e",
+                ref="f054586a8e90465d49ee5be15335c4a0c7f57caf",
+            )
+        )
+    return assets

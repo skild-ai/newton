@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import warnings
 from typing import Literal
 
 import warp as wp
@@ -13,38 +12,6 @@ from ..geometry.tri_mesh_collision import TriMeshCollisionInfo, build_tri_mesh_c
 
 GENERATION_SENTINEL = -1
 """Value reserved as an impossible generation; the increment kernel skips it."""
-
-_RIGID_CONTACT_DIFF_REPLACEMENTS = {
-    "rigid_contact_diff_distance": (
-        "allocate an output array and pass it as out_distance to newton.eval_rigid_contact_kinematics()"
-    ),
-    "rigid_contact_diff_normal": "use Contacts.rigid_contact_normal",
-    "rigid_contact_diff_point0_world": (
-        "allocate an output array and pass it as out_point0_world to newton.eval_rigid_contact_kinematics()"
-    ),
-    "rigid_contact_diff_point1_world": (
-        "allocate an output array and pass it as out_point1_world to newton.eval_rigid_contact_kinematics()"
-    ),
-}
-
-
-def _warn_rigid_contact_diff_deprecated(name: str) -> None:
-    replacement = _RIGID_CONTACT_DIFF_REPLACEMENTS[name]
-    warnings.warn(
-        f"Contacts.{name} is deprecated in Newton 1.6 and will be removed in a future release; {replacement}.",
-        DeprecationWarning,
-        stacklevel=3,
-    )
-
-
-@wp.kernel(enable_backward=False)
-def _increment_contact_generation(generation: wp.array[wp.int32]):
-    g = generation[0]
-    if g == 2147483647:
-        g = 0
-    else:
-        g = g + 1
-    generation[0] = g
 
 
 @wp.kernel(enable_backward=False)
@@ -113,71 +80,6 @@ def contact_surface_point(
         Effective-surface contact point [m], world space.
     """
     return wp.transform_point(X_wb, point_local + offset_local)
-
-
-class _ContactsGraphLease:
-    """Keep graph-captured contact users and their storage alive.
-
-    Warp graphs retain executable modules, but not arbitrary arrays passed to
-    recorded launches.  A lease is therefore attached to the Python Graph
-    object itself.  It owns both the Contacts buffer and the object whose
-    launches captured it (a collision pipeline or solver), and releases the
-    corresponding compatibility token only after the graph is destroyed.
-    """
-
-    def __init__(self, contacts: Contacts, mode: str, owner):
-        # Keep construction transactional. In particular, a rejected writer
-        # must not run the normal final-release path from __del__ and falsely
-        # stamp an untouched raw buffer as reduced.
-        self.contacts = None
-        self.mode = mode
-        self.owner = None
-        self.token = object()
-        acquired = False
-        try:
-            contacts._acquire_graph_use(self.token, mode)
-            acquired = True
-            self.contacts = contacts
-            self.owner = owner
-            callback = getattr(owner, "_acquire_contacts_graph_lease", None)
-            if callback is not None:
-                callback(self.token, contacts, mode)
-        except Exception:
-            if acquired:
-                contacts._release_graph_use(self.token, mode, preserve_provenance=False)
-            self.contacts = None
-            self.owner = None
-            raise
-
-    def matches(self, contacts: Contacts, mode: str, owner) -> bool:
-        return self.contacts is contacts and self.mode == mode and self.owner is owner
-
-    def release(self):
-        contacts = self.contacts
-        if contacts is None:
-            return
-        owner = self.owner
-        token = self.token
-        mode = self.mode
-        # Break strong references first so an exception during interpreter
-        # shutdown cannot make a second release observe a live lease.
-        self.contacts = None
-        self.owner = None
-        try:
-            contacts._release_graph_use(token, mode)
-        finally:
-            callback = getattr(owner, "_release_contacts_graph_lease", None)
-            if callback is not None:
-                callback(token, contacts, mode)
-
-    def __del__(self):
-        try:
-            self.release()
-        except Exception:
-            # Module teardown may clear Python globals and bound methods in an
-            # arbitrary order.  Graph destruction must remain best-effort and
-            # never turn garbage collection into a user-visible exception.
-            pass
 
 
 class Contacts:
@@ -261,10 +163,8 @@ class Contacts:
             requires_grad: Whether contact arrays require gradients for differentiable
                 simulation. When ``True``, soft contact arrays (body_pos, body_vel, normal)
                 are allocated with gradients so that gradient-based optimization can flow
-                through particle-shape contacts. For compatibility, the deprecated
-                rigid-contact distance and point outputs are also allocated; new code
-                should provide selected outputs to
-                :func:`newton.eval_rigid_contact_kinematics`.
+                through particle-shape contacts. Rigid-contact gradients come from
+                :func:`newton.eval_rigid_contact_kinematics` and do not depend on this flag.
             device: Device to allocate buffers on
             per_contact_shape_properties: Enable per-contact stiffness/damping/friction arrays
             clear_buffers: If True, clear() will zero all contact buffers (slower but conservative).
@@ -309,21 +209,25 @@ class Contacts:
         self.per_contact_shape_properties = per_contact_shape_properties
         self.clear_buffers = clear_buffers
         self._contact_matching_mode: Literal["disabled", "latest", "sticky"] = "disabled"
+        self._mesh_recovery_contacts = None
         with wp.ScopedDevice(device):
-            # One int32[3] array holding two independent contact counts, [0] rigid and [1] soft,
-            # plus [2] an internal flag set when global contact reduction lost candidates.
+            # Two contact counts, [0] rigid and [1] soft, plus overflow flags:
+            # [2] global contact reduction and [3] a coupled source's soft-contact buffer.
             # rigid_contact_count (the [0:1] view) and soft_contact_count (the [1:2] view) index
             # into this same array, so each remains a separate count; they share one array only so
             # a single kernel can reset all slots to zero in one launch. The reset
             # happens at the start of every collision pass -- folded into the first kernel that
             # runs, compute_shape_aabbs -- and clear() resets them as well.
-            self.contact_counters = wp.zeros(3, dtype=wp.int32)
+            self.contact_counters = wp.zeros(4, dtype=wp.int32)
             # Sliced view for the rigid counter (no additional allocation)
             self.rigid_contact_count = self.contact_counters[0:1]
             # Nonzero when the collision pass that filled this buffer dropped contact candidates
             # inside global contact reduction (reducer buffer or hashtable full). Owned by this
             # contact stream rather than aliased to a pipeline's reusable reducer counters.
             self._reduction_overflow = self.contact_counters[2:3]
+            # Coupling packs stored rows and loses the source count's overflow sentinel.
+            # Preserve that loss so force consumers keep the source's overflow policy.
+            self._soft_contact_source_overflow = self.contact_counters[3:4]
 
             self.contact_generation = wp.zeros(1, dtype=wp.int32)
             """Device-side generation counter, incremented each time :meth:`clear` is called.
@@ -369,25 +273,6 @@ class Contacts:
             # to be filled by the solver (currently unused)
             self.rigid_contact_force = wp.zeros(rigid_contact_max, dtype=wp.vec3)
             """Contact force [N], shape (rigid_contact_max,), dtype :class:`vec3`."""
-
-            # Deprecated compatibility outputs, retained for one deprecation cycle.
-            if requires_grad:
-                self._rigid_contact_diff_distance = wp.zeros(rigid_contact_max, dtype=wp.float32, requires_grad=True)
-                """Differentiable signed distance [m], shape (rigid_contact_max,), dtype float."""
-                self._rigid_contact_diff_point0_world = wp.zeros(rigid_contact_max, dtype=wp.vec3, requires_grad=True)
-                """World-space contact point on shape 0 [m], shape (rigid_contact_max,), dtype :class:`vec3`."""
-                self._rigid_contact_diff_point1_world = wp.zeros(rigid_contact_max, dtype=wp.vec3, requires_grad=True)
-                """World-space contact point on shape 1 [m], shape (rigid_contact_max,), dtype :class:`vec3`."""
-            else:
-                self._rigid_contact_diff_distance = None
-                """Differentiable signed distance [m], shape (rigid_contact_max,), dtype float."""
-                self._rigid_contact_diff_point0_world = None
-                """World-space contact point on shape 0 [m], shape (rigid_contact_max,), dtype :class:`vec3`."""
-                self._rigid_contact_diff_point1_world = None
-                """World-space contact point on shape 1 [m], shape (rigid_contact_max,), dtype :class:`vec3`."""
-            # The deprecated normal output aliases rigid_contact_normal by
-            # default; retain a separate array only if a caller assigns one.
-            self._rigid_contact_diff_normal_override = None
 
             # contact stiffness/damping/friction (only allocated if per_contact_shape_properties is enabled)
             if self.per_contact_shape_properties:
@@ -471,6 +356,31 @@ class Contacts:
             Particle contact ``(p, -1, -1)``, edge contact ``(v0, v1, -1)``, face contact
             ``(v0, v1, v2)``. Pair with :attr:`soft_contact_barycentric` to recover the contact
             point over the non-negative slots."""
+            self.soft_contact_rigid_indices = wp.full(soft_contact_max, wp.vec3i(-1, -1, -1), dtype=wp.vec3i)
+            """Rigid mesh primitive corners per contact [dimensionless], shape (soft_contact_max,), dtype :class:`vec3i`.
+
+            Entries are offsets into the rigid mesh's triangle index buffer, as
+            accepted by ``warp.mesh_get_point``, for the shape identified by
+            :attr:`soft_contact_shape`. ``(i0, i1, i2)`` identifies a triangle,
+            ``(i0, i1, -1)`` an edge, and ``(i0, -1, -1)`` a vertex. These describe
+            the complete primitive, including corners with zero contact weight.
+            Analytic, particle-only, and penetration-recovery point records use
+            ``(-1, -1, -1)``. Preserve this geometry when copying contact records,
+            independently of contact force eligibility.
+
+            .. experimental::
+
+                Full-surface mesh primitive metadata may change without prior notice.
+            """
+            # Detected mesh feature IDs are discrete and unchanged through backward replay.
+            # Records use the final contact slots, never an intermediate candidate pool. The
+            # parameter holds a detection-time soft-edge parameter for penetration recovery.
+            # Detection reports every feature pair. Force evaluation uses these
+            # records and the topology reference to test the current configuration.
+            self._soft_contact_mesh_features = None
+            self._soft_contact_mesh_params = None
+            self._soft_contact_mesh_state = None
+            self._soft_contact_mesh_data = None
             # Particle-only view kept for solvers that consume particle contacts exclusively (XPBD,
             # semi-implicit, Style3D). Holds the particle id for particle contacts; -1 for edge/face.
             self.soft_contact_particle = wp.full(soft_contact_max, -1, dtype=int)
@@ -560,94 +470,7 @@ class Contacts:
 
         self.rigid_contact_max = rigid_contact_max
         self.soft_contact_max = soft_contact_max
-
-        self.rigid_contacts_body_pair_reduced = False
-        """Provenance: whether the pipeline that last wrote this buffer runs
-        body-pair contact reduction.  Assigned on every
-        :meth:`newton.CollisionPipeline.collide` call from the pipeline's mode
-        (never a sticky observation), and checked by solvers or solver
-        configurations that require unreduced buffers."""
-        self.rigid_contacts_body_pair_reduced_capture = False
-        """Whether a live CUDA graph can write reduced contacts.
-
-        Replay is invisible to host-side provenance, so this remains true
-        until the graph-owned writer lease is destroyed.  It deliberately
-        survives :meth:`clear` while such a graph is live.
-        """
-        self._rigid_contact_reduction_graph_leases: set[object] = set()
-        self._unreduced_solver_graph_leases: set[object] = set()
-
-    def _current_warp_capture_graph(self):
-        """Return the Warp graph recording the current CUDA stream, if any."""
-        device = self.device
-        if not device.is_cuda:
-            return None
-        stream = wp.get_stream(device)
-        # Warp registers wp.capture_begin/ScopedCapture graphs here, including
-        # external captures introduced with capture_begin(external=True).
-        # Reading the registry avoids a CUDA driver is-capturing query on every
-        # ordinary solver step.
-        return getattr(device, "captures", {}).get(stream)
-
-    def _acquire_graph_lease(self, graph, mode: str, owner):
-        """Attach one compatible contact lease per (graph, mode, owner)."""
-        leases = getattr(graph, "_newton_contact_graph_leases", None)
-        if leases is None:
-            leases = []
-            graph._newton_contact_graph_leases = leases
-        for lease in leases:
-            if lease.matches(self, mode, owner):
-                return lease
-        lease = _ContactsGraphLease(self, mode, owner)
-        leases.append(lease)
-        return lease
-
-    def _acquire_graph_use(self, token: object, mode: str):
-        if mode == "reduced_writer":
-            if self._unreduced_solver_graph_leases:
-                raise RuntimeError(
-                    "cannot write body-pair-reduced contacts while a CUDA graph for an "
-                    "unreduced-only solver configuration still reads this Contacts buffer; destroy every "
-                    "reference to that solver graph first"
-                )
-            if self._rigid_contact_reduction_graph_leases:
-                raise RuntimeError(
-                    "cannot capture a second body-pair reducer graph for the same Contacts "
-                    "buffer; the reducer and output buffer are stateful and concurrent graph "
-                    "replays would race. Destroy every reference to the existing graph first"
-                )
-            self._rigid_contact_reduction_graph_leases.add(token)
-            self.rigid_contacts_body_pair_reduced_capture = True
-        elif mode == "unreduced_reader":
-            if self._rigid_contact_reduction_graph_leases:
-                raise RuntimeError(
-                    "cannot capture an unreduced-only solver while a reducer CUDA graph "
-                    "can still write this Contacts buffer"
-                )
-            self._unreduced_solver_graph_leases.add(token)
-        else:
-            raise ValueError(f"unknown Contacts graph lease mode {mode!r}")
-
-    def _release_graph_use(self, token: object, mode: str, preserve_provenance: bool = True):
-        if mode == "reduced_writer":
-            if token not in self._rigid_contact_reduction_graph_leases:
-                return
-            self._rigid_contact_reduction_graph_leases.remove(token)
-            if not self._rigid_contact_reduction_graph_leases:
-                self.rigid_contacts_body_pair_reduced_capture = False
-                if preserve_provenance:
-                    # The final replay may have left compacted rows in the
-                    # buffer. Preserve conservative ordinary provenance until
-                    # clear() or a subsequent Python-level collide proves what
-                    # replaced them.
-                    self.rigid_contacts_body_pair_reduced = True
-        elif mode == "unreduced_reader":
-            if token in self._unreduced_solver_graph_leases:
-                self._unreduced_solver_graph_leases.remove(token)
-
-    @property
-    def _has_unreduced_solver_graph_lease(self) -> bool:
-        return bool(self._unreduced_solver_graph_leases)
+        self._rigid_contact_body_pair_reduced = False
 
     def clear(self, bump_generation: bool = True):
         """
@@ -667,12 +490,6 @@ class Contacts:
                 generation via another fused kernel (e.g. :func:`compute_shape_aabbs`) can pass
                 ``False`` to avoid an unnecessary double-bump per collision pass.
         """
-        # Provenance resets with the contents: a cleared buffer holds no
-        # reduced contacts, whatever pipeline previously filled it.  The
-        # CAPTURE marker deliberately does not reset: a replay of the graph
-        # that captured this buffer can re-reduce it at any moment after the
-        # clear, so destruction of the final writer graph lease drops it.
-        self.rigid_contacts_body_pair_reduced = False
         # Clear all counters and (optionally) bump generation in a single kernel launch.
         num_counters = self.contact_counters.shape[0]
         wp.launch(
@@ -694,13 +511,6 @@ class Contacts:
             if self.force is not None:
                 self.force.zero_()
 
-            if self._rigid_contact_diff_distance is not None:
-                self._rigid_contact_diff_distance.zero_()
-                self._rigid_contact_diff_point0_world.zero_()
-                self._rigid_contact_diff_point1_world.zero_()
-            if self._rigid_contact_diff_normal_override is not None:
-                self._rigid_contact_diff_normal_override.zero_()
-
             if self.per_contact_shape_properties:
                 self.rigid_contact_stiffness.zero_()
                 self.rigid_contact_damping.zero_()
@@ -710,13 +520,30 @@ class Contacts:
                 self.rigid_contact_match_index.fill_(-1)
                 self.rigid_contact_match_generation.fill_(GENERATION_SENTINEL)
 
-            self.soft_contact_indices.fill_(wp.vec3i(-1, -1, -1))
+            self.soft_contact_indices.view(wp.int32).fill_(-1)
+            self.soft_contact_rigid_indices.view(wp.int32).fill_(-1)
             self.soft_contact_particle.fill_(-1)
             self.soft_contact_shape.fill_(-1)
             self.soft_contact_tids.fill_(-1)
+            if self._soft_contact_mesh_features is not None:
+                self._soft_contact_mesh_features.view(wp.int32).fill_(-1)
         # else: Optimized path (default) - only counter clear needed
         #   Collision detection overwrites all active contacts [0, contact_count)
         #   Solvers only read [0, contact_count), so stale data is never accessed
+
+    @property
+    def rigid_contact_body_pair_reduced(self) -> bool:
+        """Whether this buffer holds body-pair-reduced rigid contacts.
+
+        Fixed when :meth:`newton.CollisionPipeline.contacts` allocates the buffer
+        from a pipeline with body-pair reduction whose scene has primitive or
+        convex contact pairs. The stamp records pipeline ownership and selection;
+        the kept rows use the ordinary contact layout accepted by built-in
+        Newton-contact consumers, eagerly and under CUDA graph capture alike.
+
+        .. experimental::
+        """
+        return self._rigid_contact_body_pair_reduced
 
     @property
     def device(self):
@@ -724,73 +551,6 @@ class Contacts:
         Returns the device on which the contact buffers are allocated.
         """
         return self.rigid_contact_count.device
-
-    @property
-    def rigid_contact_diff_distance(self) -> wp.array[float] | None:
-        """Differentiable signed distance [m].
-
-        .. deprecated:: 1.6
-            Allocate an output array and pass it as ``out_distance`` to
-            :func:`newton.eval_rigid_contact_kinematics`.
-        """
-        _warn_rigid_contact_diff_deprecated("rigid_contact_diff_distance")
-        return self._rigid_contact_diff_distance
-
-    @rigid_contact_diff_distance.setter
-    def rigid_contact_diff_distance(self, value: wp.array[float] | None) -> None:
-        _warn_rigid_contact_diff_deprecated("rigid_contact_diff_distance")
-        self._rigid_contact_diff_distance = value
-
-    @property
-    def rigid_contact_diff_normal(self) -> wp.array[wp.vec3] | None:
-        """Frozen world-space contact normal.
-
-        .. deprecated:: 1.6
-            Use :attr:`rigid_contact_normal`, which contains the same values.
-        """
-        _warn_rigid_contact_diff_deprecated("rigid_contact_diff_normal")
-        if self._rigid_contact_diff_normal_override is not None:
-            return self._rigid_contact_diff_normal_override
-        if self.requires_grad:
-            return self.rigid_contact_normal
-        return None
-
-    @rigid_contact_diff_normal.setter
-    def rigid_contact_diff_normal(self, value: wp.array[wp.vec3] | None) -> None:
-        _warn_rigid_contact_diff_deprecated("rigid_contact_diff_normal")
-        self._rigid_contact_diff_normal_override = value
-
-    @property
-    def rigid_contact_diff_point0_world(self) -> wp.array[wp.vec3] | None:
-        """Differentiable world-space contact point on shape 0 [m].
-
-        .. deprecated:: 1.6
-            Allocate an output array and pass it as ``out_point0_world`` to
-            :func:`newton.eval_rigid_contact_kinematics`.
-        """
-        _warn_rigid_contact_diff_deprecated("rigid_contact_diff_point0_world")
-        return self._rigid_contact_diff_point0_world
-
-    @rigid_contact_diff_point0_world.setter
-    def rigid_contact_diff_point0_world(self, value: wp.array[wp.vec3] | None) -> None:
-        _warn_rigid_contact_diff_deprecated("rigid_contact_diff_point0_world")
-        self._rigid_contact_diff_point0_world = value
-
-    @property
-    def rigid_contact_diff_point1_world(self) -> wp.array[wp.vec3] | None:
-        """Differentiable world-space contact point on shape 1 [m].
-
-        .. deprecated:: 1.6
-            Allocate an output array and pass it as ``out_point1_world`` to
-            :func:`newton.eval_rigid_contact_kinematics`.
-        """
-        _warn_rigid_contact_diff_deprecated("rigid_contact_diff_point1_world")
-        return self._rigid_contact_diff_point1_world
-
-    @rigid_contact_diff_point1_world.setter
-    def rigid_contact_diff_point1_world(self, value: wp.array[wp.vec3] | None) -> None:
-        _warn_rigid_contact_diff_deprecated("rigid_contact_diff_point1_world")
-        self._rigid_contact_diff_point1_world = value
 
     @property
     def contact_matching_mode(self) -> Literal["disabled", "latest", "sticky"]:

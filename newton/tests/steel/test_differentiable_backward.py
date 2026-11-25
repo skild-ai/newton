@@ -19,7 +19,7 @@ _OPTIONS = {
     "enable_restitution": False,
     "iterations": 16,
     "articulation_constraint_max": 48,
-    "deterministic": True,
+    "deterministic": wp.DeterministicMode.RUN_TO_RUN,
 }
 
 

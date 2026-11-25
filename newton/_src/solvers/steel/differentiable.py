@@ -11,17 +11,19 @@ stores every intermediate in buffers owned by the output state, so a
 from __future__ import annotations
 
 import math
-import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import warp as wp
 
+from ...core.types import MAXVAL
+from ...geometry.utils import scan_with_total
 from ...sim import Contacts, Control, Model, State
 from ...sim.articulation import eval_fk
 from ...sim.enums import BodyFlags, JointType
-from .contact_torsion import _contact_groups, _group_budget
+from .contact_torsion import _contact_groups, _flag_torsion_overflow, _group_budget, validate_torsion_step
 from .differentiable_implicit import (
     cholesky_adjoint_left,
     cholesky_adjoint_phi,
@@ -30,16 +32,14 @@ from .differentiable_implicit import (
     pgs_implicit_adjoint,
     pgs_implicit_adjoint_tiled,
 )
+from .friction import contact_tangent_basis
 from .friction_patches import (
     FrictionPatches,
     _pose_motion,
-    _store_history,
-    contact_tangent_basis,
     finish_patch_impulses,
     link_patch_rows,
 )
 from .kernels import (
-    ANGULAR_FRICTION_FREE_RIGID,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
@@ -48,21 +48,21 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_TORSION,
-    ROW_SLOTS_ATOMIC,
     ROW_SLOTS_COUNT,
-    ROW_SLOTS_WRITE,
+    WARP_DETERMINISM_OFF,
     _anchor_to_world,
     _compute_body_net_wrench,
     _gyro_skew,
     _is_identity_rotation,
     accumulate_contact_wrenches_from_impulses,
+    accumulate_free_rigid_angular_wrenches_from_impulses,
     accumulate_torsion_wrenches_from_impulses,
+    advance_world_contact_counters,
     allocate_joint_velocity_limit_slots,
     allocate_physx_drive_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
     apply_free_root_transport_to_predictor,
-    apply_impulses_world_par_dof,
     assign_world_contact_slots,
     combine_shape_coefficients,
     compute_composite_inertia,
@@ -76,23 +76,20 @@ from .kernels import (
     contact_restitution_fires,
     copy_unarticulated_body_state,
     eval_post_solve_parent_wrenches,
-    fill_contact_world_sort_keys,
+    fill_contact_family_sort_keys,
     finalize_mf_constraint_counts,
     finalize_world_constraint_counts,
     finalize_world_diag_cfm,
-    find_contact_world_segments,
+    find_contact_family_segments,
     free_rigid_angular_friction_coefficients,
-    free_rigid_angular_row,
     integrate_generalized_joints,
+    joint_limit_effective_gap,
     mixed_contact_restitution,
     populate_joint_velocity_limit_J_for_size,
     populate_physx_drive_J_for_size,
     prescribed_relative_contact_target,
     remove_free_root_transport_from_qdd,
     reserve_world_rows,
-    rhs_accum_world_par_art,
-    rhs_accum_world_par_row,
-    scan_world_row_requests,
     subtract_arrays,
     surface_contact_target,
     update_qdd_from_velocity,
@@ -103,8 +100,9 @@ if TYPE_CHECKING:
     from ..solver import SolverBase
     from .solver_steel import SolverSteel
 
-# Unroll fixed-count loops up to 32 iterations, so taped kernels replay every iterate.
-wp.set_module_options({"max_unroll": 32})
+# Unroll fixed-count loops up to 32 iterations, so taped kernels replay every iterate. The ordered kernel copies
+# select Warp's deterministic lowering themselves; this module keeps it off, as every Steel module does.
+wp.set_module_options({"max_unroll": 32, **WARP_DETERMINISM_OFF})
 
 
 def _taped(kernel: wp.Kernel) -> wp.Kernel:
@@ -120,12 +118,12 @@ _taped_remove_free_root_transport_from_qdd = _taped(remove_free_root_transport_f
 _taped_integrate_generalized_joints = _taped(integrate_generalized_joints)
 _taped_finalize_world_diag_cfm = _taped(finalize_world_diag_cfm)
 _taped_compute_world_contact_bias = _taped(compute_world_contact_bias)
-_taped_rhs_accum_world_par_art = _taped(rhs_accum_world_par_art)
-_taped_rhs_accum_world_par_row = _taped(rhs_accum_world_par_row)
-_taped_apply_impulses_world_par_dof = _taped(apply_impulses_world_par_dof)
 _taped_compute_contact_spatial_force_from_impulses = _taped(compute_contact_spatial_force_from_impulses)
 _taped_accumulate_contact_wrenches_from_impulses = _taped(accumulate_contact_wrenches_from_impulses)
 _taped_accumulate_torsion_wrenches_from_impulses = _taped(accumulate_torsion_wrenches_from_impulses)
+_taped_accumulate_free_rigid_angular_wrenches_from_impulses = _taped(
+    accumulate_free_rigid_angular_wrenches_from_impulses
+)
 _taped_eval_post_solve_parent_wrenches = _taped(eval_post_solve_parent_wrenches)
 _taped_zero_unattached_parent_wrenches = _taped(zero_unattached_parent_wrenches)
 _taped_subtract_arrays = _taped(subtract_arrays)
@@ -133,13 +131,24 @@ _taped_populate_physx_drive_J_for_size = _taped(populate_physx_drive_J_for_size)
 _taped_compute_physx_pgs_drive_desc = _taped(compute_physx_pgs_drive_desc)
 
 
+@contextmanager
+def _untaped():
+    """Launch the enclosed work off any active :class:`warp.Tape`."""
+    runtime = wp._src.context.runtime
+    tape, runtime.tape = runtime.tape, None
+    try:
+        yield
+    finally:
+        runtime.tape = tape
+
+
 def validate_differentiable_options(model: Model, options: dict) -> None:
     """Raise for constructor options the differentiable step does not reproduce."""
     checks = (
         (not model.requires_grad, "a model finalized with requires_grad=True"),
         (model.particle_count > 0, "no particles"),
+        (options["solve_mode"] != "serial", 'solve_mode="serial"'),
         (options["contact_warmstart"], "contact_warmstart=False"),
-        (options["enable_torsional_rolling_friction"], "enable_torsional_rolling_friction=False"),
         (options["contact_compliance"], "contact_compliance=False"),
         (options["articulated_contact_response"] != "immediate", 'articulated_contact_response="immediate"'),
         (options["update_mass_matrix_interval"] != 1, "update_mass_matrix_interval=1"),
@@ -159,21 +168,14 @@ def validate_differentiable_model(solver: SolverSteel) -> None:
     """Raise for model features and resolved kernels the differentiable step does not reproduce."""
     plan = solver._model_plan
     checks = (
-        (
-            solver._has_rigid_body_velocity_limits and solver._solve_mode == "split",
-            'solve_mode="matrix_free" for rigid-body velocity limits',
-        ),
         (solver._velocity_limits_fused, "fuse_joint_velocity_limits=False"),
         (solver._mimic_count or solver._connect_count, "no mimic or loop-closing joints"),
         (
             not np.array_equal(plan.articulation_joint_end, solver.model.articulation_start.numpy()[1:]),
             "no mimic or loop-closing joints",
         ),
-        # The dense sweep reproduces the loop and tiled_row updates; CPU and matrix_free resolve to loop.
-        (
-            solver._solve_mode == "split" and solver._pgs_kernel in ("tiled_contact", "streaming"),
-            'the "loop" or "tiled_row" dense PGS kernel',
-        ),
+        (solver._adhesion_enabled, "no steel:adhesion"),
+        (solver._distance_limit_count, "no DISTANCE joint limits"),
     )
     for unsupported, requirement in checks:
         if unsupported:
@@ -238,7 +240,7 @@ class DifferentiableOptions:
     unchanged). It bounds the adjoint of redundant contacts; smaller values follow the exact fixed-point
     derivative more closely and let rare worlds' adjoints grow by orders of magnitude."""
     deterministic_adjoint: bool = True
-    """With ``deterministic=True``, also reduce the backward's atomic adds in a fixed order, so repeated backward
+    """With ``deterministic=RUN_TO_RUN``, also reduce the backward's atomic adds in a fixed order, so repeated backward
     passes are bitwise identical. Warp's ordered reductions keep a record per atomic add, which grows with the
     world count and the row capacity and can exceed device memory or Warp's array size limit at a few hundred worlds.
     False keeps the fixed row order of the forward and uses plain atomics in the backward."""
@@ -300,7 +302,7 @@ class DifferentiableStep:
         self.smooth_contact = smooth_contact
         self.options = options
         self._ordered_kernels = (
-            _ordered_kernel_set(solver) if solver._deterministic and options.deterministic_adjoint else {}
+            _ordered_kernel_set(solver) if solver._ordered_rows and options.deterministic_adjoint else {}
         )
         model = solver.model
         device = model.device
@@ -351,6 +353,20 @@ class DifferentiableStep:
             self.crba_body[size] = wp.array(body, dtype=wp.int32, device=device)
             self.crba_dofs[size] = wp.array(dofs.reshape(len(arts), size, size * 2), dtype=wp.int32, device=device)
         self.mass_update_mask = wp.ones(model.articulation_count, dtype=wp.int32, device=device)
+        # Ordered rows: each size group's articulations listed per world, for the fixed-order sums.
+        self.world_groups_by_size = {}
+        if solver._ordered_rows:
+            art_world = solver._art_to_world.numpy()
+            for size in solver._size_groups:
+                group_world = art_world[solver._group_to_art[size].numpy()].astype(np.int64)
+                listed = np.flatnonzero(group_world >= 0)
+                elements = listed[np.argsort(group_world[listed], kind="stable")]
+                counts = np.bincount(group_world[listed], minlength=solver._world_count)
+                start = np.concatenate(([0], np.cumsum(counts))).astype(np.int32)
+                self.world_groups_by_size[size] = (
+                    wp.array(start, dtype=wp.int32, device=device),
+                    wp.array(elements.astype(np.int32), dtype=wp.int32, device=device),
+                )
         # body_dof_chain[body, d]: DOF d of the body's articulation moves the body (its joint chain).
         body_art = solver._body_to_articulation.numpy()
         max_size = max(solver._size_groups, default=1)
@@ -367,12 +383,6 @@ class DifferentiableStep:
                 parent_body = joint_parent[joint]
                 joint = body_to_joint.get(int(parent_body), -1) if parent_body >= 0 else -1
         self.body_dof_chain = wp.array(chain, dtype=wp.int32, device=device)
-        # Free rigid bodies take dense rows; the default solves them after the articulated rows instead.
-        plan = solver._model_plan
-        free = plan.is_free_rigid != 0
-        worlds_free = set(plan.articulation_world[free].tolist())
-        worlds_articulated = set(plan.articulation_world[~free & (plan.response_dof_count > 0)].tolist())
-        self.has_mixed_free_worlds = bool(worlds_free & worlds_articulated)
         self.body_inertia_terms = wp.zeros((1, 12), dtype=wp.float32, device=device)
         self.pgs_adjoint = options.pgs_adjoint
         if self.pgs_adjoint == "implicit":
@@ -393,7 +403,7 @@ class DifferentiableStep:
             self._world_bodies = _world_index(model.body_world, model.body_count, model.world_count, device)
 
     def _ordered(self, kernel: wp.Kernel) -> wp.Kernel:
-        """The copy of ``kernel`` whose atomics, its adjoint's included, reduce in a fixed order under deterministic=True."""
+        """The copy of ``kernel`` whose atomics, its adjoint's included, reduce in a fixed order under RUN_TO_RUN."""
         return self._ordered_kernels.get(kernel, kernel)
 
     def buffers(self, state_out: State) -> _StepBuffers:
@@ -410,14 +420,15 @@ class DifferentiableStep:
         control: Control | None,
         contacts: Contacts | None,
         dt: float,
-        collide_done_event: wp.Event | None = None,
         observables: SolverBase.Observables | None = None,
     ):
         solver = self.solver
         model = solver.model
         device = model.device
         if contacts is not None:
-            self.validate_contacts()
+            self.validate_contacts(contacts)
+        if solver._contact_torsion_enabled:
+            validate_torsion_step(solver)
         if state_in is state_out:
             raise ValueError("differentiable=True requires distinct input and output states")
         if control is None:
@@ -458,15 +469,20 @@ class DifferentiableStep:
                 device=device,
                 record_tape=False,
             )
-        if solver._tree_joint_world is not None:
-            wp.launch(
-                _flag_disabled_tree_joints,
-                dim=model.joint_count,
-                inputs=[model.joint_enabled, solver._tree_joint_world],
-                outputs=[solver._disabled_tree_joint],
-                device=device,
-                record_tape=False,
-            )
+        wp.launch(
+            _flag_disabled_tree_joints,
+            dim=model.joint_count,
+            inputs=[
+                model.joint_enabled,
+                model.joint_articulation,
+                model.joint_world,
+                int(model.world_count),
+                solver._coupling_owned_joint,
+            ],
+            outputs=[solver._disabled_tree_joint],
+            device=device,
+            record_tape=False,
+        )
         # The default scales each articulation's velocity into its joint velocity limits before the dynamics;
         # the joint torques and the integration keep the input velocity.
         stage_qd = state_in.joint_qd
@@ -554,9 +570,9 @@ class DifferentiableStep:
                 model.joint_qd_start,
                 control.joint_f,
                 state_in.joint_q,
-                state_in.joint_qd,
+                stage_qd,
                 solver._passive_spring_stiffness,
-                solver._passive_spring_ref,
+                solver._passive_spring_rest_q,
                 solver._passive_joint_damping,
                 b.joint_S_s,
                 b.body_fnet_s,
@@ -580,6 +596,7 @@ class DifferentiableStep:
                 control.joint_target_q,
                 control.joint_target_qd,
                 model.joint_effort_limit,
+                solver._passive_joint_damping,
                 b.tau_rigid,
                 dt,
                 int(solver._drive_mode == "augmented"),
@@ -689,14 +706,12 @@ class DifferentiableStep:
                 device=device,
             )
             v_out = b.v_gyro
-        if collide_done_event is not None:
-            wp.get_stream(device).wait_event(collide_done_event)
         if (
             contacts is not None
             or solver._enable_joint_limits
             or solver._enable_joint_velocity_limits
             or solver._has_rigid_body_velocity_limits
-            or solver._drive_slot is not None
+            or solver._has_drive_rows
         ):
             v_out = self._solve_dense_rows(b, state_in, control, contacts, v_out, dt)
         wp.launch(
@@ -812,22 +827,10 @@ class DifferentiableStep:
 
         tape.record_func(backward, [])
 
-    def validate_contacts(self) -> None:
+    def validate_contacts(self, contacts: Contacts) -> None:
         """Raise for contact configurations the differentiable step does not reproduce yet."""
-        solver = self.solver
-        checks = (
-            (
-                self.has_mixed_free_worlds and solver._solve_mode == "split",
-                'solve_mode="matrix_free" for worlds mixing free rigid bodies and articulations',
-            ),
-            (
-                solver._regularization_enabled and solver._solve_mode == "split",
-                'solve_mode="matrix_free" for contact_regularization',
-            ),
-        )
-        for unsupported, requirement in checks:
-            if unsupported:
-                raise NotImplementedError(f"differentiable=True contacts require {requirement}")
+        if contacts._mesh_recovery_contacts is not None:
+            raise NotImplementedError("differentiable=True contacts require a collision pipeline without mesh recovery")
 
     def _solve_dense_rows(
         self,
@@ -871,6 +874,7 @@ class DifferentiableStep:
         ):
             wp.copy(dst, src)
         threads = min(c.capacity, _CONTACT_BUILD_THREAD_CAP)
+        solver._cross_world_contacts.zero_()
 
         # Topology: integer bookkeeping, frozen for the derivative and kept off the tape.
         wp.launch(
@@ -881,21 +885,22 @@ class DifferentiableStep:
             record_tape=False,
         )
         solver._dense_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)
-        dummy = solver._dummy_mf_slot_counter
         # Free-body contacts reserve matrix-free slots first and take dense rows after the articulated ones,
         # the order in which the matrix-free kernel sweeps the two families.
         free_rows = int(solver._has_free_rigid_bodies)
         c.mf_slot_counter.zero_()
         c.mf_first_rejected.fill_(_ROW_SLOT_UNBOUNDED)
-        deterministic = int(solver._deterministic)
-        for array in (c.C, c.diag, c.rhs, *c.J.values(), *c.Y.values()):
+        c.propagation_slot_counter.zero_()
+        c.propagation_first_rejected.fill_(_ROW_SLOT_UNBOUNDED)
+        ordered = int(solver._ordered_rows)
+        for array in (c.C, c.diag, c.rhs, *c.C_chain, *c.diag_chain, *c.rhs_chain, *c.J.values(), *c.Y.values()):
             array.zero_()
         # The default reserves drive rows, then joint-limit rows, then velocity-limit rows, ahead of the contacts.
-        drives = solver._drive_slot is not None
+        drives = solver._has_drive_rows
         if drives:
             self._reserve_drive_rows(c, state_in, control)
         if solver._enable_joint_limits:
-            self._reserve_joint_limit_rows(c, state_in.joint_q)
+            self._reserve_joint_limit_rows(c, state_in.joint_q, v_hat, dt)
         if solver._enable_joint_velocity_limits:
             self._reserve_velocity_limit_rows(c, v_hat)
         patches = solver._friction_anchors_enabled and has_contacts
@@ -926,50 +931,49 @@ class DifferentiableStep:
                 0,
                 0,
                 0,
-                solver._contact_gap_limit,
                 max_rows,
                 solver._free_body_constraint_max,
                 solver._propagation_max_constraints,
+                solver._articulation_model_world,
+                solver._contact_gap_limit,
                 solver._friction_gap,
                 solver._friction_patches.view,
-                ANGULAR_FRICTION_FREE_RIGID if solver._free_rigid_angular_rows else 0,
-                solver._shape_mu_torsional,
-                solver._shape_mu_rolling,
+                int(solver._free_rigid_angular_rows),
                 solver._free_rigid_mu_torsional,
                 solver._free_rigid_mu_rolling,
-                deterministic,
-                solver._contact_torsion_radius_dummy,
+                ordered,
+                solver._no_torsion_radius,
                 0,
-                solver._friction_combine_id,
+                None,
             ],
             outputs=[
                 c.world,
                 c.slot,
                 c.art_a,
                 c.art_b,
+                c.slots_needed,
                 c.slot_counter,
                 c.path,
                 c.mf_slot_counter,
-                dummy,
+                c.propagation_slot_counter,
                 c.dense_world_flag,
-                c.slots_needed,
                 solver._row_dropped_dense,
                 solver._row_dropped_mf,
                 solver._row_dropped_propagation,
                 solver._dense_first_rejected_slot,
                 c.mf_first_rejected,
-                dummy,
-                c.mf_origin,
+                c.propagation_first_rejected,
+                solver._cross_world_contacts,
             ],
             device=device,
             record_tape=False,
         )
-        if deterministic and has_contacts:
+        if ordered and has_contacts:
             self._assign_slots_by_world(c, contacts)
         wp.launch(
             finalize_world_constraint_counts,
             dim=solver._world_count,
-            inputs=[c.slot_counter, max_rows, solver._dense_first_rejected_slot],
+            inputs=[c.slot_counter, max_rows, 3, solver._dense_first_rejected_slot],
             outputs=[c.row_count],
             device=device,
             record_tape=False,
@@ -978,7 +982,7 @@ class DifferentiableStep:
             wp.launch(
                 finalize_mf_constraint_counts,
                 dim=solver._world_count,
-                inputs=[c.mf_slot_counter, solver._free_body_constraint_max, c.mf_first_rejected],
+                inputs=[c.mf_slot_counter, solver._free_body_constraint_max, 3, c.mf_first_rejected],
                 outputs=[c.mf_row_count],
                 device=device,
                 record_tape=False,
@@ -1004,18 +1008,20 @@ class DifferentiableStep:
                 self._reserve_rigid_velocity_limit_rows(c, v_hat)
         wp.launch(
             _finalize_constraint_status,
-            dim=solver._world_count,
+            dim=solver._world_count + 1,
             inputs=[
                 c.slot_counter,
                 c.mf_slot_counter,
-                dummy,
+                c.propagation_slot_counter,
                 solver._row_dropped_all,
+                solver._cross_world_contacts,
                 c.count,
                 contacts._reduction_overflow if has_contacts else solver._dummy_contact_count,
                 max_rows,
                 solver._free_body_constraint_max,
                 solver._propagation_max_constraints,
                 contacts.rigid_contact_max if has_contacts else 0,
+                int(solver._has_responding_global),
                 solver.constraint_overflow,
             ],
             device=device,
@@ -1069,10 +1075,6 @@ class DifferentiableStep:
                 solver._restitution_combine_id,
                 solver._rebound_velocity_threshold,
                 int(solver._contact_shared_anchor),
-                solver._contact_friction_scale,
-                solver._friction_anchor_beta,
-                solver._baumgarte,
-                solver._cfm,
                 solver._rigid_body_max_depenetration_velocity,
                 solver._body_to_articulation,
                 solver._dummy_is_free_rigid if solver._is_free_rigid is None else solver._is_free_rigid,
@@ -1092,8 +1094,6 @@ class DifferentiableStep:
                 c.row_type,
                 c.row_parent,
                 c.row_mu,
-                c.row_beta,
-                c.row_cfm,
                 c.phi,
                 c.target_velocity,
                 c.row_rebound_velocity,
@@ -1165,16 +1165,30 @@ class DifferentiableStep:
                 outputs=[c.Y[size]],
                 device=device,
             )
-        for size in solver._size_groups:
+        last = len(solver._size_groups) - 1
+        for group, size in enumerate(solver._size_groups):
             n_arts = solver._n_arts_by_size[size]
-            if solver._deterministic:
-                # A world's articulations add in a fixed order, so repeated steps are bitwise identical.
-                world_group_start, world_groups = solver._world_groups_by_size[size]
+            if solver._ordered_rows:
+                # A world's articulations add in a fixed order, so repeated steps are bitwise identical. Each size
+                # group adds onto the previous group's sums in a new array, so no launch reads what it writes.
+                world_group_start, world_groups = self.world_groups_by_size[size]
                 wp.launch(
                     self._ordered(_delassus_dense_ordered),
                     dim=(solver._world_count, max_rows, max_rows),
-                    inputs=[c.J[size], c.Y[size], world_group_start, world_groups, c.row_count, size],
-                    outputs=[c.C, c.diag],
+                    inputs=[
+                        c.J[size],
+                        c.Y[size],
+                        world_group_start,
+                        world_groups,
+                        c.row_count,
+                        size,
+                        c.C_chain[group - 1] if group > 0 else None,
+                        c.diag_chain[group - 1] if group > 0 else None,
+                    ],
+                    outputs=[
+                        c.C if group == last else c.C_chain[group],
+                        c.diag if group == last else c.diag_chain[group],
+                    ],
                     device=device,
                 )
                 continue
@@ -1197,7 +1211,7 @@ class DifferentiableStep:
         wp.launch(
             _taped_finalize_world_diag_cfm,
             dim=solver._world_count,
-            inputs=[c.row_count, c.row_cfm],
+            inputs=[c.row_count, c.row_type, solver._cfm],
             outputs=[c.diag],
             device=device,
         )
@@ -1207,20 +1221,14 @@ class DifferentiableStep:
                 dim=solver._world_count,
                 inputs=[
                     c.row_count,
-                    solver._world_dof_indices,
-                    solver._max_world_dofs,
                     c.row_type,
                     c.diag,
-                    c.C,
-                    v_hat,
                     c.target_velocity,
                     c.drive_stiffness,
                     c.drive_damping,
                     c.drive_geom_error,
                     c.drive_max_force,
                     dt,
-                    1.0,
-                    0.0,
                 ],
                 outputs=[c.drive_bias, c.drive_velocity_scale, c.drive_impulse_scale, c.drive_max_impulse],
                 device=device,
@@ -1231,23 +1239,31 @@ class DifferentiableStep:
             inputs=[
                 c.row_count,
                 c.phi,
-                c.row_beta,
                 c.row_type,
                 c.target_velocity,
-                dt,
-                1.0,
+                solver._baumgarte,
+                solver._friction_anchor_beta,
                 solver._contact_speculative_scale,
-                1.0,
                 solver._contact_w,
+                dt,
             ],
-            outputs=[c.rhs, c.row_w],
+            outputs=[c.rhs_bias if solver._ordered_rows else c.rhs, c.row_w],
             device=device,
         )
-        for size in solver._size_groups:
-            if solver._deterministic:
-                world_group_start, world_groups = solver._world_groups_by_size[size]
+        if drives:
+            # The force-drive update reads J v from the residual; the drive target enters through drive_bias.
+            wp.launch(
+                _clear_drive_row_bias,
+                dim=(solver._world_count, max_rows),
+                inputs=[c.row_count, c.row_type],
+                outputs=[c.rhs_bias if solver._ordered_rows else c.rhs],
+                device=device,
+            )
+        for group, size in enumerate(solver._size_groups):
+            if solver._ordered_rows:
+                world_group_start, world_groups = self.world_groups_by_size[size]
                 wp.launch(
-                    self._ordered(_taped_rhs_accum_world_par_row),
+                    self._ordered(_rhs_accum_world_par_row),
                     dim=solver._world_count * max_rows,
                     inputs=[
                         c.row_count,
@@ -1259,13 +1275,14 @@ class DifferentiableStep:
                         c.J[size],
                         size,
                         max_rows,
+                        c.rhs_chain[group - 1] if group > 0 else c.rhs_bias,
                     ],
-                    outputs=[c.rhs],
+                    outputs=[c.rhs if group == last else c.rhs_chain[group]],
                     device=device,
                 )
                 continue
             wp.launch(
-                self._ordered(_taped_rhs_accum_world_par_art),
+                self._ordered(_rhs_accum_world_par_art),
                 dim=solver._n_arts_by_size[size],
                 inputs=[
                     c.row_count,
@@ -1292,7 +1309,7 @@ class DifferentiableStep:
                 inputs=[
                     c.row_count,
                     c.phi,
-                    c.row_beta,
+                    solver._baumgarte,
                     c.row_type,
                     c.rhs,
                     dt,
@@ -1311,7 +1328,7 @@ class DifferentiableStep:
                 inputs=[
                     c.row_count,
                     c.phi,
-                    c.row_beta,
+                    solver._baumgarte,
                     c.row_type,
                     c.row_rebound_velocity,
                     c.row_max_depenetration,
@@ -1326,7 +1343,7 @@ class DifferentiableStep:
 
         # Fixed-iteration PGS; iteration k reads impulses[k] and writes impulses[k + 1] once.
         c.impulses[0].zero_()
-        friction_start = solver._contact_friction_start_iteration(solver._iterations)
+        friction_start = solver._friction_start_iteration(solver._iterations)
         torsion = solver._contact_torsion_enabled
         velocity_limits = solver._enable_joint_velocity_limits or solver._has_rigid_body_velocity_limits
         iterations = solver._iterations
@@ -1421,7 +1438,7 @@ class DifferentiableStep:
         for size in solver._size_groups:
             n_arts = solver._n_arts_by_size[size]
             wp.launch(
-                self._ordered(_taped_apply_impulses_world_par_dof),
+                self._ordered(_apply_impulses_world_par_dof),
                 dim=n_arts * size,
                 inputs=[
                     solver._group_to_art[size],
@@ -1519,23 +1536,12 @@ class DifferentiableStep:
         tape.record_func(backward, [c.C, rhs, lam, c.smooth_impulse])
 
     def _reserve_rows(self, launch, slot_counter: wp.array, world_index=None) -> None:
-        """Reserve one row family like the default's _reserve_rows: per world in articulation order if deterministic."""
+        """Reserve one row family like the default's _reserve_rows: per world in articulation order if ordered."""
         solver = self.solver
-        if not solver._deterministic:
-            launch(ROW_SLOTS_ATOMIC)
-            return
-        solver._row_cursor.zero_()
-        launch(ROW_SLOTS_COUNT)
-        start, elements = solver._articulation_world_index if world_index is None else world_index
-        wp.launch(
-            scan_world_row_requests,
-            dim=solver._world_count,
-            inputs=[start, elements],
-            outputs=[slot_counter, solver._row_cursor],
-            device=solver.model.device,
-            record_tape=False,
-        )
-        launch(ROW_SLOTS_WRITE)
+        world_index = solver._articulation_world_index if world_index is None else world_index
+        # The reservation scans launch without record_tape; the rows they reserve are frozen topology.
+        with _untaped():
+            solver._reserve_rows(world_index, slot_counter, launch)
 
     def _reserve_drive_rows(self, c: _ContactBuffers, state_in: State, control: Control) -> None:
         """allocate_physx_drive_slots off the tape; the rows' targets and errors are written on it."""
@@ -1548,6 +1554,7 @@ class DifferentiableStep:
                 dim=model.articulation_count,
                 inputs=[
                     model.articulation_start,
+                    solver._articulation_joint_end,
                     solver._articulation_dof_start,
                     solver._articulation_H_rows,
                     model.joint_type,
@@ -1570,6 +1577,7 @@ class DifferentiableStep:
                 dim=solver._n_arts_by_size[size],
                 inputs=[
                     model.articulation_start,
+                    solver._articulation_joint_end,
                     solver._articulation_dof_start,
                     model.joint_type,
                     model.joint_q_start,
@@ -1582,7 +1590,7 @@ class DifferentiableStep:
                     control.joint_target_q,
                     model.joint_target_q_start,
                     control.joint_target_qd,
-                    c.drive_velocity_limit,
+                    model.joint_velocity_limit,
                     0,
                     solver._art_to_world,
                     c.drive_slot,
@@ -1593,8 +1601,6 @@ class DifferentiableStep:
                     c.row_type,
                     c.row_parent,
                     c.row_mu,
-                    c.row_beta,
-                    c.row_cfm,
                     c.phi,
                     c.target_velocity,
                     c.drive_stiffness,
@@ -1606,32 +1612,30 @@ class DifferentiableStep:
                 device=model.device,
             )
 
-    def _reserve_joint_limit_rows(self, c: _ContactBuffers, joint_q: wp.array) -> None:
-        """build_joint_limit_rows_for_size's rows; the gaps are recomputed on the tape by _joint_limit_gap."""
+    def _reserve_joint_limit_rows(self, c: _ContactBuffers, joint_q: wp.array, v_hat: wp.array, dt: float) -> None:
+        """build_joint_limit_rows' rows; the gaps are recomputed on the tape by _joint_limit_gap."""
         solver = self.solver
         model = solver.model
 
         def launch(mode):
-            for size in solver._size_groups:
+            for size in solver._joint_limit_sizes:
                 wp.launch(
                     _reserve_joint_limit_rows,
                     dim=solver._n_arts_by_size[size],
                     inputs=[
-                        model.articulation_start,
                         solver._articulation_dof_start,
-                        model.joint_type,
-                        model.joint_q_start,
-                        model.joint_qd_start,
-                        model.joint_dof_dim,
+                        solver._art_to_world,
+                        solver._group_to_art[size],
+                        solver._joint_limit_q_index,
                         model.joint_limit_lower,
                         model.joint_limit_upper,
                         joint_q,
-                        solver._joint_limit_activation_gap,
-                        solver._art_to_world,
-                        solver._group_to_art[size],
+                        solver._joint_limit_gap,
+                        v_hat,
+                        solver._joint_limit_activation_speed_scale,
+                        dt,
                         solver._articulation_constraint_max,
-                        solver._baumgarte,
-                        solver._cfm,
+                        size,
                         mode,
                     ],
                     outputs=[
@@ -1640,8 +1644,6 @@ class DifferentiableStep:
                         c.row_type,
                         c.row_parent,
                         c.row_mu,
-                        c.row_beta,
-                        c.row_cfm,
                         c.phi,
                         c.target_velocity,
                         c.limit_coordinate,
@@ -1665,6 +1667,7 @@ class DifferentiableStep:
                 dim=model.articulation_count,
                 inputs=[
                     model.articulation_start,
+                    solver._articulation_joint_end,
                     solver._articulation_dof_start,
                     solver._articulation_H_rows,
                     model.joint_type,
@@ -1673,8 +1676,8 @@ class DifferentiableStep:
                     model.joint_velocity_limit,
                     v_hat,
                     solver._velocity_limit_activation_fraction,
-                    solver._vel_limit_drive_slot_arg,
-                    solver._vel_limit_skip_driven,
+                    c.drive_slot,
+                    int(solver._velocity_limits_fused),
                     solver._art_to_world,
                     solver._articulation_constraint_max,
                     solver._constraint_art_active,
@@ -1697,6 +1700,7 @@ class DifferentiableStep:
                 dim=solver._n_arts_by_size[size],
                 inputs=[
                     model.articulation_start,
+                    solver._articulation_joint_end,
                     solver._articulation_dof_start,
                     model.joint_type,
                     model.joint_qd_start,
@@ -1706,15 +1710,12 @@ class DifferentiableStep:
                     solver._velocity_limit_slot,
                     solver._velocity_limit_sign,
                     solver._group_to_art[size],
-                    solver._cfm,
                 ],
                 outputs=[
                     c.J[size],
                     c.row_type,
                     c.row_parent,
                     c.row_mu,
-                    c.row_beta,
-                    c.row_cfm,
                     c.phi,
                     c.target_velocity,
                 ],
@@ -1883,9 +1884,36 @@ class DifferentiableStep:
                         c.patch_view if solver._friction_anchors_enabled else solver._friction_patches.view,
                         inv_dt,
                     ],
-                    outputs=[o.contact_wrench, o.dense_slot_contact],
+                    outputs=[o.contact_wrench, o.dense_slot_contact, None],
                     device=device,
                 )
+                if solver._free_rigid_angular_rows:
+                    impulses = c.impulses[solver._iterations]
+                    wp.launch(
+                        self._ordered(_taped_accumulate_free_rigid_angular_wrenches_from_impulses),
+                        dim=c.capacity,
+                        inputs=[
+                            c.count,
+                            c.capacity,
+                            c.world,
+                            c.slot,
+                            c.path,
+                            c.slots_needed,
+                            c.normal,
+                            c.shape0,
+                            c.shape1,
+                            model.shape_body,
+                            c.row_count,
+                            c.row_type,
+                            impulses,
+                            c.row_count,
+                            c.row_type,
+                            impulses,
+                            inv_dt,
+                        ],
+                        outputs=[o.contact_wrench],
+                        device=device,
+                    )
                 if solver._contact_torsion_enabled:
                     wp.launch(
                         self._ordered(_taped_accumulate_torsion_wrenches_from_impulses),
@@ -1896,6 +1924,7 @@ class DifferentiableStep:
                             c.row_parent,
                             c.impulses[solver._iterations],
                             o.dense_slot_contact,
+                            0,
                             c.count,
                             c.capacity,
                             c.world,
@@ -1982,6 +2011,7 @@ class DifferentiableStep:
                     state_out.body_q,
                     state_out.body_qd,
                     model.body_com,
+                    solver._body_to_articulation,
                     contacts.rigid_contact_surface_velocity,
                     c.world,
                     c.slot,
@@ -1996,15 +2026,8 @@ class DifferentiableStep:
                 device=model.device,
                 record_tape=False,
             )
-        history = solver._friction_patches
-        wp.launch(
-            _store_history,
-            dim=max(history.capacity, history.previous_q.shape[0]),
-            inputs=[c.patch_q0, history.body_world, history.current, history.previous, history.previous_world],
-            outputs=[history.previous_q],
-            device=model.device,
-            record_tape=False,
-        )
+        with _untaped():
+            solver._friction_patches.store(_PoseView(c.patch_q0))
 
     def _reserve_rigid_velocity_limit_rows(self, c: _ContactBuffers, v_hat: wp.array) -> None:
         """The free bodies' velocity-limit rows, which the matrix-free route reserves after its contact rows."""
@@ -2056,15 +2079,12 @@ class DifferentiableStep:
                 solver._rigid_body_max_angular_velocity,
                 solver._rigid_velocity_limit_slot,
                 solver._rigid_velocity_limit_sign,
-                solver._cfm,
             ],
             outputs=[
                 c.J[6],
                 c.row_type,
                 c.row_parent,
                 c.row_mu,
-                c.row_beta,
-                c.row_cfm,
                 c.phi,
                 c.target_velocity,
             ],
@@ -2085,43 +2105,57 @@ class DifferentiableStep:
         solver = self.solver
         device = solver.model.device
         count = contacts.rigid_contact_max
+        segment_count = solver._contact_segment_count
+        slots_needed = solver._sorted_contact_slots_needed[: count + 1]
+        slot_offsets = solver._sorted_contact_slot_offsets[: count + 1]
+        segment_start, segment_end = solver._contact_segments[0], solver._contact_segments[1]
         wp.launch(
-            fill_contact_world_sort_keys,
+            fill_contact_family_sort_keys,
             dim=count,
-            inputs=[c.count, c.path, c.world, solver._world_count],
-            outputs=[solver._contact_sort_keys, solver._contact_sort_values],
+            inputs=[c.count, c.path, c.world, segment_count, count],
+            outputs=[solver._contact_sort_keys, solver._contact_sort_values, solver._contact_slot_scan_length],
             device=device,
             record_tape=False,
         )
         wp.utils.radix_sort_pairs(
             solver._contact_sort_keys, solver._contact_sort_values, count, end_bit=solver._contact_sort_end_bit
         )
-        solver._world_contact_segments.zero_()
+        solver._contact_segments.zero_()
         wp.launch(
-            find_contact_world_segments,
-            dim=count,
-            inputs=[solver._contact_sort_keys, count, solver._world_count],
-            outputs=[solver._world_contact_segments[0], solver._world_contact_segments[1]],
+            find_contact_family_segments,
+            dim=count + 1,
+            inputs=[solver._contact_sort_keys, solver._contact_sort_values, c.slots_needed, count, segment_count],
+            outputs=[segment_start, segment_end, slots_needed],
             device=device,
             record_tape=False,
         )
+        scan_with_total(
+            slots_needed,
+            slot_offsets,
+            solver._contact_slot_scan_length,
+            solver._ordered_scan_total,
+            solver._ordered_scan_scratch,
+        )
         wp.launch(
             assign_world_contact_slots,
-            dim=solver._world_count,
+            dim=count,
             inputs=[
-                solver._world_contact_segments[0],
-                solver._world_contact_segments[1],
+                solver._contact_sort_keys,
                 solver._contact_sort_values,
+                segment_start,
+                segment_end,
+                slot_offsets,
                 c.slots_needed,
+                segment_count,
                 solver._articulation_constraint_max,
                 solver._free_body_constraint_max,
                 solver._propagation_max_constraints,
-            ],
-            outputs=[
-                c.path,
                 c.slot_counter,
                 c.mf_slot_counter,
                 c.propagation_slot_counter,
+            ],
+            outputs=[
+                c.path,
                 c.slot,
                 c.dense_world_flag,
                 solver._row_dropped_dense,
@@ -2131,6 +2165,14 @@ class DifferentiableStep:
                 c.mf_first_rejected,
                 c.propagation_first_rejected,
             ],
+            device=device,
+            record_tape=False,
+        )
+        wp.launch(
+            advance_world_contact_counters,
+            dim=segment_count,
+            inputs=[segment_start, segment_end, slot_offsets],
+            outputs=[c.slot_counter, c.mf_slot_counter, c.propagation_slot_counter],
             device=device,
             record_tape=False,
         )
@@ -2173,18 +2215,7 @@ class DifferentiableStep:
             for witness in group:
                 membership[world, witness.slot] = row
             entries.append((world, row, lead.slot, lead.body_a, lead.body_b, coefficient, radius, lead.normal))
-        overflowed = np.flatnonzero(requested > count)
-        if overflowed.size:
-            overflow = solver.constraint_overflow.numpy()
-            overflow[overflowed] = True
-            solver.constraint_overflow.assign(overflow)
-            if solver._warn_constraint_overflow:
-                warnings.warn(
-                    "Steel contact torsion row overflow: groups beyond articulation_constraint_max get no row and "
-                    "flag their worlds in constraint_overflow. Increase articulation_constraint_max.",
-                    RuntimeWarning,
-                    stacklevel=4,
-                )
+        _flag_torsion_overflow(solver, requested, count)
         if not entries:
             return
         rows = wp.array(np.array([e[:5] for e in entries], dtype=np.int32), dtype=wp.int32, device=device)
@@ -2196,13 +2227,11 @@ class DifferentiableStep:
         wp.launch(
             _write_torsion_rows,
             dim=len(entries),
-            inputs=[rows, coefficients, solver._cfm],
+            inputs=[rows, coefficients],
             outputs=[
                 c.row_type,
                 c.row_parent,
                 c.row_mu,
-                c.row_beta,
-                c.row_cfm,
                 c.phi,
                 c.target_velocity,
                 c.row_rebound_velocity,
@@ -2339,7 +2368,7 @@ class _ContactBuffers:
         self.shape1 = zeros(capacity, wp.int32, False)
         self.margin0 = zeros(capacity, wp.float32, False)
         self.margin1 = zeros(capacity, wp.float32, False)
-        for name in ("world", "slot", "art_a", "art_b", "path", "slots_needed", "mf_origin"):
+        for name in ("world", "slot", "art_a", "art_b", "path", "slots_needed"):
             setattr(self, name, zeros(capacity, wp.int32, False))
         self.slot_counter = zeros(worlds, wp.int32, False)
         self.mf_slot_counter = zeros(worlds, wp.int32, False)
@@ -2353,13 +2382,18 @@ class _ContactBuffers:
         self.row_type = zeros((worlds, rows), wp.int32, False)
         self.row_parent = zeros((worlds, rows), wp.int32, False)
         self.row_mu = zeros((worlds, rows))
-        self.row_beta = zeros((worlds, rows))
-        self.row_cfm = zeros((worlds, rows))
         self.row_w = zeros((worlds, rows))
         self.row_w_restituted = zeros((worlds, rows))
         self.phi = zeros((worlds, rows))
         self.target_velocity = zeros((worlds, rows))
         self.rhs = zeros((worlds, rows))
+        # Ordered rows: the bias before J v_hat, and each size group's partial sums but the last.
+        ordered = solver._ordered_rows
+        partial_groups = len(solver._size_groups) - 1 if ordered else 0
+        self.rhs_bias = zeros((worlds, rows) if ordered else (1, 1))
+        self.rhs_chain = [zeros((worlds, rows)) for _ in range(partial_groups)]
+        self.C_chain = [zeros((worlds, rows, rows)) for _ in range(partial_groups)]
+        self.diag_chain = [zeros((worlds, rows)) for _ in range(partial_groups)]
         self.rhs_restituted = zeros((worlds, rows))
         self.row_rebound_velocity = zeros((worlds, rows))
         self.row_max_depenetration = zeros((worlds, rows))
@@ -2396,9 +2430,8 @@ class _ContactBuffers:
         self.pair_load = [zeros((worlds, rows)) for _ in range(patch_iterations)]
         self.pair_load_dummy = zeros((1, 1))
         self.limit_dof = zeros((worlds, rows), wp.int32, False)
-        drive_shape = (worlds, rows) if solver._drive_slot is not None else (1, 1)
+        drive_shape = (worlds, rows) if solver._has_drive_rows else (1, 1)
         self.drive_slot = zeros(max(solver.model.joint_dof_count, 1), wp.int32, False)
-        self.drive_velocity_limit = zeros(1)
         self.drive_velocity_limit_rows = zeros((1, 1))
         for name in (
             "drive_stiffness",
@@ -2422,7 +2455,7 @@ class _ContactBuffers:
             n_arts = solver._n_arts_by_size[size]
             self.J[size] = zeros((n_arts, rows, size))
             self.Y[size] = zeros((n_arts, rows, size))
-            self.Y_tmp[size] = zeros((n_arts, rows, size))
+            self.Y_tmp[size] = zeros((n_arts, rows, size), requires_grad=False)
 
 
 @wp.kernel
@@ -2576,7 +2609,7 @@ def _project_joint_tau(
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
     joint_spring_stiffness: wp.array[float],
-    joint_spring_ref: wp.array[float],
+    joint_rest_q: wp.array[float],
     joint_damping: wp.array[float],
     joint_S_s: wp.array[wp.spatial_vector],
     body_fnet_s: wp.array[wp.spatial_vector],
@@ -2591,8 +2624,8 @@ def _project_joint_tau(
     if type == JointType.BALL:
         value = value - joint_damping[dof] * joint_qd[dof]
     elif type == JointType.PRISMATIC or type == JointType.REVOLUTE or type == JointType.D6:
-        axis = dof - joint_qd_start[joint]
-        passive_f = joint_spring_stiffness[dof] * (joint_spring_ref[dof] - joint_q[joint_q_start[joint] + axis])
+        coord = joint_q_start[joint] + dof - joint_qd_start[joint]
+        passive_f = joint_spring_stiffness[dof] * (joint_rest_q[coord] - joint_q[coord])
         passive_f -= joint_damping[dof] * joint_qd[dof]
         value = value + passive_f
     tau[dof] = value
@@ -2721,6 +2754,7 @@ def _augmented_drives_by_dof(
     joint_target_pos: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_effort_limit: wp.array[float],
+    joint_damping: wp.array[float],
     tau_in: wp.array[float],
     dt: float,
     augmented: int,
@@ -2728,13 +2762,17 @@ def _augmented_drives_by_dof(
     tau_out: wp.array[float],
     drive_K: wp.array[float],
 ):
-    """Per-DOF form of prepare_articulation_augmented_drives with the same arithmetic; a pass-through for drive rows."""
+    """Per-DOF form of prepare_articulation_augmented_drives with the same arithmetic.
+
+    Drive rows leave only the implicit passive damping on the diagonal.
+    """
     dof = wp.tid()
     joint = dof_joint[dof]
     type = joint_type[joint]
     value = tau_in[dof]
     K = float(0.0)
-    if augmented != 0 and (type == JointType.PRISMATIC or type == JointType.REVOLUTE or type == JointType.D6):
+    hinge = type == JointType.PRISMATIC or type == JointType.REVOLUTE or type == JointType.D6
+    if augmented != 0 and hinge:
         ke = joint_target_ke[dof]
         kd = joint_target_kd[dof]
         if ke > 0.0 or kd > 0.0:
@@ -2750,6 +2788,8 @@ def _augmented_drives_by_dof(
                     u0 = wp.clamp(u0, -effort_limit, effort_limit)
                 value = value + u0
                 K = K_drive
+    if hinge or type == JointType.BALL:
+        K += wp.max(joint_damping[dof], 0.0) * dt
     tau_out[dof] = value
     drive_K[dof] = K
 
@@ -2934,6 +2974,18 @@ def _solve_dense(
 
 
 @wp.func
+def _free_rigid_angular_row(
+    row_offset: int, torsional: float, rolling: float, t0: wp.vec3, t1: wp.vec3, normal: wp.vec3
+):
+    """The type, coefficient [m] and axis of a free-body contact's angular row ``row_offset`` (3 to 5)."""
+    if rolling > 0.0 and row_offset < 5:
+        if row_offset == 4:
+            return PGS_CONSTRAINT_TYPE_CONTACT_ROLLING, rolling, t1
+        return PGS_CONSTRAINT_TYPE_CONTACT_ROLLING, rolling, t0
+    return PGS_CONSTRAINT_TYPE_CONTACT_SPIN, torsional, normal
+
+
+@wp.func
 def _contact_world_points(
     c: int,
     point0: wp.array[wp.vec3],
@@ -2983,10 +3035,6 @@ def _dense_contact_rows(
     restitution_combine: int,
     restitution_velocity_threshold: float,
     contact_shared_anchor: int,
-    contact_friction_scale: float,
-    friction_anchor_beta: float,
-    baumgarte: float,
-    cfm: float,
     max_depenetration_velocity: wp.array[float],
     body_to_articulation: wp.array[int],
     is_free_rigid: wp.array[int],
@@ -3005,8 +3053,6 @@ def _dense_contact_rows(
     row_type: wp.array2d[int],
     row_parent: wp.array2d[int],
     row_mu: wp.array2d[float],
-    row_beta: wp.array2d[float],
-    row_cfm: wp.array2d[float],
     row_phi: wp.array2d[float],
     row_target_velocity: wp.array2d[float],
     row_rebound_velocity: wp.array2d[float],
@@ -3049,8 +3095,8 @@ def _dense_contact_rows(
                 contact_art_a[c],
                 body_b,
                 contact_art_b[c],
-                point_a,
-                point_b,
+                target_a,
+                target_b,
                 normal,
                 articulation_origin,
                 body_v_s,
@@ -3070,8 +3116,6 @@ def _dense_contact_rows(
             row_max_depenetration[world, slot] = max_depenetration
             row_parent[world, slot] = -1
             row_mu[world, slot] = mu
-            row_beta[world, slot] = baumgarte
-            row_cfm[world, slot] = cfm
             row_phi[world, slot] = phi
             row_target_velocity[world, slot] = prescribed_relative_contact_target(
                 body_a,
@@ -3114,9 +3158,7 @@ def _dense_contact_rows(
                     row = slot + 1 + k
                     row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
                     row_parent[world, row] = slot
-                    row_mu[world, row] = mu * contact_friction_scale
-                    row_beta[world, row] = friction_anchor_beta
-                    row_cfm[world, row] = cfm
+                    row_mu[world, row] = mu
                     row_phi[world, row] = spring[k]
                     row_target_velocity[world, row] = prescribed_relative_contact_target(
                         body_a,
@@ -3135,15 +3177,21 @@ def _dense_contact_rows(
                     shape0[c], shape1[c], free_rigid_mu_torsional, free_rigid_mu_rolling
                 )
                 for row_offset in range(3, slots_needed[c]):
-                    angular_type, angular_mu, _axis = free_rigid_angular_row(row_offset, torsional, rolling, normal)
+                    angular_type, angular_mu, axis = _free_rigid_angular_row(
+                        row_offset, torsional, rolling, t0, t1, normal
+                    )
                     row = slot + row_offset
                     row_type[world, row] = angular_type
                     row_parent[world, row] = slot
                     row_mu[world, row] = angular_mu
-                    row_beta[world, row] = 0.0
-                    row_cfm[world, row] = cfm
                     row_phi[world, row] = 0.0
-                    row_target_velocity[world, row] = 0.0
+                    # A prescribed side's angular rate moves into the target, as in build_mf_angular_friction_rows.
+                    known = float(0.0)
+                    if body_a >= 0 and contact_art_a[c] >= 0 and prescribed_articulation[contact_art_a[c]] != 0:
+                        known += wp.dot(axis, wp.spatial_bottom(body_v_s[body_a]))
+                    if body_b >= 0 and contact_art_b[c] >= 0 and prescribed_articulation[contact_art_b[c]] != 0:
+                        known -= wp.dot(axis, wp.spatial_bottom(body_v_s[body_b]))
+                    row_target_velocity[world, row] = -known
 
 
 @wp.func
@@ -3269,7 +3317,9 @@ def _dense_contact_jacobian(
                 shape0[c], shape1[c], free_rigid_mu_torsional, free_rigid_mu_rolling
             )
             for row_offset in range(3, slots_needed[c]):
-                _angular_type, _angular_mu, axis = free_rigid_angular_row(row_offset, torsional, rolling, normal)
+                _angular_type, _angular_mu, axis = _free_rigid_angular_row(
+                    row_offset, torsional, rolling, t0, t1, normal
+                )
                 if a_matches:
                     value_a = _angular_jacobian_entry(
                         body_a, art_a, 1.0, axis, dof, articulation_dof_start, body_dof_chain, joint_S_s
@@ -3350,26 +3400,31 @@ def _cholesky_solve_row(
     tmp: wp.array3d[float],
     x: wp.array3d[float],
 ):
-    """hinv_jt_par_row's L L^T x = rhs for one constraint row of one articulation."""
+    """hinv_jt_par_row's L L^T x = rhs for one constraint row of one articulation.
+
+    The substitutions run in ``tmp`` and ``x`` is only written, so Warp's ordered reductions can defer its adjoint.
+    """
     for i in range(n):
         value = rhs[g, row, i]
         for k in range(i):
-            value -= L[g, i, k] * x[g, row, k]
+            value -= L[g, i, k] * tmp[g, row, k]
         L_ii = L[g, i, i]
         if L_ii != 0.0:
-            x[g, row, i] = value / L_ii
+            tmp[g, row, i] = value / L_ii
         else:
-            x[g, row, i] = 0.0
+            tmp[g, row, i] = 0.0
     for i_rev in range(n):
         i = n - 1 - i_rev
-        value = x[g, row, i]
+        value = tmp[g, row, i]
         for k in range(i + 1, n):
-            value -= L[g, k, i] * x[g, row, k]
+            value -= L[g, k, i] * tmp[g, row, k]
         L_ii = L[g, i, i]
         if L_ii != 0.0:
-            x[g, row, i] = value / L_ii
+            tmp[g, row, i] = value / L_ii
         else:
-            x[g, row, i] = 0.0
+            tmp[g, row, i] = 0.0
+    for i in range(n):
+        x[g, row, i] = tmp[g, row, i]
 
 
 @wp.func_grad(_cholesky_solve_row)
@@ -3413,6 +3468,89 @@ def _adj_cholesky_solve_row(
 
 
 @wp.kernel
+def _rhs_accum_world_par_art(
+    world_constraint_count: wp.array[int],
+    art_to_world: wp.array[int],
+    art_dof_start: wp.array[int],
+    v_hat: wp.array[float],
+    group_to_art: wp.array[int],
+    J_group: wp.array3d[float],
+    n_dofs: int,
+    # outputs
+    world_rhs: wp.array2d[float],
+):
+    """Add ``J v_hat`` of one size group's articulations to their world's right-hand side."""
+    idx = wp.tid()
+    art = group_to_art[idx]
+    world = art_to_world[art]
+    dof_start = art_dof_start[art]
+    for c in range(world_constraint_count[world]):
+        jv = float(0.0)
+        for d in range(n_dofs):
+            jv += J_group[idx, c, d] * v_hat[dof_start + d]
+        wp.atomic_add(world_rhs, world, c, jv)
+
+
+@wp.kernel
+def _rhs_accum_world_par_row(
+    world_constraint_count: wp.array[int],
+    world_group_start: wp.array[int],
+    world_groups: wp.array[int],
+    group_to_art: wp.array[int],
+    art_dof_start: wp.array[int],
+    v_hat: wp.array[float],
+    J_group: wp.array3d[float],
+    n_dofs: int,
+    max_constraints: int,
+    rhs_in: wp.array2d[float],
+    # outputs
+    world_rhs: wp.array2d[float],
+):
+    """``rhs_in`` plus ``J v_hat`` of one size group, a world's articulations summed in a fixed order."""
+    tid = wp.tid()
+    world = tid // max_constraints
+    c = tid - world * max_constraints
+    if c >= world_constraint_count[world]:
+        return
+    jv = float(0.0)
+    for i in range(world_group_start[world], world_group_start[world + 1]):
+        group_idx = world_groups[i]
+        dof_start = art_dof_start[group_to_art[group_idx]]
+        for d in range(n_dofs):
+            jv += J_group[group_idx, c, d] * v_hat[dof_start + d]
+    world_rhs[world, c] = rhs_in[world, c] + jv
+
+
+@wp.kernel
+def _apply_impulses_world_par_dof(
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    art_dof_start: wp.array[int],
+    n_dofs: int,
+    n_arts: int,
+    world_constraint_count: wp.array[int],
+    Y_group: wp.array3d[float],
+    world_impulses: wp.array2d[float],
+    v_hat: wp.array[float],
+    # outputs
+    v_out: wp.array[float],
+):
+    """``v_out = v_hat + Y impulses`` for one size group, one thread per articulation DOF."""
+    tid = wp.tid()
+    local_dof = tid % n_dofs
+    idx = tid // n_dofs
+    if idx >= n_arts:
+        return
+    art = group_to_art[idx]
+    world = art_to_world[art]
+    delta_v = float(0.0)
+    for c in range(world_constraint_count[world]):
+        delta_v += Y_group[idx, c, local_dof] * world_impulses[world, c]
+    global_dof = art_dof_start[art] + local_dof
+    v_out[global_dof] = v_hat[global_dof] + delta_v
+
+
+@wp.kernel
 def _hinv_jt_dense(
     L: wp.array3d[float],
     J: wp.array3d[float],
@@ -3436,7 +3574,7 @@ def _hinv_jt_dense(
 def _dense_contact_restitution(
     row_count: wp.array[int],
     row_phi: wp.array2d[float],
-    row_beta: wp.array2d[float],
+    baumgarte: float,
     row_type: wp.array2d[int],
     row_rebound_velocity: wp.array2d[float],
     row_max_depenetration: wp.array2d[float],
@@ -3463,7 +3601,7 @@ def _dense_contact_restitution(
     phi = row_phi[world, i]
     geometric_bias = contact_speculative_scale * phi / dt
     if phi < 0.0:
-        geometric_bias = row_beta[world, i] * phi / dt
+        geometric_bias = baumgarte * phi / dt
         max_depenetration = row_max_depenetration[world, i]
         if max_depenetration > 0.0 and wp.isfinite(max_depenetration) and geometric_bias < -max_depenetration:
             value = value - geometric_bias - max_depenetration
@@ -3473,7 +3611,7 @@ def _dense_contact_restitution(
         relative_incident = value - geometric_bias
         if contact_restitution_fires(phi, relative_incident, dt):
             value = relative_incident - rebound_velocity
-            # A firing rebound target is solved rigid, as apply_world_contact_restitution_matrix_free does.
+            # A firing rebound target is solved rigid, as apply_world_contact_restitution does.
             row_w_out[world, i] = 1.0
     rhs_out[world, i] = value
 
@@ -3482,7 +3620,7 @@ def _dense_contact_restitution(
 def _smooth_contact_impulse(
     row_count: wp.array[int],
     row_phi: wp.array2d[float],
-    row_beta: wp.array2d[float],
+    baumgarte: float,
     row_type: wp.array2d[int],
     rhs: wp.array2d[float],
     dt: float,
@@ -3503,7 +3641,7 @@ def _smooth_contact_impulse(
         # Same branch as compute_world_contact_bias, so the bias and its derivative cancel at phi == 0.
         geometric_bias = contact_speculative_scale * phi / dt
         if phi <= 0.0:
-            geometric_bias = row_beta[world, i] * phi / dt
+            geometric_bias = baumgarte * phi / dt
         separating_velocity = rhs[world, i] - geometric_bias
         gate = _sigmoid(-phi / softness)
         depth = -(phi + damping / stiffness * gate * separating_velocity)
@@ -3569,11 +3707,14 @@ def _delassus_dense_ordered(
     world_groups: wp.array[int],
     row_count: wp.array[int],
     n_dofs: int,
+    C_in: wp.array3d[float],
+    diag_in: wp.array2d[float],
     # outputs
     world_C: wp.array3d[float],
     world_diag: wp.array2d[float],
 ):
-    """_delassus_dense with each world's articulations of one size summed in their listed order."""
+    """_delassus_dense with each world's articulations of one size summed in their listed order, added to the
+    previous size groups' ``C_in`` and ``diag_in`` (None for the first group)."""
     world, i, j = wp.tid()
     m = row_count[world]
     if i >= m or j >= m:
@@ -3583,9 +3724,15 @@ def _delassus_dense_ordered(
         group = world_groups[g]
         for k in range(n_dofs):
             val += J_group[group, i, k] * Y_group[group, j, k]
-    world_C[world, i, j] = world_C[world, i, j] + val
+    entry = val
+    if C_in:
+        entry = C_in[world, i, j] + val
+    world_C[world, i, j] = entry
     if i == j:
-        world_diag[world, i] = world_diag[world, i] + val
+        diagonal = val
+        if diag_in:
+            diagonal = diag_in[world, i] + val
+        world_diag[world, i] = diagonal
 
 
 @wp.kernel
@@ -4066,13 +4213,10 @@ def _adj_friction_pair(
 def _write_torsion_rows(
     rows: wp.array2d[int],
     coefficients: wp.array2d[float],
-    cfm: float,
     # outputs
     row_type: wp.array2d[int],
     row_parent: wp.array2d[int],
     row_mu: wp.array2d[float],
-    row_beta: wp.array2d[float],
-    row_cfm: wp.array2d[float],
     row_phi: wp.array2d[float],
     row_target_velocity: wp.array2d[float],
     row_rebound_velocity: wp.array2d[float],
@@ -4086,8 +4230,6 @@ def _write_torsion_rows(
     row_type[world, row] = PGS_CONSTRAINT_TYPE_TORSION
     row_parent[world, row] = rows[e, 2]
     row_mu[world, row] = coefficients[e, 0]
-    row_beta[world, row] = 0.0
-    row_cfm[world, row] = cfm
     row_phi[world, row] = 0.0
     row_target_velocity[world, row] = 0.0
     row_rebound_velocity[world, row] = 0.0
@@ -4294,21 +4436,19 @@ def _finalize_appended_rows(
 
 @wp.kernel
 def _reserve_joint_limit_rows(
-    articulation_start: wp.array[int],
     articulation_dof_start: wp.array[int],
-    joint_type: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
+    art_to_world: wp.array[int],
+    group_to_art: wp.array[int],
+    limit_q_index: wp.array[int],
     joint_limit_lower: wp.array[float],
     joint_limit_upper: wp.array[float],
     joint_q: wp.array[float],
-    joint_limit_activation_gap: float,
-    art_to_world: wp.array[int],
-    group_to_art: wp.array[int],
+    activation_gap: wp.array[float],
+    joint_qd: wp.array[float],
+    activation_speed_scale: float,
+    dt: float,
     max_constraints: int,
-    baumgarte: float,
-    cfm: float,
+    n_dofs: int,
     row_slot_mode: int,
     # outputs
     world_slot_counter: wp.array[int],
@@ -4316,51 +4456,53 @@ def _reserve_joint_limit_rows(
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
     world_row_mu: wp.array2d[float],
-    world_row_beta: wp.array2d[float],
-    world_row_cfm: wp.array2d[float],
     world_phi: wp.array2d[float],
     world_target_velocity: wp.array2d[float],
     limit_coordinate: wp.array2d[int],
     limit_dof: wp.array2d[int],
     element_row_cursor: wp.array[int],
 ):
-    """build_joint_limit_rows_for_size, also recording each row's coordinate and side for _joint_limit_gap."""
+    """build_joint_limit_rows, also recording each row's coordinate and side for _joint_limit_gap."""
     group_idx = wp.tid()
     art = group_to_art[group_idx]
     world = art_to_world[art]
     dof_start = articulation_dof_start[art]
-    for j in range(articulation_start[art], articulation_start[art + 1]):
-        jtype = joint_type[j]
-        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
+    for local_dof in range(n_dofs):
+        dof = dof_start + local_dof
+        q_index = limit_q_index[dof]
+        if q_index < 0:
             continue
-        axis_count = joint_dof_dim[j, 0] + joint_dof_dim[j, 1]
-        for axis in range(axis_count):
-            dof = joint_qd_start[j] + axis
-            coordinate = joint_q_start[j] + axis
-            q_val = joint_q[coordinate]
-            lower = joint_limit_lower[dof]
-            upper = joint_limit_upper[dof]
-            for side in range(2):
-                sign = 1.0
-                active = wp.isfinite(lower) and q_val <= lower + joint_limit_activation_gap
-                if side == 1:
-                    sign = -1.0
-                    active = wp.isfinite(upper) and q_val >= upper - joint_limit_activation_gap
-                if not active:
-                    continue
-                slot = reserve_world_rows(row_slot_mode, world_slot_counter, world, 1, element_row_cursor, art)
-                if row_slot_mode == ROW_SLOTS_COUNT or slot >= max_constraints:
-                    continue
-                J_group[group_idx, slot, dof - dof_start] = sign
-                world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
-                world_row_parent[world, slot] = -1
-                world_row_mu[world, slot] = 0.0
-                world_row_beta[world, slot] = baumgarte
-                world_row_cfm[world, slot] = cfm
-                world_phi[world, slot] = 0.0
-                world_target_velocity[world, slot] = 0.0
-                limit_coordinate[world, slot] = coordinate
-                limit_dof[world, slot] = 2 * dof + side
+        q = joint_q[q_index]
+        gap = joint_limit_effective_gap(activation_gap[dof], activation_speed_scale, dt, joint_qd[dof])
+        for side in range(2):
+            bound = joint_limit_lower[dof]
+            active = wp.abs(bound) < MAXVAL and q <= bound + gap
+            sign = 1.0
+            if side == 1:
+                bound = joint_limit_upper[dof]
+                active = wp.abs(bound) < MAXVAL and q >= bound - gap
+                sign = -1.0
+            if not active:
+                continue
+            slot = reserve_world_rows(row_slot_mode, world_slot_counter, world, 1, element_row_cursor, art)
+            if row_slot_mode == ROW_SLOTS_COUNT or slot >= max_constraints:
+                continue
+            J_group[group_idx, slot, local_dof] = sign
+            world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+            world_row_parent[world, slot] = -1
+            world_row_mu[world, slot] = 0.0
+            world_phi[world, slot] = 0.0
+            world_target_velocity[world, slot] = 0.0
+            limit_coordinate[world, slot] = q_index
+            limit_dof[world, slot] = 2 * dof + side
+
+
+@wp.kernel
+def _clear_drive_row_bias(row_count: wp.array[int], row_type: wp.array2d[int], rhs: wp.array2d[float]):
+    """Zero the drive rows' right-hand side before ``J v_hat`` is added."""
+    world, slot = wp.tid()
+    if slot < row_count[world] and row_type[world, slot] == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
+        rhs[world, slot] = 0.0
 
 
 @wp.kernel
@@ -4600,14 +4742,11 @@ def _rigid_velocity_limit_rows(
     rigid_body_max_angular_velocity: wp.array[float],
     slots: wp.array[int],
     signs: wp.array[float],
-    cfm: float,
     # outputs
     J_group: wp.array3d[float],
     row_type: wp.array2d[int],
     row_parent: wp.array2d[int],
     row_mu: wp.array2d[float],
-    row_beta: wp.array2d[float],
-    row_cfm: wp.array2d[float],
     row_phi: wp.array2d[float],
     row_target_velocity: wp.array2d[float],
 ):
@@ -4638,8 +4777,6 @@ def _rigid_velocity_limit_rows(
                 row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
                 row_parent[world, slot] = -1
                 row_mu[world, slot] = 0.0
-                row_beta[world, slot] = 0.0
-                row_cfm[world, slot] = cfm
                 row_phi[world, slot] = 0.0
                 row_target_velocity[world, slot] = -limit
 
@@ -4678,11 +4815,12 @@ def _ordered_kernel_set(solver: SolverSteel) -> dict[wp.Kernel, wp.Kernel]:
         _delassus_dense: max_size,
         _delassus_dense_ordered: int(world_dofs),
         _joint_limit_gap: 0,
-        _taped_rhs_accum_world_par_row: int(world_dofs),
-        _taped_rhs_accum_world_par_art: rows * max_size,
-        _taped_apply_impulses_world_par_dof: rows,
+        _rhs_accum_world_par_row: int(world_dofs),
+        _rhs_accum_world_par_art: rows * max_size,
+        _apply_impulses_world_par_dof: rows,
         _taped_accumulate_contact_wrenches_from_impulses: 0,
         _taped_accumulate_torsion_wrenches_from_impulses: 0,
+        _taped_accumulate_free_rigid_angular_wrenches_from_impulses: 0,
     }
     kernels = {}
     for kernel, records in bounds.items():
@@ -4718,24 +4856,19 @@ class _ObservableBuffers:
 
 
 def _contact_force_inputs(c: _ContactBuffers) -> list:
-    """The routes, impulses and rows the contact-force kernels read; free-body rows live in the dense arrays."""
+    """The routes, impulses and row counts the contact-force kernels read; free-body rows live in the dense arrays."""
     impulses = c.impulses[-1]
     return [
         c.world,
         c.slot,
         c.path,
+        c.slots_needed,
         impulses,
         impulses,
         impulses,
         c.row_count,
         c.row_count,
         c.row_count,
-        c.row_type,
-        c.row_parent,
-        c.row_type,
-        c.row_parent,
-        c.row_type,
-        c.row_parent,
     ]
 
 

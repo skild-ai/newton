@@ -1,3 +1,13 @@
+> [!NOTE]
+> This is [skild-ai/newton](https://github.com/skild-ai/newton), a development fork of
+> [newton-physics/newton](https://github.com/newton-physics/newton) for work on Steel, a rigid-body solver
+> developed by Skild AI in collaboration with NVIDIA. Fork changes are recorded in this repository's git
+> history, and we send them upstream as pull requests. Apart from the added example rows, the rest of this
+> README and the status badges below describe upstream Newton. As in upstream Newton, a Linux Foundation
+> project, the code is licensed under Apache-2.0, the documentation under CC-BY-4.0, and third-party
+> components under their own licenses (see below). The original copyright and license notices are kept.
+> Skild and Skild AI are trademarks of Skild AI and are not licensed under any of these licenses.
+
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/newton-physics/newton/main)
 [![Downloads](https://api.pepy.tech/badge/newton/month)](https://pepy.tech/projects/newton)
@@ -17,9 +27,9 @@ Newton was initiated by [Disney Research](https://www.disneyresearch.com/), [Goo
 
 ## Requirements
 
-- **Python** 3.10+
+- **Python** 3.11+
 - **OS:** Linux (x86-64, aarch64), Windows (x86-64), or macOS (CPU only)
-- **GPU:** Fresh installs currently select Warp 1.18, which requires an NVIDIA Turing GPU (compute capability 7.5+) and driver R580+ for CUDA acceleration.
+- **GPU:** Since Warp 1.18, standard Warp wheels require an NVIDIA Turing GPU (compute capability 7.5+) and driver R580+ for CUDA acceleration.
   On an R545–R579 driver or an older supported GPU, install with `warp-lang==1.17.0` (see the installation guide).
   No local CUDA Toolkit is required; macOS runs on CPU.
 
@@ -34,6 +44,14 @@ python -m newton.examples
 
 To install from source with [uv](https://docs.astral.sh/uv/), see the [installation guide](https://newton-physics.github.io/newton/latest/guide/installation.html).
 
+## Community Projects
+
+Explore community solvers, integrations, and applications through the [`newton-physics` topic on GitHub](https://github.com/topics/newton-physics).
+
+To share your own project, add the `newton-physics` topic to your public repository's **About** section. See [GitHub's guide to repository topics](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/classifying-your-repository-with-topics) for instructions.
+
+Projects opt in by adding the topic; inclusion does not imply endorsement or support by the Newton maintainers. External solvers and extensions are maintained separately from Newton. Check each project's documentation for maturity, compatibility, and support.
+
 ## Examples
 
 Before running the examples below, install Newton with the examples extra:
@@ -45,6 +63,14 @@ pip install "newton[examples]"
 If you run the examples from a source checkout with uv, use
 `uv run --extra examples -m newton.examples <example_name>` instead of the
 `python -m newton.examples <example_name>` commands below.
+
+Every example keeps its general description and success criteria beside its
+implementation. Inspect the resulting specification without running the
+example:
+
+```bash
+python -m newton.examples --describe robot_omniwheel
+```
 
 <table>
   <tr>
@@ -168,14 +194,20 @@ If you run the examples from a source checkout with uv, use
         <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_mimic_joint.jpg" alt="Mimic Joint">
       </a>
     </td>
-    <td width="33%"></td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/basic/example_basic_multi_solver_overlay.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_basic_multi_solver_overlay.jpg" alt="Multi-Solver Overlay">
+      </a>
+    </td>
     <td width="33%"></td>
   </tr>
   <tr>
     <td align="center" width="33%">
       <code>python -m newton.examples basic_mimic_joint</code>
     </td>
-    <td width="33%"></td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples basic_multi_solver_overlay</code>
+    </td>
     <td width="33%"></td>
   </tr>
   <tr>
@@ -307,10 +339,10 @@ If you run the examples from a source checkout with uv, use
   </tr>
   <tr>
     <td align="center" width="33%">
-      <code>python -m newton.examples controller_joint_impedance_heterogeneous</code>
+      <a href="#joint-impedance-heterogeneous">Run joint impedance heterogeneous</a>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples controller_operational_space_hybrid_force_motion</code>
+      <a href="#operational-space-hybrid-force-and-motion">Run operational space hybrid force/motion</a>
     </td>
     <td align="center" width="33%">
       <code>python -m newton.examples controller_differential_ik</code>
@@ -374,17 +406,6 @@ If you run the examples from a source checkout with uv, use
     <td align="center" width="33%">
       <code>python -m newton.examples cable_plectoneme</code>
     </td>
-  </tr>
-  <tr><td colspan="3"><h3>Steel Tabletop Examples (CUDA)</h3></td></tr>
-  <tr>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_bolt_sweep.py"><img width="320" src="docs/images/examples/example_steel_bolt_sweep.jpg" alt="Bolt sweep"></a><br><code>python -m newton.examples steel_bolt_sweep</code></td>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_wrecking_ball.py"><img width="320" src="docs/images/examples/example_steel_wrecking_ball.jpg" alt="Wrecking ball"></a><br><code>python -m newton.examples steel_wrecking_ball</code></td>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_plate_rack.py"><img width="320" src="docs/images/examples/example_steel_plate_rack.jpg" alt="Plate rack"></a><br><code>python -m newton.examples steel_plate_rack</code></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_pelican_bicycle.py"><img width="320" src="docs/images/examples/example_steel_pelican_bicycle.jpg" alt="Pelican bicycle"></a><br><code>python -m newton.examples steel_pelican_bicycle</code></td>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_cup_unpacking.py"><img width="320" src="docs/images/examples/example_steel_cup_unpacking.jpg" alt="Cup unpacking"></a><br><code>python -m newton.examples steel_cup_unpacking</code></td>
-    <td align="center" width="33%"><a href="newton/examples/robot/example_steel_toy_well.py"><img width="320" src="docs/images/examples/example_steel_toy_well.jpg" alt="Toy well"></a><br><code>python -m newton.examples steel_toy_well</code></td>
   </tr>
   <tr>
     <td align="center" width="33%">
@@ -674,6 +695,26 @@ If you run the examples from a source checkout with uv, use
     </td>
   </tr>
   <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mpm/example_mpm_pinch_carry.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mpm_pinch_carry.jpg" alt="MPM Pinch and Carry">
+      </a>
+    </td>
+    <td align="center" width="33%">
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples mpm_pinch_carry</code>
+    </td>
+    <td align="center" width="33%">
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
     <td colspan="3"><h3>Sensor Examples</h3></td>
   </tr>
   <tr>
@@ -815,6 +856,18 @@ If you run the examples from a source checkout with uv, use
     </td>
   </tr>
   <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/diffsim/example_diffsim_anymal_backflip.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_diffsim_anymal_backflip.jpg" alt="DiffSim Anymal Backflip">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples diffsim_anymal_backflip</code>
+    </td>
+  </tr>
+  <tr>
     <td colspan="3"><h3>Multi-Physics Examples</h3></td>
   </tr>
   <tr>
@@ -867,7 +920,7 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples franka_cable_ik_pick_place</code>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples mujoco_franka_vbd_cable_admm_solver</code>
+      <a href="#mujoco-franka-vbd-cable-admm">Run MuJoCo Franka VBD cable ADMM</a>
     </td>
     <td align="center" width="33%">
       <code>python -m newton.examples vbd_dat_rigid_soft</code>
@@ -875,13 +928,13 @@ If you run the examples from a source checkout with uv, use
   </tr>
   <tr>
     <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/multiphysics/example_franka_cloth_block.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_franka_cloth_block.jpg" alt="Franka Cloth Block">
+      <a href="https://github.com/skild-ai/newton/blob/main/newton/examples/multiphysics/example_franka_cloth_block.py">
+        <img width="320" src="https://raw.githubusercontent.com/skild-ai/newton/main/docs/images/examples/example_franka_cloth_block.jpg" alt="Franka Cloth Block">
       </a>
     </td>
     <td align="center" width="33%">
-      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/multiphysics/example_franka_shirt_fold_stack.py">
-        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_franka_shirt_fold_stack.jpg" alt="Franka Shirt Fold Stack">
+      <a href="https://github.com/skild-ai/newton/blob/main/newton/examples/multiphysics/example_franka_shirt_fold_stack.py">
+        <img width="320" src="https://raw.githubusercontent.com/skild-ai/newton/main/docs/images/examples/example_franka_shirt_fold_stack.jpg" alt="Franka Shirt Fold Stack">
       </a>
     </td>
     <td align="center" width="33%">
@@ -1054,6 +1107,9 @@ If you run the examples from a source checkout with uv, use
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/kamino/example_kamino_earworm_flowers.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_kamino_earworm_flowers.jpg" alt="Kamino Stewart platform garden with Hoberman flowers">
+      </a>
     </td>
   </tr>
   <tr>
@@ -1064,9 +1120,180 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples kamino_robot_dr_legs</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples kamino_earworm_flowers</code>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="3"><h3>Steel Examples</h3></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/steel/example_steel_sleeping.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_steel_sleeping.jpg" alt="Steel Sleeping">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/steel/example_steel_determinism_arms.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_steel_determinism_arms.jpg" alt="Steel Determinism Arms">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/skild-ai/newton/blob/main/newton/examples/steel/example_steel_magnetic_door.py">
+        <img width="320" src="https://raw.githubusercontent.com/skild-ai/newton/main/docs/images/examples/example_steel_magnetic_door.jpg" alt="Steel Magnetic Door">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_sleeping</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_determinism_arms</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_magnetic_door</code>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/skild-ai/newton/blob/main/newton/examples/robot/example_steel_bolt_sweep.py">
+        <img width="320" src="https://raw.githubusercontent.com/skild-ai/newton/main/docs/images/examples/example_steel_bolt_sweep.jpg" alt="Steel Bolt Sweep">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/skild-ai/newton/blob/main/newton/examples/robot/example_steel_wrecking_ball.py">
+        <img width="320" src="https://raw.githubusercontent.com/skild-ai/newton/main/docs/images/examples/example_steel_wrecking_ball.jpg" alt="Steel Wrecking Ball">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/skild-ai/newton/blob/main/newton/examples/robot/example_steel_plate_rack.py">
+        <img width="320" src="https://raw.githubusercontent.com/skild-ai/newton/main/docs/images/examples/example_steel_plate_rack.jpg" alt="Steel Plate Rack">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_bolt_sweep</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_wrecking_ball</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_plate_rack</code>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/skild-ai/newton/blob/main/newton/examples/robot/example_steel_pelican_bicycle.py">
+        <img width="320" src="https://raw.githubusercontent.com/skild-ai/newton/main/docs/images/examples/example_steel_pelican_bicycle.jpg" alt="Steel Pelican Bicycle">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/skild-ai/newton/blob/main/newton/examples/robot/example_steel_cup_unpacking.py">
+        <img width="320" src="https://raw.githubusercontent.com/skild-ai/newton/main/docs/images/examples/example_steel_cup_unpacking.jpg" alt="Steel Cup Unpacking">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/skild-ai/newton/blob/main/newton/examples/robot/example_steel_toy_well.py">
+        <img width="320" src="https://raw.githubusercontent.com/skild-ai/newton/main/docs/images/examples/example_steel_toy_well.jpg" alt="Steel Toy Well">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_pelican_bicycle</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_cup_unpacking</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples steel_toy_well</code>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="3"><h3>Surface Gripper Examples</h3></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/surface_gripper/example_surface_gripper.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_surface_gripper.jpg" alt="Surface Gripper">
+      </a>
+    </td>
+    <td align="center" width="33%">
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples surface_gripper</code>
+    </td>
+    <td align="center" width="33%">
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
+    <td colspan="3"><h3>MuJoCo Examples</h3></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mujoco/example_mujoco_sleeping.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mujoco_sleeping.jpg" alt="MuJoCo Sleeping">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/mujoco/example_mujoco_flex.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_mujoco_flex.jpg" alt="MuJoCo Flex">
+      </a>
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples mujoco_sleeping</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples mujoco_flex</code>
+    </td>
+    <td align="center" width="33%">
     </td>
   </tr>
 </table>
+
+#### Joint impedance heterogeneous
+
+<details>
+<summary>Show command</summary>
+
+```sh
+python -m newton.examples controller_joint_impedance_heterogeneous
+```
+
+</details>
+
+#### Operational space hybrid force and motion
+
+<details>
+<summary>Show command</summary>
+
+```sh
+python -m newton.examples controller_operational_space_hybrid_force_motion
+```
+
+</details>
+
+#### MuJoCo Franka VBD cable ADMM
+
+<details>
+<summary>Show command</summary>
+
+```sh
+python -m newton.examples mujoco_franka_vbd_cable_admm_solver
+```
+
+</details>
 
 ### Example Options
 

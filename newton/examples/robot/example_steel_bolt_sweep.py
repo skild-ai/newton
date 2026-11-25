@@ -2,7 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Sweep 96 loose nuts, bolts and washers into a bin using a robot-mounted scraper.
 
-Command: python -m newton.examples steel_bolt_sweep
+Success criteria:
+- A robot with a scraper sweeps a pile of loose nuts, bolts and washers across a table.
+- At least the required number of fasteners end up inside the collection bin.
+- Fasteners stay on the table or in the bin without tunneling or exploding.
+
+Runs:
+- `python -m newton.examples steel_bolt_sweep`
 """
 
 import numpy as np
@@ -20,7 +26,7 @@ class Example(TabletopDemo):
     @staticmethod
     def create_parser():
         parser = TabletopDemo.create_parser()
-        parser.set_defaults(contact_response="propagation_colored")
+        parser.set_defaults(solve_mode="colored", contact_response="propagation")
         return parser
 
     def populate(self, builder, info, ee, down, fingers):

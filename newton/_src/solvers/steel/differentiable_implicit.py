@@ -22,9 +22,14 @@ from __future__ import annotations
 
 import warp as wp
 
-from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+from .kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    WARP_DETERMINISM_OFF,
+)
 
-wp.set_module_options({"enable_backward": False})
+wp.set_module_options({"enable_backward": False, **WARP_DETERMINISM_OFF})
 
 ROW_FROZEN = wp.constant(0)
 ROW_ACTIVE = wp.constant(1)
