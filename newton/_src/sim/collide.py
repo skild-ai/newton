@@ -443,7 +443,7 @@ def _record_reduction_overflow(
 
 @wp.kernel(enable_backward=False)
 def _record_body_pair_fallback(group_fallback: wp.array[wp.int32], fallback: wp.array[wp.int32]):
-    """Raise the contact stream's fallback flag if body-pair reduction kept every contact this pass."""
+    """Raise the contact stream's fallback flag if body-pair reduction fell back this pass."""
     if group_fallback[0] != 0:
         fallback[0] = 1
 
@@ -2877,7 +2877,8 @@ class CollisionPipeline:
         """Whole-run body-pair reduction telemetry, or ``None`` when body-pair reduction is disabled.
 
         Forces a device sync; call it outside CUDA graph capture. ``fallback_frames`` counts passes that
-        kept every contact because the group table saturated; ``max_hashtable_entries`` against
+        skipped reduction because the group table saturated; such a pass writes its staged contacts unreduced,
+        still bounded by the staging and ``rigid_contact_max`` capacities. ``max_hashtable_entries`` against
         ``hashtable_capacity`` shows how close the table runs to that limit.
 
         .. experimental::

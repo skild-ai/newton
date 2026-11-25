@@ -2300,7 +2300,7 @@ GROUP_VALUES_PER_KEY = GROUP_SHALLOWEST_SLOT + 1
 # noise in flat-patch probes. Varying-depth cells conservatively keep their rows.
 GROUP_DEPTH_TOLERANCE = 1.0e-5
 # A probe chain this long means the table is saturated for this frame; the whole
-# frame then keeps every contact rather than let scheduling pick which groups fit.
+# frame then writes its staged contacts unreduced, so scheduling never picks which groups fit.
 GROUP_PROBE_BUDGET = 128
 
 # Staged-contact markers in ``GroupReductionData.contact_entry``.
@@ -2353,7 +2353,7 @@ class GroupReductionData:
     contact_pos2d: wp.array[wp.vec2]
     frame_state: wp.array[wp.int32]
     stats: wp.array[wp.int64]
-    # [0] this pass kept every contact; [1] the saturation warning was printed.
+    # [0] this pass skipped reduction; [1] the saturation warning was printed.
     fallback: wp.array[wp.int32]
     verify: int
 

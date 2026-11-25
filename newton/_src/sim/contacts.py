@@ -213,7 +213,7 @@ class Contacts:
         with wp.ScopedDevice(device):
             # Two contact counts, [0] rigid and [1] soft, plus flags: overflow in [2] global
             # contact reduction and [3] a coupled source's soft-contact buffer, and
-            # [4] a body-pair reduction pass that kept every contact.
+            # [4] a body-pair reduction pass that skipped reduction.
             # rigid_contact_count (the [0:1] view) and soft_contact_count (the [1:2] view) index
             # into this same array, so each remains a separate count; they share one array only so
             # a single kernel can reset all slots to zero in one launch. The reset

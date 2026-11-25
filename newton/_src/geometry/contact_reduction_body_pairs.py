@@ -66,7 +66,8 @@ projected grid and its length scale.
 Reduction never crosses a normal bin, so multi-patch configurations (a body
 touching floor and wall at once) keep representatives of every patch.  On
 hashtable probe exhaustion the reduction fails open: if any contact cannot be
-registered within the bounded probe budget, the frame keeps every contact.  Probe
+registered within the bounded probe budget, the frame writes its staged contacts
+unreduced, still bounded by the staging and output capacities.  Probe
 exhaustion can mean a full table or a long collision cluster; telemetry does
 not claim to distinguish the two.
 
@@ -467,7 +468,7 @@ class BodyPairReduction:
 
         Returns:
             ``probe_failures``: group-table insertions that ran out of probes; each one
-            makes its whole frame keep every contact (counted in ``fallback_frames``).
+            makes its whole frame write its staged contacts unreduced (counted in ``fallback_frames``).
             ``invariant_violations``: discarded contacts that out-rank a recorded
             winner, counted only with :attr:`verify` on.
             ``cell_clamp_events``: contacts whose spatial cell hit the packed +/-31 range.
