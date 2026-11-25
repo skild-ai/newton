@@ -5143,6 +5143,307 @@ for _name, _func in (
         iterations=2,
     )
 
+# Planar double pendulum for velocity_terms_theta: hinges about -y (angles grow from +x toward +z), gravity -z.
+_DP_L1, _DP_LC1, _DP_LC2 = 0.3, 0.15, 0.12  # [m]
+_DP_M1, _DP_M2, _DP_I1, _DP_I2 = 0.6, 0.4, 0.006, 0.002  # [kg], [kg m^2] about the hinge-parallel COM axis
+_DP_G = 9.81
+
+
+def _build_double_pendulum(device):
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -_DP_G))
+
+    def tf(x):
+        return wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity())
+
+    links = []
+    for x, mass, inertia in ((_DP_LC1, _DP_M1, _DP_I1), (_DP_L1 + _DP_LC2, _DP_M2, _DP_I2)):
+        # Principal about y; the other two axes differ so the bodies are not isotropic.
+        links.append(
+            b.add_link(
+                xform=tf(x),
+                mass=mass,
+                inertia=wp.mat33(np.diag([0.5 * inertia, inertia, 0.8 * inertia])),
+                lock_inertia=True,
+            )
+        )
+    axis = wp.vec3(0.0, -1.0, 0.0)
+    j0 = b.add_joint_revolute(-1, links[0], parent_xform=tf(0.0), child_xform=tf(-_DP_LC1), axis=axis)
+    j1 = b.add_joint_revolute(
+        links[0], links[1], parent_xform=tf(_DP_L1 - _DP_LC1), child_xform=tf(-_DP_LC2), axis=axis
+    )
+    b.add_articulation([j0, j1], label="double_pendulum")
+    return b.finalize(device=device)
+
+
+def _double_pendulum_terms(q, v):
+    """Mass matrix, velocity-product bias ``c`` and gravity force in the joint coordinates, float64."""
+    T = np.array([[1.0, 0.0], [1.0, 1.0]])
+    th, w = T @ q, T @ v
+    c1, s1, c2, s2 = np.cos(th[0]), np.sin(th[0]), np.cos(th[1]), np.sin(th[1])
+    jac = (
+        np.array([[-_DP_LC1 * s1, 0.0], [_DP_LC1 * c1, 0.0]]),
+        np.array([[-_DP_L1 * s1, -_DP_LC2 * s2], [_DP_L1 * c1, _DP_LC2 * c2]]),
+    )
+    jdot_v = (
+        -_DP_LC1 * w[0] ** 2 * np.array([c1, s1]),
+        -_DP_L1 * w[0] ** 2 * np.array([c1, s1]) - _DP_LC2 * w[1] ** 2 * np.array([c2, s2]),
+    )
+    M, c, g = np.diag([_DP_I1, _DP_I2]), np.zeros(2), np.zeros(2)
+    for m, J, Jdv in zip((_DP_M1, _DP_M2), jac, jdot_v, strict=True):
+        M = M + m * J.T @ J
+        c = c + m * J.T @ Jdv
+        g = g + m * J.T @ np.array([0.0, -_DP_G])
+    return T.T @ M @ T, T.T @ c, T.T @ g
+
+
+def _double_pendulum_reference(steps, dt, theta):
+    """Steel's step in float64: explicit bias plus the previous step's ``theta``-weighted velocity-derivative
+    correction ``-theta dt H^-1 (dc/dv) x``, measured with that step's ``H`` on its velocity change ``x``."""
+    q, v = np.zeros(2), np.zeros(2)
+    lagged = np.zeros(2)
+    out = []
+    for _ in range(steps):
+        M, c, g = _double_pendulum_terms(q, v)
+        v_next = v + dt * np.linalg.solve(M, g - c) + lagged
+        if theta > 0.0:
+            # D x = (dc/dv) x; c is quadratic in v, so the central difference is exact.
+            x = v_next - v
+            Dx = 0.5 * (_double_pendulum_terms(q, v + x)[1] - _double_pendulum_terms(q, v - x)[1])
+            lagged = -theta * dt * np.linalg.solve(M, Dx)
+        v = v_next
+        q = q + dt * v
+        out.append(np.concatenate([q, v]))
+    return np.asarray(out)
+
+
+def test_velocity_terms_theta_matches_float64_reference(test, device):
+    """Weight the end-of-step velocity in the Coriolis and centrifugal bias as a float64 replica of the step does.
+
+    A double pendulum released horizontally reaches 12 rad/s in 0.3 s. For each ``theta`` the joint trajectory
+    follows the float64 step that adds each step's ``-theta dt H^-1 (dc/dv) (v+ - v)`` to the next step's
+    prediction. The float64 trajectories of theta 0 and 1 part by more than 0.01 rad, far above the float32
+    tolerance, and theta 0.5 lies between them.
+    """
+    steps, dt = 150, 0.002
+    thetas = (0.0, 0.5, 1.0)
+    refs = {theta: _double_pendulum_reference(steps, dt, theta) for theta in thetas}
+    test.assertGreater(float(np.abs(refs[1.0][:, :2] - refs[0.0][:, :2]).max()), 1.0e-2)
+    test.assertGreater(float(np.abs(refs[0.5][:, :2] - refs[0.0][:, :2]).max()), 5.0e-3)
+    for theta in thetas:
+        with test.subTest(velocity_terms_theta=theta):
+            model = _build_double_pendulum(device)
+            solver = SolverSteel(model, iterations=1, update_mass_matrix_interval=1, velocity_terms_theta=theta)
+            test.assertEqual(solver.velocity_terms_theta, theta)
+            state_0, state_1 = model.state(), model.state()
+            history = []
+            for _ in range(steps):
+                state_0.clear_forces()
+                solver.step(state_0, state_1, None, None, dt)
+                state_0, state_1 = state_1, state_0
+                history.append(np.concatenate([state_0.joint_q.numpy(), state_0.joint_qd.numpy()]))
+            history = np.asarray(history)
+            np.testing.assert_allclose(history[:, :2], refs[theta][:, :2], atol=1.0e-4)
+            np.testing.assert_allclose(history[:, 2:], refs[theta][:, 2:], atol=2.0e-3)
+    for theta in (-0.1, 1.5):
+        with test.assertRaisesRegex(ValueError, "velocity_terms_theta"):
+            SolverSteel(_build_double_pendulum(device), velocity_terms_theta=theta)
+
+
+def _floating_chain_momentum_drift(device, theta, steps=500, dt=0.002):
+    """Change of total linear momentum [kg m/s] of a spinning free-floating two-link chain in zero gravity."""
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
+    base = b.add_link(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+        mass=2.0,
+        inertia=wp.mat33(np.diag([0.02, 0.05, 0.04])),
+    )
+    tip = b.add_link(
+        xform=wp.transform(wp.vec3(0.4, 0.0, 1.0), wp.quat_identity()),
+        mass=1.0,
+        inertia=wp.mat33(np.diag([0.01, 0.03, 0.02])),
+    )
+    j_free = b.add_joint_free(base)
+    j_hinge = b.add_joint_revolute(
+        base,
+        tip,
+        parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
+        axis=(0.3, 1.0, 0.2),
+    )
+    b.add_articulation([j_free, j_hinge])
+    model = b.finalize(device=device)
+    model.joint_qd.assign(np.array([0.5, -0.2, 0.3, 2.0, 5.0, -3.0, 8.0], dtype=np.float32))
+    solver = SolverSteel(model, iterations=1, update_mass_matrix_interval=1, velocity_terms_theta=theta)
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    mass = model.body_mass.numpy()
+
+    def momentum(state):
+        return (mass[:, None] * state.body_qd.numpy()[:, :3]).sum(axis=0)
+
+    p0 = momentum(state_0)
+    for _ in range(steps):
+        state_0.clear_forces()
+        solver.step(state_0, state_1, None, None, dt)
+        state_0, state_1 = state_1, state_0
+    return float(np.linalg.norm(momentum(state_0) - p0))
+
+
+def test_velocity_terms_theta_keeps_floating_base_momentum(test, device):
+    """Differentiate the free root's transport ``w x v`` along with the bias, so the weight adds no momentum drift.
+
+    The free root's bias, taken at its COM, holds ``m w x v``, which the predictor's transport cancels; correcting
+    the bias alone pushed the chain's COM (drift 1.6x and 2.2x the explicit step's at theta 0.5 and 1).
+    """
+    explicit = _floating_chain_momentum_drift(device, 0.0)
+    for theta in (0.5, 1.0):
+        with test.subTest(velocity_terms_theta=theta):
+            test.assertLess(_floating_chain_momentum_drift(device, theta), 1.1 * explicit)
+
+
+_RH_L, _RH_R = 0.2, 0.02  # rhombus bar half length and capsule radius [m]
+_RH_DIRECT = {
+    "mass_solve": "articulated_body",
+    "closure_sweep": "direct",
+    "closure_direct_factor": "sparse",
+    "closure_direct_scale": "approx",
+    "closure_direct_response": "skip",
+    "closure_direct_contacts": "elim",
+    "closure_direct_eps": 1.0e-3,
+}
+
+
+def _dropped_rhombus(device, theta, dt, steps, overrides, record=1):
+    """Drop a free-floating planar rhombus (four capsule bars, hinges about y, one BALL closure) corner first,
+    spinning and opening. Returns the rhombus angle [rad], the loop gap [m] and the deepest bar-end penetration [m]
+    after every ``record``-th step; ``theta=None`` constructs the solver without ``velocity_terms_theta``."""
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
+    y = wp.vec3(0.0, 1.0, 0.0)
+    to_x = wp.quat_from_axis_angle(y, 0.5 * np.pi)  # capsule axis z -> x
+    bars = []
+    for _ in range(4):
+        bars.append(b.add_link())
+        b.add_shape_capsule(bars[-1], xform=wp.transform(wp.vec3(), to_x), radius=_RH_R, half_height=_RH_L)
+
+    def tf(x, q=None):
+        return wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity() if q is None else q)
+
+    up = wp.quat_from_axis_angle(y, -0.5 * np.pi)  # local x -> +z: each bar turns 90 deg from its parent
+    joints = [b.add_joint_free(bars[0])]
+    joints.append(b.add_joint_revolute(bars[0], bars[1], parent_xform=tf(_RH_L, up), child_xform=tf(-_RH_L), axis=y))
+    joints.append(b.add_joint_revolute(bars[1], bars[2], parent_xform=tf(_RH_L, up), child_xform=tf(-_RH_L), axis=y))
+    joints.append(b.add_joint_revolute(bars[0], bars[3], parent_xform=tf(-_RH_L, up), child_xform=tf(-_RH_L), axis=y))
+    b.add_articulation(joints)
+    b.add_joint_ball(bars[2], bars[3], parent_xform=tf(_RH_L), child_xform=tf(_RH_L))
+    b.add_ground_plane()
+    model = b.finalize(device=device)
+    q = model.joint_q.numpy()
+    q[:7] = [0.0, 0.0, 0.45, *wp.quat_from_axis_angle(y, 0.5)]
+    model.joint_q.assign(q)
+    # Falling, spinning about y and opening the rhombus (rates consistent with the closure).
+    model.joint_qd.assign(np.array([0.3, 0.0, -1.5, 0.0, 6.0, 0.0, 8.0, -8.0, 8.0], dtype=np.float32))
+    options = {} if theta is None else {"velocity_terms_theta": theta}
+    with kernel_overrides(overrides):
+        solver = SolverSteel(
+            model,
+            iterations=16,
+            baumgarte=0.2,
+            update_mass_matrix_interval=1,
+            articulation_constraint_max=64,
+            **options,
+        )
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    angle, gap, pen = [], [], []
+    for n in range(steps):
+        state_0.clear_forces()
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, None, contacts, dt)
+        state_0, state_1 = state_1, state_0
+        if (n + 1) % record:
+            continue
+        body_q = state_0.body_q.numpy().astype(np.float64)
+
+        def end(body, x, body_q=body_q):
+            rot = wp.quat(*body_q[body, 3:])
+            return body_q[body, :3] + np.array(wp.quat_rotate(rot, wp.vec3(x, 0.0, 0.0)))
+
+        angle.append(float(state_0.joint_q.numpy()[7]))
+        gap.append(float(np.linalg.norm(end(2, _RH_L) - end(3, _RH_L))))
+        pen.append(max(_RH_R - end(body, x)[2] for body in range(4) for x in (-_RH_L, _RH_L)))
+    return np.asarray(angle), np.asarray(gap), np.asarray(pen)
+
+
+def test_velocity_terms_theta_keeps_loop_and_contact_targets(test, device):
+    """Keep the loop closure and the contacts on target with the velocity-terms weight through impacts.
+
+    A rhombus with a loop closure falls corner first onto the ground at a 2.5 ms step, with the default constraint
+    path and with the sparse direct closure solve and elim contacts. Applied after the constraint solve, the
+    correction ``theta dt H^-1 D (v - v0)`` moved the closure off its velocity target at every impact: the loop gap
+    reached 0.45 mm (default) and 0.40 mm (direct) at theta 0.5, against 0.07 and 0.04 mm at theta 0. Added to the
+    next step's predictor instead, it is projected by that step's constraint solve, so the gap and the penetration
+    stay at theta 0's, and the rhombus angle stays as close to a small-step reference (theta 0 at dt / 16).
+    """
+    dt, steps, div = 0.0025, 240, 16
+    for name, overrides in (("default", {}), ("direct", _RH_DIRECT)):
+        with test.subTest(path=name):
+            ref, _, _ = _dropped_rhombus(device, 0.0, dt / div, steps * div, overrides, record=div)
+            angle_0, gap_0, pen_0 = _dropped_rhombus(device, 0.0, dt, steps, overrides)
+            angle_h, gap_h, pen_h = _dropped_rhombus(device, 0.5, dt, steps, overrides)
+            test.assertTrue(np.isfinite(angle_h).all())
+            test.assertLess(gap_0.max(), 1.0e-4)
+            test.assertLess(gap_h.max(), 1.5 * gap_0.max() + 1.0e-5)
+            test.assertLess(pen_h.max(), max(1.5 * pen_0.max(), 0.0) + 1.0e-4)
+            test.assertLess(np.abs(angle_h - ref).max(), 1.1 * np.abs(angle_0 - ref).max())
+
+
+def test_velocity_terms_theta_default_keeps_the_explicit_step(test, device):
+    """Leave the step untouched by default: no delayed correction, bitwise the same as ``velocity_terms_theta=0``.
+
+    The dropped rhombus exercises the loop closure, the contacts and the free root on the default and the sparse
+    direct paths; a nonzero weight moves it, so the bitwise match is not vacuous.
+    """
+    dt, steps = 0.0025, 120
+    for name, overrides in (("default", {}), ("direct", _RH_DIRECT)):
+        with test.subTest(path=name):
+            default = _dropped_rhombus(device, None, dt, steps, overrides)
+            zero = _dropped_rhombus(device, 0.0, dt, steps, overrides)
+            half = _dropped_rhombus(device, 0.5, dt, steps, overrides)
+            for a, b in zip(default, zero, strict=True):
+                np.testing.assert_array_equal(a, b)
+            test.assertGreater(float(np.abs(half[0] - zero[0]).max()), 1.0e-6)
+
+
+class TestSteelVelocityTermsTheta(unittest.TestCase):
+    pass
+
+
+add_function_test(
+    TestSteelVelocityTermsTheta,
+    "test_velocity_terms_theta_matches_float64_reference",
+    test_velocity_terms_theta_matches_float64_reference,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestSteelVelocityTermsTheta,
+    "test_velocity_terms_theta_keeps_floating_base_momentum",
+    test_velocity_terms_theta_keeps_floating_base_momentum,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestSteelVelocityTermsTheta,
+    "test_velocity_terms_theta_default_keeps_the_explicit_step",
+    test_velocity_terms_theta_default_keeps_the_explicit_step,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelVelocityTermsTheta,
+    "test_velocity_terms_theta_keeps_loop_and_contact_targets",
+    test_velocity_terms_theta_keeps_loop_and_contact_targets,
+    devices=get_cuda_test_devices(),
+)
 
 if __name__ == "__main__":
     unittest.main()

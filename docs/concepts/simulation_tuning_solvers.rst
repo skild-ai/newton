@@ -269,7 +269,8 @@ repository examples spend tuning effort, not a shared solver API.
        ``free_rigid_rolling_friction``,
        ``contact_shared_anchor``, ``contact_friction_shared_anchor``,
        ``row_watermark``, ``row_schedule``, ``use_parallel_streams``,
-       ``double_buffer``, ``friction_mode``, ``nesterov_momentum``.
+       ``double_buffer``, ``friction_mode``, ``nesterov_momentum``,
+       ``velocity_terms_theta``.
      - Experimental. The solve is matrix-free; ``solve_mode`` selects its
        Gauss-Seidel sweep order: ``"serial"`` (the default) sweeps each world's rows
        in order, ``"colored"`` solves the propagation contact rows in parallel
@@ -319,6 +320,14 @@ repository examples spend tuning effort, not a shared solver API.
        cost depends on the scene and can be significant for colored free-body
        piles. Each CUDA sweep keeps its row order, factorization
        and specialized solver, including fused colored propagation.
+       The opt-in ``velocity_terms_theta`` weights the end-of-step velocity in
+       the Coriolis, centrifugal and gyroscopic forces of articulations
+       (``1`` is the first-order form of MuJoCo's ``implicit`` integrator).
+       ``0.5`` cancels the first-order frequency error that both ``0`` and
+       ``1`` leave on fast closed loops, which can allow a larger ``dt``; each
+       step's correction enters the next step's prediction, so loop closures
+       and contacts keep their velocity targets. It costs one more
+       inverse-dynamics pass and mass solve per step.
        Experimental contact torsion adds spin friction to the contacts of
        articulated bodies whose shapes carry a positive
        ``steel:min_torsional_patch_radius`` (imported from
