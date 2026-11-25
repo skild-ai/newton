@@ -3117,10 +3117,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._warn_unsolvable_global_contacts(model)
         self._build_mimic_plan(model)
         self._build_connect_plan(model)
-        # Root-relative body poses for the loop-closure geometry (see _launch_body_relative_poses).
-        self._body_rel = None
+        # Root-relative body positions for the loop-closure geometry (see _launch_body_relative_poses).
+        self._body_rel_t = None
         if self._connect_count > 0:
-            self._body_rel = wp.zeros(model.body_count, dtype=wp.transform, device=model.device)
+            self._body_rel_t = wp.zeros(model.body_count, dtype=wp.vec3, device=model.device)
         self._build_joint_limit_gap(model)
         self._build_distance_limit_plan(model)
         self._warn_persistent_row_capacity(model)
@@ -4999,7 +4999,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.joint_qd_start,
                         state_aug._joint_S_s,
                         self._articulation_origin,
-                        self._body_rel,
+                        self._body_rel_t,
                         self._body_to_articulation,
                         model.articulation_start,
                         model.joint_child,
@@ -5018,9 +5018,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 )
 
     def _launch_body_relative_poses(self, state_in: State) -> None:
-        """Compose every articulation's body poses from its root with the root translation removed.
+        """Compose every articulation's body positions from its root with the root translation removed.
 
-        The loop-closure rows take their gap ``p_A - p_B`` and lever arms from these poses. The
+        The loop-closure rows take their gap ``p_A - p_B`` and lever arms from these positions. The
         world poses of a body far from the origin carry the float32 rounding of its world
         position, which the gap of two nearby anchors would inherit in full and a nearly
         degenerate (normalized) closure row would amplify.
@@ -5045,7 +5045,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 model.joint_dof_dim,
                 state_in.body_q,
             ],
-            outputs=[self._body_rel],
+            outputs=[self._body_rel_t],
             device=model.device,
         )
 
