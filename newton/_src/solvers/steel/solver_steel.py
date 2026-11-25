@@ -195,6 +195,7 @@ from .kernels import (
     local_solve_launch_gate,
     mark_propagation_bodies,
     mask_passive_spring_stiffness,
+    offset64,
     populate_connect_J_for_size,
     populate_joint_velocity_limit_J_for_size,
     populate_mimic_J_for_size,
@@ -13787,7 +13788,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
             const unsigned lower_lanes = lane == 0 ? 0u : ((1u << lane) - 1u);
             const int slot = first_slot + __popc(active_mask & lower_lanes);
             if (slot < max_constraints) {{
-                J_group.data[(group_idx * max_constraints + slot) * {size} + local_dof] = side == 0 ? 1.0f : -1.0f;
+                J_group.data[{offset64("group_idx * max_constraints + slot", size)} + local_dof] = side == 0 ? 1.0f : -1.0f;
                 const int row = world * max_constraints + slot;
                 world_row_type.data[row] = {PGS_CONSTRAINT_TYPE_JOINT_LIMIT};
                 world_row_parent.data[row] = -1;
@@ -13933,7 +13934,7 @@ def _get_joint_friction_warp_kernel(size: int, device_arch: str, warps_per_block
             const unsigned lower_lanes = lane == 0 ? 0u : ((1u << lane) - 1u);
             const int slot = first_slot + __popc(active_mask & lower_lanes);
             if (slot < max_constraints) {{
-                J_group.data[(group_idx * max_constraints + slot) * {size} + local_dof] = 1.0f;
+                J_group.data[{offset64("group_idx * max_constraints + slot", size)} + local_dof] = 1.0f;
                 const int row = world * max_constraints + slot;
                 world_row_type.data[row] = {PGS_CONSTRAINT_TYPE_JOINT_FRICTION};
                 world_row_parent.data[row] = -1;
@@ -14279,7 +14280,7 @@ def _get_crba_cholesky_warp_kernel(n_dofs: int, device_arch: str, *, warps_per_b
     __syncwarp();
 
     if (lane < {int(n_dofs)}) {{
-        const int factor_base = group * {matrix_elements};
+        const long long factor_base = {offset64("group", matrix_elements)};
 #pragma unroll
         for (int col = 0; col <= lane; ++col)
             L_group.data[factor_base + lane * {int(n_dofs)} + col] = factor[lane * {int(n_dofs)} + col];
@@ -14493,7 +14494,7 @@ def _get_inverse_cholesky_register_kernel(n_dofs: int, device_arch: str, *, lowe
     const int art = group_to_art.data[group];
     if (mass_update_mask.data[art] == 0) return;
 
-    const int factor_base = group * {n_dofs * n_dofs};
+    const long long factor_base = {offset64("group", n_dofs * n_dofs)};
     float column[{n_dofs}];
 #pragma unroll
     for (int i = 0; i < {n_dofs}; ++i) {{
@@ -14560,9 +14561,9 @@ def _get_paired_hinv_jt_kernel(
     __shared__ float s_secondary_Hinv[{secondary_dofs * secondary_dofs}];"""
     hinv_load = f"""
     for (int element = threadIdx.x; element < {primary_dofs * primary_dofs}; element += blockDim.x)
-        s_primary_Hinv[element] = primary_Hinv.data[primary_group * {primary_dofs * primary_dofs} + element];
+        s_primary_Hinv[element] = primary_Hinv.data[{offset64("primary_group", primary_dofs * primary_dofs)} + element];
     for (int element = threadIdx.x; element < {secondary_dofs * secondary_dofs}; element += blockDim.x)
-        s_secondary_Hinv[element] = secondary_Hinv.data[secondary_group * {secondary_dofs * secondary_dofs} + element];"""
+        s_secondary_Hinv[element] = secondary_Hinv.data[{offset64("secondary_group", secondary_dofs * secondary_dofs)} + element];"""
     factor_shared = ""
     factor_load = ""
     factor_world_declaration = ""
@@ -14589,9 +14590,9 @@ def _get_paired_hinv_jt_kernel(
     __shared__ float s_secondary_Linv[{secondary_dofs * secondary_dofs}];"""
         factor_load = f"""
     for (int element = threadIdx.x; element < {primary_dofs * primary_dofs}; element += blockDim.x)
-        s_primary_Linv[element] = primary_Linv.data[primary_group * {primary_dofs * primary_dofs} + element];
+        s_primary_Linv[element] = primary_Linv.data[{offset64("primary_group", primary_dofs * primary_dofs)} + element];
     for (int element = threadIdx.x; element < {secondary_dofs * secondary_dofs}; element += blockDim.x)
-        s_secondary_Linv[element] = secondary_Linv.data[secondary_group * {secondary_dofs * secondary_dofs} + element];"""
+        s_secondary_Linv[element] = secondary_Linv.data[{offset64("secondary_group", secondary_dofs * secondary_dofs)} + element];"""
         factor_world_declaration = "    const bool factor_world = world_mf_constraint_count.data[world] == 0;"
         response_calculation = f"""
         float y = 0.0f;
@@ -14649,14 +14650,14 @@ def _get_paired_hinv_jt_kernel(
     __syncthreads();
 
     for (int constraint = row_warp; constraint < n_constraints; constraint += {warps_per_block}) {{
-        const int world_row = (world * {max_constraints} + constraint) * {max_world_dofs};
+        const long long world_row = {offset64("world * " + str(max_constraints) + " + constraint", max_world_dofs)};
         float j = 0.0f;
         if (lane < {primary_dofs}) {{
-            const int row = (primary_group * {max_constraints} + constraint) * {primary_dofs};
+            const long long row = {offset64("primary_group * " + str(max_constraints) + " + constraint", primary_dofs)};
             j = primary_J.data[row + lane];
         }} else if (lane < {total_dofs}) {{
             const int secondary_lane = lane - {primary_dofs};
-            const int row = (secondary_group * {max_constraints} + constraint) * {secondary_dofs};
+            const long long row = {offset64("secondary_group * " + str(max_constraints) + " + constraint", secondary_dofs)};
             j = secondary_J.data[row + secondary_lane];
         }}
 
@@ -14818,14 +14819,14 @@ def _get_pgs_solve_paired_factor_kernel(
     if (m == 0 || world_mf_constraint_count.data[world] != 0) return;
 
     const int off = world * {M};
-    const int row_base = off * {D};
+    const long long row_base = {offset64("off", D)};
     const int dof_map_base = world * {D};
     const int primary_group = primary_group_by_world.data[world];
     const int secondary_group = secondary_group_by_world.data[world];
     const int primary_offset = primary_offset_by_world.data[world];
     const int secondary_offset = secondary_offset_by_world.data[world];
-    const int primary_matrix_base = primary_group * {P * P};
-    const int secondary_matrix_base = secondary_group * {S * S};
+    const long long primary_matrix_base = {offset64("primary_group", P * P)};
+    const long long secondary_matrix_base = {offset64("secondary_group", S * S)};
     float* s_lam = &s_lam_storage[world_slot * {M}];
     float* s_rhs = &s_rhs_storage[world_slot * {M}];
     float* s_diag = &s_diag_storage[world_slot * {M}];
@@ -15460,8 +15461,8 @@ def _get_pgs_solve_local_owned_kernel(
     const int secondary_art = candidate_secondary_articulations.data[candidate];
     if (articulation_world.data[secondary_art] != world) return;
     const int secondary_group = articulation_group_index.data[secondary_art];
-    const int secondary_group_j_base = secondary_group * {max_rows * paired_dofs};
-    const int secondary_group_l_base = secondary_group * {paired_dofs * paired_dofs};"""
+    const long long secondary_group_j_base = {offset64("secondary_group", max_rows * paired_dofs)};
+    const long long secondary_group_l_base = {offset64("secondary_group", paired_dofs * paired_dofs)};"""
         if paired_dofs
         else ""
     )
@@ -16197,8 +16198,8 @@ def _get_pgs_solve_local_owned_kernel(
     if (row_count == 0 || row_count > {local_rows}) return;
 
     const int world_row_base = world * {max_rows};
-    const int group_j_base = group * {max_rows * dofs};
-    const int group_l_base = group * {dofs * dofs};
+    const long long group_j_base = {offset64("group", max_rows * dofs)};
+    const long long group_l_base = {offset64("group", dofs * dofs)};
 {pair_setup}
 {shared_declarations}
 {mf_setup}
@@ -16754,7 +16755,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
             const int i = vlim_base + vlim_first;
             float denom = s_diag_dense[i];
-            int row_base = jy_world_base + i * {D};
+            long long row_base = jy_world_base + i * {D};
             const int unit = i - vlim_lo < {U} ? s_vlim_unit[i - vlim_lo] : 0;
             float jv;
             if (unit > 0) {{
@@ -16793,7 +16794,7 @@ def _get_pgs_solve_mf_gs_kernel(
             float denom = s_diag_dense[i];
             if (denom <= 0.0f) continue;
             float qdot_max = s_drive_vel_limit_dense[i];
-            int row_base = jy_world_base + i * {D};
+            long long row_base = jy_world_base + i * {D};
             float my_sum = 0.0f;
             for (int d = lane; d < {D}; d += 32) my_sum += J_world.data[row_base + d] * s_v[d];
             float jv = warp_sum(my_sum);
@@ -16918,8 +16919,8 @@ def _get_pgs_solve_mf_gs_kernel(
                 if (lane == 0) s_pair_slot[i] = -1;
                 continue;
             }}
-            int row_base = jy_world_base + i * {D};
-            int sib_row_base = jy_world_base + (i + 1) * {D};
+            long long row_base = jy_world_base + i * {D};
+            long long sib_row_base = jy_world_base + (i + 1) * {D};
             float cross = 0.0f;
 {prologue_cross}
             cross = warp_sum(cross);
@@ -17018,7 +17019,7 @@ def _get_pgs_solve_mf_gs_kernel(
                     new_impulse = old_impulse;
                 }} else {{
                     int sib = parent_idx + 2;
-                    int sib_row_base = jy_world_base + sib * {D};
+                    long long sib_row_base = jy_world_base + sib * {D};
                     // A patch's normal rows form a cycle through their parent links; its
                     // anchors share the pooled normal load (a point contact links to -1).
                     float lambda_n = s_lam_dense[parent_idx];
@@ -17260,7 +17261,7 @@ def _get_pgs_solve_mf_gs_kernel(
     int off_dense = world * {M_D};
     int off_mf = world * {M_MF};
     int off_meta = off_mf * 4;
-    int jy_world_base = world * {M_D} * {D};
+    long long jy_world_base = {offset64("world", M_D * D)};
     int mf6_base = world * {M_MF} * 6;
 
     __shared__ float s_v[{D}];
@@ -17305,7 +17306,7 @@ def _get_pgs_solve_mf_gs_kernel(
         for (int i = 0; i < dense_main_end; i++) {{
 {dense_consume}
             if (i + 1 < dense_main_end) {{
-                int next_jy_base = jy_world_base + (i + 1) * {D};
+                long long next_jy_base = jy_world_base + (i + 1) * {D};
 {dense_prefetch_next}
             }}
 
@@ -17816,7 +17817,7 @@ def _prefetch_streamed_dense_metadata(snippet: str) -> str:
         "            const int cur_row_type = pre_row_type, cur_row_parent = pre_row_parent;\n"
         "            const float cur_diag = pre_diag, cur_rhs = pre_rhs, cur_row_w = pre_row_w;\n",
     )
-    sweep = after_line(sweep, "int next_jy_base = ", loads("i + 1", " " * 16))
+    sweep = after_line(sweep, "long long next_jy_base = ", loads("i + 1", " " * 16))
     for source, register in (
         ("world_row_type.data[off_dense + i]", "cur_row_type"),
         ("world_row_parent.data[off_dense + i]", "cur_row_parent"),
@@ -24564,7 +24565,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     if (candidate_valid && batch_lane < {P}) {{
                         candidate_coord = dense_offset + batch_lane;
                         candidate_jacobian = dense_J.data[
-                            (dense_group * {M} + candidate_normal) * {P} + batch_lane];
+                            {offset64(f"dense_group * {M} + candidate_normal", P)} + batch_lane];
                     }} else if (candidate_valid && batch_lane <= {P + 1}) {{
                         const int sparse_slot = batch_lane - {P};
                         const int sparse_row = row_base + candidate_normal;
@@ -24709,7 +24710,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             float response = 0.0f;
             if (lane < {P}) {{
                 coord = dense_offset + lane;
-                const int dense_index = (dense_group * {M} + row) * {P} + lane;
+                const long long dense_index = {offset64(f"dense_group * {M} + row", P)} + lane;
                 jacobian = dense_J.data[dense_index];
                 response = dense_Y.data[dense_index];
             }} else if (lane <= {P + 1}) {{
@@ -24752,7 +24753,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 const int sibling_sparse_row = row_base + sibling;
                 if (lane < {P}) {{
                     sibling_coord = dense_offset + lane;
-                    const int sibling_dense_index = (dense_group * {M} + sibling) * {P} + lane;
+                    const long long sibling_dense_index = {offset64(f"dense_group * {M} + sibling", P)} + lane;
                     sibling_jacobian = dense_J.data[sibling_dense_index];
                     sibling_response = dense_Y.data[sibling_dense_index];
                     sibling_response_here = sibling_response;
@@ -24983,9 +24984,9 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                 if (i != i_t1) {
                     new_impulse = s_lam_dense[i];
                 } else {
-                    int n_row_base = jy_world_base + parent_idx * __D__;
-                    int t1_row_base = jy_world_base + i_t1 * __D__;
-                    int t2_row_base = jy_world_base + i_t2 * __D__;
+                    long long n_row_base = jy_world_base + parent_idx * __D__;
+                    long long t1_row_base = jy_world_base + i_t1 * __D__;
+                    long long t2_row_base = jy_world_base + i_t2 * __D__;
 
                     float target_vel_n = -s_rhs_dense[parent_idx];
                     float mu = s_mu_dense[i];

@@ -192,6 +192,22 @@ def _steel_module(name: str) -> wp.Module:
     return module
 
 
+def offset64(index: str, stride: int | str) -> str:
+    """Return the CUDA expression ``index * stride`` evaluated in 64-bit integers.
+
+    Native kernels index per-world blocks of the dense row system (rows x DOFs) and of the
+    mass matrices (DOFs x DOFs) by hand. Their totals pass 2**31 elements at large world
+    counts, for example 6,477 worlds of 921 rows x 360 DOFs or 42,207 worlds of 320 rows x
+    159 DOFs, where a 32-bit product wraps and reads or writes outside the buffer. Indices
+    derived from this offset must stay ``long long``.
+
+    Args:
+        index: CUDA expression of the block index, such as a world or articulation group.
+        stride: Elements per block, as a number or a CUDA expression.
+    """
+    return f"((long long)({index}) * ({stride}))"
+
+
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 # PGS joint drive row (``drive_mode="rows"``): a bilateral row per driven DOF whose
 # impulse follows the PhysX force-drive update each iteration; the velocity-only

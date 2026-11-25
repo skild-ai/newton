@@ -239,7 +239,7 @@ def _get_pgs_solve_sparse_kernel(
     const int lane = threadIdx.x & 31;
     const int slot = threadIdx.x >> 5;
     const int offset = world * {M};
-    const int row_base = offset * {S};
+    const long long row_base = (long long)offset * {S};
     const int count = min(world_constraint_count.data[world], {M});
     float* delta = delta_storage + slot * {D};
     float* impulse = impulse_storage + slot * {M};
@@ -288,9 +288,9 @@ def _get_pgs_solve_sparse_kernel(
                 float sibling_response = sibling_value;
                 if ({str(bool(P)).lower()} && index >= 0 && world_free_dof_mask.data[world * {D} + index] != 0) {{
                     const int width = row_free_response.shape[2];
-                    response = row_free_response.data[(offset + row) * width + entry];
+                    response = row_free_response.data[(long long)(offset + row) * width + entry];
                     if (friction)
-                        sibling_response = row_free_response.data[(offset + sibling) * width + entry];
+                        sibling_response = row_free_response.data[(long long)(offset + sibling) * width + entry];
                 }}
                 indices[q] = index;
                 responses[q] = response;

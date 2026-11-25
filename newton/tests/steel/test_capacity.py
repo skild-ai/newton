@@ -1279,6 +1279,47 @@ class TestSteelSweepSharedMemory(unittest.TestCase):
     pass
 
 
+def _row_offset_kernel(rows, dofs):
+    """A kernel that forms ``(world * rows + row) * dofs + dof`` the way Steel's native kernels index dense rows."""
+    from newton._src.solvers.steel.kernels import offset64  # noqa: PLC0415
+
+    snippet = f"""
+    const long long row_base = {offset64("world", rows * dofs)} + row * {dofs};
+    out.data[0] = row_base + dof;
+    """
+
+    @wp.func_native(snippet)
+    def row_offset_native(world: int, row: int, dof: int, out: wp.array[wp.int64]): ...
+
+    def row_offset_kernel(world: int, row: int, dof: int, out: wp.array[wp.int64]):
+        row_offset_native(world, row, dof, out)
+
+    row_offset_kernel.__name__ = f"row_offset_{rows}_{dofs}"
+    row_offset_kernel.__qualname__ = row_offset_kernel.__name__
+    return wp.kernel(enable_backward=False, module="unique")(row_offset_kernel)
+
+
+def test_dense_row_offsets_do_not_wrap_at_large_world_counts(test, device):
+    """Native row offsets stay exact past 2**31 elements, where the old 32-bit products wrapped.
+
+    The world counts are the first that overflowed int32: the Hoberman flower at resolution 2 (921 rows x 360 DOFs,
+    6,477 worlds) and the SMPL-X humanoid (320 rows x 159 DOFs, 42,207 worlds). The buffers themselves would need
+    more than 16 GB, so the test checks the offset arithmetic the kernels share rather than a full solve.
+    """
+    for rows, dofs, world in ((921, 360, 6477), (320, 159, 42207), (320, 159, 65535)):
+        kernel = _row_offset_kernel(rows, dofs)
+        out = wp.zeros(1, dtype=wp.int64, device=device)
+        row, dof = rows - 1, dofs - 1
+        wp.launch(kernel, dim=1, inputs=[world, row, dof, out], device=device)
+        expected = (world * rows + row) * dofs + dof
+        test.assertGreater(expected, 2**31 - 1)
+        test.assertEqual(int(out.numpy()[0]), expected)
+
+
+class TestSteelIndexRange(unittest.TestCase):
+    pass
+
+
 add_function_test(
     TestSteelSweepSharedMemory,
     "test_free_body_capacity_past_sweep_shared_memory",
@@ -1302,6 +1343,12 @@ add_function_test(
     "test_cpu_free_body_capacity_past_the_cuda_index_limit",
     test_cpu_free_body_capacity_past_the_cuda_index_limit,
     devices=["cpu"],
+)
+add_function_test(
+    TestSteelIndexRange,
+    "test_dense_row_offsets_do_not_wrap_at_large_world_counts",
+    test_dense_row_offsets_do_not_wrap_at_large_world_counts,
+    devices=get_cuda_test_devices(),
 )
 
 
