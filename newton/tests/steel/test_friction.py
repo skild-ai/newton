@@ -1207,6 +1207,8 @@ _JAMMED_BLOCKS = {
     "rank_one_slipping_off_axis": (-1.0, 0.0, 0.1, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
     # The same jam slipping just slower than its limit: the residual tends to -1.85e-5 and never reaches zero.
     "rank_one_slipping_under_its_limit": (-0.001, 0.0, 0.0017, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+    # The residual tends to -1.04e-3 of the gap, below float32 rounding of its terms past 1e4 times the first load.
+    "rank_one_slipping_near_its_limit": (-1.0, 0.0, 1.7303188, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
     # Near rank one, the second tangent eigenvalue bounds the off-axis impulse: the residual peaks below zero.
     "near_rank_one_slipping": (-0.001, 0.0, 0.001733, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-6, 2.0),
     # Regular near-singular blocks: the probe sticks again only at a load near 1e4 times the frictionless one.

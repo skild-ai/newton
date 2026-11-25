@@ -24738,10 +24738,16 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                                     for (int _it = 0; _it < 64; _it++) {
                                         const float f_x = probe(x, new_lambda_t1, new_lambda_t2);
                                         new_lambda_n = x;
+                                        // Until a jammed search brackets a root, a residual within four float32 epsilons of its terms certifies
+                                        // neither a root nor a sign change, so it counts as below the root.
+                                        const float noise = jammed && !bracketed
+                                            ? 4.8e-7f * (fabsf(u_n - target_vel_n) + G_nn * fabsf(x - old_lambda_n)
+                                                + fabsf(G_nt1 * (new_lambda_t1 - old_lambda_t1)) + fabsf(G_nt2 * (new_lambda_t2 - old_lambda_t2)))
+                                            : 0.0f;
                                         // Within what a 1e-5 relative error in the load would leave. A jammed block, whose load can grow without
                                         // approaching a root, is held to its starting gap instead.
-                                        if (last_probe || fabsf(f_x) <= (jammed ? 1.0e-5f * gap : 1.0e-5f * G_nn * x)) break;
-                                        if (jammed && f_x < 0.0f) {
+                                        if (last_probe || fabsf(f_x) + noise <= (jammed ? 1.0e-5f * gap : 1.0e-5f * G_nn * x)) break;
+                                        if (jammed && f_x < noise) {
                                             bool sticks_here = false;
                                             if (clamp_axis || !rank_one) {
                                                 // The probe sticks if its unconstrained tangent pair lies in the cone, within rounding.
@@ -24766,7 +24772,7 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                                                 continue;
                                             }
                                         }
-                                        if (f_x < 0.0f) {
+                                        if (f_x < noise) {
                                             lo = x;
                                             f_lo = f_x;
                                             if (last_side < 0) f_hi *= 0.5f;
@@ -25016,10 +25022,16 @@ _MF_BISECTION_FRICTION_SOURCE = """
                                     for (int _it = 0; _it < 64; _it++) {
                                         const float f_x = probe(x, new_lambda_t1, new_lambda_t2);
                                         new_lambda_n = x;
+                                        // Until a jammed search brackets a root, a residual within four float32 epsilons of its terms certifies
+                                        // neither a root nor a sign change, so it counts as below the root.
+                                        const float noise = jammed && !bracketed
+                                            ? 4.8e-7f * (fabsf(u_n - target_vel_n) + G_nn * fabsf(x - old_lambda_n)
+                                                + fabsf(G_nt1 * (new_lambda_t1 - old_lambda_t1)) + fabsf(G_nt2 * (new_lambda_t2 - old_lambda_t2)))
+                                            : 0.0f;
                                         // Within what a 1e-5 relative error in the load would leave. A jammed block, whose load can grow without
                                         // approaching a root, is held to its starting gap instead.
-                                        if (last_probe || fabsf(f_x) <= (jammed ? 1.0e-5f * gap : 1.0e-5f * G_nn * x)) break;
-                                        if (jammed && f_x < 0.0f) {
+                                        if (last_probe || fabsf(f_x) + noise <= (jammed ? 1.0e-5f * gap : 1.0e-5f * G_nn * x)) break;
+                                        if (jammed && f_x < noise) {
                                             bool sticks_here = false;
                                             if (clamp_axis || !rank_one) {
                                                 // The probe sticks if its unconstrained tangent pair lies in the cone, within rounding.
@@ -25044,7 +25056,7 @@ _MF_BISECTION_FRICTION_SOURCE = """
                                                 continue;
                                             }
                                         }
-                                        if (f_x < 0.0f) {
+                                        if (f_x < noise) {
                                             lo = x;
                                             f_lo = f_x;
                                             if (last_side < 0) f_hi *= 0.5f;
