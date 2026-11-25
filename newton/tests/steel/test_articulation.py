@@ -5416,6 +5416,57 @@ def test_velocity_terms_theta_default_keeps_the_explicit_step(test, device):
             test.assertGreater(float(np.abs(half[0] - zero[0]).max()), 1.0e-6)
 
 
+def _branched_tree_rollout(device, kernel, theta, steps=200, dt=0.002, worlds=3):
+    """Joint state of a spinning free-floating branched tree (a base with two hinge chains, one forked) in zero
+    gravity after ``steps`` steps, with the given ``velocity_terms_kernel``."""
+    main = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
+    b = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
+
+    def link(mass, diag):
+        return b.add_link(mass=mass, inertia=wp.mat33(np.diag(diag)))
+
+    def hinge(parent, child, offset, axis):
+        return b.add_joint_revolute(
+            parent, child, parent_xform=wp.transform(wp.vec3(*offset), wp.quat_identity()), axis=axis
+        )
+
+    base = link(2.0, [0.02, 0.05, 0.04])
+    a1, a2, b1, b2, b3 = (link(1.0 + 0.1 * k, [0.01, 0.03, 0.02]) for k in range(5))
+    joints = [b.add_joint_free(base)]
+    joints.append(hinge(base, a1, (0.2, 0.0, 0.0), (0.3, 1.0, 0.2)))
+    joints.append(hinge(a1, a2, (0.2, 0.0, 0.0), (0.0, 1.0, 0.0)))
+    joints.append(hinge(base, b1, (-0.2, 0.0, 0.0), (1.0, 0.1, 0.0)))
+    joints.append(hinge(b1, b2, (-0.2, 0.1, 0.0), (0.0, 0.0, 1.0)))
+    joints.append(hinge(b1, b3, (-0.2, -0.1, 0.0), (0.2, 1.0, 0.0)))
+    b.add_articulation(joints)
+    for _ in range(worlds):
+        main.add_world(b)
+    model = main.finalize(device=device)
+    qd = np.array([0.5, -0.2, 0.3, 2.0, 5.0, -3.0, 8.0, -6.0, 4.0, 7.0, -5.0], dtype=np.float32)
+    model.joint_qd.assign(np.tile(qd, worlds))
+    with kernel_overrides({"velocity_terms_kernel": kernel}):
+        solver = SolverSteel(model, iterations=1, update_mass_matrix_interval=1, velocity_terms_theta=theta)
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    for _ in range(steps):
+        solver.step(state_0, state_1, None, None, dt)
+        state_0, state_1 = state_1, state_0
+    return np.concatenate([state_0.joint_q.numpy(), state_0.joint_qd.numpy()])
+
+
+def test_velocity_terms_theta_level_kernel_matches_serial(test, device):
+    """Form the velocity-derivative product level by level, one block per articulation, as the serial kernel does.
+
+    On a spinning floating tree with a forked branch the weight moves the joints by 0.05 rad over 200 steps; the
+    level kernel gathers each joint's child wrenches in the serial pass's order, so the rollouts agree exactly.
+    """
+    explicit = _branched_tree_rollout(device, "serial", 0.0)
+    serial = _branched_tree_rollout(device, "serial", 1.0)
+    levels = _branched_tree_rollout(device, "levels", 1.0)
+    test.assertGreater(float(np.abs(serial - explicit).max()), 1.0e-2)
+    np.testing.assert_allclose(levels, serial, rtol=0.0, atol=1.0e-6)
+
+
 class TestSteelVelocityTermsTheta(unittest.TestCase):
     pass
 
@@ -5431,6 +5482,12 @@ add_function_test(
     "test_velocity_terms_theta_keeps_floating_base_momentum",
     test_velocity_terms_theta_keeps_floating_base_momentum,
     devices=get_test_devices(),
+)
+add_function_test(
+    TestSteelVelocityTermsTheta,
+    "test_velocity_terms_theta_level_kernel_matches_serial",
+    test_velocity_terms_theta_level_kernel_matches_serial,
+    devices=get_cuda_test_devices(),
 )
 add_function_test(
     TestSteelVelocityTermsTheta,

@@ -59,9 +59,12 @@ from .cpu_fallback import pgs_solve_mf_gs_cpu, pgs_solve_propagation_contact_cpu
 from .friction import FRICTION_PAIR_CUDA, coupled_contact_cuda
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
 from .implicit_velocity import (
+    LEVEL_THREADS,
     add_free_root_transport_derivative,
     add_lagged_velocity_terms,
+    build_level_schedule,
     eval_velocity_derivative_product,
+    eval_velocity_derivative_product_levels,
     flag_discontinuous_articulations,
     store_velocity_derivative_correction,
 )
@@ -2896,6 +2899,14 @@ class SolverSteel(SolverBase, CouplingInterface):
             raise ValueError(f"velocity_terms_theta must be in [0, 1], got {velocity_terms_theta}")
         self._velocity_terms_theta = velocity_terms_theta
         self._ivt_buffers = None
+        # D x kernel (override): "serial" (one thread per articulation), "levels" (one block per articulation,
+        # one barrier per tree level, CUDA only) or "auto", resolved after the world mapping: levels on CUDA when
+        # some articulation averages at least two joints per tree level.
+        self._ivt_kernel = str(self._kernel_overrides.get("velocity_terms_kernel", "auto"))
+        if self._ivt_kernel not in ("serial", "levels", "auto"):
+            raise ValueError("velocity_terms_kernel must be one of ['auto', 'levels', 'serial']")
+        if self._ivt_kernel == "levels" and not model.device.is_cuda:
+            raise NotImplementedError("velocity_terms_kernel='levels' requires a CUDA device")
         if velocity_terms_theta > 0.0 and model.articulation_count and model.joint_dof_count:
             dofs, bodies = model.joint_dof_count, max(model.body_count, 1)
             self._ivt_buffers = {
@@ -10410,44 +10421,61 @@ class SolverSteel(SolverBase, CouplingInterface):
         :mod:`implicit_velocity`)."""
         model = self.model
         buf = self._ivt_buffers
-        wp.launch(
-            eval_velocity_derivative_product,
-            dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                self._articulation_joint_end,
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state_in.joint_q,
-                model.joint_axis,
-                model.joint_dof_dim,
-                model.joint_X_p,
-                state_in.body_q,
-                state_aug._body_q_com,
-                model.body_mass,
-                model.body_inertia,
-                self._articulation_origin,
-                self._body_to_articulation,
-                self._is_free_rigid,
-                self._dynamics_art_active,
-                velocity_start,
-                self._v_out,
-                buf["qd_probe"],
-                buf["S_probe"],
-                buf["v_probe"],
-                buf["a_probe"],
-                buf["f_plus"],
-                buf["f_minus"],
-                state_aug._body_I_s,
-                self._body_inertia_terms,
-            ],
-            outputs=[buf["tau"]],
-            block_dim=self._serial_block_dim(model.articulation_count),
-            device=model.device,
-        )
+        common = [
+            model.articulation_start,
+            self._articulation_joint_end,
+            model.joint_type,
+            model.joint_parent,
+            model.joint_child,
+            model.joint_q_start,
+            model.joint_qd_start,
+            state_in.joint_q,
+            model.joint_axis,
+            model.joint_dof_dim,
+            model.joint_X_p,
+            state_in.body_q,
+            state_aug._body_q_com,
+            model.body_mass,
+            model.body_inertia,
+            self._articulation_origin,
+            self._body_to_articulation,
+            self._is_free_rigid,
+            self._dynamics_art_active,
+            velocity_start,
+            self._v_out,
+        ]
+        probes = [buf["qd_probe"], buf["S_probe"], buf["v_probe"], buf["a_probe"], buf["f_plus"], buf["f_minus"]]
+        if self._ivt_kernel == "levels":
+            sched = buf["levels"]
+            wp.launch_tiled(
+                eval_velocity_derivative_product_levels,
+                dim=[model.articulation_count],
+                inputs=[
+                    sched["art_level_start"],
+                    sched["level_joint_start"],
+                    sched["level_joints"],
+                    sched["child_start"],
+                    sched["child_joints"],
+                    *common,
+                    LEVEL_THREADS,
+                    *probes,
+                    buf["joint_wrench"],
+                    state_aug._body_I_s,
+                    self._body_inertia_terms,
+                ],
+                outputs=[buf["tau"]],
+                block_dim=LEVEL_THREADS,
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                eval_velocity_derivative_product,
+                dim=model.articulation_count,
+                inputs=[*common, *probes, state_aug._body_I_s, self._body_inertia_terms],
+                outputs=[buf["tau"]],
+                block_dim=self._serial_block_dim(model.articulation_count),
+                device=model.device,
+            )
         # Reuse stage 3's mass solves on the derivative force; the stage's own tau and qdd stay untouched.
         tau, qdd = state_aug._joint_tau, state_aug._joint_qdd
         state_aug._joint_tau, state_aug._joint_qdd = buf["tau"], buf["dv"]
@@ -10489,7 +10517,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
 
     def _setup_velocity_terms(self, model) -> None:
-        """Map each tree DOF to its articulation for the continuity check of the delayed correction."""
+        """Map each tree DOF to its articulation for the continuity check of the delayed correction, resolve
+        ``velocity_terms_kernel="auto"`` and build the level schedule the level kernel reads."""
         # Loop-closure joints past the tree end belong to no articulation and get no correction.
         dof_art = np.full(max(model.joint_dof_count, 1), -1, dtype=np.int32)
         qd_start = model.joint_qd_start.numpy()
@@ -10497,6 +10526,23 @@ class SolverSteel(SolverBase, CouplingInterface):
         for art in range(model.articulation_count):
             dof_art[qd_start[starts[art]] : qd_start[ends[art]]] = art
         self._ivt_buffers["dof_art"] = wp.array(dof_art, dtype=wp.int32, device=model.device)
+        host = None
+        if self._ivt_kernel == "auto":
+            self._ivt_kernel = "serial"
+            if model.device.is_cuda:
+                host = build_level_schedule(model, ends)
+                levels = np.diff(host["art_level_start"][: model.articulation_count + 1])
+                joints = ends[: model.articulation_count] - starts[: model.articulation_count]
+                if np.any(joints >= 2 * np.maximum(levels, 1)):
+                    self._ivt_kernel = "levels"
+        if self._ivt_kernel == "levels":
+            if host is None:
+                host = build_level_schedule(model, ends)
+            device = model.device
+            self._ivt_buffers["levels"] = {k: wp.array(v, dtype=wp.int32, device=device) for k, v in host.items()}
+            self._ivt_buffers["joint_wrench"] = wp.zeros(
+                max(model.joint_count, 1), dtype=wp.spatial_vector, device=device
+            )
 
     def _stage3_mass_solve(self, state_aug: State) -> None:
         """Solve ``H joint_qdd = joint_tau`` for every articulation group with stage 2's factors."""
