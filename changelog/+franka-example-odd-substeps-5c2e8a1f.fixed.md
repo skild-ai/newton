@@ -1,1 +1,0 @@
-Fix CUDA graph replay of the Franka cable pick-and-place examples (`franka_cable_ik_pick_place`, `mujoco_franka_vbd_cable_admm_solver`) with an odd `--substeps`: a frame now ends on the state buffer it started from, so every replay advances the full substep count.
