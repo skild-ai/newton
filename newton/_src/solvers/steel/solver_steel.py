@@ -657,6 +657,21 @@ def _finalize_constraint_status(
 
 
 @wp.kernel
+def _flag_propagation_unit_overflow(
+    unit_cursor: wp.array[int], unit_max: int, has_responding_global: int, overflow: wp.array[wp.bool]
+):
+    """Latch the worlds whose colored units exceeded their capacity; their rows were left unsolved.
+
+    World 0 also flags the global entry while a responding global articulation shares its rows.
+    """
+    world = wp.tid()
+    if unit_cursor[world] > unit_max:
+        overflow[world] = True
+        if world == 0 and has_responding_global != 0:
+            overflow[overflow.shape[0] - 1] = True
+
+
+@wp.kernel
 def _reset_solver_status(
     world_mask: wp.array[wp.bool],
     world_count: int,
@@ -1768,6 +1783,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     articulation_constraint_max = _ConstructionOption()
     free_body_constraint_max = _ConstructionOption()
     propagation_constraint_max = _ConstructionOption()
+    propagation_contact_max = _ConstructionOption()
     warn_constraint_overflow = _StepOption(lambda name, value: bool(value))
     row_watermark = _ConstructionOption()
     coupled_contact_passes = _ConstructionOption()
@@ -2071,6 +2087,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         articulation_constraint_max: int = 32,
         free_body_constraint_max: int = 512,
         propagation_constraint_max: int | None = None,
+        propagation_contact_max: int | None = None,
         warn_constraint_overflow: bool = True,
         row_watermark: bool = False,
         coupled_contact_passes: int = 0,
@@ -2251,6 +2268,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ``free_body_constraint_max + articulation_constraint_max``. Setting it lets
                 ``free_body_constraint_max`` shrink to the free-body velocity-limit rows. At least
                 1; rejected with ``articulated_contact_response="immediate"``.
+            propagation_contact_max: Propagation contacts one world holds, which sizes the colored sweep's
+                unit lists: a unit is a contact (one row, or three with its friction pair) or a loop closure, so
+                each world keeps this many plus its own closures, at most ``propagation_constraint_max``. ``None``
+                (default) keeps one unit per row. A step whose contacts exceed it leaves them unsolved and is
+                reported like a row overflow (:meth:`check_constraint_capacity`). At least 1; only with
+                ``articulated_contact_response="propagation"``.
             warn_constraint_overflow: Print a device-side warning the first time a world
                 exceeds a row capacity. The warning does not synchronize the host and is
                 compatible with CUDA graph capture. The host contact torsion preparation
@@ -3015,6 +3038,12 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_constraint_max = (
             None if propagation_constraint_max is None else int(propagation_constraint_max)
         )
+        self._propagation_contact_max = None if propagation_contact_max is None else int(propagation_contact_max)
+        if self._propagation_contact_max is not None:
+            if articulated_contact_response == "immediate":
+                raise ValueError("propagation_contact_max requires articulated_contact_response='propagation'")
+            if self._propagation_contact_max < 1:
+                raise ValueError("propagation_contact_max must be >= 1")
         if self._propagation_constraint_max is not None:
             if articulated_contact_response == "immediate":
                 raise ValueError("propagation_constraint_max requires articulated_contact_response='propagation'")
@@ -12563,12 +12592,21 @@ class SolverSteel(SolverBase, CouplingInterface):
         """Allocate the unit lists, the coloring scratch and the unit records of the colored sweep."""
         device = model.device
         worlds = max(self._world_count, 1)
-        units = worlds * rows
+        # A unit is a propagation contact (one row, three with its friction pair) or a loop closure, so a world
+        # holds at most its contact capacity plus its closures; without propagation_contact_max, one unit per row.
+        unit_max = rows
+        if self._propagation_contact_max is not None:
+            closures = 0
+            if self._connect_count:
+                closures = int(np.max(np.bincount(self._connect_world.numpy(), minlength=worlds)))
+            unit_max = max(1, min(rows, self._propagation_contact_max + closures))
+        self._propagation_unit_max = unit_max
+        units = worlds * unit_max
         self._color_body_used_mask = wp.zeros(
             (max(model.body_count, 1) * ((PROPAGATION_COLOR_TAIL + 31) // 32),), dtype=wp.int32, device=device
         )
         # The coloring sorts each world's units over a power-of-two stride.
-        self._color_order_stride = 1 << max(rows - 1, 0).bit_length()
+        self._color_order_stride = 1 << max(unit_max - 1, 0).bit_length()
         self._color_unit_order = wp.zeros((worlds * self._color_order_stride,), dtype=wp.int32, device=device)
         # Steps colored so far; with propagation_color_order="rotating" it sets each step's start and direction.
         self._color_step = wp.zeros(1, dtype=wp.int32, device=device)
@@ -12582,7 +12620,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._color_unit_sorted = wp.zeros((units,), dtype=wp.int32, device=device)
         self._color_world_unit_cursor = wp.zeros((worlds,), dtype=wp.int32, device=device)
         self._color_unit_meta = wp.zeros((units * PROPAGATION_UNIT_META,), dtype=wp.int32, device=device)
-        self._color_ring_overflow = wp.zeros((units,), dtype=wp.int32, device=device)
+        # Rows past a unit's stored ring, listed per world: rows, not units.
+        self._color_ring_overflow = wp.zeros((worlds * rows,), dtype=wp.int32, device=device)
         self._color_ring_overflow_cursor = wp.zeros((worlds,), dtype=wp.int32, device=device)
         self._color_unit_friction_setup = wp.zeros(
             (units * PROPAGATION_UNIT_FRICTION_SETUP,), dtype=wp.float32, device=device
@@ -12736,7 +12775,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._colored_worlds_per_block = 1
         if packed or staged:
             self._color_unit_payload = wp.zeros(
-                (max(self._world_count, 1) * rows * PROPAGATION_UNIT_PAYLOAD,), dtype=wp.float32, device=model.device
+                (max(self._world_count, 1) * self._propagation_unit_max * PROPAGATION_UNIT_PAYLOAD,),
+                dtype=wp.float32,
+                device=model.device,
             )
         self._colored_staged = staged
         # The sweep variant, which the fused latency loop builds again for one world per block.
@@ -12748,6 +12789,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             "friction_mode": self._friction_mode,
             "contact_torsion": self._propagation_torsion_rows,
             "free_rigid_angular": self._free_rigid_angular_rows,
+            "unit_max": self._propagation_unit_max,
         }
         if bodies * self._colored_worlds_per_block * 48 <= _COLORED_STAGING_BYTES:
             self._pgs_solve_propagation_colored_warp_kernel = _get_pgs_solve_propagation_colored_warp_kernel(
@@ -12779,6 +12821,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 friction_mode=self._friction_mode,
                 contact_torsion=self._propagation_torsion_rows,
                 free_rigid_angular=self._free_rigid_angular_rows,
+                unit_max=self._propagation_unit_max,
             )
         # The coloring keeps a world's used-color masks in shared memory when its unit bodies
         # span few enough indices: the bodies of one world plus the global ones.
@@ -12789,12 +12832,13 @@ class SolverSteel(SolverBase, CouplingInterface):
             span = max(per_world, int(starts[-1] - starts[-2] + starts[0]))
         prebuild_span = min(max(span, 1), 32768 // 4)
         self._color_jp_scratch = wp.zeros(
-            max(self._world_count, 1) * color_prebuild_scratch_stride(rows, prebuild_span),
+            max(self._world_count, 1) * color_prebuild_scratch_stride(self._propagation_unit_max, prebuild_span),
             dtype=wp.int32,
             device=model.device,
         )
+        # The coloring reads and writes only the unit lists, so their capacity is its stride.
         self._color_prebuild_kernel = _get_color_propagation_prebuild_kernel(
-            rows,
+            self._propagation_unit_max,
             entries,
             _COLOR_PREBUILD_BLOCK_DIM,
             self._color_order_stride,
@@ -12889,7 +12933,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.shape_body,
                         self._body_prescribed,
                         self._contact_slots_needed,
-                        self._propagation_max_constraints,
+                        self._propagation_unit_max,
                     ],
                     outputs=[
                         self._color_world_unit_cursor,
@@ -12914,7 +12958,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._articulation_response_dof_count,
                         self._body_prescribed,
                         self._max_contacts_alloc,
-                        self._propagation_max_constraints,
+                        self._propagation_unit_max,
                         self._contact_slot,
                     ],
                     outputs=[
@@ -12952,6 +12996,14 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
             if rotating:
                 wp.launch(advance_color_step, dim=1, inputs=[self._color_step], device=model.device)
+            # Units past a world's capacity were left out of its coloring: their rows go unsolved.
+            wp.launch(
+                _flag_propagation_unit_overflow,
+                dim=self._world_count,
+                inputs=[self._color_world_unit_cursor, self._propagation_unit_max, int(self._has_responding_global)],
+                outputs=[self.constraint_overflow],
+                device=model.device,
+            )
             self._color_unit_meta_stale = True
         if contacts is not None:
             wp.launch(
@@ -14961,13 +15013,15 @@ class SolverSteel(SolverBase, CouplingInterface):
         """Pack the unit records, the friction-pair setups and, when packed, the row payloads of the colored units."""
         device = self.model.device
         rows = self._propagation_max_constraints
+        units = self._propagation_unit_max
         entries = PROPAGATION_COLOR_TAIL + 2
         self._color_ring_overflow_cursor.zero_()
         wp.launch(
             gather_propagation_unit_meta,
-            dim=self._world_count * rows,
+            dim=self._world_count * units,
             inputs=[
                 rows,
+                units,
                 entries,
                 self._color_world_offsets,
                 self._color_world_row_order,
@@ -14984,8 +15038,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             device=device,
         )
         wp.launch(
-            _get_colored_friction_setup_kernel(rows, entries, device.arch),
-            dim=self._world_count * rows,
+            _get_colored_friction_setup_kernel(rows, entries, device.arch, units),
+            dim=self._world_count * units,
             inputs=[
                 self._color_world_offsets,
                 self._propagation_constraint_count,
@@ -15004,8 +15058,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         if self._color_unit_payload is not None:
             wp.launch(
-                _get_colored_payload_pack_kernel(rows, entries, device.arch),
-                dim=self._world_count * rows,
+                _get_colored_payload_pack_kernel(rows, entries, device.arch, units),
+                dim=self._world_count * units,
                 inputs=[
                     self._color_world_offsets,
                     self._propagation_constraint_count,
@@ -19978,7 +20032,7 @@ PROPAGATION_UNIT_FRICTION_SETUP = 5
 
 @cache
 def _get_colored_friction_setup_kernel(
-    propagation_max_constraints: int, n_color_entries: int, device_arch: str
+    propagation_max_constraints: int, n_color_entries: int, device_arch: str, unit_max: int = 0
 ) -> "wp.Kernel":
     """Build the kernel computing every colored unit's friction-pair setup once per step.
 
@@ -19989,13 +20043,14 @@ def _get_colored_friction_setup_kernel(
     """
     _ = device_arch
     M = propagation_max_constraints
+    U = int(unit_max) or M  # per-world stride of the unit records; the rows keep M
     NE = n_color_entries
     MR = int(PROPAGATION_UNIT_META)
     FS = int(PROPAGATION_UNIT_FRICTION_SETUP)
     snippet = f"""
 #if defined(__CUDA_ARCH__)
-    const int world = tid / {M};
-    const int pos = tid - world * {M};
+    const int world = tid / {U};
+    const int pos = tid - world * {U};
     if (pos >= world_color_offsets.data[world * {NE} + {NE - 1}]) return;
     int m = propagation_constraint_count.data[world];
     if (m > {M}) m = {M};
@@ -20070,7 +20125,7 @@ def _get_colored_friction_setup_kernel(
             unit_friction_setup,
         )
 
-    name = f"colored_friction_setup_{M}_{NE}"
+    name = f"colored_friction_setup_{M}_u{U}_{NE}"
     colored_friction_setup_template.__name__ = name
     colored_friction_setup_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(
@@ -20084,7 +20139,7 @@ PROPAGATION_UNIT_PAYLOAD = 96
 
 @cache
 def _get_colored_payload_pack_kernel(
-    propagation_max_constraints: int, n_color_entries: int, device_arch: str
+    propagation_max_constraints: int, n_color_entries: int, device_arch: str, unit_max: int = 0
 ) -> "wp.Kernel":
     """Build the kernel packing every colored unit's static row payload once per step.
 
@@ -20096,13 +20151,14 @@ def _get_colored_payload_pack_kernel(
     """
     _ = device_arch
     M = propagation_max_constraints
+    U = int(unit_max) or M  # per-world stride of the unit records; the rows keep M
     NE = n_color_entries
     MR = int(PROPAGATION_UNIT_META)
     PW = int(PROPAGATION_UNIT_PAYLOAD)
     snippet = f"""
 #if defined(__CUDA_ARCH__)
-    const int world = tid / {M};
-    const int pos = tid - world * {M};
+    const int world = tid / {U};
+    const int pos = tid - world * {U};
     if (pos >= world_color_offsets.data[world * {NE} + {NE - 1}]) return;
     int m = propagation_constraint_count.data[world];
     if (m > {M}) m = {M};
@@ -20190,7 +20246,7 @@ def _get_colored_payload_pack_kernel(
             unit_payload,
         )
 
-    name = f"colored_payload_pack_{M}_{NE}"
+    name = f"colored_payload_pack_{M}_u{U}_{NE}"
     colored_payload_pack_template.__name__ = name
     colored_payload_pack_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(
@@ -20957,7 +21013,7 @@ def _colored_prefetch_unit_body(
                 {{
                     const int slot = start_slot + {r};
                     const int off = world_base + ((slot < m) ? slot : start_slot);
-                    const float4* pr = reinterpret_cast<const float4*>(&propagation_unit_payload.data[(size_t)(world_base + w) * {PROPAGATION_UNIT_PAYLOAD} + {r * 32}]);
+                    const float4* pr = reinterpret_cast<const float4*>(&propagation_unit_payload.data[(size_t)(unit_base + w) * {PROPAGATION_UNIT_PAYLOAD} + {r * 32}]);
                     float4 v[8];
                     #pragma unroll
                     for (int k = 0; k < 8; ++k) v[k] = __ldg(&pr[k]);
@@ -21126,7 +21182,7 @@ def _colored_prefetch_unit_body(
                 float u_fp[{PROPAGATION_UNIT_FRICTION_SETUP}];
                 #pragma unroll
                 for (int q = 0; q < {PROPAGATION_UNIT_FRICTION_SETUP}; ++q)
-                    u_fp[q] = __ldg(&propagation_unit_friction_setup.data[(world_base + w) * {PROPAGATION_UNIT_FRICTION_SETUP} + q]);
+                    u_fp[q] = __ldg(&propagation_unit_friction_setup.data[(unit_base + w) * {PROPAGATION_UNIT_FRICTION_SETUP} + q]);
                 float u_ring_imp[{PROPAGATION_UNIT_RING}];
                 #pragma unroll
                 for (int q = 0; q < {PROPAGATION_UNIT_RING}; ++q)
@@ -21191,6 +21247,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     contact_torsion: bool = False,
     free_rigid_angular: bool = False,
     block_threads: int = 0,
+    unit_max: int = 0,
 ) -> "wp.Kernel":
     """Build the warp-per-world colored sweep, one lane per contact unit.
 
@@ -21216,6 +21273,8 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     if contact_compliance and friction_mode != "fixed_normal":
         raise ValueError(f"contact_compliance requires friction_mode='fixed_normal', got {friction_mode!r}")
     M = propagation_max_constraints
+    # Per-world stride of the unit records (see SolverSteel._propagation_unit_max); the rows keep M.
+    U = int(unit_max) or M
     NE = n_color_entries
     MB = max(int(max_propagation_bodies), 1)
     # The torsion and angular rows follow the unit's last solved row, so the row loops keep their row index.
@@ -21536,7 +21595,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
             for (int q = lane; q < n_st * {PW // 4}; q += 32) {{{{
                 const int u = q / {PW // 4};
                 const int k = q - u * {PW // 4};
-                cp_async16(buf + u * {PL * 4}u + k * 16u, &propagation_unit_payload.data[(size_t)(world_base + {seg0} + u) * {PW} + k * 4]);
+                cp_async16(buf + u * {PL * 4}u + k * 16u, &propagation_unit_payload.data[(size_t)(unit_base + {seg0} + u) * {PW} + k * 4]);
             }}}}
             for (int q = lane; q < n_st * 6; q += 32) {{{{
                 const int u = q / 6;
@@ -21557,7 +21616,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
             for (int q = lane; q < n_st * {MC}; q += 32) {{{{
                 const int u = q / {MC};
                 const int k = q - u * {MC};
-                cp_async16(buf + (u * {MR} + k * 4) * 4u, &propagation_unit_meta.data[(size_t)(world_base + {seg0} + u) * {MR} + k * 4]);
+                cp_async16(buf + (u * {MR} + k * 4) * 4u, &propagation_unit_meta.data[(size_t)(unit_base + {seg0} + u) * {MR} + k * 4]);
             }}}}
         }}}}"""
 
@@ -21597,7 +21656,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
         unit_head = f"""                int um[{MR}];
                 #pragma unroll
                 for (int e = 0; e < {MR}; ++e)
-                    um[e] = (w == seg_start + lane) ? cm[e] : __ldg(&propagation_unit_meta.data[(world_base + w) * {MR} + e]);
+                    um[e] = (w == seg_start + lane) ? cm[e] : __ldg(&propagation_unit_meta.data[(unit_base + w) * {MR} + e]);
                 const int start_slot = um[0];"""
         color_loop_tail = ""
     elif _prefetch:
@@ -21608,7 +21667,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     int seg_end_next = world_color_offsets.data[off_base + 1];
     int nm[{MR}];
     #pragma unroll
-    for (int e = 0; e < {MR}; ++e) nm[e] = (lane < n_units) ? __ldg(&propagation_unit_meta.data[(world_base + lane) * {MR} + e]) : -1;
+    for (int e = 0; e < {MR}; ++e) nm[e] = (lane < n_units) ? __ldg(&propagation_unit_meta.data[(unit_base + lane) * {MR} + e]) : -1;
     for (int c = 0; c + 1 < {NE} && seg_start < n_units; ++c) {{
         const int seg_end = seg_end_next;
         seg_end_next = (c + 2 < {NE}) ? world_color_offsets.data[off_base + c + 2] : seg_end;
@@ -21617,10 +21676,10 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
         for (int e = 0; e < {MR}; ++e) cm[e] = nm[e];
         #pragma unroll
         for (int e = 0; e < {MR}; ++e)
-            nm[e] = (seg_end + lane < n_units) ? __ldg(&propagation_unit_meta.data[(world_base + seg_end + lane) * {MR} + e]) : -1;
+            nm[e] = (seg_end + lane < n_units) ? __ldg(&propagation_unit_meta.data[(unit_base + seg_end + lane) * {MR} + e]) : -1;
         if ({int(bool(packed))} && seg_end + lane < n_units) {{
             // Warm L1 with the lane's next unit record while this color solves.
-            const char* np = reinterpret_cast<const char*>(&propagation_unit_payload.data[(size_t)(world_base + seg_end + lane) * {PROPAGATION_UNIT_PAYLOAD}]);
+            const char* np = reinterpret_cast<const char*>(&propagation_unit_payload.data[(size_t)(unit_base + seg_end + lane) * {PROPAGATION_UNIT_PAYLOAD}]);
             asm volatile("prefetch.global.L1 [%0];" :: "l"(np));
             asm volatile("prefetch.global.L1 [%0];" :: "l"(np + 128));
             asm volatile("prefetch.global.L1 [%0];" :: "l"(np + 256));
@@ -21628,14 +21687,14 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
         unit_head = f"""                int um[{MR}];
                 #pragma unroll
                 for (int e = 0; e < {MR}; ++e)
-                    um[e] = (w == seg_start + lane) ? cm[e] : __ldg(&propagation_unit_meta.data[(world_base + w) * {MR} + e]);
+                    um[e] = (w == seg_start + lane) ? cm[e] : __ldg(&propagation_unit_meta.data[(unit_base + w) * {MR} + e]);
                 const int start_slot = um[0];"""
         color_loop_tail = ""
     else:
         color_loop_head = f"""    int seg_start = 0;
     for (int c = 0; c + 1 < {NE} && seg_start < n_units; ++c) {{
         const int seg_end = world_color_offsets.data[off_base + c + 1];"""
-        unit_head = "                const int start_slot = world_row_order.data[world_base + w];"
+        unit_head = "                const int start_slot = world_row_order.data[unit_base + w];"
         color_loop_tail = ""
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -21648,6 +21707,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
     if (m > {M}) m = {M};
     if (m == 0) return;
     const int world_base = world * {M};
+    const int unit_base = world * {U};
     const int off_base = world * {NE};
     const int n_units = world_color_offsets.data[off_base + {NE} - 1];
 
@@ -21674,7 +21734,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
             }}
         }} else if (lane == 0) {{
             for (int w = seg_start; w < seg_end; ++w) {{
-                const int start_slot = world_row_order.data[world_base + w];
+                const int start_slot = world_row_order.data[unit_base + w];
 {tail_body}
             }}
         }}
@@ -21849,7 +21909,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
         )
 
     name = (
-        f"pgs_solve_propagation_colored_warp_{M}_{NE}_r{R}_w{W}_mb{MB}_pf{int(_prefetch)}_st{int(staged)}"
+        f"pgs_solve_propagation_colored_warp_{M}_u{U}_{NE}_r{R}_w{W}_mb{MB}_pf{int(_prefetch)}_st{int(staged)}"
         f"_pk{int(bool(packed or staged))}_sl{int(bool(straight_line))}{'_cc' if contact_compliance else ''}"
         f"{'_tor' if contact_torsion else ''}{'_fra' if free_rigid_angular else ''}"
         f"{f'_b{block_threads}' if block_threads else ''}"
@@ -21876,6 +21936,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     friction_mode: str = "fixed_normal",
     contact_torsion: bool = False,
     free_rigid_angular: bool = False,
+    unit_max: int = 0,
 ) -> "wp.Kernel":
     """Build the block-per-world colored sweep, one thread per contact unit.
 
@@ -21889,6 +21950,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     if contact_compliance and friction_mode != "fixed_normal":
         raise ValueError(f"contact_compliance requires friction_mode='fixed_normal', got {friction_mode!r}")
     M = propagation_max_constraints
+    U = int(unit_max) or M
     NE = n_color_entries
     B = int(block_dim)
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
@@ -22209,6 +22271,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     if (m > {M}) m = {M};
     if (m == 0) return;
     const int world_base = world * {M};
+    const int unit_base = world * {U};
     const int t = threadIdx.x;
     const int off_base = world * {NE};
     const int n_units = world_color_offsets.data[off_base + {NE} - 1];
@@ -22219,13 +22282,13 @@ def _get_pgs_solve_propagation_colored_block_kernel(
         if (c + 2 < {NE}) {{
             // The units of one color share no body.
             for (int w = seg_start + t; w < seg_end; w += {B}) {{
-                const int start_slot = world_row_order.data[world_base + w];
+                const int start_slot = world_row_order.data[unit_base + w];
 {body}
             }}
         }} else if (t == 0) {{
             // Units past the color cap run in order.
             for (int w = seg_start; w < seg_end; ++w) {{
-                const int start_slot = world_row_order.data[world_base + w];
+                const int start_slot = world_row_order.data[unit_base + w];
 {body}
             }}
         }}
@@ -22346,7 +22409,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
 
     stag = "sb" if use_staging else "gb"
     name = (
-        f"pgs_solve_propagation_colored_units_{M}_{NE}_bd{B}_{stag}{MB}{'_cc' if contact_compliance else ''}"
+        f"pgs_solve_propagation_colored_units_{M}_u{U}_{NE}_bd{B}_{stag}{MB}{'_cc' if contact_compliance else ''}"
         f"{'_tor' if contact_torsion else ''}{'_fra' if free_rigid_angular else ''}"
         f"{'' if friction_mode == 'fixed_normal' else '_' + friction_mode}"
     )

@@ -10106,6 +10106,8 @@ def collect_propagation_units_ordered(
     world = key // CONTACT_ROW_FAMILIES
     idx = i - segment_start[key]
     if idx >= propagation_max_constraints:
+        # Past the world's unit capacity: the cursor records the count, so the step is flagged.
+        wp.atomic_max(world_unit_cursor, world, idx + 1)
         return
     base = world * propagation_max_constraints
     body_a = -1
@@ -10173,6 +10175,7 @@ def fold_prescribed_propagation_sides(
 @wp.kernel(enable_backward=False)
 def gather_propagation_unit_meta(
     propagation_max_constraints: int,
+    unit_max: int,
     n_color_entries: int,
     world_color_offsets: wp.array[int],
     world_row_order: wp.array[int],
@@ -10196,8 +10199,10 @@ def gather_propagation_unit_meta(
     row loop) and the rest of the ring in ``ring_overflow`` (offset | count << 20, or -1).
     """
     tid = wp.tid()
-    world = tid // propagation_max_constraints
-    pos = tid - world * propagation_max_constraints
+    # The unit records have unit_max entries per world; the rows (and the ring overflow list) have
+    # propagation_max_constraints.
+    world = tid // unit_max
+    pos = tid - world * unit_max
     if pos >= world_color_offsets[world * n_color_entries + n_color_entries - 1]:
         return
     slot = world_row_order[tid]

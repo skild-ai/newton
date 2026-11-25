@@ -87,6 +87,7 @@ def make_solver(
     iterations,
     *,
     contact_rows=32,
+    contacts=None,
     parallel_tree=False,
     enable_joint_limits=False,
     coupled_contact_passes=0,
@@ -112,6 +113,8 @@ def make_solver(
             articulated_contact_response="propagation" if propagation else "immediate",
             propagation_same_articulation_rows=propagation,
             propagation_constraint_max=contact_rows if propagation else None,
+            # The colored sweep keeps one unit per contact (and per clamp closure) instead of one per row.
+            propagation_contact_max=contacts if propagation else None,
             articulation_constraint_max=dense_rows,
             row_watermark=True,
             # Each step publishes its body state through the solver's own kinematics and the next step starts from

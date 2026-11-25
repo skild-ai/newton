@@ -180,6 +180,7 @@ class Example:
         self.solver = cable_solver.make_solver(
             self.model,
             args,
+            contacts=self.contacts_per_world,
             contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies),
             iterations=self.sim_iterations,
             rigid_contact_history=True,

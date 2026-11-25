@@ -178,6 +178,7 @@ class Example:
             self.model,
             args,
             # Three rows (normal and two tangents) per contact of the world's budget.
+            contacts=self.contacts_per_world,
             contact_rows=3 * self.contacts_per_world,
             iterations=self.sim_iterations,
             rigid_body_contact_buffer_size=256,

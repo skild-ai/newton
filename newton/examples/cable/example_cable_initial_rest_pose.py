@@ -143,7 +143,11 @@ class Example:
         )
         self.contacts = self.collision_pipeline.contacts()
         self.solver = cable_solver.make_solver(
-            self.model, args, self.sim_iterations, contact_rows=3 * self.contacts_per_world
+            self.model,
+            args,
+            self.sim_iterations,
+            contacts=self.contacts_per_world,
+            contact_rows=3 * self.contacts_per_world,
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

@@ -1084,5 +1084,45 @@ add_function_test(
 )
 
 
+def test_propagation_contact_max_sizes_the_colored_units(test, device):
+    """Size the colored sweep's units per contact: ample capacity solves the same step, too little is reported."""
+    model = _box_on_ground(device)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in = model.state()
+    pipeline.collide(state_in, contacts)
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    test.assertGreater(count, 1)
+    options = {"solve_mode": "colored", "articulated_contact_response": "propagation", "propagation_constraint_max": 64}
+    with test.assertRaisesRegex(ValueError, "propagation_contact_max must be >= 1"):
+        SolverSteel(model, propagation_contact_max=0, **options)
+    with test.assertRaisesRegex(ValueError, "propagation_contact_max requires"):
+        SolverSteel(model, propagation_contact_max=8)
+
+    def step(**extra):
+        solver = SolverSteel(model, warn_constraint_overflow=False, **options, **extra)
+        state_out = model.state()
+        solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
+        return solver, state_out.body_qd.numpy()
+
+    default, default_qd = step()
+    test.assertEqual(default._propagation_unit_max, 64)
+    default.check_constraint_capacity()
+    sized, sized_qd = step(propagation_contact_max=count)
+    test.assertEqual(sized._propagation_unit_max, count)
+    sized.check_constraint_capacity()
+    np.testing.assert_allclose(sized_qd, default_qd, atol=1e-6)
+    short, _ = step(propagation_contact_max=count - 1)
+    with test.assertRaisesRegex(RuntimeError, "dropped"):
+        short.check_constraint_capacity()
+
+
+add_function_test(
+    TestSteelRowAllocation,
+    "test_propagation_contact_max_sizes_the_colored_units",
+    test_propagation_contact_max_sizes_the_colored_units,
+    devices=get_cuda_test_devices(),
+)
+
 if __name__ == "__main__":
     unittest.main()
