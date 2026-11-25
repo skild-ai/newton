@@ -32,6 +32,7 @@ from typing import Any
 import warp as wp
 
 from .kernels import WARP_DETERMINISM_OFF
+from .momentum import SplitSweep, split_momentum
 
 # Tree groups one fused kernel can carry, one warp each.
 MAX_TREE_SLOTS = 4
@@ -288,6 +289,7 @@ def get_fused_iteration_kernel(
     tree_natives: tuple[tuple[Any, Any, bool], ...],
     has_phase3: bool,
     has_phase5: bool,
+    nesterov_momentum: bool = False,
 ) -> wp.Kernel:
     """Build the fused loop kernel for one solver configuration.
 
@@ -333,6 +335,7 @@ def get_fused_iteration_kernel(
         cache_max_bodies: int,
         colored: ColoredArgs,
         rows: RowArgs,
+        momentum: wp.array[SplitSweep],
         cache: wp.array[CacheArgs],
         tree: wp.array[TreeArgs],
         slots: wp.array[TreeSlot],
@@ -349,6 +352,10 @@ def get_fused_iteration_kernel(
         lane = t - warp_id * 32
         for i in range(iterations):
             g = iteration_offset + i
+            if wp.static(nesterov_momentum):
+                if warp_id == 0:
+                    split_momentum(world, lane, i, g == friction_start_iteration, momentum[0])
+                _block_sync()
             # row phases 3 (internal rows) and 4 (dense and free-body contacts)
             if warp_id == 0:
                 if wp.static(has_phase3):

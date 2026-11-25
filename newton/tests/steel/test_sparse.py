@@ -2251,11 +2251,20 @@ def _step(case):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Sparse integrated solve requires CUDA")
 class TestSteelSparseSolver(unittest.TestCase):
-    def test_nesterov_momentum_bypasses_the_sparse_factor(self):
-        """Solve on the general sweep, which alone carries Nesterov momentum."""
-        model = _build_model()
-        self.assertEqual(_make_solver(model, True)._sparse_mass_matrix_size, 9)
-        self.assertIsNone(_make_solver(model, True, nesterov_momentum=True)._sparse_mass_matrix_size)
+    def test_nesterov_momentum_uses_sparse_factors(self):
+        """Keep the sparse owner and change its finite-budget solution only after extrapolation starts."""
+
+        def solve(iterations, momentum):
+            case = _case(True, free_count=1, boxes=True, iterations=iterations, nesterov_momentum=momentum)
+            self.assertEqual(case[1]._sparse_mass_matrix_size, 9)
+            _step(case)
+            return case[1]._impulses.numpy(), case[2].joint_qd.numpy()
+
+        for off, on in zip(solve(2, False), solve(2, True), strict=True):
+            np.testing.assert_array_equal(off, on)
+        for off, on in zip(solve(8, False), solve(8, True), strict=True):
+            self.assertTrue(np.all(np.isfinite(on)))
+            self.assertGreater(np.max(np.abs(off - on)), 1e-7)
 
     def test_heterogeneous_worlds_do_not_invent_joint_support(self):
         """Admit a robot-only world and a separate free-only world without oversized row support."""
@@ -2982,6 +2991,7 @@ class TestSteelLocalInternalSolve(unittest.TestCase):
             persistent_queue: bool = False,
             active_count: int = 2,
             dense_response_matrix: bool = False,
+            momentum: bool = False,
         ):
             variant_diagonal = wp.array(cfm, dtype=wp.float32, device=device)
             variant_impulses = wp.zeros((2, max_constraints), dtype=wp.float32, device=device)
@@ -2996,6 +3006,7 @@ class TestSteelLocalInternalSolve(unittest.TestCase):
                 lanes_per_world=lanes_per_world,
                 contact_capable=contact_capable,
                 dense_response_matrix=dense_response_matrix,
+                nesterov_momentum=momentum,
             )
             inputs = [candidate_articulations, candidate_articulations]
             if persistent_queue:
@@ -3066,6 +3077,19 @@ class TestSteelLocalInternalSolve(unittest.TestCase):
         for variant_outputs in numerical_variants + matrix_variants:
             for one_warp, variant in zip(one_warp_outputs, variant_outputs, strict=True):
                 np.testing.assert_allclose(variant, one_warp, rtol=0.0, atol=2.0e-6)
+
+        # Independent row-space response and velocity-space owners must extrapolate
+        # the same iterate, including when a warp is split between two solve worlds.
+        direct = launch_variant(1, contact_capable=False, momentum=True)
+        subwarp = launch_variant(
+            1, contact_capable=False, lanes_per_world=16, dense_response_matrix=True, momentum=True
+        )
+        for actual, expected in zip(subwarp, direct, strict=True):
+            np.testing.assert_allclose(actual, expected, rtol=0.0, atol=2.0e-6)
+        self.assertGreater(np.max(np.abs(direct[1] - one_warp_outputs[1])), 1.0e-7)
+        np.testing.assert_allclose(
+            direct[2][:dof_count] - velocity[:dof_count], direct[1][0, :2] @ response, rtol=0.0, atol=2.0e-6
+        )
 
         one_warp_queue = launch_variant(1, persistent_queue=True, active_count=1)
         two_warp_queue = launch_variant(2, persistent_queue=True, active_count=1)

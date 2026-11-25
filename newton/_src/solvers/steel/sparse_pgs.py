@@ -15,6 +15,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     WARP_DETERMINISM_OFF,
 )
+from .momentum import SweepField, warp_momentum
 
 wp.set_module_options(WARP_DETERMINISM_OFF)
 
@@ -27,6 +28,7 @@ def _get_pgs_solve_sparse_kernel(
     *,
     free_body_constraint_max: int = 0,
     free_row_dofs: int = 0,
+    nesterov_momentum: bool = False,
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -193,6 +195,22 @@ def _get_pgs_solve_sparse_kernel(
         mf_writeback = """
     for (int i = lane; i < mf_count; i += 32) mf_impulses.data[mf_offset + i] = mf_impulse[i];
 """
+    fields = [SweepField("impulse[i]", "count", M, True), SweepField("delta[i]", str(D), D)]
+    restart = "false"
+    if F:
+        fields.append(SweepField("mf_impulse[i]", "mf_count", F, True))
+        # A stateless velocity clamp is outside the accumulated row impulses. Restart
+        # after an active clamp so its physical velocity correction is never extrapolated.
+        restart = "__any_sync(MASK, clamped)"
+    mom_history, mom_step = warp_momentum(nesterov_momentum, fields, restart=restart)
+    if nesterov_momentum and F:
+        mom_history += "\nbool clamped = false;"
+        mom_step += "\nclamped = false;"
+        mf_sweep = mf_sweep.replace(
+            "if (change != 0.0f || sibling_change != 0.0f)",
+            f"if (kind == {velocity_limit_type} && change != 0.0f) clamped = true;\n"
+            "            if (change != 0.0f || sibling_change != 0.0f)",
+        )
     snippet = (
         "#if defined(__CUDA_ARCH__)\n"
         + FRICTION_PAIR_CUDA
@@ -225,7 +243,9 @@ def _get_pgs_solve_sparse_kernel(
 {mf_initialize}
     __syncwarp(MASK);
 
+{mom_history}
     for (int iteration = 0; iteration < iterations; ++iteration) {{
+{mom_step}
         int changed = 0;
         for (int row = 0; row < count; ++row) {{
             const int row_type = static_cast<int>(type[row]);

@@ -4029,6 +4029,42 @@ class TestSteelLatencyFused(unittest.TestCase):
         """Match the per-pass launches with trees (a limited arm, a ball chain) and free boxes in every block role."""
         self._check_fused_matches(_build_latency_scene("cuda:0"), iterations=8, enable_joint_limits=True)
 
+    def test_fused_momentum_matches_per_pass_launches(self):
+        """Apply the same momentum to the colored solve inside and outside the fused loop."""
+        model = _build_latency_scene("cuda:0")
+        self._check_fused_matches(model, iterations=8, enable_joint_limits=True, nesterov_momentum=True)
+
+        # A fused/per-pass comparison alone would also pass if both dropped the update.
+        # Reuse one fixed collision manifold with deterministic row ordering.
+        state = model.state()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True, reduce_contacts=False)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+
+        def solve(iterations, momentum):
+            solver = SolverSteel(
+                model,
+                **steel_mode_options("colored"),
+                enable_joint_limits=True,
+                articulation_constraint_max=96,
+                free_body_constraint_max=32,
+                iterations=iterations,
+                nesterov_momentum=momentum,
+                deterministic=wp.DeterministicMode.RUN_TO_RUN,
+            )
+            self.assertTrue(solver._latency_fused)
+            start, result = model.state(), model.state()
+            start.assign(state)
+            solver.step(start, result, model.control(), contacts, 1.0 / 240.0)
+            return solver._propagation_impulses.numpy(), result.joint_qd.numpy()
+
+        for off, on in zip(solve(2, False), solve(2, True), strict=True):
+            np.testing.assert_array_equal(off, on)
+        for off, on in zip(solve(8, False), solve(8, True), strict=True):
+            self.assertTrue(np.isfinite(on).all())
+            self.assertGreater(np.max(np.abs(on - off)), 1.0e-6)
+
     def test_fused_loop_with_level_trees_matches(self):
         """Match the per-pass launches when hand trees take the level-walk refresh inside the fused loop."""
         scene = newton.ModelBuilder()

@@ -1188,8 +1188,8 @@ class TestSteelSolveModeOptions(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "articulated_contact_response must be 'immediate' or 'propagation'"):
             SolverSteel(model, articulated_contact_response="colored")
 
-    def test_nesterov_momentum_is_an_opt_in_serial_immediate_option(self):
-        """Offer nesterov_momentum off by default, read-only, and only with the serial immediate interleaved sweep."""
+    def test_nesterov_momentum_is_a_construction_option(self):
+        """Keep Nesterov momentum opt-in and read-only after construction."""
         parameter = inspect.signature(SolverSteel.__init__).parameters["nesterov_momentum"]
         self.assertIs(parameter.default, False)
         self.assertIsInstance(SolverSteel.nesterov_momentum, _ConstructionOption)
@@ -1198,13 +1198,6 @@ class TestSteelSolveModeOptions(unittest.TestCase):
         self.assertFalse(solver.nesterov_momentum)
         with self.assertRaises(AttributeError):
             solver.nesterov_momentum = True
-        for options in (
-            {"articulated_contact_response": "propagation"},
-            {"row_schedule": "contact_then_internal"},
-            {"row_schedule": "phased"},
-        ):
-            with self.subTest(**options), self.assertRaisesRegex(ValueError, "nesterov_momentum requires"):
-                SolverSteel(model, nesterov_momentum=True, **options)
 
     def test_colored_sleeping_requires_cuda(self):
         """On CPU the colored mode runs the serial propagation sweep, so sleeping with it names CUDA, not the mode."""
