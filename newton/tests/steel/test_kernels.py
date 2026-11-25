@@ -1589,6 +1589,7 @@ def test_split_kinematics_match_the_fused_fk_id_kernel(test, device):
     for materialize_inertia, materialize_terms in ((1, 1), (0, 0), (1, 0)):
         with test.subTest(inertia=materialize_inertia, terms=materialize_terms):
             fused, split = fresh(), fresh()
+            materialize_all = wp.array([materialize_inertia], dtype=wp.int32, device=device)
             common = [
                 model.articulation_start,
                 solver._articulation_joint_end,
@@ -1614,7 +1615,7 @@ def test_split_kinematics_match_the_fused_fk_id_kernel(test, device):
                     model.body_mass,
                     model.body_inertia,
                     solver._is_free_rigid,
-                    materialize_inertia,
+                    materialize_all,
                     materialize_terms,
                     model.body_world,
                     model.gravity,
@@ -1680,7 +1681,7 @@ def test_split_kinematics_match_the_fused_fk_id_kernel(test, device):
                     model.body_inertia,
                     solver._is_free_rigid,
                     split["origin"],
-                    materialize_inertia,
+                    materialize_all,
                     materialize_terms,
                     model.body_world,
                     model.gravity,

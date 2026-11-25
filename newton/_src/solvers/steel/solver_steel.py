@@ -102,6 +102,7 @@ from .kernels import (
     accumulate_row_watermarks,
     accumulate_sparse_diagonal_response_diag,
     accumulate_torsion_wrenches_from_impulses,
+    advance_mass_refresh_step,
     advance_world_contact_counters,
     allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
@@ -239,6 +240,7 @@ from .kernels import (
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
     warp_momentum,
+    zero_on_global_mass_refresh,
     zero_unattached_parent_wrenches,
 )
 from .sleeping import _publish_body_awake, _SleepState
@@ -290,6 +292,8 @@ _JOINT_FRICTION_TYPES = (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(
 _SPARSE_FACTOR_WARPS_PER_BLOCK = 4
 # Warps (articulations) per block of the warp-parallel composite-inertia reduction.
 _COMPOSITE_INERTIA_WARPS_PER_BLOCK = 4
+_MASS_REFRESH_ZERO_THREADS = 1 << 18
+"""Threads of the device-predicated mass-matrix clear; each zeroes a strided slice of the buffer."""
 # Warps (articulations) per block of the fused small mass-matrix assembly and factorization.
 _CRBA_CHOLESKY_WARPS_PER_BLOCK = 4
 # Largest DOF count of the fused tiled mass-matrix assembly and factorization.
@@ -2158,9 +2162,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 calls to :meth:`step`; ``1`` rebuilds it every step. Larger values reuse a
                 stale factorization between rebuilds. A change of ``dt`` beyond a relative
                 tolerance of ``1e-6``, :meth:`reset` and :meth:`notify_model_changed` request a
-                refresh of the affected articulations. Under CUDA graph capture the host-side
-                cadence is baked into the graph, so the interval should divide the
-                number of steps captured per graph. The timestep associated with each factor
+                refresh of the affected articulations. The cadence is counted on the device, so a
+                captured CUDA graph keeps it on every replay, whatever step it was captured at
+                and however many steps it holds. The timestep associated with each factor
                 is checked on the device, so replaying a graph after a step or graph with a
                 different timestep refreshes the factor even between scheduled rebuilds.
             enable_joint_limits: Enforce :attr:`~newton.Model.joint_limit_lower` and
@@ -3076,7 +3080,13 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._small_dof_threshold = _SMALL_DOF_THRESHOLD_DEFAULT
 
         self._step = 0
-        self._force_mass_update = False
+        # The global mass-refresh flag of the current step lives on the device so that a captured step reads it
+        # on every replay; with an interval above one a device counter advances it, otherwise it stays set.
+        self._mass_refresh_flag = wp.ones(1, dtype=wp.int32, device=model.device)
+        self._mass_refresh_step = wp.zeros(1, dtype=wp.int32, device=model.device)
+        self._mass_refresh_always = wp.ones(1, dtype=wp.int32, device=model.device)
+        self._mass_matrix_flat_views: dict[int, wp.array] = {}
+        self._mass_matrices_written = False
         self._coupling_patch_history_snapshot_pending = False
         self._coupling_patch_history_restore_pending = False
         self._coupling_iteration_restarts = True
@@ -3899,10 +3909,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         articulation exists. Any reset, whatever its mask, also clears the solver-wide contact
         torsion input error; it clears the disabled-tree-joint and invalid-joint-friction status of the
         selected worlds. The reset is launched on the device without host synchronization and can be
-        captured in a CUDA graph. A full reset (``world_mask=None``) also restarts the host-side step
-        cadence (mass-matrix refresh interval, ``dt`` change detection, double-buffer schedule and
-        warm-start history) for subsequent eager :meth:`step` calls; CUDA graphs captured before the
-        reset keep the cadence captured into them.
+        captured in a CUDA graph. A full reset (``world_mask=None``) also restarts the mass-matrix
+        refresh cadence, which is counted on the device, and the host-side ``dt`` change detection,
+        double-buffer schedule and warm-start history for subsequent eager :meth:`step` calls; CUDA
+        graphs captured before the reset keep the host-side values captured into them.
 
         Args:
             state: Simulation state; left unchanged. With ``enable_sleeping``, a masked reset
@@ -3922,8 +3932,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._coupling_patch_history_snapshot_pending = False
         self._coupling_patch_history_restore_pending = False
         if world_mask is None:
-            # Restart the host-side cadence; graphs captured earlier keep the values baked into them.
+            # Restart the cadence; graphs captured earlier keep the host-side values baked into them.
             self._step = 0
+            self._mass_refresh_step.zero_()
             self._buffer_index = 0
             self._ws_history_dt.zero_()
             self._ws_history_generation.fill_(CONTACT_GENERATION_NONE)
@@ -8086,7 +8097,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         """Make the current buffer set active; the step that cleared it joined the clearing before returning."""
         self._double_buffer_selected = True
         # Set by the mass-matrix stage; a step that raises before it wrote no mass matrices.
-        self._mass_update_global_flag = 0
+        self._mass_matrices_written = False
         index = self._buffer_index
         self._H_by_size = self._H_bufs[index]
         self._J_by_size = self._J_bufs[index]
@@ -8101,8 +8112,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         with wp.ScopedStream(self._memset_stream, sync_enter=True, sync_exit=True):
             for size in self._size_groups:
                 # A step without a global mass refresh wrote no mass matrices.
-                if self._mass_update_global_flag:
-                    self._H_bufs[index][size].zero_()
+                if self._mass_matrices_written:
+                    self._zero_on_global_mass_refresh(self._H_bufs[index][size])
                 self._J_bufs[index][size].zero_()
         self._buffer_index = 1 - index
 
@@ -9143,7 +9154,15 @@ class SolverSteel(SolverBase, CouplingInterface):
         else:
             stage3_qd = state_in.joint_qd
 
-        refresh_composite = (self._step % self._update_mass_matrix_interval) == 0 or self._force_mass_update
+        if self._update_mass_matrix_interval > 1:
+            # Decide the global refresh on the device: a host decision would be frozen into a captured step.
+            wp.launch(
+                advance_mass_refresh_step,
+                dim=1,
+                inputs=[self._update_mass_matrix_interval],
+                outputs=[self._mass_refresh_step, self._mass_refresh_flag],
+                device=model.device,
+            )
         fk_inputs = [
             model.articulation_start,
             self._articulation_joint_end,
@@ -9163,7 +9182,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             model.body_mass,
             model.body_inertia,
             self._is_free_rigid,
-            int(refresh_composite),
+            self._mass_refresh_flag,
             0,
             model.body_world,
             model.gravity,
@@ -9247,7 +9266,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     model.body_inertia,
                     self._is_free_rigid,
                     self._articulation_origin,
-                    int(refresh_composite),
+                    self._mass_refresh_flag,
                     0,
                     model.body_world,
                     model.gravity,
@@ -9436,16 +9455,18 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _stage1_crba(self, state_aug: State, dt: float):
         """Build the joint-space mass matrix of articulations due for a refresh and add drive terms."""
         model = self.model
-        global_flag = 1 if ((self._step % self._update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
-        self._mass_update_global_flag = global_flag
+        # Every step of interval 1 is a global refresh; otherwise the device flag decides, and the launches that
+        # depend on it run on every step and return early on the device.
+        every_step = self._update_mass_matrix_interval == 1
+        self._mass_matrices_written = True
         wp.launch(
             build_mass_update_mask,
             dim=model.articulation_count,
-            inputs=[global_flag, dt, self._mass_update_requested, self._dynamics_art_active],
+            inputs=[self._mass_refresh_flag, dt, self._mass_update_requested, self._dynamics_art_active],
             outputs=[self._mass_update_mask, self._mass_factor_dt],
             device=model.device,
         )
-        if not global_flag:
+        if not every_step:
             # Articulations refreshed between global rebuilds (reset or notifications)
             # need fresh body inertias.
             wp.launch(
@@ -9462,11 +9483,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                     model.body_mass,
                     model.body_inertia,
                     0,
+                    self._mass_refresh_flag,
                 ],
                 outputs=[state_aug._body_I_s, self._body_inertia_terms],
                 device=model.device,
             )
-        if global_flag and self._composite_inertia_warp_kernel is not None:
+        if self._composite_inertia_warp_kernel is not None:
             # A global refresh reduces every articulation that reads composite inertias,
             # one warp per articulation.
             wp.launch_tiled(
@@ -9484,12 +9506,17 @@ class SolverSteel(SolverBase, CouplingInterface):
                     model.joint_child,
                     state_aug._body_I_s,
                     self._dynamics_art_active,
+                    self._mass_refresh_flag,
                 ],
                 outputs=[self._body_I_c],
                 block_dim=32 * _COMPOSITE_INERTIA_WARPS_PER_BLOCK,
                 device=model.device,
             )
-        elif not global_flag or self._composite_articulation_count:
+        if not every_step or (self._composite_inertia_warp_kernel is None and self._composite_articulation_count):
+            # A global refresh reduces here only without the warp kernel and when an articulation reads composites.
+            skip_global_refresh = (
+                self._composite_inertia_warp_kernel is not None or not self._composite_articulation_count
+            )
             wp.launch(
                 compute_composite_inertia,
                 dim=model.articulation_count,
@@ -9500,6 +9527,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     model.joint_ancestor,
                     model.joint_child,
                     state_aug._body_I_s,
+                    self._mass_refresh_flag,
+                    int(skip_global_refresh),
                 ],
                 outputs=[self._body_I_c],
                 device=model.device,
@@ -9515,8 +9544,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 continue
             if self._launch_fused_crba_cholesky(state_aug, size):
                 continue
-            if global_flag and not self._double_buffered:
-                self._H_by_size[size].zero_()
+            if not self._double_buffered:
+                self._zero_on_global_mass_refresh(self._H_by_size[size])
             wp.launch(
                 crba_fill_par_dof,
                 dim=int(n_arts * size),
@@ -9554,7 +9583,25 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
             )
         self._mass_update_requested.zero_()
-        self._force_mass_update = False
+
+    def _zero_on_global_mass_refresh(self, values: wp.array) -> None:
+        """Zero a mass-matrix buffer on a global refresh step, known on the host only for interval 1."""
+        if self._update_mass_matrix_interval == 1:
+            values.zero_()
+            return
+        flat = self._mass_matrix_flat_views.get(values.ptr)
+        if flat is None:
+            flat = self._mass_matrix_flat_views[values.ptr] = values.flatten()
+        if not flat.size:
+            return
+        threads = min(flat.size, _MASS_REFRESH_ZERO_THREADS)
+        wp.launch(
+            zero_on_global_mass_refresh,
+            dim=threads,
+            inputs=[self._mass_refresh_flag, threads],
+            outputs=[flat],
+            device=self.model.device,
+        )
 
     def _init_paired_response_kernels(self, model: Model) -> None:
         """Resolve the paired response, inverse-factorization and factor-coordinate solve kernels."""
@@ -11602,8 +11649,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
             if model.body_count:
                 # Materialize the body inertias at every publication: whatever makes the next step rebuild the
-                # mass matrix (its cadence, a reset request, a timestep change or a captured step's baked
-                # refresh flag) then reads inertias of its input configuration.
+                # mass matrix (its cadence, a reset request or a timestep change) then reads inertias of its
+                # input configuration.
                 wp.launch(
                     finalize_body_dynamics,
                     dim=model.body_count,
@@ -11616,7 +11663,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.body_inertia,
                         self._is_free_rigid,
                         self._articulation_origin,
-                        1,
+                        self._mass_refresh_always,
                         0,
                         model.body_world,
                         model.gravity,
@@ -13712,8 +13759,12 @@ def _get_composite_inertia_warp_kernel(device_arch: str, warps_per_block: int) -
         joint_child: wp.array[int],
         body_I_s: wp.array[wp.spatial_matrix],
         articulation_active: wp.array[int],
+        global_refresh: wp.array[int],
         body_I_c: wp.array[wp.spatial_matrix],
     ):
+        # Reuse steps keep their composite inertias; the scalar kernel reduces masked articulations.
+        if global_refresh[0] == 0:
+            return
         block, _lane = wp.tid()
         composite_inertia_warp_native(
             block,
