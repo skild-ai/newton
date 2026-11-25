@@ -2615,12 +2615,27 @@ def cholesky_loop(
 # in registers; other joints use the general block code.
 
 
+# Relative size below which an eliminated pivot of a joint block counts as a dependent
+# (massless or redundant) direction; such directions get a zero response, as the Cholesky
+# solves give an exactly zero pivot.
+_AB_PIVOT_RTOL = wp.constant(1.0e-6)
+
+
 @wp.func
 def _invert_spd_block(D: wp.spatial_matrix, k: int) -> wp.spatial_matrix:
-    """Return the inverse of the leading ``k x k`` block of a symmetric positive-definite matrix."""
+    """Return the inverse of the leading ``k x k`` block of a symmetric positive-semidefinite matrix.
+
+    A pivot that is not positive, or below ``_AB_PIVOT_RTOL`` of its original diagonal, leaves its
+    row and column zero, so a massless or redundant direction responds with zero instead of NaN.
+    """
     A = wp.spatial_matrix(D)
     inv = wp.identity(n=6, dtype=wp.float32)
     for c in range(k):
+        if A[c, c] <= _AB_PIVOT_RTOL * D[c, c] or A[c, c] <= 0.0:
+            for j in range(k):
+                A[c, j] = 0.0
+                inv[c, j] = 0.0
+            continue
         pivot = 1.0 / A[c, c]
         for j in range(k):
             A[c, j] = A[c, j] * pivot
@@ -2629,6 +2644,34 @@ def _invert_spd_block(D: wp.spatial_matrix, k: int) -> wp.spatial_matrix:
             if r != c:
                 f = A[r, c]
                 for j in range(k):
+                    A[r, j] = A[r, j] - f * A[c, j]
+                    inv[r, j] = inv[r, j] - f * inv[c, j]
+    return inv
+
+
+@wp.func
+def _invert_psd3(D: wp.mat33) -> wp.mat33:
+    """Return the inverse of a symmetric positive-semidefinite 3 x 3 block, as :func:`_invert_spd_block`.
+
+    Unlike ``wp.inverse`` it does not form the determinant, which underflows float32 for
+    well-conditioned blocks below about 1e-13 and then zeroes the whole block.
+    """
+    A = wp.mat33(D)
+    inv = wp.identity(n=3, dtype=wp.float32)
+    for c in range(3):
+        if A[c, c] <= _AB_PIVOT_RTOL * D[c, c] or A[c, c] <= 0.0:
+            for j in range(3):
+                A[c, j] = 0.0
+                inv[c, j] = 0.0
+            continue
+        pivot = 1.0 / A[c, c]
+        for j in range(3):
+            A[c, j] = A[c, j] * pivot
+            inv[c, j] = inv[c, j] * pivot
+        for r in range(3):
+            if r != c:
+                f = A[r, c]
+                for j in range(3):
                     A[r, j] = A[r, j] - f * A[c, j]
                     inv[r, j] = inv[r, j] - f * inv[c, j]
     return inv
@@ -2699,7 +2742,11 @@ def factor_articulated_body(
         if k == 1:
             S = joint_S_s[dof0 + d0]
             U = IA * S
-            dinv = 1.0 / (wp.dot(S, U) + diag_group[idx, d0])
+            D1 = wp.dot(S, U) + diag_group[idx, d0]
+            # A massless DOF without armature responds with zero, like a zero Cholesky pivot.
+            dinv = float(0.0)
+            if D1 > 0.0:
+                dinv = 1.0 / D1
             S_group[idx, d0] = S
             U_group[idx, d0] = U
             Dinv_group[idx, d0, 0] = dinv
@@ -2729,7 +2776,7 @@ def factor_articulated_body(
                 d12,
                 wp.dot(S2, U2) + diag_group[idx, d0 + 2],
             )
-            Di = wp.inverse(D)
+            Di = _invert_psd3(D)
             S_group[idx, d0] = S0
             S_group[idx, d0 + 1] = S1
             S_group[idx, d0 + 2] = S2
