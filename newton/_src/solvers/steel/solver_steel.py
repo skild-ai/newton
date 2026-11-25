@@ -12365,11 +12365,14 @@ class SolverSteel(SolverBase, CouplingInterface):
             arts = max(model.articulation_count, 1)
             self._propagation_body_activity = wp.zeros((bodies,), dtype=wp.float32, device=device)
             self._propagation_articulation_activity = wp.zeros((arts,), dtype=wp.float32, device=device)
-            self._split_free_rigid = (
-                self._is_free_rigid
-                if self._is_free_rigid is not None
-                else wp.zeros((arts,), dtype=wp.int32, device=device)
-            )
+            # The rod articulations, which weigh their links (a free body or an arm keeps even shares).
+            rod_art = np.zeros(arts, dtype=np.int32)
+            joint_art = model.joint_articulation.numpy()
+            rod_joint = (model.joint_type.numpy() == int(JointType.ROD)) & (joint_art >= 0)
+            rod_art[joint_art[rod_joint]] = 1
+            if self._is_free_rigid is not None:
+                rod_art[self._is_free_rigid.numpy()[: len(rod_art)] != 0] = 0
+            self._split_weighted_articulation = wp.array(rod_art, dtype=wp.int32, device=device)
         # Momentum of the sweeps: the previous sweep's impulses, a sweep's starting impulses, the move to install,
         # and each world's Nesterov sequence.
         momentum = self._propagation_momentum_option
@@ -13385,7 +13388,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_body_activity,
                     self._body_to_articulation,
                     self._propagation_articulation_activity,
-                    self._split_free_rigid,
+                    self._split_weighted_articulation,
                     _SPLIT_WEIGHT_LEVELS,
                 ],
                 outputs=[self._propagation_body_split_weight],
@@ -13654,6 +13657,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_body_response,
                     self._propagation_body_response_split,
                     self._propagation_joint_split,
+                    self._propagation_body_split_weight,
                     self._propagation_constraint_count,
                     self._propagation_body_a,
                     self._propagation_body_b,

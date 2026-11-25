@@ -650,11 +650,11 @@ def test_propagation_weighted_split_weights(test, device):
         outputs=[art_activity],
         device=device,
     )
-    no_free = wp.zeros(1, dtype=wp.int32, device=device)
+    rod = wp.ones(1, dtype=wp.int32, device=device)
     wp.launch(
         compute_propagation_body_split_weight,
         dim=3,
-        inputs=[activity, body_to_art, art_activity, no_free, 15],
+        inputs=[activity, body_to_art, art_activity, rod, 15],
         outputs=[weight],
         device=device,
     )
@@ -671,8 +671,8 @@ def test_propagation_weighted_split_weights(test, device):
     np.testing.assert_array_equal(split.numpy(), [19, 19, 16])
     w = weight.numpy()
     test.assertAlmostEqual((w[1] + w[2]) / split.numpy()[1], 1.0)
-    # A free body keeps weight one: its split response is its own inverse mass, not a share of joints.
-    free = wp.ones(1, dtype=wp.int32, device=device)
+    # An articulation that is not a rod (a free body, an arm) keeps weight one.
+    free = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(
         compute_propagation_body_split_weight,
         dim=3,

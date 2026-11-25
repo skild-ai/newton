@@ -9095,7 +9095,7 @@ def compute_propagation_body_split_weight(
     body_activity: wp.array[float],
     body_to_articulation: wp.array[int],
     articulation_activity: wp.array[float],
-    is_free_rigid: wp.array[int],
+    articulation_weighted: wp.array[int],
     levels: int,
     # outputs
     body_split_weight: wp.array[int],
@@ -9105,8 +9105,9 @@ def compute_propagation_body_split_weight(
     body = wp.tid()
     weight = int(1)
     art = body_to_articulation[body]
-    # A free body's split response is its own inverse mass, not a share of joints: it keeps weight one.
-    if art >= 0 and is_free_rigid[art] == 0:
+    # Only rod articulations weigh their links: a cable's rows along its length dilute a loaded link. Other
+    # articulations (a free body, whose split response is its own inverse mass; an arm) keep weight one.
+    if art >= 0 and articulation_weighted[art] != 0:
         top = articulation_activity[art]
         if top > 0.0:
             weight = 1 + int(wp.round(float(levels) * body_activity[body] / top))
@@ -11079,6 +11080,7 @@ def refine_same_articulation_propagation_rows_paths(
     propagation_body_response: wp.array3d[float],
     propagation_body_response_split: wp.array3d[float],
     propagation_joint_split: wp.array[int],
+    body_split_weight: wp.array[int],
     propagation_constraint_count: wp.array[int],
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
@@ -11139,6 +11141,7 @@ def refine_same_articulation_propagation_rows_paths(
             propagation_body_response,
             propagation_body_response_split,
             propagation_joint_split,
+            body_split_weight,
             propagation_constraint_count,
             propagation_body_a,
             propagation_body_b,
@@ -11199,6 +11202,7 @@ def _refine_chain_row(
     propagation_tree_BR: wp.array2d[float],
     propagation_body_response: wp.array3d[float],
     propagation_body_response_split: wp.array3d[float],
+    body_split_weight: wp.array[int],
     propagation_J_a: wp.array3d[float],
     propagation_J_b: wp.array3d[float],
     propagation_row_type: wp.array2d[int],
@@ -11241,16 +11245,21 @@ def _refine_chain_row(
         g = _chain_B_apply(propagation_tree_BR, k, g, 0)
         k -= 1
     ds = _response_apply(propagation_body_response, s_body, fs + g)
-    dss = _response_apply(propagation_body_response_split, s_body, fs + g)
+    # Each link's split response holds its own share (weight / joint weight); the row takes the smaller of its two
+    # links' shares, so it never claims more of a joint than either link does.
+    w_row = float(wp.min(body_split_weight[ba], body_split_weight[bb]))
+    f_s = float(body_split_weight[s_body]) / w_row
+    f_d = float(body_split_weight[d_body]) / w_row
+    dss = _response_apply(propagation_body_response_split, s_body, fs + g) * f_s
     h = _response_apply(propagation_body_response, s_body, fs)
-    hs = _response_apply(propagation_body_response_split, s_body, fs)
+    hs = _response_apply(propagation_body_response_split, s_body, fs) * f_s
     k = s_pos + 1
     while k <= d_pos:
         h = _chain_B_apply(propagation_tree_BR, k, h, 1)
         hs = _chain_B_apply(propagation_tree_BR, k, hs, 1)
         k += 1
     dd = h + _response_apply(propagation_body_response, d_body, fd)
-    dds = hs + _response_apply(propagation_body_response_split, d_body, fd)
+    dds = hs + _response_apply(propagation_body_response_split, d_body, fd) * f_d
     da = ds
     db = dd
     sa = dss
@@ -11302,6 +11311,7 @@ def _refine_path_row(
     propagation_body_response: wp.array3d[float],
     propagation_body_response_split: wp.array3d[float],
     propagation_joint_split: wp.array[int],
+    body_split_weight: wp.array[int],
     propagation_constraint_count: wp.array[int],
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
@@ -11344,6 +11354,7 @@ def _refine_path_row(
             propagation_tree_BR,
             propagation_body_response,
             propagation_body_response_split,
+            body_split_weight,
             propagation_J_a,
             propagation_J_b,
             propagation_row_type,
@@ -11445,6 +11456,10 @@ def _refine_path_row(
             sp += propagation_body_response_split[lca, r, c] * impulse[c]
         delta[r] = e
         split[r] = sp
+    # The row takes the smaller of its two links' shares of every joint: the common ancestor's split response holds
+    # its own share, and each walked joint's weight sums the bodies' weights below it.
+    w_row = float(wp.min(body_split_weight[ba], body_split_weight[bb]))
+    split = split * (float(body_split_weight[lca]) / w_row)
     da = delta
     sa = split
     for k in range(a_count):
@@ -11453,7 +11468,7 @@ def _refine_path_row(
         child = joint_child[joint]
         parent = joint_parent[joint]
         dofs = joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
-        weight = float(wp.max(propagation_joint_split[joint], 1))
+        weight = float(wp.max(propagation_joint_split[joint], 1)) / w_row
         da = _path_forward_step(
             joint,
             child,
@@ -11493,7 +11508,7 @@ def _refine_path_row(
         child = joint_child[joint]
         parent = joint_parent[joint]
         dofs = joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
-        weight = float(wp.max(propagation_joint_split[joint], 1))
+        weight = float(wp.max(propagation_joint_split[joint], 1)) / w_row
         db = _path_forward_step(
             joint,
             child,
