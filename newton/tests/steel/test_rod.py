@@ -762,3 +762,41 @@ def test_propagation_tree_dynamics(test, device):
 add_function_test(
     TestSteelRod, "test_propagation_tree_dynamics", test_propagation_tree_dynamics, devices=get_cuda_test_devices()
 )
+
+
+def test_propagation_tree_dynamics_frees_dense_buffers(test, device):
+    """Rod trees no dense row reaches keep no dense mass matrix, factor or row blocks, and step as before.
+
+    With joint limits on, the limit rows reach the rod trees, so they keep their dense buffers.
+    """
+    from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415
+
+    model = _crossing_rods(device)
+    _, rest, contacts = _settle(model, 20, iterations=32)
+    test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+    solver = newton.solvers.SolverSteel(model, articulation_constraint_max=640, iterations=8, **_PROPAGATION)
+    test.assertTrue(solver._tree_dynamics_sizes)
+    test.assertEqual(solver._row_free_sizes, frozenset(solver._tree_dynamics_sizes))
+    for size in solver._row_free_sizes:
+        test.assertNotIn(size, solver._dense_row_sizes)
+        test.assertEqual(solver._H_by_size[size].size, 1)
+        test.assertEqual(solver._L_by_size[size].size, 1)
+    freed = _step_from(model, rest, solver).joint_qd.numpy()
+    with kernel_overrides({"tree_dynamics": False}):
+        dense = newton.solvers.SolverSteel(model, articulation_constraint_max=640, iterations=8, **_PROPAGATION)
+    test.assertFalse(dense._row_free_sizes)
+    reference = _step_from(model, rest, dense).joint_qd.numpy()
+    np.testing.assert_allclose(freed, reference, atol=1.0e-4, rtol=1.0e-5)
+    limited = newton.solvers.SolverSteel(
+        model, articulation_constraint_max=640, iterations=8, enable_joint_limits=True, **_PROPAGATION
+    )
+    if limited._joint_limit_sizes & limited._tree_dynamics_sizes:
+        test.assertFalse(limited._row_free_sizes & limited._joint_limit_sizes)
+
+
+add_function_test(
+    TestSteelRod,
+    "test_propagation_tree_dynamics_frees_dense_buffers",
+    test_propagation_tree_dynamics_frees_dense_buffers,
+    devices=get_cuda_test_devices(),
+)

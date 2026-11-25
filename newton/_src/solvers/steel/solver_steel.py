@@ -3305,6 +3305,21 @@ class SolverSteel(SolverBase, CouplingInterface):
         ):
             self._packed_rod_size = self._size_groups[0]
 
+        if (
+            self._rod_material is not None
+            and self._propagation_active
+            and self._rod_material.loops is None
+            and self._kernel_overrides.get("tree_dynamics", True)
+        ):
+            # Rod trees take their unconstrained velocity from the propagation factorization, which already
+            # holds each joint's material block: no dense mass matrix is factored for them.
+            spatial = self._propagation_rod_trees()
+            for size in self._propagation_tree_sizes:
+                if size in (self._sparse_mass_matrix_size, self._sparse_diagonal_response_size):
+                    continue
+                arts = self._group_to_art[size].numpy()
+                if len(arts) and bool(np.all(spatial[arts])):
+                    self._tree_dynamics_sizes.add(int(size))
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
         self._allocate_paired_response_buffers(model)
@@ -3336,21 +3351,6 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_torsion_next = wp.full(propagation_torsion_shape, -1, dtype=wp.int32, device=model.device)
         self._no_torsion_radius = wp.zeros(1, dtype=wp.float32, device=model.device)
         self._allocate_propagation_buffers(model)
-        if (
-            self._rod_material is not None
-            and self._propagation_active
-            and self._rod_material.loops is None
-            and self._kernel_overrides.get("tree_dynamics", True)
-        ):
-            # Rod trees take their unconstrained velocity from the propagation factorization, which already
-            # holds each joint's material block: no dense mass matrix is factored for them.
-            spatial = self._propagation_rod_trees()
-            for size in self._propagation_tree_sizes:
-                if size in (self._sparse_mass_matrix_size, self._sparse_diagonal_response_size):
-                    continue
-                arts = self._group_to_art[size].numpy()
-                if len(arts) and bool(np.all(spatial[arts])):
-                    self._tree_dynamics_sizes.add(int(size))
         if (
             self._rod_material is not None
             and self._propagation_active
@@ -6729,10 +6729,45 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._aug_row_dof_index = wp.zeros((total_rows,), dtype=wp.int32, device=device)
         self._aug_row_K = wp.zeros((total_rows,), dtype=wp.float32, device=device)
 
+    def _plan_row_free_sizes(self) -> frozenset:
+        """Tree-dynamics groups no dense row reaches, which need no dense mass-matrix, factor or row buffers.
+
+        Tree-dynamics groups take their unconstrained velocity and their contact responses from the propagation
+        factorization, so their dense H and L are never assembled or factored. Without joint-limit, drive,
+        velocity-limit, mimic or pre-eliminated bilateral rows on them, and with same-articulation contacts on the
+        propagation rows, no dense row reaches them either, so their J and Y stay empty. Each such group would
+        otherwise hold two ``size x size`` matrices and two ``rows x size`` blocks per articulation, most of the
+        solver's memory with many worlds. The dense row stages walk ``_dense_row_sizes``, which leaves them out.
+        """
+        if (
+            not self._tree_dynamics_sizes
+            or not self._propagation_same_articulation_rows
+            or self._has_drive_rows
+            or self._enable_joint_velocity_limits
+            or self._preelim_active
+        ):
+            return frozenset()
+        reserved = {
+            6,
+            self._sparse_mass_matrix_size,
+            self._sparse_diagonal_response_size,
+            self._packed_rod_size,
+            self._paired_response_primary_size,
+            self._paired_response_secondary_size,
+        }
+        limit_sizes = self._joint_limit_sizes if self._enable_joint_limits else frozenset()
+        return frozenset(
+            size
+            for size in self._tree_dynamics_sizes
+            if size not in reserved and size not in limit_sizes and size not in self._mimic_sizes
+        )
+
     def _allocate_buffers(self, model):
         """Allocate per-group mass-matrix and response buffers and per-contact row bookkeeping."""
         device = model.device
         max_constraints = self._articulation_constraint_max
+        self._row_free_sizes = self._plan_row_free_sizes()
+        self._dense_row_sizes = [size for size in self._size_groups if size not in self._row_free_sizes]
         self._H_by_size = {}
         self._L_by_size = {}
         self._J_by_size = {}
@@ -6754,6 +6789,25 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._H_by_size[size] = self._L_by_size[size] = stand_in
                 self._J_by_size[size] = self._Y_by_size[size] = stand_in
                 self._diag_by_size[size] = self._dummy_hinv_diag
+                continue
+            if size in self._row_free_sizes:
+                # No dense row reaches the group (see _plan_row_free_sizes); with one articulation per world
+                # the world rows alias its J and Y, which stay allocated (and empty).
+                stand_in = wp.zeros((1, 1, 1), dtype=wp.float32, device=device)
+                self._H_by_size[size] = self._L_by_size[size] = stand_in
+                if self._jy_world_aliased:
+                    self._J_by_size[size] = wp.zeros((n_arts, max_constraints, size), dtype=wp.float32, device=device)
+                    self._Y_by_size[size] = wp.zeros((n_arts, max_constraints, size), dtype=wp.float32, device=device)
+                    self._diag_by_size[size] = (
+                        wp.zeros((n_arts, max_constraints), dtype=wp.float32, device=device)
+                        if size in self._hinv_jt_diag_sizes
+                        else self._dummy_hinv_diag
+                    )
+                else:
+                    self._J_by_size[size] = self._Y_by_size[size] = stand_in
+                    self._diag_by_size[size] = self._dummy_hinv_diag
+                self._tau_by_size[size] = wp.zeros((n_arts, size, 1), dtype=wp.float32, device=device)
+                self._qdd_by_size[size] = wp.zeros((n_arts, size, 1), dtype=wp.float32, device=device)
                 continue
             self._H_by_size[size] = wp.zeros((n_arts, size, size), dtype=wp.float32, device=device)
             self._L_by_size[size] = wp.zeros((n_arts, size, size), dtype=wp.float32, device=device)
@@ -8417,7 +8471,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         index = self._buffer_index
         # Join on exit: a capture paused between steps (e.g. by a conditional node) rejects unjoined streams.
         with wp.ScopedStream(self._memset_stream, sync_enter=True, sync_exit=True):
-            for size in self._size_groups:
+            for size in self._dense_row_sizes:
                 # A step without a global mass refresh wrote no mass matrices.
                 if self._mass_update_global_flag:
                     self._H_bufs[index][size].zero_()
@@ -8887,7 +8941,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._stage4_hinv_jt_paired()
         elif self._sparse_mass_matrix_size is None:
             for size in self._for_sizes():
-                if size == self._sparse_diagonal_response_size:
+                if size == self._sparse_diagonal_response_size or size in self._row_free_sizes:
                     continue
                 if self._execution_plan.use_diagonal_mass(size):
                     self._stage4_hinv_jt_diagonal(size)
@@ -9012,7 +9066,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             and not self._jy_world_aliased
             and not self._hinv_jt_writes_world
         ):
-            for size in self._size_groups:
+            for size in self._dense_row_sizes:
                 n_arts = self._n_arts_by_size[size]
                 wp.launch(
                     gather_JY_to_world,
@@ -10837,7 +10891,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         # Rows are rebuilt every step; clear the grouped Jacobians once before any family writes.
         # Double-buffered Jacobians were cleared on the memset stream after their last use.
         if sparse_size is None and not self._double_buffered:
-            for size in self._size_groups:
+            for size in self._dense_row_sizes:
                 self._J_by_size[size].zero_()
 
         if self._has_drive_rows:
@@ -11314,7 +11368,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             ) or self._sparse_diagonal_contact_solve:
                 # Small articulations: one lane per (row, DOF) of each contact.
                 contact_jacobian_workers = min(contacts.rigid_contact_max, _CONTACT_JACOBIAN_WORKER_CAP)
-                for size in self._size_groups:
+                for size in self._dense_row_sizes:
                     if size == self._sparse_diagonal_response_size:
                         continue
                     wp.launch(
@@ -11358,7 +11412,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 if split:
                     threads = min(contact_build_threads * SPLIT_CONTACT_JACOBIAN_LANES, _CONTACT_BUILD_THREAD_CAP)
                     geometry = [contact_geometry[0], threads, *contact_geometry[2:]]
-                for size in self._size_groups:
+                for size in self._dense_row_sizes:
                     wp.launch(
                         populate_world_J_for_size_split if split else populate_world_J_for_size,
                         dim=threads,
@@ -11806,7 +11860,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
             return
         if self._hinv_jt_diag_sizes:
-            for size in self._size_groups:
+            for size in self._dense_row_sizes:
                 if size in self._hinv_jt_diag_sizes:
                     wp.launch(
                         accumulate_group_diag_worlds,
@@ -11840,7 +11894,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=self.model.device,
             )
         else:
-            for size in self._size_groups:
+            for size in self._dense_row_sizes:
                 self._stage4_diag_from_JY(size)
         if self._local_internal_fast_path:
             # The local solves add their own J Y to the diagonal, which keeps only the CFM.
