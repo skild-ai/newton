@@ -136,10 +136,14 @@ class Example:
             builder.color(balance_colors=False)
         self.model = builder.finalize(device=args.device)
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="latest")
+        # Contacts per world: the task's peak, 704 contacts, under Steel and VBD, with a quarter on top.
+        self.contacts_per_world = cable_solver.contact_budget(self.model, 7.5)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model, contact_matching="latest", rigid_contact_max=self.contacts_per_world * self.model.world_count
+        )
         self.contacts = self.collision_pipeline.contacts()
         self.solver = cable_solver.make_solver(
-            self.model, args, self.sim_iterations, contact_rows=3 * self.collision_pipeline.rigid_contact_max
+            self.model, args, self.sim_iterations, contact_rows=3 * self.contacts_per_world
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

@@ -138,10 +138,15 @@ class Example:
         self._build_scene()
         self.use_graph = self.use_graph and self.device.is_cuda
         self.control = self.model.control()
+        # Native Steel: contacts per world, the task's peak (104) with room for the jaws on other payloads.
+        capacity = {}
+        if self.native_cable:
+            capacity["rigid_contact_max"] = cable_solver.contact_budget(self.model, 8) * self.model.world_count
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             broad_phase="explicit",
             shape_pairs_filtered=None if self.native_cable else self._ground_shape_pairs(),
+            **capacity,
             **cable_solver.pipeline_options(args),
         )
         self.contacts = self.collision_pipeline.contacts()

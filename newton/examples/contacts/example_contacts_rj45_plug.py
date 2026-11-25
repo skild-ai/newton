@@ -405,7 +405,13 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.collision_pipeline = newton.CollisionPipeline(self.model, **cable_solver.pipeline_options(args))
+        # Contacts per world: the task's peak, 297 contacts while the plug is inserted, under Steel and VBD, with a quarter on top.
+        self.contacts_per_world = cable_solver.contact_budget(self.model, 10)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            rigid_contact_max=self.contacts_per_world * self.model.world_count,
+            **cable_solver.pipeline_options(args),
+        )
         self.contacts = self.collision_pipeline.contacts()
 
         self._initial_body_q = self.state_0.body_q.numpy().copy()
@@ -415,9 +421,7 @@ class Example:
             self.model,
             args,
             enable_joint_limits=True,
-            contact_rows=3 * self.collision_pipeline.rigid_contact_max
-            + 6 * len(self.clamps.bodies)
-            + self.model.joint_dof_count,
+            contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies) + self.model.joint_dof_count,
             iterations=12,
             rigid_body_contact_buffer_size=256,
         )

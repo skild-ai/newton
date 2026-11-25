@@ -211,12 +211,18 @@ class Example:
         # Finalize model
         self.model = builder.finalize()
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model, **cable_solver.pipeline_options(args))
+        # Contacts per world: the task's peak, 771 contacts, under Steel and VBD, with a quarter on top.
+        self.contacts_per_world = cable_solver.contact_budget(self.model, 5)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            rigid_contact_max=self.contacts_per_world * self.model.world_count,
+            **cable_solver.pipeline_options(args),
+        )
         self.clamps.bind(self.model)
         self.solver = cable_solver.make_solver(
             self.model,
             args,
-            contact_rows=3 * self.collision_pipeline.rigid_contact_max + 6 * len(self.clamps.bodies),
+            contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies),
             iterations=self.sim_iterations,
         )
 

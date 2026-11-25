@@ -3,6 +3,8 @@
 
 """Solver selection for examples that use Newton's rod material."""
 
+import math
+
 import warp as wp
 
 import newton
@@ -66,6 +68,19 @@ def pipeline_options(args):
     return {}
 
 
+def contact_budget(model, per_body, *, minimum=64):
+    """Rigid contacts one world holds: ``per_body`` contacts for each body of a world, at least ``minimum``.
+
+    Each example's ``per_body`` is its scene's peak contact count over the whole task, under Steel and VBD alike,
+    with a quarter on top. Without it the collision pipeline sizes its buffer for every shape pair's worst case,
+    many times what a cable scene makes, and Steel keeps friction-patch and warm-start state for every slot.
+    Both solvers flag a pass that makes more contacts than this (Steel's ``check_constraint_capacity``).
+    Pass ``rigid_contact_max=contact_budget(...) * model.world_count`` to the pipeline.
+    """
+    bodies = max(model.body_count // max(model.world_count, 1), 1)
+    return 32 * math.ceil(max(minimum, per_body * bodies) / 32)
+
+
 def make_solver(
     model,
     args,
@@ -81,17 +96,15 @@ def make_solver(
     if getattr(args, "solver", "vbd") == "steel":
         if not model.device.is_cuda:
             raise ValueError("Steel cable examples require a CUDA device.")
+        if model.rigid_contact_max is None:
+            # No collision pipeline published a capacity: the scene makes no rigid contacts, so Steel keeps no
+            # per-contact state (its fallback estimate sizes it for every shape pair touching at once).
+            model.rigid_contact_max = 0
         propagation = getattr(args, "contact_response", "propagation") == "propagation"
-        # The propagation response solves contacts and rod clamps as body rows; the generalized rows then
-        # carry only joint limits and drives. Its capacity is per world: the contact buffer is shared by all
-        # worlds, so each world takes its share with headroom for uneven worlds, and at most 64 rows per body
-        # of a world (the cable bundle peaks at 52), which the pipeline's bound for many replicated worlds
-        # would otherwise exceed many times over.
+        # ``contact_rows`` is the rows one world holds: three per contact of the world's budget (a normal and two
+        # tangents) and six per clamped body. The propagation response solves contacts and rod clamps as body
+        # rows; the generalized rows then carry only joint limits and drives.
         dense_rows = min(contact_rows, 64) if propagation else contact_rows
-        if propagation and model.world_count > 1:
-            share = max(64, 2 * (contact_rows + model.world_count - 1) // model.world_count)
-            per_body = 64 * max(model.body_count // model.world_count, 1)
-            contact_rows = min(contact_rows, share, max(64, per_body))
         return newton.solvers.SolverSteel(
             model,
             iterations=iterations,

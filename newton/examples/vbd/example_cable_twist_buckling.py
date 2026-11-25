@@ -199,13 +199,19 @@ class Example:
         contact_history = self.contact_mode == "alm-history"
         # Native Steel warm-starts its contacts, which reads the matching.
         contact_matching = "latest" if contact_history or self.clamps.steel else "disabled"
-        self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching=contact_matching)
+        # Contacts per world: the task makes none under Steel or VBD, so the budget's minimum.
+        self.contacts_per_world = cable_solver.contact_budget(self.model, 0)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            contact_matching=contact_matching,
+            rigid_contact_max=self.contacts_per_world * self.model.world_count,
+        )
         self.contacts = self.collision_pipeline.contacts()
         self.clamps.bind(self.model)
         self.solver = cable_solver.make_solver(
             self.model,
             args,
-            contact_rows=3 * self.collision_pipeline.rigid_contact_max + 6 * len(self.clamps.bodies),
+            contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies),
             iterations=self.sim_iterations,
             rigid_contact_history=contact_history,
             rigid_body_contact_buffer_size=256,

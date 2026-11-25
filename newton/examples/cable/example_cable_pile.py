@@ -167,15 +167,18 @@ class Example:
 
         self.model = builder.finalize()
         # Size persistent contact history before graph capture.
-        self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="sticky")
+        # Contacts per world: the task's peak, 2,873 contacts, under Steel and VBD, with a quarter on top.
+        self.contacts_per_world = cable_solver.contact_budget(self.model, 0.9)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model, contact_matching="sticky", rigid_contact_max=self.contacts_per_world * self.model.world_count
+        )
         self.contacts = self.collision_pipeline.contacts()
 
         self.solver = cable_solver.make_solver(
             self.model,
             args,
-            # Three rows (normal and two tangents) for up to eight contacts per segment; the pipeline's
-            # worst-case contact count would reserve several times more rows than the pile ever uses.
-            contact_rows=min(3 * self.collision_pipeline.rigid_contact_max, 24 * self.model.body_count),
+            # Three rows (normal and two tangents) per contact of the world's budget.
+            contact_rows=3 * self.contacts_per_world,
             iterations=self.sim_iterations,
             rigid_body_contact_buffer_size=256,
             rigid_contact_history=True,
