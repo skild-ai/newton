@@ -17601,31 +17601,31 @@ def _get_pgs_solve_mf_gs_kernel(
     )
     snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + helpers, 1)
 
+    name = _mf_gs_kernel_name(
+        max_constraints,
+        free_body_constraint_max,
+        max_world_dofs,
+        has_dense_velocity_limit_rows,
+        shared_metadata,
+        has_drive_rows,
+        fuse_vel_limits,
+        contact_torsion,
+        row_phases,
+        friction_mode,
+        factor_coordinates,
+        joint_friction,
+        contact_compliance,
+        free_rigid_angular_friction,
+        row_phase,
+        pair_cache,
+        torsion_links,
+        nesterov_momentum,
+        cache_free_response=bool(capacity),
+    )
+    if stream_mf_lambda:
+        name += "_stream"
     if skip_local_internal_worlds:
-        return _mf_gs_skip_local_kernel(
-            snippet,
-            _mf_gs_kernel_name(
-                max_constraints,
-                free_body_constraint_max,
-                max_world_dofs,
-                has_dense_velocity_limit_rows,
-                shared_metadata,
-                has_drive_rows,
-                fuse_vel_limits,
-                contact_torsion,
-                row_phases,
-                friction_mode,
-                factor_coordinates,
-                joint_friction,
-                contact_compliance,
-                free_rigid_angular_friction,
-                row_phase,
-                pair_cache,
-                torsion_links,
-                nesterov_momentum,
-            )
-            + "_local",
-        )
+        return _mf_gs_skip_local_kernel(snippet, name + "_local")
 
     @wp.func_native(snippet)
     def pgs_solve_mf_gs_native(
@@ -17762,30 +17762,6 @@ def _get_pgs_solve_mf_gs_kernel(
             v_out,
         )
 
-    name = (
-        _mf_gs_kernel_name(
-            max_constraints,
-            free_body_constraint_max,
-            max_world_dofs,
-            has_dense_velocity_limit_rows,
-            shared_metadata,
-            has_drive_rows,
-            fuse_vel_limits,
-            contact_torsion,
-            row_phases,
-            friction_mode,
-            factor_coordinates,
-            joint_friction,
-            contact_compliance,
-            free_rigid_angular_friction,
-            row_phase,
-            pair_cache,
-            torsion_links,
-            nesterov_momentum,
-        )
-        + ("_stream" if stream_mf_lambda else "")
-        + ("_free_momentum_cache" if capacity else "")
-    )
     pgs_solve_mf_gs.__name__ = name
     pgs_solve_mf_gs.__qualname__ = name
     kernel = wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(pgs_solve_mf_gs)
@@ -17813,6 +17789,8 @@ def _mf_gs_kernel_name(
     pair_cache: bool = False,
     torsion_links: bool = False,
     nesterov_momentum: bool = False,
+    *,
+    cache_free_response: bool = False,
 ) -> str:
     """Return the unique name of one matrix-free Gauss-Seidel kernel shape."""
     return (
@@ -17820,6 +17798,7 @@ def _mf_gs_kernel_name(
         f"_vlim{int(has_dense_velocity_limit_rows)}_drive{int(has_drive_rows)}_fvl{int(fuse_vel_limits)}"
         f"{'' if shared_metadata else '_gmeta'}"
         f"{'_paircache' if pair_cache else ''}"
+        f"{'_freecache' if cache_free_response else ''}"
         f"{'_torsion' if contact_torsion else ''}"
         f"{'_links' if torsion_links else ''}"
         f"{('_phased' if row_phase is None else f'_phase{row_phase}') if row_phases else ''}"

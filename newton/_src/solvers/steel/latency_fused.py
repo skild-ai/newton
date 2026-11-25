@@ -279,7 +279,8 @@ def _cache_snapshot(
 
 def warp_count(tree_slots: int, max_bodies: int) -> int:
     """Reserve a warp for each stage and four warps for broad colored contact sweeps."""
-    return max(2 + tree_slots, 4 if max_bodies >= 32 else 0)
+    # Each body has six twist components. Give a full four-warp tile enough work to fill its lanes.
+    return max(2 + tree_slots, 4 if 6 * max_bodies >= 128 else 0)
 
 
 def get_fused_iteration_kernel(
