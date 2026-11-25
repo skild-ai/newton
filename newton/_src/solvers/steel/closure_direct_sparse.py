@@ -37,6 +37,9 @@ from .closure_direct_symbolic import SparseCholeskyPlan
 from .friction_patches import WARP_DETERMINISM_OFF
 from .kernels import CONNECT_MAX_ROWS, PGS_CONSTRAINT_TYPE_CONNECT, _connect_rotation_rows, _walk_has_free_dof
 
+# Steel orders its own data paths; Warp's deterministic lowering would only add cost (see kernels.py).
+wp.set_module_options({"enable_backward": False, **WARP_DETERMINISM_OFF})
+
 SOLVE_THREADS = 512
 WHOLE_W = 16  # a level that is a single supernode at least this wide runs with the whole block
 ROWS_WPB = 4  # closures (warps) per block of the row builder
