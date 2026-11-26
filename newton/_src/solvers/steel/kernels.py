@@ -11754,6 +11754,11 @@ def _refine_path_row(
     art = body_to_articulation[ba]
     if art < 0 or art != body_to_articulation[bb] or is_free_rigid[art] != 0:
         return
+    # A contact unit without a response slot (its world's slots ran out) steps with the split responses, so its
+    # effective mass stays the split one.
+    rc = propagation_row_unit(propagation_row_contact, world, i)
+    if rc >= 0 and contact_unit_response[rc >> 2] < 0:
+        return
     if chain_flag[art] != 0 and body_chain_pos[ba] >= 0 and body_chain_pos[bb] >= 0:
         _refine_chain_row(
             world,

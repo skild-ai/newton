@@ -12899,12 +12899,13 @@ class SolverSteel(SolverBase, CouplingInterface):
         """Whether the colored sweep reads each unit's rows from a packed per-unit record (test hook "colored_packed").
 
         A few large worlds are latency-bound and gain from the packed records; many worlds lose to their traffic.
-        Rod trees read their rows faster unpacked at any world count: a color's units are consecutive row slots, so
-        the lanes' row loads coalesce while the packed records (one block per lane) do not.
+        Rods read their rows faster unpacked at any world count: a color's units are consecutive row slots, so the
+        lanes' row loads coalesce while the packed records (one block per lane) do not. (The rod material, unlike the
+        rod-tree groups, is known before the rows are allocated, where contact units read this too.)
         """
         overrides = self._kernel_overrides
         return bool(overrides.get("colored_prefetch", True)) and bool(
-            overrides.get("colored_packed", self._world_count <= 16 and not self._rod_tree_sizes)
+            overrides.get("colored_packed", self._world_count <= 16 and self._rod_material is None)
         )
 
     def _contact_units_supported(self, model) -> bool:

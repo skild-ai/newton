@@ -382,6 +382,79 @@ add_function_test(
 )
 
 
+def _hairpin_rod(device):
+    """A rod folded back on itself on the ground, its legs touching, with a kinematic first segment."""
+    builder = newton.ModelBuilder()
+    radius, gap, z = 0.02, 0.0405, 0.0205
+    points = [wp.vec3(x, 0.0, z) for x in np.linspace(-0.25, 0.15, 9)]
+    turn = np.linspace(-0.5 * np.pi, 0.5 * np.pi, 7)[1:-1]
+    points += [wp.vec3(0.15 + 0.5 * gap * np.cos(t), 0.5 * gap + 0.5 * gap * np.sin(t), z) for t in turn]
+    points += [wp.vec3(x, gap, z) for x in np.linspace(0.15, -0.25, 9)]
+    rod = newton.Rod(points, radius=radius)
+    bodies, _ = builder.add_rod(rod=rod, bend_stiffness=2, twist_stiffness=1)
+    builder.body_flags[bodies[0]] = int(newton.BodyFlags.KINEMATIC)
+    builder.add_ground_plane()
+    return builder.finalize(device=device)
+
+
+def test_propagation_contact_units_self_contact(test, device):
+    """Contact units of a rod touching itself store its exact responses and reproduce the rows.
+
+    Contacts between the hairpin's legs join two links of one articulation: their units take response slots and the
+    refinement stores the exact responses there; ground contacts on the kinematic first segment fold their
+    prescribed side out. A response capacity below the contacts is reported as an overflow.
+    """
+    from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415
+
+    model = _hairpin_rod(device)
+    options = {
+        "iterations": 64,
+        "solve_mode": "colored",
+        "articulated_contact_response": "propagation",
+        "propagation_same_articulation_rows": True,
+        "friction_anchor_beta": 0.0,
+        "contact_warmstart": True,
+    }
+    with kernel_overrides({"colored_packed": False}):
+        _, rest, contacts = _settle(model, 30, **options)
+    test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    results = {}
+    for enabled in (True, False):
+        with kernel_overrides({"colored_packed": False, "contact_units": enabled}):
+            solver = newton.solvers.SolverSteel(model, articulation_constraint_max=640, **options)
+        a, b, control, step_contacts = model.state(), model.state(), model.control(), pipeline.contacts()
+        a.assign(rest)
+        pipeline.collide(a, step_contacts)
+        solver.step(a, b, control, step_contacts, 1.0 / 240.0)
+        if enabled:
+            test.assertGreater(int(solver._contact_response_count.numpy()[0]), 0)
+        results[enabled] = (b.body_q.numpy(), b.body_qd.numpy())
+    np.testing.assert_allclose(results[True][0][:, :3], results[False][0][:, :3], atol=1.0e-6)
+    np.testing.assert_allclose(results[True][1][:, :3], results[False][1][:, :3], atol=5.0e-4)
+    np.testing.assert_allclose(results[True][1][:, 3:], results[False][1][:, 3:], atol=2.0e-2)
+
+    with kernel_overrides({"colored_packed": False, "contact_units": True}):
+        solver = newton.solvers.SolverSteel(
+            model, articulation_constraint_max=640, propagation_same_articulation_contact_max=1, **options
+        )
+    a, b, control, step_contacts = model.state(), model.state(), model.control(), pipeline.contacts()
+    a.assign(rest)
+    pipeline.collide(a, step_contacts)
+    solver.step(a, b, control, step_contacts, 1.0 / 240.0)
+    test.assertTrue(np.all(np.isfinite(b.body_q.numpy())))
+    with test.assertRaises(RuntimeError):
+        solver.check_constraint_capacity()
+
+
+add_function_test(
+    TestSteelRod,
+    "test_propagation_contact_units_self_contact",
+    test_propagation_contact_units_self_contact,
+    devices=get_cuda_test_devices(),
+)
+
+
 def test_split_contact_jacobian(test, device):
     """Splitting each rod contact's Jacobian over its rows and DOFs writes the same rows as one thread per contact."""
     from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415
