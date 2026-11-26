@@ -20,6 +20,7 @@ from newton._src.solvers.steel.friction_patches import (
     seed_patch_impulses,
 )
 from newton._src.solvers.steel.kernels import (
+    MF_META_ROW_TYPE_BITS,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     compute_mf_effective_mass_and_rhs,
@@ -421,7 +422,7 @@ def _position_rhs(family: str, *, phi, baumgarte, friction_anchor_beta, dt, devi
                 wp.array([-1], dtype=wp.int32, device=device),
                 wp.array([0], dtype=wp.int32, device=device),
                 wp.zeros((1,), dtype=wp.float32, device=device),
-                wp.array([float("inf")], dtype=wp.float32, device=device),
+                wp.full((1, 3), wp.inf, dtype=wp.float32, device=device),
                 1.0e-6,
                 baumgarte,
                 1.0,
@@ -1054,7 +1055,9 @@ def _mf_block(device, block, friction_mode="coulomb_newton"):
     meta[0, :3, 0] = 0xFFFF  # dof_a 0, no body b
     meta[0, :3, 1] = np.array([0.0, 1.0, 1.0], dtype=np.float32).view(np.int32)
     row_types = [PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION]
-    meta[0, :3, 3] = np.array(row_types, dtype=np.int64) | (np.array([-1, 0, 0], dtype=np.int64) << 16)
+    meta[0, :3, 3] = np.array(row_types, dtype=np.int64) | (
+        np.array([-1, 0, 0], dtype=np.int64) << MF_META_ROW_TYPE_BITS
+    )
     old = np.zeros(4, dtype=np.float32)
     old[: len(block) - 10] = block[10:13]
     impulses = wp.array([old], dtype=float, device=device)

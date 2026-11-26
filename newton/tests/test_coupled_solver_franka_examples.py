@@ -19,7 +19,7 @@ from newton.examples.multiphysics import (
     example_franka_shirt_fold_stack,
     example_mujoco_franka_vbd_cable_admm_solver,
 )
-from newton.tests.unittest_utils import MUJOCO_MODULES, add_function_test, get_cuda_test_devices, requires
+from newton.tests.unittest_utils import MUJOCO_MODULES, add_function_test, get_cuda_test_devices
 
 FRAME_GRAPH_EXAMPLES = {
     "franka_cable_ik_pick_place": example_franka_cable_ik_pick_place,
@@ -30,7 +30,6 @@ FRAME_GRAPH_EXAMPLES = {
 
 
 class TestCoupledFrankaExamples(unittest.TestCase):
-    @requires("pxr.Usd", *MUJOCO_MODULES)
     def test_replayed_frame_matches_eager_substep_count(self):
         """Replaying one recorded simulate() advances as many substeps per frame as eager stepping."""
         frames = 4

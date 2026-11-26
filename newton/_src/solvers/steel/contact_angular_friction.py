@@ -16,6 +16,7 @@ import numpy as np
 import warp as wp
 
 from .kernels import (
+    MF_META_ROW_TYPE_BITS,
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
     accumulate_free_rigid_angular_wrenches_from_impulses,
@@ -248,9 +249,9 @@ def free_rigid_angular_friction_gs_sources() -> tuple[str, str, str]:
                 float lambda_n = angular_load;
                 if (mf_par != angular_load_parent) {{
                     lambda_n = s_lam_mf[mf_par];
-                    for (int patch_row = (mf_meta.data[off_meta + mf_par * 4 + 3] >> 16);
+                    for (int patch_row = (mf_meta.data[off_meta + mf_par * 4 + 3] >> {MF_META_ROW_TYPE_BITS});
                          patch_row >= 0 && patch_row != mf_par;
-                         patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
+                         patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> {MF_META_ROW_TYPE_BITS}))
                         lambda_n += s_lam_mf[patch_row];
                 }}
                 angular_radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);
