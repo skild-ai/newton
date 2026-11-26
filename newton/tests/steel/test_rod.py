@@ -334,6 +334,54 @@ add_function_test(
 )
 
 
+def test_propagation_contact_units(test, device):
+    """Contact units reproduce the rows of the propagation response's colored sweep.
+
+    With contact units every contact's rows read their Jacobians and responses from its unit (one record per
+    contact, PROPAGATION_CONTACT_UNIT_BLOCKS) instead of per-row arrays. Both take one step from the same settled
+    state; they differ by rounding (the sweep rebuilds each row from the unit's directions and lever arms), so the
+    tolerances follow the unconverged step's spread, as in :func:`test_contact_unit_sweep`.
+    """
+    from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415
+
+    model = _crossing_rods(device)
+    options = {
+        "iterations": 64,
+        "solve_mode": "colored",
+        "articulated_contact_response": "propagation",
+        "propagation_same_articulation_rows": True,
+        "friction_anchor_beta": 0.0,
+        "contact_warmstart": True,
+    }
+    with kernel_overrides({"colored_packed": False}):
+        _, rest, contacts = _settle(model, 60, **options)
+    test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    results = {}
+    for enabled in (True, False):
+        with kernel_overrides({"colored_packed": False, "contact_units": enabled}):
+            solver = newton.solvers.SolverSteel(model, articulation_constraint_max=640, **options)
+        test.assertEqual(solver._contact_units_on, enabled)
+        a, b, control, step_contacts = model.state(), model.state(), model.control(), pipeline.contacts()
+        a.assign(rest)
+        pipeline.collide(a, step_contacts)
+        solver.step(a, b, control, step_contacts, 1.0 / 240.0)
+        if enabled:
+            # Every contact row belongs to a contact unit.
+            count = int(solver._propagation_constraint_count.numpy()[0])
+            test.assertGreater(count, 0)
+            test.assertTrue(np.all(solver._propagation_row_contact.numpy()[0, :count] >= 0))
+        results[enabled] = (b.body_q.numpy(), b.body_qd.numpy())
+    np.testing.assert_allclose(results[True][0][:, :3], results[False][0][:, :3], atol=1.0e-6)
+    np.testing.assert_allclose(results[True][1][:, :3], results[False][1][:, :3], atol=5.0e-4)
+    np.testing.assert_allclose(results[True][1][:, 3:], results[False][1][:, 3:], atol=2.0e-2)
+
+
+add_function_test(
+    TestSteelRod, "test_propagation_contact_units", test_propagation_contact_units, devices=get_cuda_test_devices()
+)
+
+
 def test_split_contact_jacobian(test, device):
     """Splitting each rod contact's Jacobian over its rows and DOFs writes the same rows as one thread per contact."""
     from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415
