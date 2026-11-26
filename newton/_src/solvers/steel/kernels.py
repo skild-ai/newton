@@ -3961,23 +3961,23 @@ def _walk_has_free_dof(
 def _closure_anchor_parts(
     art: int,
     body: int,
+    in_articulation: bool,
     anchor: wp.vec3,
     body_q: wp.array[wp.transform],
     body_rel_t: wp.array[wp.vec3],
     articulation_ref_t: wp.array[wp.vec3],
-    body_to_articulation: wp.array[int],
 ):
     """Split a closure anchor's world position [m] into a reference point and a small offset.
 
-    A body of articulation ``art`` takes the articulation's reference and its root-relative
-    position (:func:`eval_body_relative_poses`); the world (``body < 0``) takes the anchor
-    itself; any other body takes its ``body_q`` position. The offset is the rest.
+    A body of articulation ``art`` (``in_articulation``) takes the articulation's reference and
+    its root-relative position (:func:`eval_body_relative_poses`); the world (``body < 0``) takes
+    the anchor itself; any other body takes its ``body_q`` position. The offset is the rest.
     """
     if body < 0:
         return anchor, wp.vec3(0.0, 0.0, 0.0)
     X = body_q[body]
     offset = wp.quat_rotate(wp.transform_get_rotation(X), anchor)
-    if body_to_articulation[body] == art:
+    if in_articulation:
         return articulation_ref_t[art], body_rel_t[body] + offset
     return wp.transform_get_translation(X), offset
 
@@ -4006,10 +4006,8 @@ def populate_connect_J_for_size(
     joint_ancestor: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_S_s: wp.array[wp.spatial_vector],
-    articulation_origin: wp.array[wp.vec3],
     body_rel_t: wp.array[wp.vec3],
     articulation_ref_t: wp.array[wp.vec3],
-    body_to_articulation: wp.array[int],
     articulation_start: wp.array[int],
     joint_child: wp.array[int],
     # outputs
@@ -4088,25 +4086,17 @@ def populate_connect_J_for_size(
             twist = body_qd[body_p]
             lever = wp.quat_rotate(wp.transform_get_rotation(body_q[body_p]), anchor_p - body_com[body_p])
             v_a = wp.spatial_top(twist) + wp.cross(wp.spatial_bottom(twist), lever)
-        # Each anchor as a large reference part plus a small offset; the closure's articulation
-        # frame is its reference point (world positions when the child is not in it).
-        frame_t = wp.vec3(0.0, 0.0, 0.0)
-        origin = articulation_origin[art]
-        if body_to_articulation[body_c] == art:
-            frame_t = articulation_ref_t[art]
-            root = joint_child[articulation_start[art]]
-            origin = body_rel_t[root] + wp.quat_rotate(wp.transform_get_rotation(body_q[root]), body_com[root])
+        # Each anchor as a large reference part plus a small offset, measured in the frame of the
+        # articulation's reference point. The child is always in the articulation, the parent
+        # unless it is prescribed (see ``SolverSteel._build_connect_plan``).
+        frame_t = articulation_ref_t[art]
+        root = joint_child[articulation_start[art]]
+        origin = body_rel_t[root] + wp.quat_rotate(wp.transform_get_rotation(body_q[root]), body_com[root])
         big_a, small_a = _closure_anchor_parts(
-            art, body_p, anchor_p, body_q, body_rel_t, articulation_ref_t, body_to_articulation
+            art, body_p, not prescribed, anchor_p, body_q, body_rel_t, articulation_ref_t
         )
         big_b, small_b = _closure_anchor_parts(
-            art,
-            body_c,
-            wp.transform_get_translation(joint_X_c[joint]),
-            body_q,
-            body_rel_t,
-            articulation_ref_t,
-            body_to_articulation,
+            art, body_c, True, wp.transform_get_translation(joint_X_c[joint]), body_q, body_rel_t, articulation_ref_t
         )
         rel_a = (big_a - frame_t) + small_a - origin
         rel_b = (big_b - frame_t) + small_b - origin

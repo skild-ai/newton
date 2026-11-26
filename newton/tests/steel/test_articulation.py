@@ -1220,10 +1220,8 @@ class TestPreeliminationKernels(unittest.TestCase):
                 arr([-1]),
                 arr([0, 1]),
                 arr([[0.0, 0.0, 0.0, 0.0, 0.0, 1.0]], wp.spatial_vector),
-                wp.zeros(1, dtype=wp.vec3, device=device),
-                wp.zeros(2, dtype=wp.vec3, device=device),  # body_rel_t
+                wp.zeros(2, dtype=wp.vec3, device=device),  # body_rel_t: body_q sits at the origin
                 wp.zeros(1, dtype=wp.vec3, device=device),  # articulation_ref_t
-                arr([-1, -1]),  # body_to_articulation: world-pose geometry
                 arr([0]),  # articulation_start
                 arr([0]),  # joint_child
             ],
