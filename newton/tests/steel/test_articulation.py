@@ -4452,6 +4452,91 @@ def test_world_parent_closure_rows_are_translation_invariant(test, device):
     test.assertGreater(largest_gap, 1.0e-6)  # the closure opened, so the rows compared real gaps
 
 
+def test_second_root_closure_rows_are_translation_invariant(test, device):
+    """A closure between the subtrees of two world roots of one articulation steps alike far from the origin.
+
+    The articulation has two hinged roots, each carrying one link, and a BALL closure joins the two links. The second
+    root's subtree is measured from the articulation's reference point through its exact ``joint_X_p``, as the first
+    is, so the far copy's closure rows match the near copy's to rounding of the small offsets. Measured from the first
+    root body's FK position instead, which rounds the 256 m offset, the far copy's closure gap was off by up to 8e-6 m
+    within the six steps.
+    """
+    template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    joints, tips = [], []
+    for side, tip_axis in ((-1.0, wp.vec3(0.0, 1.0, 0.0)), (1.0, wp.vec3(0.0, 0.0, 1.0))):
+        # Each root link's origin sits 0.3 m below its hinge, so its FK position rounds the world offset. The hinges
+        # sit where float32 holds the offset copy exactly, so the far copy is an exact translation.
+        root = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01))
+        joints.append(
+            template.add_joint_revolute(
+                -1,
+                root,
+                axis=wp.vec3(1.0, 0.0, 0.0),
+                parent_xform=wp.transform(wp.vec3(0.0, 0.25 * side, 2.0), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity()),
+                target_ke=20.0,
+                target_kd=1.0,
+                armature=0.002,
+            )
+        )
+        tip = template.add_link(mass=0.3, inertia=wp.mat33(np.eye(3) * 0.003))
+        joints.append(
+            template.add_joint_revolute(
+                root,
+                tip,
+                axis=tip_axis,
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, -0.3), wp.quat_identity()),
+                target_ke=5.0,
+                target_kd=0.2,
+                armature=0.001,
+            )
+        )
+        tips.append(tip)
+    template.add_articulation(joints)
+    # Both anchors sit at (0, 0, 1.3) in the rest pose.
+    template.add_joint_ball(
+        tips[0],
+        tips[1],
+        parent_xform=wp.transform(wp.vec3(0.0, 0.25, -0.1), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(0.0, -0.25, -0.1), wp.quat_identity()),
+    )
+    builder = newton.ModelBuilder()
+    offsets = [(0.0, 0.0, 0.0), (256.0, 256.0, 0.0)]
+    builder.replicate(template, len(offsets), xforms=[wp.transform(wp.vec3(*o), wp.quat_identity()) for o in offsets])
+    model = builder.finalize(device=device)
+    test.assertEqual(int(model.joint_parent.numpy()[2]), -1)  # the second root joint
+    test.assertEqual(int(model.joint_articulation.numpy()[2]), int(model.joint_articulation.numpy()[0]))
+
+    solver = SolverSteel(model, iterations=8, update_mass_matrix_interval=1)
+    state, out = model.state(), model.state()
+    n_coords, n_dofs = model.joint_coord_count // 2, model.joint_dof_count // 2
+    qd = np.random.default_rng(7).uniform(-2.0, 2.0, n_dofs).astype(np.float32)
+    state.joint_qd.assign(np.concatenate([qd, qd]))
+    control = model.control()
+    largest_gap = 0.0
+    for _ in range(6):
+        q, v = state.joint_q.numpy(), state.joint_qd.numpy()
+        q[n_coords:], v[n_dofs:] = q[:n_coords], v[:n_dofs]
+        state.joint_q.assign(q)
+        state.joint_qd.assign(v)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        solver.step(state, out, control, None, 1.0 / 120.0)
+        slots = solver._connect_slot.numpy()
+        inv_norm = solver._connect_row_inv_norm.numpy()[:, :3]
+        phi = solver._phi.numpy()
+        gap = [phi[w, slots[w] : slots[w] + 3] / inv_norm[w] for w in range(2)]
+        largest_gap = max(largest_gap, float(np.abs(gap[0]).max()))
+        np.testing.assert_allclose(gap[1], gap[0], rtol=0.0, atol=2.0e-7)
+        qd_out = out.joint_qd.numpy()
+        np.testing.assert_allclose(
+            qd_out[n_dofs:], qd_out[:n_dofs], rtol=0.0, atol=2.0e-2 * np.abs(qd_out[:n_dofs]).max()
+        )
+        gaps = _float64_closure_gaps(model, out.joint_q.numpy()).reshape(2, -1)
+        np.testing.assert_allclose(gaps[1], gaps[0], rtol=0.0, atol=1.0e-6)
+        state.assign(out)
+    test.assertGreater(largest_gap, 1.0e-6)  # the closure opened, so the rows compared real gaps
+
+
 class TestSteelRevoluteLoop(unittest.TestCase):
     pass
 
@@ -4470,6 +4555,7 @@ for _name in (
     "test_revolute_loop_from_fixed_root_matches_world_parent",
     "test_closure_rows_are_translation_invariant",
     "test_world_parent_closure_rows_are_translation_invariant",
+    "test_second_root_closure_rows_are_translation_invariant",
 ):
     add_function_test(TestSteelRevoluteLoop, _name, globals()[_name], devices=get_cuda_test_devices())
 
