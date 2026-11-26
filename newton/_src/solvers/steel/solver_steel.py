@@ -6858,21 +6858,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._diag_by_size[size] = self._dummy_hinv_diag
                 continue
             if size in self._row_free_sizes:
-                # No dense row reaches the group (see _plan_row_free_sizes); with one articulation per world
-                # the world rows alias its J and Y, which stay allocated (and empty).
+                # No dense row reaches the group (see _plan_row_free_sizes), so its dense blocks stay empty. With
+                # one articulation per world the world rows alias them: every world-row kernel stops at the world's
+                # dense row count, which then stays zero.
                 stand_in = wp.zeros((1, 1, 1), dtype=wp.float32, device=device)
                 self._H_by_size[size] = self._L_by_size[size] = stand_in
-                if self._jy_world_aliased:
-                    self._J_by_size[size] = wp.zeros((n_arts, max_constraints, size), dtype=wp.float32, device=device)
-                    self._Y_by_size[size] = wp.zeros((n_arts, max_constraints, size), dtype=wp.float32, device=device)
-                    self._diag_by_size[size] = (
-                        wp.zeros((n_arts, max_constraints), dtype=wp.float32, device=device)
-                        if size in self._hinv_jt_diag_sizes
-                        else self._dummy_hinv_diag
-                    )
-                else:
-                    self._J_by_size[size] = self._Y_by_size[size] = stand_in
-                    self._diag_by_size[size] = self._dummy_hinv_diag
+                self._J_by_size[size] = self._Y_by_size[size] = stand_in
+                self._diag_by_size[size] = self._dummy_hinv_diag
                 # Armature, tau and qdd feed only the dense factor and solve, which tree dynamics skips.
                 self._R_by_size[size] = wp.zeros((1, 1), dtype=wp.float32, device=device)
                 self._tau_by_size[size] = self._qdd_by_size[size] = stand_in
