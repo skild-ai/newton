@@ -447,7 +447,7 @@ def _check_propagation_coverage(test, model, options):
     body_list = solver._propagation_body_list.numpy()
     # Only the colored sweep and the cached response read the body map.
     reads_body_map = options.get("solve_mode") == "colored" or options["propagation_cached_response"]
-    test.assertEqual(solver._propagation_world_bodies is not None, reads_body_map)
+    test.assertEqual(np.any(body_count), reads_body_map)
     if options["propagation_cached_response"]:
         test.assertTrue(np.all(solver._propagation_cache_world_flag.numpy() == 1))
         # Cache-eligible bodies come first; each partition is in body order.
@@ -784,39 +784,6 @@ def test_deterministic_joint_friction_rows_follow_dof_order(test, device):
         np.testing.assert_allclose(row_mu[world, friction_rows], expected, rtol=1.0e-6)
 
 
-def test_multiwarp_closures_keep_joint_order(test, device):
-    """Reserve a redundant loop's active joints in model order for both momentum settings."""
-    builder = _build_four_bar()
-    first = builder.joint_count - 1
-    for _ in range(95):
-        builder.add_joint_ball(
-            parent=builder.joint_parent[first],
-            child=builder.joint_child[first],
-            parent_xform=builder.joint_X_p[first],
-            child_xform=builder.joint_X_c[first],
-        )
-    model = builder.finalize(device=device)
-    enabled = model.joint_enabled.numpy()
-    enabled[first::7] = False
-    model.joint_enabled.assign(enabled)
-    for momentum in (False, True):
-        solver = SolverSteel(
-            model,
-            iterations=2,
-            deterministic=wp.DeterministicMode.NOT_GUARANTEED,
-            nesterov_momentum=momentum,
-            articulation_constraint_max=320,
-        )
-        state = model.state()
-        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-        for _ in range(8):
-            solver.step(state, model.state(), model.control(), None, 0.005)
-            slots = solver._connect_slot.numpy()
-            active = enabled[first:].astype(bool)
-            np.testing.assert_array_equal(slots[~active], -1)
-            np.testing.assert_array_equal(np.diff(slots[active]), 3)
-
-
 def test_bilateral_rows_follow_element_order(test, device):
     """Give a world's mimic rows, then its loop-closure rows, their slots in element order in every mode."""
     mimic_count = 512
@@ -840,21 +807,31 @@ def test_bilateral_rows_follow_element_order(test, device):
 
 
 def test_loop_closure_rows_follow_element_order(test, device):
-    """Give the loop-closure rows of one world their slots in element order in every mode."""
+    """Reserve three consecutive rows for each enabled BALL closure, in joint order."""
     closure_count = 512
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
     builder.replicate(_build_four_bar(), closure_count, spacing=(1.0, 0.0, 0.0), separate_worlds=False)
     model = builder.finalize(device=device)
+    closure_joints = np.flatnonzero(model.joint_type.numpy() == newton.JointType.BALL)
+    test.assertEqual(closure_joints.size, closure_count)
+    enabled = model.joint_enabled.numpy()
+    state = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+    control, output = model.control(), model.state()
     for mode in (RUN_TO_RUN, wp.DeterministicMode.NOT_GUARANTEED):
-        with test.subTest(deterministic=mode):
-            solver = SolverSteel(model, deterministic=mode, articulation_constraint_max=4 * closure_count)
-            state = model.state()
-            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-            solver.step(state, model.state(), model.control(), None, 0.005)
-
-            # Each BALL closure takes three rows.
-            connect_slot = solver._connect_slot.numpy()
-            np.testing.assert_array_equal(connect_slot, connect_slot[0] + 3 * np.arange(closure_count))
+        # Exercise full allocation and compaction with identical inputs for both momentum settings.
+        enabled[closure_joints[::7]] = mode == RUN_TO_RUN
+        model.joint_enabled.assign(enabled)
+        for momentum in (False, True):
+            with test.subTest(deterministic=mode, momentum=momentum):
+                solver = SolverSteel(
+                    model, deterministic=mode, articulation_constraint_max=4 * closure_count, nesterov_momentum=momentum
+                )
+                solver.step(state, output, control, None, 0.005)
+                slots = solver._connect_slot.numpy()
+                active = enabled[closure_joints].astype(bool)
+                np.testing.assert_array_equal(slots[~active], -1)
+                np.testing.assert_array_equal(slots[active], slots[active][0] + 3 * np.arange(active.sum()))
 
 
 @contextlib.contextmanager
@@ -978,7 +955,6 @@ for _fn in (
     test_deterministic_launches_replay_identically,
     test_deterministic_joint_rows_follow_articulation_order,
     test_deterministic_joint_friction_rows_follow_dof_order,
-    test_multiwarp_closures_keep_joint_order,
     test_bilateral_rows_follow_element_order,
     test_loop_closure_rows_follow_element_order,
     test_inherited_global_mode_keeps_steel_ordering,

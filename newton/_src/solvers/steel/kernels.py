@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import dataclass
 from functools import cache
 
 import warp as wp
@@ -20,6 +21,86 @@ from .friction_patches import WARP_DETERMINISM_OFF, FrictionPatches, warmstart_d
 
 # SolverSteel rejects models with ``requires_grad``, so no kernel needs an adjoint.
 wp.set_module_options({"enable_backward": False, **WARP_DETERMINISM_OFF})
+
+
+@dataclass(frozen=True)
+class SweepField:
+    """A lane-strided vector in the sweep's own coordinates."""
+
+    value: str  # CUDA lvalue, indexed by i
+    count: str
+    capacity: int
+    impulse: bool = False
+
+
+def warp_momentum(
+    enabled: bool,
+    fields: list[SweepField],
+    *,
+    lanes: int = 32,
+    iteration: str = "iteration",
+    restart: str = "false",
+    row_gamma: str = "",
+) -> tuple[str, str]:
+    """Emit register-local history and the update before a sweep.
+
+    The impulse displacement determines the gradient restart. Velocity, residuals
+    and other affine images of the impulses take the same extrapolation in their
+    native coordinates. No extra response traversal or shared memory is needed.
+    """
+    if not enabled:
+        return "", ""
+    declarations = ["int momentum_age = 0;"]
+    if row_gamma:
+        declarations.append(f"""bool momentum_soft = false;
+            for (int i = lane; i < {fields[0].count}; i += {lanes}) momentum_soft |= {row_gamma} > 0.0f;
+            momentum_soft = __any_sync(MASK, momentum_soft);""")
+    products = []
+    updates = []
+    for k, field in enumerate(fields):
+        slots = (field.capacity + lanes - 1) // lanes
+        previous, extrap = f"previous_{k}", f"extrap_{k}"
+        declarations.append(f"float {previous}[{slots}];")
+        loop = f"for (int i = lane, j = 0; i < {field.count}; i += {lanes}, ++j)"
+        if field.impulse:
+            declarations.append(f"float {extrap}[{slots}];")
+            products.append(f"""{loop} {{
+                const float move = {field.value} - {previous}[j];
+                const float correction = move - {extrap}[j];
+                dot += correction * {extrap}[j];
+                {"norm += correction * correction; displacement += move * move;" if row_gamma else ""}
+            }}""")
+        updates.append(f"""{loop} {{
+            const float x = {field.value};
+            const float y = beta != 0.0f ? x + beta * (x - {previous}[j]) : x;
+            {previous}[j] = x;
+            {f"{extrap}[j] = y - x;" if field.impulse else ""}
+            if (beta != 0.0f) {field.value} = y;
+        }}""")
+    bound = ""
+    if row_gamma:
+        bound = f"""if (momentum_soft) {{
+                for (int d = {lanes // 2}; d; d >>= 1) {{
+                    norm += __shfl_xor_sync(MASK, norm, d, {lanes});
+                    displacement += __shfl_xor_sync(MASK, displacement, d, {lanes});
+                }}
+                if (displacement > 0.0f) beta = fminf(beta, sqrtf(norm / displacement));
+            }}"""
+    step = f"""
+        float beta = 0.0f;
+        if ({iteration} > 0) {{
+            float dot = 0.0f;
+            {"float norm = 0.0f, displacement = 0.0f;" if row_gamma else ""}
+            {chr(10).join(products)}
+            for (int d = {lanes // 2}; d; d >>= 1) dot += __shfl_xor_sync(MASK, dot, d, {lanes});
+            momentum_age = dot < 0.0f || ({restart}) ? 0 : momentum_age + 1;
+            if (momentum_age > 1) beta = static_cast<float>(momentum_age - 1) / (momentum_age + 2);
+            {bound}
+        }}
+        {chr(10).join(updates)}
+        __syncwarp(MASK);
+"""
+    return "\n".join(declarations), step
 
 
 def _steel_module(name: str) -> wp.Module:
@@ -1593,8 +1674,8 @@ def publish_fk_id_source(
     __syncwarp();
 #endif
 """)
-def _tree_warp_sync():
-    """Order dependent tree levels within one complete CUDA warp."""
+def warp_sync():
+    """Order memory accesses within one complete CUDA warp."""
 
 
 @cache
@@ -1686,7 +1767,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
                         segment += lanes
                 # Inactive groups still participate in every full-warp barrier.
                 if wp.static(lanes > 1):
-                    _tree_warp_sync()
+                    warp_sync()
 
         return tree_fk_public
 
@@ -1772,7 +1853,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
                         origin = wp.transform_point(body_q[root_body], body_com[root_body])
                 articulation_origin[articulation] = origin
         if wp.static(lanes > 1):
-            _tree_warp_sync()
+            warp_sync()
 
         origin = wp.vec3()
         write_body_inertia = materialize_all_body_inertia
@@ -1852,7 +1933,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
                     segment += lanes
             # Inactive groups still participate in every full-warp barrier.
             if wp.static(lanes > 1):
-                _tree_warp_sync()
+                warp_sync()
 
     return tree_fk_id
 
@@ -2257,7 +2338,7 @@ def _get_tree_tau_kernel(lanes: int):
                     segment += lanes
             # Inactive groups still participate in every full-warp barrier.
             if wp.static(lanes > 1):
-                _tree_warp_sync()
+                warp_sync()
 
     return tree_tau
 

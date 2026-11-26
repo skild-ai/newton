@@ -1207,23 +1207,6 @@ class TestSteelSolveModeOptions(unittest.TestCase):
             SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation", enable_sleeping=True)
 
 
-def test_cuda_momentum_default_and_opt_out(test, device):
-    """Enable momentum on the selected CUDA sweep unless explicitly disabled."""
-    model, _ = _build_plane_model(device, separation=0.0, restitution=0.0)
-    default = SolverSteel(model)
-    plain = SolverSteel(model, nesterov_momentum=False)
-    test.assertTrue(default.nesterov_momentum)
-    test.assertFalse(plain.nesterov_momentum)
-
-
-add_function_test(
-    TestSteelSolveModeOptions,
-    "test_cuda_momentum_default_and_opt_out",
-    test_cuda_momentum_default_and_opt_out,
-    devices=get_cuda_test_devices(),
-)
-
-
 class TestSteelPrivateApi(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

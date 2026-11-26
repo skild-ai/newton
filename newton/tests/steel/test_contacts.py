@@ -4399,7 +4399,7 @@ def test_nesterov_momentum_on_articulated_rows(test, device):
     builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=4000.0))
     model = builder.finalize(device=device)
 
-    plain_solver = SolverSteel(model)
+    plain_solver = SolverSteel(model, nesterov_momentum=False)
     accelerated_solver = SolverSteel(model, nesterov_momentum=True)
     test.assertTrue(plain_solver._local_internal_fast_path)
     for name in (

@@ -92,6 +92,7 @@ from .kernels import (
     ROW_WATERMARK_CONTACT_SLOT,
     ROW_WATERMARK_FAMILY_STRIDE,
     WARP_DETERMINISM_OFF,
+    SweepField,
     _get_tree_fk_kernel,
     _get_tree_tau_kernel,
     accumulate_connect_wrenches_from_impulses,
@@ -238,9 +239,9 @@ from .kernels import (
     trisolve_loop,
     update_body_qd_from_featherstone,
     update_qdd_from_velocity,
+    warp_momentum,
     zero_unattached_parent_wrenches,
 )
-from .momentum import SplitSweep, SplitSweepOptions, SweepField, get_advance_split_sweep, warp_momentum
 from .sleeping import _publish_body_awake, _SleepState
 from .sparse_contact import (
     _get_sparse_contact_response_kernel,
@@ -6765,6 +6766,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._cpu_mf_meta_rhs = None
         self._cpu_mf_gs_v = None
         self._mf_gs_row_phases = False
+        self._split_momentum = None
         self._pgs_solve_mf_gs_kernel = None
         self._mfgs_pair_cache = False
         self._mfgs_torsion_links = False
@@ -6893,13 +6895,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 nesterov_momentum=self._nesterov_momentum,
             )
             self._mf_gs_row_phases = row_phases
-            # Per-world sweep history of nesterov_momentum; a (1, 1) stand-in when it is off.
-            momentum_shape = (
-                (self._world_count, 2 * (self._articulation_constraint_max + mf_rows))
-                if self._nesterov_momentum
-                else (1, 1)
-            )
-            self._momentum_scratch = wp.zeros(momentum_shape, dtype=float, device=model.device)
+            if self._nesterov_momentum and (self._propagation_active or self._row_schedule == "phased"):
+                self._setup_split_momentum(model)
+            else:
+                shape = (self._world_count, 2 * (self._articulation_constraint_max + mf_rows))
+                self._momentum_scratch = wp.empty(shape if self._nesterov_momentum else (1, 1), device=model.device)
             if not model.device.is_cuda:
                 # CPU fallback: _launch_mf_gs_phase runs the world-serial twin of the native kernel.
                 self._pgs_solve_mf_gs_kernels = {}
@@ -6924,18 +6924,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             if model.device.is_cuda:
                 self._pgs_solve_mf_gs_kernel = next(iter(self._pgs_solve_mf_gs_kernels.values()))
             self._init_local_solve_kernels(device_arch, mf_rows)
-        self._split_momentum = None
-        if (
-            self._nesterov_momentum
-            and self._pgs_solve_mf_gs_kernel is not None
-            and (self._propagation_active or self._row_schedule == "phased")
-        ):
-            self._setup_split_momentum(model)
         self._setup_latency_fused(model)
 
     def _setup_split_momentum(self, model: Model) -> None:
         """Keep the iterate across kernel boundaries for phased and propagation solves."""
-        self._split_momentum_options = SplitSweepOptions(
+        options = latency_fused.SplitSweepOptions(
             propagation=self._propagation_active,
             torsion=self._contact_torsion_enabled,
             warmstart=self._contact_warmstart,
@@ -6943,48 +6936,49 @@ class SolverSteel(SolverBase, CouplingInterface):
             compliance=self._contact_compliance,
             velocity_limits=self._internal_row_phases()[1],
         )
-        self._advance_split_sweep = get_advance_split_sweep(self._split_momentum_options)
-        h = SplitSweep()
-        h.dense_count, h.free_count = self._constraint_count, self._mf_constraint_count
-        h.dense_type, h.free_type = self._row_type, self._mf_row_type
-        h.dense, h.free = self._impulses, self._mf_impulses
+
+        def rows(count, impulses, kind):
+            group = latency_fused.MomentumRows()
+            group.count, group.impulses, group.kind = count, impulses, kind
+            return group
+
+        h = latency_fused.SplitSweep()
+        h.dense = rows(self._constraint_count, self._impulses, self._row_type)
+        h.free = rows(self._mf_constraint_count, self._mf_impulses, self._mf_row_type)
         h.dofs, h.velocity = self._world_dof_indices, self._v_out
-        h.prop_torsion_head = self._propagation_torsion_head
-        if self._contact_compliance:
-            h.dense_gamma = self._compliance.dense_gamma
-            h.free_gamma = self._compliance.mf_gamma
-            h.prop_gamma = self._compliance.propagation_gamma
-        else:
-            h.dense_gamma = h.free_gamma = h.prop_gamma = self._compliance_off_gamma
-        h.response = self._Y_world
-        h.free_a, h.free_b = self._mf_dof_a, self._mf_dof_b
-        h.response_a, h.response_b = self._mf_MiJt_a, self._mf_MiJt_b
-        worlds = self._world_count
-        device = model.device
-        if self._propagation_active:
-            h.prop_type = self._propagation_row_type
-            h.prop_count, h.prop = self._propagation_constraint_count, self._propagation_impulses
+        worlds, device = self._world_count, model.device
+        width = self._impulses.shape[1] + self._mf_impulses.shape[1]
+        if options.propagation:
+            h.prop = rows(self._propagation_constraint_count, self._propagation_impulses, self._propagation_row_type)
+            width += self._propagation_impulses.shape[1]
             h.twist = self._propagation_body_qd
-            if self._propagation_world_bodies is not None:
-                h.body_start, h.bodies = self._propagation_world_body_start, self._propagation_world_bodies
-            else:
-                h.body_start, h.bodies = self._responding_world_bodies(model)
+            h.prev_twist = wp.empty_like(h.twist)
+            h.prev_velocity = wp.empty_like(h.velocity)
+            h.body_start, h.bodies = self._propagation_world_body_start, self._propagation_world_bodies
         else:
-            h.prop_type = self._row_type
-            h.prop = wp.empty((worlds, 1), dtype=float, device=device)
-            h.prop_count = wp.zeros(worlds, dtype=int, device=device)
-            h.twist = wp.empty((1, 6), dtype=float, device=device)
-            h.body_start = wp.zeros(worlds + 1, dtype=int, device=device)
-            h.bodies = wp.empty(1, dtype=int, device=device)
-        h.prev_twist = wp.empty_like(h.twist)
-        h.prev_velocity = wp.empty_like(h.velocity)
-        width = h.dense.shape[1] + h.free.shape[1] + h.prop.shape[1]
-        h.history = wp.empty((worlds, width), dtype=wp.vec2, device=device)
-        h.correction_norm_sq = wp.empty(worlds, dtype=float, device=device)
+            h.response = self._Y_world
+            h.free_a, h.free_b = self._mf_dof_a, self._mf_dof_b
+            h.response_a, h.response_b = self._mf_MiJt_a, self._mf_MiJt_b
+        if options.compliance:
+            h.dense.gamma = self._compliance.dense_gamma
+            h.free.gamma = self._compliance.mf_gamma
+            if options.propagation:
+                h.prop.gamma = self._compliance.propagation_gamma
+        if options.torsion:
+            h.prop_torsion_head = self._propagation_torsion_head
+            h.correction_norm_sq = wp.empty(worlds, dtype=float, device=device)
+        # Split phases keep their clamp flag in column zero. A separately launched native
+        # sweep initializes its own history and can reuse the entire world's allocation.
+        storage = wp.empty((worlds, width + 1), dtype=wp.vec2, device=device)
+        h.history = storage[:, 1:]
+        self._momentum_scratch = storage.view(float).reshape((worlds, 2 * (width + 1)))
+        if options.propagation and options.velocity_limits:
+            h.clamp = self._momentum_scratch
         h.age = wp.empty(worlds, dtype=int, device=device)
-        h.clamp = self._momentum_scratch
+        self._split_momentum_options = options
+        self._advance_split_sweep = latency_fused.get_advance_split_sweep(options)
         self._split_momentum_state = h
-        self._split_momentum = wp.array([h], dtype=SplitSweep, device=device)
+        self._split_momentum = wp.array([h], dtype=latency_fused.SplitSweep, device=device)
 
     def _advance_split_momentum(self, iteration: int, friction_transition: bool) -> None:
         if self._split_momentum is not None:
@@ -11943,25 +11937,22 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_cache_art_eligible = wp.array(art_eligible, dtype=wp.int32, device=device)
         self._propagation_world_body_start = None
         self._propagation_world_bodies = None
-        if self._ordered_rows and self._propagation_needs_body_map:
-            self._propagation_world_body_start, self._propagation_world_bodies = self._responding_world_bodies(model)
+        if self._nesterov_momentum or (self._ordered_rows and self._propagation_needs_body_map):
+            # Tree bodies of each solve world's responding articulations, by body index.
+            articulation_start = model.articulation_start.numpy()
+            joint_child = model.joint_child.numpy()
+            world_bodies = [[] for _ in range(worlds)]
+            for art in np.flatnonzero(plan.response_dof_count > 0):
+                tree_joints = slice(int(articulation_start[art]), int(plan.articulation_joint_end[art]))
+                world_bodies[int(plan.articulation_world[art])].extend(joint_child[tree_joints].tolist())
+            world_bodies = [np.unique(np.asarray(listed, dtype=np.int32)) for listed in world_bodies]
+            start = np.concatenate(([0], np.cumsum([listed.size for listed in world_bodies])))
+            self._propagation_world_body_start = wp.array(start, dtype=wp.int32, device=device)
+            self._propagation_world_bodies = wp.array(
+                np.concatenate([*world_bodies, np.zeros(1, dtype=np.int32)]), dtype=wp.int32, device=device
+            )
         if self._propagation_colored:
             self._allocate_colored_buffers(model, rows)
-
-    def _responding_world_bodies(self, model):
-        """List each solve world's responding tree bodies in body-index order."""
-        device, worlds, plan = model.device, self._world_count, self._model_plan
-        articulation_start = model.articulation_start.numpy()
-        joint_child = model.joint_child.numpy()
-        world_bodies = [[] for _ in range(worlds)]
-        for art in np.flatnonzero(plan.response_dof_count > 0):
-            tree_joints = slice(int(articulation_start[art]), int(plan.articulation_joint_end[art]))
-            world_bodies[int(plan.articulation_world[art])].extend(joint_child[tree_joints].tolist())
-        world_bodies = [np.unique(np.asarray(listed, dtype=np.int32)) for listed in world_bodies]
-        start = np.concatenate(([0], np.cumsum([listed.size for listed in world_bodies])))
-        return wp.array(start, dtype=wp.int32, device=device), wp.array(
-            np.concatenate([*world_bodies, np.zeros(1, dtype=np.int32)]), dtype=wp.int32, device=device
-        )
 
     def _allocate_colored_buffers(self, model, rows: int) -> None:
         """Allocate the unit lists, the coloring scratch and the unit records of the colored sweep."""
@@ -12338,7 +12329,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             outputs=[self._propagation_constraint_count],
             device=model.device,
         )
-        if self._propagation_world_bodies is not None:
+        if self._ordered_rows and self._propagation_needs_body_map:
             self._build_propagation_body_map_ordered(partitioned=bool(self._propagation_cached_kernels))
             if self._propagation_cached_kernels:
                 wp.launch(
@@ -17096,15 +17087,18 @@ def _get_pgs_solve_mf_gs_kernel(
     # Nesterov momentum with O'Donoghue-Candes restart; per-world scratch holds
     # [lam_prev dense][lam_prev mf][e dense][e mf].
     capacity = min(64, M_MF) if inner_momentum and cache_free_response else 0
-    cache_init = ""
-    cache_history = ""
-    if capacity:
-        # Compact each DOF's nonzero response coefficients in the original
-        # row order. Its lane can apply momentum without a barrier per row.
-        cache_init = f"""
+    momentum_init = momentum_sweep = momentum_finish = ""
+    if inner_momentum:
+        cache_init = ""
+        cache_history = ""
+        cached_response = ""
+        if capacity:
+            # Compact each DOF's nonzero response coefficients in the original
+            # row order. Its lane can apply momentum without a barrier per row.
+            cache_init = f"""
     __shared__ float free_response[{capacity}][{D}];
     __shared__ unsigned char free_row[{capacity}][{D}];
-    int response_count[({D} + 31) / 32];
+    int response_count[{ELEMS_PER_LANE}];
     __shared__ float free_previous[{capacity}], free_extrap[{capacity}];
     bool cache_response = m_dense == 0 && m_mf <= {capacity};
     if (cache_response) {{
@@ -17136,11 +17130,20 @@ def _get_pgs_solve_mf_gs_kernel(
         __syncwarp();
     }}
 """
-        cache_history = "if (cache_response) { mom_prev_m = free_previous; mom_e_m = free_extrap; }"
-    momentum_init = (
-        f"""
+            cache_history = "if (cache_response) { mom_prev_m = free_previous; mom_e_m = free_extrap; }"
+            cached_response = f"""
+            if (cache_response) {{
+                for (int d = lane; d < {D}; d += 32) {{
+                    float v = s_v[d];
+                    for (int k = 0; k < response_count[d / 32]; ++k) v += free_response[k][d] * free_extrap[free_row[k][d]];
+                    s_v[d] = v;
+                }}
+                __syncwarp();
+            }} else
+"""
+        momentum_init = f"""
 {cache_init}
-    float* mom_prev_d = &momentum_scratch.data[world * 2 * ({M_D} + {M_MF})];
+    float* mom_prev_d = &momentum_scratch.data[world * momentum_scratch.shape[1]];
     float* mom_prev_m = mom_prev_d + {M_D};
     float* mom_e_d = mom_prev_m + {M_MF};
     float* mom_e_m = mom_e_d + {M_D};
@@ -17150,33 +17153,16 @@ def _get_pgs_solve_mf_gs_kernel(
     if ({inner_guard}) for (int i = lane; i < m_mf; i += 32) {{ mom_prev_m[i] = s_lam_mf[i]; mom_e_m[i] = 0.0f; }}
     __syncwarp();
 """
-        if inner_momentum
-        else ""
-    )
-    momentum_response = f"""
+        momentum_response = f"""
             // Apply each row's impulse change through its own response, as the sweep does.
-            constexpr int chunks = {(D + 31) // 32};
-            float velocity[chunks];
-            #pragma unroll
-            for (int chunk = 0; chunk < chunks; ++chunk) {{
-                const int d = lane + 32 * chunk;
-                velocity[chunk] = d < {D} ? s_v[d] : 0.0f;
-            }}
+{lanes(f"            float v_{{k}} = {{d}} < {D} ? s_v[{{d}}] : 0.0f;")}
             for (int i = 0; i < m_dense; ++i) {{
                 const float e = mom_e_d[i];
                 if (e == 0.0f) continue;
                 const int base = jy_world_base + i * {D};
-                #pragma unroll
-                for (int chunk = 0; chunk < chunks; ++chunk) {{
-                    const int d = lane + 32 * chunk;
-                    if (d < {D}) velocity[chunk] += Y_world.data[base + d] * e;
-                }}
+{lanes(f"                if ({{d}} < {D}) v_{{k}} += Y_world.data[base + {{d}}] * e;")}
             }}
-            #pragma unroll
-            for (int chunk = 0; chunk < chunks; ++chunk) {{
-                const int d = lane + 32 * chunk;
-                if (d < {D}) s_v[d] = velocity[chunk];
-            }}
+{lanes(f"            if ({{d}} < {D}) s_v[{{d}}] = v_{{k}};")}
             __syncwarp();
             for (int i = 0; i < m_mf; i++) {{
                 float e = mom_e_m[i];
@@ -17189,9 +17175,6 @@ def _get_pgs_solve_mf_gs_kernel(
                 __syncwarp();
             }}
 """
-    momentum_finish = ""
-    momentum_reanchor = ""
-    if inner_momentum:
         # On an equality block the complete sweep displacement has the same
         # linear image in velocity space. Retain the impulse-space restart.
         momentum_init += f"""
@@ -17209,127 +17192,93 @@ def _get_pgs_solve_mf_gs_kernel(
     }}
     only_equalities = __all_sync(MASK, only_equalities);
     const bool dense_torsion = __all_sync(MASK, accumulated) && __any_sync(MASK, has_torsion);
-    constexpr int velocity_chunks = {(D + 31) // 32};
-    float previous_velocity[velocity_chunks];
+    float previous_velocity[{ELEMS_PER_LANE}];
     bool rebuild_at_end = false;
-"""
-        # Reconstruct from the solve's initial velocity and the net change of
-        # stored impulses. This bounds accumulated fp32 extrapolation error,
-        # including the final force/velocity discrepancy on long solves.
-        rebuild_velocity = f"""
-            #pragma unroll
-            for (int chunk = 0; chunk < velocity_chunks; ++chunk) {{
-                const int d = lane + 32 * chunk;
-                if (d < {D}) {{
-                    const int global_dof = world_dof_indices.data[dof_map_base + d];
-                    if (global_dof >= 0) {{
-                        double velocity = v_out.data[global_dof];
-                        for (int i = 0; i < m_dense; ++i) {{
-                            const double impulse_change = (double)s_lam_dense[i] - world_impulses.data[off_dense + i];
-                            velocity += (double)Y_world.data[jy_world_base + i * {D} + d] * impulse_change;
-                        }}
-                        s_v[d] = (float)velocity;
-                    }}
-                }}
+    // Reconstruct accepted velocities in fp64 from the initial velocity and net applied impulses.
+    auto rebuild_velocity = [&]() {{
+        for (int d = lane; d < {D}; d += 32) {{
+            const int global_dof = world_dof_indices.data[dof_map_base + d];
+            if (global_dof < 0) continue;
+            double velocity = v_out.data[global_dof];
+            for (int i = 0; i < m_dense; ++i) {{
+                const double change = (double)s_lam_dense[i] - world_impulses.data[off_dense + i];
+                velocity += (double)Y_world.data[jy_world_base + i * {D} + d] * change;
             }}
-            __syncwarp();
+            s_v[d] = (float)velocity;
+        }}
+        __syncwarp();
+    }};
 """
-        # Rebuild the accepted iterate before extrapolating either coordinate.
-        momentum_reanchor = f"if (only_equalities && rebuild_at_end && (iter & 31) == 0) {{ {rebuild_velocity} }}"
-        momentum_finish = "if (rebuild_at_end) {" + rebuild_velocity + "}"
+        momentum_reanchor = "if (only_equalities && rebuild_at_end && (iter & 31) == 0) rebuild_velocity();"
+        momentum_finish = "if (rebuild_at_end) rebuild_velocity();"
         momentum_response = f"""
             if (only_equalities) {{
                 #pragma unroll
-                for (int chunk = 0; chunk < velocity_chunks; ++chunk) {{
-                    const int d = lane + 32 * chunk;
-                    if (d < {D}) {{
-                        const float v = s_v[d];
-                        if (beta != 0.0f) s_v[d] = v + beta * (v - previous_velocity[chunk]);
-                        previous_velocity[chunk] = v;
-                    }}
+                for (int k = 0; k < {ELEMS_PER_LANE}; ++k) {{
+                    const int d = lane + 32 * k;
+                    if (d >= {D}) continue;
+                    const float v = s_v[d];
+                    if (beta != 0.0f) s_v[d] = v + beta * (v - previous_velocity[k]);
+                    previous_velocity[k] = v;
                 }}
                 rebuild_at_end |= beta != 0.0f;
                 __syncwarp();
             }} else if (beta != 0.0f) {{
-                {momentum_response}
+                {cached_response} {{ {momentum_response} }}
                 rebuild_at_end |= dense_torsion;
             }}
 """
-    if capacity:
-        momentum_response = f"""
-            if (cache_response) {{
-                if (beta != 0.0f) {{
-                    for (int d = lane; d < {D}; d += 32) {{
-                        float v = s_v[d];
-                        for (int k = 0; k < response_count[d / 32]; ++k) v += free_response[k][d] * free_extrap[free_row[k][d]];
-                        s_v[d] = v;
-                    }}
-                    __syncwarp();
-                }}
-            }} else {{ {momentum_response} }}
-"""
-    # Soft contacts include an impulse-dependent term in the row residual.
-    # Bound their lookahead by the last projected correction on every owner.
-    if inner_momentum and contact_compliance:
-        momentum_init += """
+        # Soft contacts include an impulse-dependent term in the row residual.
+        # Bound their lookahead by the last projected correction on every owner.
+        if contact_compliance:
+            momentum_init += """
     bool soft_rows = false;
     for (int i = lane; i < m_dense; i += 32) soft_rows |= compliance_dense_gamma.data[off_dense + i] > 0.0f;
     for (int i = lane; i < m_mf; i += 32) soft_rows |= compliance_mf_gamma.data[off_mf + i] > 0.0f;
     soft_rows = __any_sync(MASK, soft_rows);
 """
-    progress_vars = ", correction_sq = 0.0f, move_sq = 0.0f" if contact_compliance else ""
-    norm_update = "correction_sq += correction * correction; move_sq += move * move;" if contact_compliance else ""
-    bound_lookahead = (
-        "const float norm = warp_sum(move_sq); const float correction = warp_sum(correction_sq);"
-        " if (soft_rows && norm > 0.0f) beta = fminf(beta, sqrtf(correction / norm));"
-        if contact_compliance
-        else ""
-    )
-    momentum_sweep = (
-        f"""
+        else:
+            momentum_init += "    constexpr bool soft_rows = false;\n"
+        momentum_sweep = f"""
         if ({inner_guard} && iter > 0) {{
             // Restart when the last sweep's correction opposes its extrapolation, and when friction switches on.
-            float mom_dot = 0.0f{progress_vars};
-            for (int i = lane; i < m_dense; i += 32) {{
-                const float move = s_lam_dense[i] - mom_prev_d[i];
-                const float correction = move - mom_e_d[i];
-                mom_dot += correction * mom_e_d[i];
-                {norm_update}
-            }}
-            for (int i = lane; i < m_mf; i += 32) {{
-                const float move = s_lam_mf[i] - mom_prev_m[i];
-                const float correction = move - mom_e_m[i];
-                mom_dot += correction * mom_e_m[i];
-                {norm_update}
-            }}
+            float mom_dot = 0.0f, correction_sq = 0.0f, move_sq = 0.0f;
+            auto measure = [&](float move, float extrap) {{
+                const float correction = move - extrap;
+                mom_dot += correction * extrap;
+                correction_sq += correction * correction;
+                move_sq += move * move;
+            }};
+            for (int i = lane; i < m_dense; i += 32) measure(s_lam_dense[i] - mom_prev_d[i], mom_e_d[i]);
+            for (int i = lane; i < m_mf; i += 32) measure(s_lam_mf[i] - mom_prev_m[i], mom_e_m[i]);
             bool restart = warp_sum(mom_dot) < 0.0f || global_iter == friction_start_iteration;
             mom_k = restart ? 0 : mom_k + 1;
             float beta = mom_k > 1 ? (float)(mom_k - 1) / (float)(mom_k + 2) : 0.0f;
-            {bound_lookahead}
+            if (soft_rows) {{
+                const float norm = warp_sum(move_sq), correction = warp_sum(correction_sq);
+                if (norm > 0.0f) beta = fminf(beta, sqrtf(correction / norm));
+            }}
 {momentum_reanchor}
             // Extrapolate the impulses; stateless velocity-limit rows keep their last clamp. e holds the
             // change the stored impulse actually took, so v below follows it exactly as a sweep update would.
+            auto extrapolate = [&](float x, int kind, float& previous, float& extrap) {{
+                const float y = kind == {vlim_type} ? x : x + beta * (x - previous);
+                previous = x;
+                extrap = y - x;
+                return y;
+            }};
             for (int i = lane; i < m_dense; i += 32) {{
-                float lam = s_lam_dense[i];
-                float y = (s_meta_dense[i] & {type_mask}) == {vlim_type} ? lam : lam + beta * (lam - mom_prev_d[i]);
-                mom_prev_d[i] = lam;
-                mom_e_d[i] = y - lam;
-                s_lam_dense[i] = y;
+                const int kind = s_meta_dense[i] & {type_mask};
+                s_lam_dense[i] = extrapolate(s_lam_dense[i], kind, mom_prev_d[i], mom_e_d[i]);
             }}
             for (int i = lane; i < m_mf; i += 32) {{
-                float lam = s_lam_mf[i];
-                float y = (mf_meta.data[off_meta + i * 4 + 3] & {MF_META_ROW_TYPE_MASK}) == {vlim_type} ? lam : lam + beta * (lam - mom_prev_m[i]);
-                mom_prev_m[i] = lam;
-                mom_e_m[i] = y - lam;
-                s_lam_mf[i] = y;
+                const int kind = mf_meta.data[off_meta + i * 4 + 3] & {MF_META_ROW_TYPE_MASK};
+                s_lam_mf[i] = extrapolate(s_lam_mf[i], kind, mom_prev_m[i], mom_e_m[i]);
             }}
             __syncwarp();
 {momentum_response}
         }}
 """
-        if inner_momentum
-        else ""
-    )
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;

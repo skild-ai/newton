@@ -16,8 +16,9 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     WARP_DETERMINISM_OFF,
+    SweepField,
+    warp_momentum,
 )
-from .momentum import SweepField, warp_momentum
 
 wp.set_module_options(WARP_DETERMINISM_OFF)
 

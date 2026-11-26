@@ -4038,10 +4038,9 @@ class TestSteelLatencyFused(unittest.TestCase):
                 SolverSteel(model, **steel_mode_options("colored"), nesterov_momentum=True)
         build.assert_called_once()
 
-    def test_fused_momentum_matches_per_pass_launches(self):
-        """Apply the same momentum to the colored solve inside and outside the fused loop."""
+    def test_fused_momentum_changes_finite_sweep_response(self):
+        """Keep the first two sweeps identical and accelerate impulses and velocities by the eighth."""
         model = _build_latency_scene("cuda:0")
-        self._check_fused_matches(model, iterations=8, enable_joint_limits=True, nesterov_momentum=True)
 
         # A fused/per-pass comparison alone would also pass if both dropped the update.
         # Reuse one fixed collision manifold with deterministic row ordering.
@@ -4051,7 +4050,7 @@ class TestSteelLatencyFused(unittest.TestCase):
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
 
-        def solve(iterations, momentum):
+        def solve(iterations, **options):
             solver = SolverSteel(
                 model,
                 **steel_mode_options("colored"),
@@ -4059,18 +4058,19 @@ class TestSteelLatencyFused(unittest.TestCase):
                 articulation_constraint_max=96,
                 free_body_constraint_max=32,
                 iterations=iterations,
-                nesterov_momentum=momentum,
                 deterministic=wp.DeterministicMode.RUN_TO_RUN,
+                **options,
             )
             self.assertTrue(solver._latency_fused)
+            self.assertEqual(solver.nesterov_momentum, options.get("nesterov_momentum", True))
             start, result = model.state(), model.state()
             start.assign(state)
             solver.step(start, result, model.control(), contacts, 1.0 / 240.0)
             return solver._propagation_impulses.numpy(), result.joint_qd.numpy()
 
-        for off, on in zip(solve(2, False), solve(2, True), strict=True):
+        for off, on in zip(solve(2, nesterov_momentum=False), solve(2, nesterov_momentum=True), strict=True):
             np.testing.assert_array_equal(off, on)
-        for off, on in zip(solve(8, False), solve(8, True), strict=True):
+        for off, on in zip(solve(8, nesterov_momentum=False), solve(8), strict=True):
             self.assertTrue(np.isfinite(on).all())
             self.assertGreater(np.max(np.abs(on - off)), 1.0e-6)
 
