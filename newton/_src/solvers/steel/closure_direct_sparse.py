@@ -35,7 +35,13 @@ import warp as wp
 
 from .closure_direct_symbolic import SparseCholeskyPlan
 from .friction_patches import WARP_DETERMINISM_OFF
-from .kernels import CONNECT_MAX_ROWS, PGS_CONSTRAINT_TYPE_CONNECT, _connect_rotation_rows, _walk_has_free_dof
+from .kernels import (
+    CONNECT_MAX_ROWS,
+    PGS_CONSTRAINT_TYPE_CONNECT,
+    _closure_anchor_parts,
+    _connect_rotation_rows,
+    _walk_has_free_dof,
+)
 
 # Steel orders its own data paths; Warp's deterministic lowering would only add cost (see kernels.py).
 wp.set_module_options({"enable_backward": False, **WARP_DETERMINISM_OFF})
@@ -461,11 +467,10 @@ def ds_connect_geometry(
     body_to_joint: wp.array[int],
     joint_ancestor: wp.array[int],
     joint_qd_start: wp.array[int],
-    articulation_origin: wp.array[wp.vec3],
     closure_local: wp.array[int],
     mid_local: wp.array[int],
     body_rel_t: wp.array[wp.vec3],
-    body_to_articulation: wp.array[int],
+    articulation_ref_t: wp.array[wp.vec3],
     articulation_start: wp.array[int],
     joint_child: wp.array[int],
     # outputs
@@ -476,9 +481,10 @@ def ds_connect_geometry(
     """Directions, raw position errors and targets of one closure row (as ``populate_connect_J_for_size``).
 
     ``geom_closure[k, 7]`` is 0 for an inactive closure, 1 when the anchor mode matches the static support
-    (``mid_local``), 2 otherwise (the rows kernel counts those in ``status[1]``). Closures inside one articulation
-    take their gap and lever arms from the root-relative positions ``body_rel_t`` (see
-    :func:`~newton._src.solvers.steel.kernels.eval_body_relative_poses`).
+    (``mid_local``), 2 otherwise (the rows kernel counts those in ``status[1]``). Each anchor is split into the
+    articulation's reference point ``articulation_ref_t`` and a small offset, from the root-relative positions
+    ``body_rel_t`` (see :func:`~newton._src.solvers.steel.kernels.eval_body_relative_poses`), as in
+    ``populate_connect_J_for_size``.
     """
     tid = wp.tid()
     k = tid // CONNECT_MAX_ROWS
@@ -503,34 +509,25 @@ def ds_connect_geometry(
     prescribed = connect_parent_prescribed[k] != 0
     joint = connect_joint[k]
     anchor_p = wp.transform_get_translation(joint_X_p[joint])
-    p_a = anchor_p
     v_a = wp.vec3(0.0, 0.0, 0.0)
-    if body_p >= 0:
-        p_a = wp.transform_point(body_q[body_p], anchor_p)
-        if prescribed:
-            twist = body_qd[body_p]
-            x_com = wp.transform_point(body_q[body_p], body_com[body_p])
-            v_a = wp.spatial_top(twist) + wp.cross(wp.spatial_bottom(twist), p_a - x_com)
-    p_b = wp.transform_point(body_q[body_c], wp.transform_get_translation(joint_X_c[joint]))
-    origin = articulation_origin[art]
-    rel_a = p_a - origin
-    rel_b = p_b - origin
-    delta = p_a - p_b
-    same_articulation = False
-    if body_p >= 0:
-        same_articulation = body_to_articulation[body_p] == art and body_to_articulation[body_c] == art
-    if same_articulation:
-        # Both sides in the closure's articulation: gap and lever arms from root-relative positions, which do not
-        # carry the float32 rounding of the articulation's world position.
-        root = joint_child[articulation_start[art]]
-        origin_rel = body_rel_t[root] + wp.quat_rotate(wp.transform_get_rotation(body_q[root]), body_com[root])
-        q_a = body_rel_t[body_p] + wp.quat_rotate(wp.transform_get_rotation(body_q[body_p]), anchor_p)
-        q_b = body_rel_t[body_c] + wp.quat_rotate(
-            wp.transform_get_rotation(body_q[body_c]), wp.transform_get_translation(joint_X_c[joint])
-        )
-        rel_a = q_a - origin_rel
-        rel_b = q_b - origin_rel
-        delta = q_a - q_b
+    if body_p >= 0 and prescribed:
+        twist = body_qd[body_p]
+        lever = wp.quat_rotate(wp.transform_get_rotation(body_q[body_p]), anchor_p - body_com[body_p])
+        v_a = wp.spatial_top(twist) + wp.cross(wp.spatial_bottom(twist), lever)
+    # Gap and lever arms from the articulation's reference point, which do not carry the float32 rounding of the
+    # articulation's world position. The child is always in the articulation, the parent unless it is prescribed.
+    frame_t = articulation_ref_t[art]
+    root = joint_child[articulation_start[art]]
+    origin = body_rel_t[root] + wp.quat_rotate(wp.transform_get_rotation(body_q[root]), body_com[root])
+    big_a, small_a = _closure_anchor_parts(
+        art, body_p, not prescribed, anchor_p, body_q, body_rel_t, articulation_ref_t
+    )
+    big_b, small_b = _closure_anchor_parts(
+        art, body_c, True, wp.transform_get_translation(joint_X_c[joint]), body_q, body_rel_t, articulation_ref_t
+    )
+    rel_a = (big_a - frame_t) + small_a - origin
+    rel_b = (big_b - frame_t) + small_b - origin
+    delta = (big_a - big_b) + (small_a - small_b)
     at_midpoint = (
         not prescribed
         and _walk_has_free_dof(body_p, body_to_joint, joint_ancestor, joint_qd_start, kinematic_dof_mask)
@@ -777,11 +774,10 @@ def launch_connect_rows(solver, state_in, state_aug) -> None:
             solver._body_to_joint,
             model.joint_ancestor,
             model.joint_qd_start,
-            solver._articulation_origin,
             buf.closure_local,
             buf.mid_local,
             solver._body_rel_t,
-            solver._body_to_articulation,
+            solver._articulation_ref_t,
             model.articulation_start,
             model.joint_child,
         ],

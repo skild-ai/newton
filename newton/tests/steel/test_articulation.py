@@ -4463,19 +4463,21 @@ def test_closure_rows_are_translation_invariant(test, device, overrides=None, it
         state.assign(out)
 
 
-def test_world_parent_closure_rows_are_translation_invariant(test, device):
+def test_world_parent_closure_rows_are_translation_invariant(test, device, overrides=None, iterations=8):
     """A closure to the world steps alike at the origin and far from it.
 
     The ladder's last tip is pinned to a world anchor that the world offset moves exactly. Its rows measure the gap
     and lever arms from the articulation's reference point, the fixed root's ``joint_X_p``, so the world anchor and
     the tip both lose the offset before any rounding. From world poses, the tip's position 256 m out carried up to
     3e-5 m of float32 rounding (one ulp of 256 m) into the closure gap, several times the gap the closure holds.
+    ``overrides`` selects another closure solve (the sparse direct solve builds its own rows).
     """
     offset = (256.0, 256.0, 0.0)
     model = _build_closure_ladder(device, offsets=[(0.0, 0.0, 0.0), offset], world_closure=True)
-    solver = SolverSteel(
-        model, iterations=8, update_mass_matrix_interval=1, deterministic=wp.DeterministicMode.RUN_TO_RUN
-    )
+    with kernel_overrides(overrides or {}):
+        solver = SolverSteel(
+            model, iterations=iterations, update_mass_matrix_interval=1, deterministic=wp.DeterministicMode.RUN_TO_RUN
+        )
     state, out = model.state(), model.state()
     n_coords, n_dofs = model.joint_coord_count // 2, model.joint_dof_count // 2
     qd = np.random.default_rng(5).uniform(-0.5, 0.5, n_dofs).astype(np.float32)
@@ -4511,14 +4513,14 @@ def test_world_parent_closure_rows_are_translation_invariant(test, device):
     test.assertGreater(largest_gap, 1.0e-6)  # the closure opened, so the rows compared real gaps
 
 
-def test_second_root_closure_rows_are_translation_invariant(test, device):
+def test_second_root_closure_rows_are_translation_invariant(test, device, overrides=None, iterations=8):
     """A closure between the subtrees of two world roots of one articulation steps alike far from the origin.
 
     The articulation has two hinged roots, each carrying one link, and a BALL closure joins the two links. The second
     root's subtree is measured from the articulation's reference point through its exact ``joint_X_p``, as the first
     is, so the far copy's closure rows match the near copy's to rounding of the small offsets. Measured from the first
     root body's FK position instead, which rounds the 256 m offset, the far copy's closure gap was off by up to 8e-6 m
-    within the six steps.
+    within the six steps. ``overrides`` selects another closure solve.
     """
     template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     joints, tips = [], []
@@ -4566,7 +4568,8 @@ def test_second_root_closure_rows_are_translation_invariant(test, device):
     test.assertEqual(int(model.joint_parent.numpy()[2]), -1)  # the second root joint
     test.assertEqual(int(model.joint_articulation.numpy()[2]), int(model.joint_articulation.numpy()[0]))
 
-    solver = SolverSteel(model, iterations=8, update_mass_matrix_interval=1)
+    with kernel_overrides(overrides or {}):
+        solver = SolverSteel(model, iterations=iterations, update_mass_matrix_interval=1)
     state, out = model.state(), model.state()
     n_coords, n_dofs = model.joint_coord_count // 2, model.joint_dof_count // 2
     qd = np.random.default_rng(7).uniform(-2.0, 2.0, n_dofs).astype(np.float32)
@@ -4840,14 +4843,25 @@ for _name in (
     "test_sparse_direct_closure_solve_is_independent_of_block_size",
 ):
     add_function_test(TestSteelSparseDirectClosureSolve, _name, globals()[_name], devices=get_cuda_test_devices())
-add_function_test(
-    TestSteelSparseDirectClosureSolve,
-    "test_sparse_direct_closure_rows_are_translation_invariant",
-    test_closure_rows_are_translation_invariant,
-    devices=get_cuda_test_devices(),
-    overrides=_SPARSE_DIRECT,
-    iterations=2,
-)
+for _name, _func in (
+    ("test_sparse_direct_closure_rows_are_translation_invariant", test_closure_rows_are_translation_invariant),
+    (
+        "test_sparse_direct_world_parent_closure_rows_are_translation_invariant",
+        test_world_parent_closure_rows_are_translation_invariant,
+    ),
+    (
+        "test_sparse_direct_second_root_closure_rows_are_translation_invariant",
+        test_second_root_closure_rows_are_translation_invariant,
+    ),
+):
+    add_function_test(
+        TestSteelSparseDirectClosureSolve,
+        _name,
+        _func,
+        devices=get_cuda_test_devices(),
+        overrides=_SPARSE_DIRECT,
+        iterations=2,
+    )
 
 
 if __name__ == "__main__":
