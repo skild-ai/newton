@@ -67,7 +67,6 @@ from .kernels import (
     MATERIAL_COMBINE_MULTIPLY,
     MF_META_ROW_TYPE_BITS,
     MF_META_ROW_TYPE_MASK,
-    PGS_CONSTRAINT_TYPE_CONNECT,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
     PGS_CONSTRAINT_TYPE_CONTACT_SPIN,
@@ -76,7 +75,6 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-    PGS_CONSTRAINT_TYPE_MIMIC,
     PGS_CONSTRAINT_TYPE_TORSION,
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
@@ -1221,8 +1219,7 @@ def _mfgs_block_shared_bytes(
 ) -> int:
     """Return the static shared memory [B] of one matrix-free Gauss-Seidel kernel block, up to 4-byte alignment.
 
-    Counts the sweep and row-metadata arrays used for base path selection. Small CUDA worlds can
-    additionally stage momentum history and free responses within the remaining static storage.
+    Every ``__shared__`` array of :func:`_get_pgs_solve_mf_gs_kernel` is counted here.
     """
     resident_mf_rows = 0 if stream_mf_lambda else free_body_constraint_max
     total = _MFGS_TILE_SHARED_STORAGE_BYTES + 4 * (max_world_dofs + max_constraints + resident_mf_rows)
@@ -2707,18 +2704,18 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ``BODY_PARENT_F`` sums contact wrenches with atomics, so it is outside this guarantee.
                 Steel's kernel modules always opt out of Warp's ``deterministic`` module option, so a
                 process-wide ``wp.config.deterministic`` only selects this mode.
-            nesterov_momentum: Accelerate the matrix-free Gauss-Seidel sweep with Nesterov momentum and
-                O'Donoghue-Candes gradient restart, as in MuJoCo's PGS solver. Each sweep starts from the
-                impulses extrapolated along the previous sweep's change, applied to the velocity through each
-                row's response; momentum restarts when a sweep's correction opposes the extrapolation.
+            nesterov_momentum: Accelerate the matrix-free Gauss-Seidel sweep by extrapolating its impulses
+                and their velocity response. An opposing projected correction restarts momentum (the
+                O'Donoghue-Candes gradient restart). The squared cosine between the correction and the
+                preceding lookahead scales extrapolation. A friction patch carrying traction into the solve
+                contributes its initial tangential impulse to both directions. Patch torsion limits angular extrapolation
+                to the magnitude of the projected angular correction.
                 Can converge in fewer iterations on stacks, mass ratios and long chains; gains appear above a
                 few iterations. The position and velocity passes each start fresh history. On CUDA this
                 preserves the selected mass factorization, row ownership, scheduling and propagation fusion.
-                Propagation restarts after a velocity clamp or a released fixed-normal constraint. Torsional
-                contact also restarts on a growing correction. Fixed-normal propagation bounds lookahead by
-                the last projected correction, as do compliant contacts. A warm-started split sweep
-                scales its lookahead by the new correction relative to the carried impulse.
-                Defaults to enabled on CUDA. Pass ``False`` for plain Gauss-Seidel sweeps. Construction-only.
+                Defaults to enabled on CUDA. CPU uses plain sweeps, so at a fixed iteration count the
+                device defaults can produce different trajectories. Pass ``False`` for plain Gauss-Seidel
+                sweeps on CUDA. Construction-only.
         """
         solve_mode, articulated_contact_response = _normalize_solve_mode(solve_mode, articulated_contact_response)
         _validate_solve_mode(solve_mode, articulated_contact_response)
@@ -2877,6 +2874,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
         self._row_schedule = row_schedule
         self._contact_warmstart = bool(contact_warmstart)
+        # A subsequent solve in the same step can start from the first solve's
+        # patch tractions, even when the step itself starts cold.
+        self._momentum_patch_anchors = self._friction_anchors_enabled and (
+            self._contact_warmstart or self._velocity_iterations > 0 or self._row_schedule == "contact_then_internal"
+        )
         self.contact_warmstart_decay = contact_warmstart_decay
         self._enable_restitution = bool(enable_restitution)
         self.restitution_velocity_threshold = restitution_velocity_threshold
@@ -6851,34 +6853,15 @@ class SolverSteel(SolverBase, CouplingInterface):
                     *mfgs_shape, **mfgs_metadata, **mfgs_residency, torsion_links=self._mfgs_torsion_links
                 )
             )
-            cache_free_response = (
-                model.device.is_cuda
-                and self._has_free_rigid_bodies
-                and not self._propagation_active
-                and not row_phases
-                and not self._paired_factor_coordinates
-                and self._world_count <= model.device.sm_count
-                and self._max_world_dofs <= 64
-                and self._articulation_constraint_max <= 64
-                and mf_rows <= 512
-                and _mfgs_block_shared_bytes(
-                    *mfgs_shape[:3],
-                    **mfgs_metadata,
-                    pair_cache=self._mfgs_pair_cache,
-                    torsion_links=self._mfgs_torsion_links,
-                )
-                + min(64, mf_rows) * (5 * self._max_world_dofs + 8)
-                <= min(mfgs_shape[3], _STATIC_SHARED_MEMORY_BYTES)
-            )
             self._pgs_solve_mf_gs_kernel_for_phase = functools.partial(
                 _get_pgs_solve_mf_gs_kernel,
                 self._articulation_constraint_max,
                 mf_rows,
                 self._max_world_dofs,
                 device_arch,
-                cache_free_response=cache_free_response,
                 has_dense_velocity_limit_rows=self._enable_joint_velocity_limits,
                 shared_metadata=shared_metadata,
+                patch_anchors=self._momentum_patch_anchors,
                 has_drive_rows=self._has_drive_rows,
                 fuse_vel_limits=self._velocity_limits_fused,
                 contact_torsion=self._contact_torsion_enabled,
@@ -6895,11 +6878,13 @@ class SolverSteel(SolverBase, CouplingInterface):
                 nesterov_momentum=self._nesterov_momentum,
             )
             self._mf_gs_row_phases = row_phases
-            if self._nesterov_momentum and (self._propagation_active or self._row_schedule == "phased"):
+            split_momentum = self._nesterov_momentum and (self._propagation_active or self._row_schedule == "phased")
+            if split_momentum:
                 self._setup_split_momentum(model)
-            else:
-                shape = (self._world_count, 2 * (self._articulation_constraint_max + mf_rows))
-                self._momentum_scratch = wp.empty(shape if self._nesterov_momentum else (1, 1), device=model.device)
+            self._momentum_scratch = None
+            # A native sweep needs its own history only if it owns a full group of iterations.
+            if self._nesterov_momentum and (not split_momentum or self._row_schedule == "contact_then_internal"):
+                self._allocate_mf_gs_momentum_scratch()
             if not model.device.is_cuda:
                 # CPU fallback: _launch_mf_gs_phase runs the world-serial twin of the native kernel.
                 self._pgs_solve_mf_gs_kernels = {}
@@ -6926,57 +6911,52 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._init_local_solve_kernels(device_arch, mf_rows)
         self._setup_latency_fused(model)
 
+    def _allocate_mf_gs_momentum_scratch(self) -> None:
+        mf_rows = self._mf_meta_packed.shape[1] // 4
+        width = 2 * (self._articulation_constraint_max + mf_rows)
+        self._momentum_scratch = wp.empty((self._world_count, width), device=self.model.device)
+
     def _setup_split_momentum(self, model: Model) -> None:
         """Keep the iterate across kernel boundaries for phased and propagation solves."""
-        options = latency_fused.SplitSweepOptions(
-            propagation=self._propagation_active,
-            torsion=self._contact_torsion_enabled,
-            warmstart=self._contact_warmstart,
-            fixed_normal=self._friction_mode == "fixed_normal",
-            compliance=self._contact_compliance,
-            velocity_limits=self._internal_row_phases()[1],
-        )
+        propagation = self._propagation_active
 
-        def rows(count, impulses, kind):
+        patch_anchors = self._momentum_patch_anchors
+
+        def rows(count, impulses, kind, parent):
             group = latency_fused.MomentumRows()
             group.count, group.impulses, group.kind = count, impulses, kind
+            if patch_anchors:
+                group.parent = parent
             return group
 
         h = latency_fused.SplitSweep()
-        h.dense = rows(self._constraint_count, self._impulses, self._row_type)
-        h.free = rows(self._mf_constraint_count, self._mf_impulses, self._mf_row_type)
+        h.dense = rows(self._constraint_count, self._impulses, self._row_type, self._row_parent)
+        h.free = rows(self._mf_constraint_count, self._mf_impulses, self._mf_row_type, self._mf_row_parent)
         h.dofs, h.velocity = self._world_dof_indices, self._v_out
+        h.prev_velocity = wp.empty_like(h.velocity)
         worlds, device = self._world_count, model.device
         width = self._impulses.shape[1] + self._mf_impulses.shape[1]
-        if options.propagation:
-            h.prop = rows(self._propagation_constraint_count, self._propagation_impulses, self._propagation_row_type)
+        if propagation:
+            h.prop = rows(
+                self._propagation_constraint_count,
+                self._propagation_impulses,
+                self._propagation_row_type,
+                self._propagation_row_parent,
+            )
             width += self._propagation_impulses.shape[1]
             h.twist = self._propagation_body_qd
             h.prev_twist = wp.empty_like(h.twist)
-            h.prev_velocity = wp.empty_like(h.velocity)
             h.body_start, h.bodies = self._propagation_world_body_start, self._propagation_world_bodies
-        else:
-            h.response = self._Y_world
-            h.free_a, h.free_b = self._mf_dof_a, self._mf_dof_b
-            h.response_a, h.response_b = self._mf_MiJt_a, self._mf_MiJt_b
-        if options.compliance:
-            h.dense.gamma = self._compliance.dense_gamma
-            h.free.gamma = self._compliance.mf_gamma
-            if options.propagation:
-                h.prop.gamma = self._compliance.propagation_gamma
-        if options.torsion:
-            h.prop_torsion_head = self._propagation_torsion_head
-            h.correction_norm_sq = wp.empty(worlds, dtype=float, device=device)
-        # Split phases keep their clamp flag in column zero. A separately launched native
-        # sweep initializes its own history and can reuse the entire world's allocation.
-        storage = wp.empty((worlds, width + 1), dtype=wp.vec2, device=device)
-        h.history = storage[:, 1:]
-        self._momentum_scratch = storage.view(float).reshape((worlds, 2 * (width + 1)))
-        if options.propagation and options.velocity_limits:
-            h.clamp = self._momentum_scratch
+        ordered = propagation and self._propagation_colored and self._ordered_rows
+        if ordered:
+            h.prop_order = self._color_unit_order.reshape((worlds, self._color_order_stride))
+        h.history = wp.empty((worlds, width), dtype=wp.vec2, device=device)
         h.age = wp.empty(worlds, dtype=int, device=device)
-        self._split_momentum_options = options
-        self._advance_split_sweep = latency_fused.get_advance_split_sweep(options)
+        if patch_anchors:
+            h.anchor_sq = wp.empty(worlds, device=device)
+        self._advance_split_sweep = latency_fused.get_advance_split_sweep(
+            propagation, self._contact_torsion_enabled, ordered, patch_anchors
+        )
         self._split_momentum_state = h
         self._split_momentum = wp.array([h], dtype=latency_fused.SplitSweep, device=device)
 
@@ -7121,6 +7101,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._compliance.dense_gamma if self._compliance is not None else self._compliance_off_gamma,
             self._compliance.mf_gamma if self._compliance is not None else self._compliance_off_gamma,
             self._momentum_scratch,
+            self._split_momentum_state.prev_velocity if self._split_momentum is not None else None,
         ]
 
     def _launch_pgs_solve(
@@ -11938,7 +11919,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_world_body_start = None
         self._propagation_world_bodies = None
         if self._nesterov_momentum or (self._ordered_rows and self._propagation_needs_body_map):
-            # Tree bodies of each solve world's responding articulations, by body index.
+            # Ordered body-map construction and momentum both traverse the responding tree bodies.
+            # Global articulations belong to solve world 0 even when the model has several worlds.
             articulation_start = model.articulation_start.numpy()
             joint_child = model.joint_child.numpy()
             world_bodies = [[] for _ in range(worlds)]
@@ -12168,6 +12150,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             max_body_span=min(max(span, 1), 16384 // (color_words * 4)),
             longest_first=self._propagation_color_order == "longest_first",
             rotating=self._propagation_color_order == "rotating",
+            preserve_row_order=self._ordered_rows and self._nesterov_momentum,
         )
 
     def _propagation_clear_rows(self) -> None:
@@ -12910,6 +12893,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         else:
             kernel = self._pgs_solve_mf_gs_kernels.get(row_phase)
             if kernel is None:
+                if self._nesterov_momentum and row_phase <= 2 and self._momentum_scratch is None:
+                    self._allocate_mf_gs_momentum_scratch()
                 kernel = self._pgs_solve_mf_gs_kernel_for_phase(row_phase=row_phase)
                 self._pgs_solve_mf_gs_kernels[row_phase] = kernel
         wp.launch_tiled(
@@ -13291,7 +13276,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 body_world[bodies] = 0
             bodies = bodies[np.argsort(body_world[bodies], kind="stable")]
             dof_start = self._articulation_dof_start.numpy()[self._body_to_articulation.numpy()[bodies]]
-        kernel = self._build_latency_fused_kernel(model, slots, momentum=self._nesterov_momentum)
+        kernel = self._build_latency_fused_kernel(model, slots)
         if kernel is None:
             return
 
@@ -13347,7 +13332,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         cache.qd_base = self._propagation_cache_qd_base
 
         self._latency_fused_kernel = kernel
-        self._latency_fused_block_dim = 32 * latency_fused.warp_count(len(slots), self._max_propagation_bodies)
+        self._latency_fused_block_dim = 32 * latency_fused.warp_count(len(slots))
         # The structs hold the only references to their per-world tables.
         self._latency_fused_structs = (cache, tree, tree_slots, free)
         self._latency_fused_static = (
@@ -13358,10 +13343,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         self._latency_fused = True
 
-    def _build_latency_fused_kernel(self, model, slots: list[int], *, momentum: bool) -> "wp.Kernel | None":
-        """Compile the fused loop, or warn and return ``None`` when it does not fit a block."""
+    def _build_latency_fused_kernel(self, model, slots: list[int]) -> "wp.Kernel | None":
+        """Compile the selected fused loop and report an unavailable accelerated kernel at construction."""
         device_arch = model.device.arch
-        block_threads = 32 * latency_fused.warp_count(len(slots), self._max_propagation_bodies)
+        block_threads = 32 * latency_fused.warp_count(len(slots))
         colored = _get_pgs_solve_propagation_colored_warp_kernel(
             self._propagation_max_constraints,
             PROPAGATION_COLOR_TAIL + 2,
@@ -13384,9 +13369,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         has_internal_rows, has_velocity_limits = self._internal_row_phases()
         interleaved = self._row_schedule != "contact_then_internal"
         # Streaming the free-body impulses frees shared memory for the other stages and keeps the results.
-        rows = self._pgs_solve_mf_gs_kernel_for_phase(
-            stream_mf_lambda=True, split_phases_only=True, nesterov_momentum=momentum
-        )
+        rows = self._pgs_solve_mf_gs_kernel_for_phase(stream_mf_lambda=True, split_phases_only=True)
         kernel = latency_fused.get_fused_iteration_kernel(
             colored.native,
             rows.native,
@@ -13400,7 +13383,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 for size in slots
             ),
             warps=block_threads // 32,
-            momentum_options=self._split_momentum_options if momentum else None,
+            patch_anchors=self._momentum_patch_anchors,
+            momentum=self._nesterov_momentum,
+            torsion=self._contact_torsion_enabled,
+            ordered=self._ordered_rows,
             has_phase3=interleaved and has_internal_rows,
             has_phase5=interleaved and has_velocity_limits,
         )
@@ -13408,7 +13394,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             # A kernel past the static shared-memory limit is rejected here, not mid-step.
             kernel.module.load(model.device)
         except Exception as error:
-            if momentum:
+            if self._nesterov_momentum:
                 raise RuntimeError(
                     "Steel could not compile Nesterov momentum for the fused propagation solve"
                 ) from error
@@ -14772,7 +14758,6 @@ def _get_pgs_solve_paired_factor_kernel(
         [SweepField("s_lam[i]", "m", M, True), SweepField("factor_velocity", "32", 32)],
         iteration="iter",
         restart="global_iter == friction_start_iteration",
-        row_gamma="compliance_dense_gamma.data[off + i]" if contact_compliance else "",
     )
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -16512,7 +16497,7 @@ def _get_pgs_solve_mf_gs_kernel(
     stream_mf_lambda: bool = False,
     torsion_links: bool = False,
     nesterov_momentum: bool = False,
-    cache_free_response: bool = False,
+    patch_anchors: bool = False,
     split_phases_only: bool = False,
 ) -> "wp.Kernel":
     """Build the fused matrix-free projected Gauss-Seidel kernel for one solver shape.
@@ -16574,8 +16559,6 @@ def _get_pgs_solve_mf_gs_kernel(
             per launch (``contact_torsion.torque_links_source``); the results are the same.
         split_phases_only: Build only the row passes of a fused propagation iteration. Its outer
             block advances momentum once for the complete iteration.
-        cache_free_response: Stage up to 64 free-body rows for a resident immediate sweep. The small
-            shape limits keep the additional static shared memory below 21 KiB.
         nesterov_momentum: Extrapolate the impulses with Nesterov momentum at the start of every sweep
             after the first, keeping the history in ``momentum_scratch`` (``SolverSteel.nesterov_momentum``).
         factor_coordinates: Skip the worlds without free-body rows, which the paired
@@ -16670,12 +16653,35 @@ def _get_pgs_solve_mf_gs_kernel(
     dynamic_phase = row_phases and row_phase is None
     inner_momentum = nesterov_momentum and not split_phases_only and (not row_phases or row_phase in (None, 0, 1, 2))
     inner_guard = "row_phase <= 2" if dynamic_phase else "true"
-    clamp_marker = ""
-    if nesterov_momentum and row_phases and (dynamic_phase or row_phase > 2):
-        split_guard = "row_phase > 2" if dynamic_phase else "true"
-        clamp_marker = (
-            f"if (lane == 0 && {split_guard}) momentum_scratch.data[world * momentum_scratch.shape[1]] = 1.0f;"
-        )
+    # Velocity limits are stateless. Exclude their applied change from the next
+    # velocity difference, so extrapolating it follows only the stored impulses.
+    clamp_snapshot = clamp_adjustment = clamp_marker = ""
+    split_clamp = nesterov_momentum and row_phases and (dynamic_phase or row_phase == 5)
+    if inner_momentum or split_clamp:
+        has_limits = "true" if fuse_vel_limits else "m_mf > mf_contact_end"
+        if has_dense_velocity_limit_rows:
+            has_limits += " || vlim_lo < vlim_hi"
+        clamp_snapshot = f"""
+        bool clamped = false;
+        float before_limits[{ELEMS_PER_LANE}];
+        if ({has_limits}) {{
+            for (int d = lane; d < {D}; d += 32) before_limits[d / 32] = s_v[d];
+            __syncwarp();
+        }}"""
+        clamp_marker = "clamped = true;"
+        local_update = "previous_velocity[d / 32] += change; projected_limit = true;"
+        split_update = """const int dof = world_dof_indices.data[dof_map_base + d];
+                if (dof >= 0 && split_previous_velocity.data) split_previous_velocity.data[dof] += change;"""
+        update = local_update if inner_momentum else split_update
+        if inner_momentum and split_clamp:
+            update = f"if ({inner_guard}) {{ {local_update} }} else {{ {split_update} }}"
+        clamp_adjustment = f"""
+        if (clamped) {{
+            for (int d = lane; d < {D}; d += 32) {{
+                const float change = s_v[d] - before_limits[d / 32];
+                {update}
+            }}
+        }}"""
     dense_velocity_limit_pass = (
         f"""
         int vlim_base = vlim_lo;
@@ -17086,199 +17092,105 @@ def _get_pgs_solve_mf_gs_kernel(
     )
     # Nesterov momentum with O'Donoghue-Candes restart; per-world scratch holds
     # [lam_prev dense][lam_prev mf][e dense][e mf].
-    capacity = min(64, M_MF) if inner_momentum and cache_free_response else 0
-    momentum_init = momentum_sweep = momentum_finish = ""
+    momentum_init = momentum_sweep = ""
     if inner_momentum:
-        cache_init = ""
-        cache_history = ""
-        cached_response = ""
-        if capacity:
-            # Compact each DOF's nonzero response coefficients in the original
-            # row order. Its lane can apply momentum without a barrier per row.
-            cache_init = f"""
-    __shared__ float free_response[{capacity}][{D}];
-    __shared__ unsigned char free_row[{capacity}][{D}];
-    int response_count[{ELEMS_PER_LANE}];
-    __shared__ float free_previous[{capacity}], free_extrap[{capacity}];
-    bool cache_response = m_dense == 0 && m_mf <= {capacity};
-    if (cache_response) {{
-        // A constraint with coincident endpoints needs two ordered products.
-        for (int i = lane; i < m_mf; i += 32) {{
-            const int pair = mf_meta.data[off_meta + 4 * i];
-            const int a = pair >> 16, b = static_cast<short>(pair);
-            if (a >= 0 && a == b) cache_response = false;
-        }}
-        cache_response = __all_sync(MASK, cache_response);
-    }}
-    if (cache_response) {{
-        for (int d = lane; d < {D}; d += 32) {{
-            int count = 0;
-            for (int i = 0; i < m_mf; ++i) {{
-                const int pair = mf_meta.data[off_meta + 4 * i];
-                const int a = pair >> 16, b = static_cast<short>(pair);
-                float y = 0.0f;
-                if (a >= 0 && unsigned(d - a) < 6) y = mf_MiJt_a.data[mf6_base + 6 * i + d - a];
-                if (b >= 0 && unsigned(d - b) < 6) y = mf_MiJt_b.data[mf6_base + 6 * i + d - b];
-                if (y != 0.0f) {{
-                    free_row[count][d] = static_cast<unsigned char>(i);
-                    free_response[count][d] = y;
-                    ++count;
-                }}
-            }}
-            response_count[d / 32] = count;
-        }}
-        __syncwarp();
-    }}
-"""
-            cache_history = "if (cache_response) { mom_prev_m = free_previous; mom_e_m = free_extrap; }"
-            cached_response = f"""
-            if (cache_response) {{
-                for (int d = lane; d < {D}; d += 32) {{
-                    float v = s_v[d];
-                    for (int k = 0; k < response_count[d / 32]; ++k) v += free_response[k][d] * free_extrap[free_row[k][d]];
-                    s_v[d] = v;
-                }}
-                __syncwarp();
-            }} else
-"""
+        # Dense and free row capacities can exceed the available registers. Keep
+        # their histories in per-world scratch; velocity history is per lane.
         momentum_init = f"""
-{cache_init}
+    float previous_velocity[{ELEMS_PER_LANE}];
+    bool projected_limit = false;
     float* mom_prev_d = &momentum_scratch.data[world * momentum_scratch.shape[1]];
     float* mom_prev_m = mom_prev_d + {M_D};
     float* mom_e_d = mom_prev_m + {M_MF};
     float* mom_e_m = mom_e_d + {M_D};
-    {cache_history}
-    int mom_k = 0;
-    if ({inner_guard}) for (int i = lane; i < m_dense; i += 32) {{ mom_prev_d[i] = s_lam_dense[i]; mom_e_d[i] = 0.0f; }}
-    if ({inner_guard}) for (int i = lane; i < m_mf; i += 32) {{ mom_prev_m[i] = s_lam_mf[i]; mom_e_m[i] = 0.0f; }}
-    __syncwarp();
 """
-        momentum_response = f"""
-            // Apply each row's impulse change through its own response, as the sweep does.
-{lanes(f"            float v_{{k}} = {{d}} < {D} ? s_v[{{d}}] : 0.0f;")}
-            for (int i = 0; i < m_dense; ++i) {{
-                const float e = mom_e_d[i];
-                if (e == 0.0f) continue;
-                const int base = jy_world_base + i * {D};
-{lanes(f"                if ({{d}} < {D}) v_{{k}} += Y_world.data[base + {{d}}] * e;")}
-            }}
-{lanes(f"            if ({{d}} < {D}) s_v[{{d}}] = v_{{k}};")}
-            __syncwarp();
-            for (int i = 0; i < m_mf; i++) {{
-                float e = mom_e_m[i];
-                if (e == 0.0f) continue;
-                int packed_dofs = mf_meta.data[off_meta + i * 4];
-                int dof_a = packed_dofs >> 16;
-                int dof_b = (packed_dofs << 16) >> 16;
-                if (lane < 6 && dof_a >= 0) s_v[dof_a + lane] += mf_MiJt_a.data[mf6_base + i * 6 + lane] * e;
-                if (lane >= 6 && lane < 12 && dof_b >= 0) s_v[dof_b + lane - 6] += mf_MiJt_b.data[mf6_base + i * 6 + lane - 6] * e;
-                __syncwarp();
-            }}
-"""
-        # On an equality block the complete sweep displacement has the same
-        # linear image in velocity space. Retain the impulse-space restart.
-        momentum_init += f"""
-    // A single warp of rows is cheap to apply directly. Amortize the
-    // velocity reconstruction only across larger dense blocks.
-    // A fused velocity clamp changes velocity outside the accumulated impulses.
-    bool only_equalities = {str(not fuse_vel_limits).lower()} && m_mf == 0 && m_dense > 32;
-    bool accumulated = {str(contact_torsion and not fuse_vel_limits).lower()} && m_mf == 0;
-    bool has_torsion = false;
-    for (int i = lane; i < m_dense; i += 32) {{
-        const int kind = s_meta_dense[i] & {type_mask};
-        only_equalities &= kind == {int(PGS_CONSTRAINT_TYPE_CONNECT)} || kind == {int(PGS_CONSTRAINT_TYPE_MIMIC)};
-        accumulated &= kind != {vlim_type};
-        has_torsion |= kind == {int(PGS_CONSTRAINT_TYPE_TORSION)};
-    }}
-    only_equalities = __all_sync(MASK, only_equalities);
-    const bool dense_torsion = __all_sync(MASK, accumulated) && __any_sync(MASK, has_torsion);
-    float previous_velocity[{ELEMS_PER_LANE}];
-    bool rebuild_at_end = false;
-    // Reconstruct accepted velocities in fp64 from the initial velocity and net applied impulses.
-    auto rebuild_velocity = [&]() {{
-        for (int d = lane; d < {D}; d += 32) {{
-            const int global_dof = world_dof_indices.data[dof_map_base + d];
-            if (global_dof < 0) continue;
-            double velocity = v_out.data[global_dof];
-            for (int i = 0; i < m_dense; ++i) {{
-                const double change = (double)s_lam_dense[i] - world_impulses.data[off_dense + i];
-                velocity += (double)Y_world.data[jy_world_base + i * {D} + d] * change;
-            }}
-            s_v[d] = (float)velocity;
-        }}
-        __syncwarp();
-    }};
-"""
-        momentum_reanchor = "if (only_equalities && rebuild_at_end && (iter & 31) == 0) rebuild_velocity();"
-        momentum_finish = "if (rebuild_at_end) rebuild_velocity();"
-        momentum_response = f"""
-            if (only_equalities) {{
-                #pragma unroll
-                for (int k = 0; k < {ELEMS_PER_LANE}; ++k) {{
-                    const int d = lane + 32 * k;
-                    if (d >= {D}) continue;
-                    const float v = s_v[d];
-                    if (beta != 0.0f) s_v[d] = v + beta * (v - previous_velocity[k]);
-                    previous_velocity[k] = v;
-                }}
-                rebuild_at_end |= beta != 0.0f;
-                __syncwarp();
-            }} else if (beta != 0.0f) {{
-                {cached_response} {{ {momentum_response} }}
-                rebuild_at_end |= dense_torsion;
-            }}
-"""
-        # Soft contacts include an impulse-dependent term in the row residual.
-        # Bound their lookahead by the last projected correction on every owner.
-        if contact_compliance:
-            momentum_init += """
-    bool soft_rows = false;
-    for (int i = lane; i < m_dense; i += 32) soft_rows |= compliance_dense_gamma.data[off_dense + i] > 0.0f;
-    for (int i = lane; i < m_mf; i += 32) soft_rows |= compliance_mf_gamma.data[off_mf + i] > 0.0f;
-    soft_rows = __any_sync(MASK, soft_rows);
-"""
-        else:
-            momentum_init += "    constexpr bool soft_rows = false;\n"
+        declarations, update = warp_momentum(
+            True,
+            [
+                SweepField(
+                    "s_lam_dense[i]",
+                    "m_dense",
+                    M_D,
+                    True,
+                    ("mom_prev_d[i]", "mom_e_d[i]"),
+                    f"(s_meta_dense[i] & {type_mask}) != {vlim_type}",
+                    patch_rows=(f"s_meta_dense[i] & {type_mask}", f"((s_meta_dense[{{row}}] >> {type_bits}) - 1)"),
+                    torque=f"(s_meta_dense[i] & {type_mask}) == {int(PGS_CONSTRAINT_TYPE_TORSION)}"
+                    if contact_torsion
+                    else "",
+                ),
+                SweepField(
+                    "s_lam_mf[i]",
+                    "m_mf",
+                    M_MF,
+                    True,
+                    ("mom_prev_m[i]", "mom_e_m[i]"),
+                    f"(mf_meta.data[off_meta + i * 4 + 3] & {MF_META_ROW_TYPE_MASK}) != {vlim_type}",
+                    patch_rows=(
+                        f"mf_meta.data[off_meta + i * 4 + 3] & {MF_META_ROW_TYPE_MASK}",
+                        f"mf_meta.data[off_meta + {{row}} * 4 + 3] >> {MF_META_ROW_TYPE_BITS}",
+                    ),
+                ),
+                SweepField("s_v[i]", str(D), D, history=("previous_velocity[j]", "")),
+            ],
+            check_response_roundoff=True,
+            patch_anchors=patch_anchors,
+            iteration="iter",
+            restart="global_iter == friction_start_iteration",
+        )
+        momentum_init += declarations
         momentum_sweep = f"""
-        if ({inner_guard} && iter > 0) {{
-            // Restart when the last sweep's correction opposes its extrapolation, and when friction switches on.
-            float mom_dot = 0.0f, correction_sq = 0.0f, move_sq = 0.0f;
-            auto measure = [&](float move, float extrap) {{
-                const float correction = move - extrap;
-                mom_dot += correction * extrap;
-                correction_sq += correction * correction;
-                move_sq += move * move;
-            }};
-            for (int i = lane; i < m_dense; i += 32) measure(s_lam_dense[i] - mom_prev_d[i], mom_e_d[i]);
-            for (int i = lane; i < m_mf; i += 32) measure(s_lam_mf[i] - mom_prev_m[i], mom_e_m[i]);
-            bool restart = warp_sum(mom_dot) < 0.0f || global_iter == friction_start_iteration;
-            mom_k = restart ? 0 : mom_k + 1;
-            float beta = mom_k > 1 ? (float)(mom_k - 1) / (float)(mom_k + 2) : 0.0f;
-            if (soft_rows) {{
-                const float norm = warp_sum(move_sq), correction = warp_sum(correction_sq);
-                if (norm > 0.0f) beta = fminf(beta, sqrtf(correction / norm));
+        if ({inner_guard}) {{
+            {update}
+            // The retained dense matrix and entry impulses determine the whole velocity
+            // while no stateless clamp has acted. Round once, including on fast-spinning bodies.
+            const bool dense_affine = m_mf == 0 && !__any_sync(MASK, projected_limit);
+            if (beta != 0.0f && dense_affine) {{
+                for (int d = lane; d < {D}; d += 32) {{
+                    const int dof = world_dof_indices.data[dof_map_base + d];
+                    if (dof < 0) continue;
+                    double v = v_out.data[dof];
+                    for (int i = 0; i < m_dense; ++i) {{
+                        if ((s_meta_dense[i] & {type_mask}) == {vlim_type}) continue;
+                        const double e = (double)s_lam_dense[i] - world_impulses.data[off_dense + i];
+                        v += Y_world.data[jy_world_base + i * {D} + d] * e;
+                    }}
+                    s_v[d] = (float)v;
+                }}
+                __syncwarp();
+            }} else if (beta != 0.0f && __any_sync(MASK, reapply_impulses)) {{
+                // Advance the mixed velocity from its stored row increments when rounding
+                // erased an increment or exceeded the last projected correction.
+                for (int d = lane; d < {D}; d += 32) {{
+                    float v = previous_velocity[d / 32];
+                    for (int i = 0; i < m_dense; ++i) {{
+                        const float e = mom_e_d[i];
+                        if (e != 0.0f) v += Y_world.data[jy_world_base + i * {D} + d] * e;
+                    }}
+                    s_v[d] = v;
+                }}
+                __syncwarp();
+                // Load a warp of free rows and visit its nonzero increments in row order.
+                // The same lane writes each twist component, including on coincident endpoints.
+                for (int base = 0; base < mf_contact_end; base += 32) {{
+                    const int i = base + lane;
+                    const float e = i < mf_contact_end ? mom_e_m[i] : 0.0f;
+                    const int pair = i < mf_contact_end ? mf_meta.data[off_meta + 4 * i] : -1;
+                    unsigned active = __ballot_sync(MASK, e != 0.0f);
+                    while (active) {{
+                        const int source = __ffs(active) - 1;
+                        const float change = __shfl_sync(MASK, e, source);
+                        const int endpoints = __shfl_sync(MASK, pair, source);
+                        const int a = endpoints >> 16, b = static_cast<short>(endpoints);
+                        const int k = mf6_base + 6 * (base + source) + lane;
+                        if (lane < 6 && a >= 0) s_v[a + lane] += mf_MiJt_a.data[k] * change;
+                        if (lane < 6 && b >= 0) s_v[b + lane] += mf_MiJt_b.data[k] * change;
+                        active &= active - 1;
+                    }}
+                }}
+                __syncwarp();
             }}
-{momentum_reanchor}
-            // Extrapolate the impulses; stateless velocity-limit rows keep their last clamp. e holds the
-            // change the stored impulse actually took, so v below follows it exactly as a sweep update would.
-            auto extrapolate = [&](float x, int kind, float& previous, float& extrap) {{
-                const float y = kind == {vlim_type} ? x : x + beta * (x - previous);
-                previous = x;
-                extrap = y - x;
-                return y;
-            }};
-            for (int i = lane; i < m_dense; i += 32) {{
-                const int kind = s_meta_dense[i] & {type_mask};
-                s_lam_dense[i] = extrapolate(s_lam_dense[i], kind, mom_prev_d[i], mom_e_d[i]);
-            }}
-            for (int i = lane; i < m_mf; i += 32) {{
-                const int kind = mf_meta.data[off_meta + i * 4 + 3] & {MF_META_ROW_TYPE_MASK};
-                s_lam_mf[i] = extrapolate(s_lam_mf[i], kind, mom_prev_m[i], mom_e_m[i]);
-            }}
-            __syncwarp();
-{momentum_response}
-        }}
-"""
+        }}"""
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
@@ -17485,6 +17397,7 @@ def _get_pgs_solve_mf_gs_kernel(
         // Velocity limits last: dense joint velocity limits, the fused clamp of driven DOFs,
         // then free-body velocity limits.
         if (velocity_limit_pass) {{
+{clamp_snapshot}
 {dense_velocity_limit_pass}
 {fused_velocity_clamp_pass}
         for (int i = mf_contact_end; i < m_mf; i++) {{
@@ -17510,6 +17423,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
             __syncwarp();
         }}
+{clamp_adjustment}
         }}
 
         // An exactly stationary sweep is a fixed point once friction rows are active; later
@@ -17517,7 +17431,6 @@ def _get_pgs_solve_mf_gs_kernel(
         if (global_iter >= friction_start_iteration && __ballot_sync(MASK, iteration_changed != 0) == 0u) break;
     }}
 
-{momentum_finish}
     for (int d = lane; d < {D}; d += 32) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
         if (global_dof >= 0) v_out.data[global_dof] = s_v[d];
@@ -17634,7 +17547,6 @@ def _get_pgs_solve_mf_gs_kernel(
         pair_cache,
         torsion_links,
         nesterov_momentum,
-        cache_free_response=bool(capacity),
     )
     if stream_mf_lambda:
         name += "_stream"
@@ -17679,6 +17591,7 @@ def _get_pgs_solve_mf_gs_kernel(
         compliance_dense_gamma: wp.array2d[float],
         compliance_mf_gamma: wp.array2d[float],
         momentum_scratch: wp.array2d[float],
+        split_previous_velocity: wp.array[float],
         iterations: int,
         omega: float,
         regularize: int,
@@ -17723,6 +17636,7 @@ def _get_pgs_solve_mf_gs_kernel(
         compliance_dense_gamma: wp.array2d[float],
         compliance_mf_gamma: wp.array2d[float],
         momentum_scratch: wp.array2d[float],
+        split_previous_velocity: wp.array[float],
         iterations: int,
         omega: float,
         regularize: int,
@@ -17768,6 +17682,7 @@ def _get_pgs_solve_mf_gs_kernel(
             compliance_dense_gamma,
             compliance_mf_gamma,
             momentum_scratch,
+            split_previous_velocity,
             iterations,
             omega,
             regularize,
@@ -17805,8 +17720,6 @@ def _mf_gs_kernel_name(
     pair_cache: bool = False,
     torsion_links: bool = False,
     nesterov_momentum: bool = False,
-    *,
-    cache_free_response: bool = False,
 ) -> str:
     """Return the unique name of one matrix-free Gauss-Seidel kernel shape."""
     return (
@@ -17814,7 +17727,6 @@ def _mf_gs_kernel_name(
         f"_vlim{int(has_dense_velocity_limit_rows)}_drive{int(has_drive_rows)}_fvl{int(fuse_vel_limits)}"
         f"{'' if shared_metadata else '_gmeta'}"
         f"{'_paircache' if pair_cache else ''}"
-        f"{'_freecache' if cache_free_response else ''}"
         f"{'_torsion' if contact_torsion else ''}"
         f"{'_links' if torsion_links else ''}"
         f"{('_phased' if row_phase is None else f'_phase{row_phase}') if row_phases else ''}"
@@ -17921,6 +17833,7 @@ def _mf_gs_skip_local_kernel(snippet: str, name: str) -> "wp.Kernel":
         compliance_dense_gamma: wp.array2d[float],
         compliance_mf_gamma: wp.array2d[float],
         momentum_scratch: wp.array2d[float],
+        split_previous_velocity: wp.array[float],
         iterations: int,
         omega: float,
         regularize: int,
@@ -17966,6 +17879,7 @@ def _mf_gs_skip_local_kernel(snippet: str, name: str) -> "wp.Kernel":
         compliance_dense_gamma: wp.array2d[float],
         compliance_mf_gamma: wp.array2d[float],
         momentum_scratch: wp.array2d[float],
+        split_previous_velocity: wp.array[float],
         iterations: int,
         omega: float,
         regularize: int,
@@ -18012,6 +17926,7 @@ def _mf_gs_skip_local_kernel(snippet: str, name: str) -> "wp.Kernel":
             compliance_dense_gamma,
             compliance_mf_gamma,
             momentum_scratch,
+            split_previous_velocity,
             iterations,
             omega,
             regularize,
@@ -18076,6 +17991,7 @@ def _get_color_propagation_prebuild_kernel(
     max_body_span: int = 0,
     longest_first: bool = False,
     rotating: bool = False,
+    preserve_row_order: bool = False,
 ) -> "wp.Kernel":
     """Build the per-world coloring of the propagation contact units, run before the rows are built.
 
@@ -18161,6 +18077,15 @@ def _get_color_propagation_prebuild_kernel(
         def walk(p: str) -> str:
             return p
 
+    # Once coloring is complete, reuse its sort scratch for the permutation
+    # from deterministic contact slots to the new color-ordered row slots.
+    row_permutation = (
+        """const int original = contact_slot.data[s_x[i]];
+            for (int row = 0; row < s_y[i]; ++row)
+                unit_order.data[order_base + original + row] = s_z[i] + row;"""
+        if preserve_row_order
+        else ""
+    )
     mask_decl = """    __shared__ int s_body_lo, s_body_hi;
     if (t == 0) { s_body_lo = 0x7FFFFFFF; s_body_hi = -1; }
     __syncthreads();"""
@@ -18351,6 +18276,7 @@ def _get_color_propagation_prebuild_kernel(
         for (int i = t; i < cnt; i += {B}) {{
             world_row_order.data[world_base + base + i] = s_z[i];
             unit_sorted_contact.data[world_base + base + i] = s_x[i];
+            {row_permutation}
             contact_slot.data[s_x[i]] = s_z[i];
         }}
         __syncthreads();
@@ -24666,7 +24592,6 @@ def _get_pgs_solve_sparse_diagonal_kernel(
         nesterov_momentum,
         fields,
         restart="global_iteration == friction_start_iteration",
-        row_gamma="compliance_gamma.data[row_base + i]" if contact_compliance else "",
     )
     snippet = f"""
 #if defined(__CUDA_ARCH__)

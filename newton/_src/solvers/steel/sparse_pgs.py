@@ -62,6 +62,25 @@ def _get_pgs_solve_sparse_kernel(
     limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
     velocity_limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
     mf_storage = mf_initialize = mf_sweep = mf_writeback = ""
+    before_clamp = after_clamp = ""
+    velocity_history = None
+    if nesterov_momentum and F:
+        # A stateless clamp has no accumulated impulse. Move the snapshot by
+        # its accepted velocity change, leaving other rows free to accelerate.
+        slots = (D + 31) // 32
+        velocity_history = ("previous_delta[j]", "")
+        before_clamp = f"""
+            float before[{slots}];
+            const bool clamping = kind == {velocity_limit_type} && change != 0.0f;
+            if (clamping) {{
+                for (int d = lane; d < {D}; d += 32) before[d / 32] = delta[d];
+                __syncwarp(MASK);
+            }}
+"""
+        after_clamp = f"""
+            if (clamping)
+                for (int d = lane; d < {D}; d += 32) previous_delta[d / 32] += delta[d] - before[d / 32];
+"""
     if F:
         mf_storage = f"""
     __shared__ float mf_impulse_storage[{W * F}];
@@ -183,6 +202,7 @@ def _get_pgs_solve_sparse_kernel(
             }}
             const float change = kind == {velocity_limit_type} ? new_impulse : new_impulse - old_impulse;
             if (lane == 0) mf_impulse[row] = new_impulse;
+{before_clamp}
             if (change != 0.0f || sibling_change != 0.0f) {{
                 changed = 1;
                 if (index >= 0) {{
@@ -193,27 +213,19 @@ def _get_pgs_solve_sparse_kernel(
                 }}
             }}
             __syncwarp(MASK);
+{after_clamp}
         }}
 """
         mf_writeback = """
     for (int i = lane; i < mf_count; i += 32) mf_impulses.data[mf_offset + i] = mf_impulse[i];
 """
-    fields = [SweepField("impulse[i]", "count", M, True), SweepField("delta[i]", str(D), D)]
-    restart = "false"
+    fields = [SweepField("impulse[i]", "count", M, True), SweepField("delta[i]", str(D), D, history=velocity_history)]
     if F:
-        fields.append(SweepField("mf_impulse[i]", "mf_count", F, True))
-        # A stateless velocity clamp is outside the accumulated row impulses. Restart
-        # after an active clamp so its physical velocity correction is never extrapolated.
-        restart = "__any_sync(MASK, clamped)"
-    mom_history, mom_step = warp_momentum(nesterov_momentum, fields, restart=restart)
-    if nesterov_momentum and F:
-        mom_history += "\nbool clamped = false;"
-        mom_step += "\nclamped = false;"
-        mf_sweep = mf_sweep.replace(
-            "if (change != 0.0f || sibling_change != 0.0f)",
-            f"if (kind == {velocity_limit_type} && change != 0.0f) clamped = true;\n"
-            "            if (change != 0.0f || sibling_change != 0.0f)",
-        )
+        movable = f"(mf_meta.data[(mf_offset + i) * 4 + 3] & {MF_META_ROW_TYPE_MASK}) != {velocity_limit_type}"
+        fields.append(SweepField("mf_impulse[i]", "mf_count", F, True, movable=movable))
+    mom_history, mom_step = warp_momentum(nesterov_momentum, fields)
+    if velocity_history:
+        mom_history += f"\nfloat previous_delta[{slots}];"
     snippet = (
         "#if defined(__CUDA_ARCH__)\n"
         + FRICTION_PAIR_CUDA

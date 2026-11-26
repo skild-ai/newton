@@ -3,6 +3,7 @@
 
 """Friction patches, anchors, directions and friction modes of SolverSteel."""
 
+import functools
 import math
 import unittest
 import warnings
@@ -194,19 +195,64 @@ class TestSteelFrictionAnchors(unittest.TestCase):
         pipeline.collide(state, contacts)
         solver.step(state, model.state(), model.control(), contacts, 0.005)
 
+    def test_warmstarted_anchors_hold_a_skewed_card_pair(self):
+        """Hold two inclined cards on a bridge supported by two other pairs for two seconds."""
+        builder = newton.ModelBuilder()
+        builder.rigid_gap = 0.002
+        material = newton.ModelBuilder.ShapeConfig(mu=0.7, density=0.002 / (0.094 * 0.064 * 0.0007))
+        builder.add_ground_plane(cfg=material)
+
+        def card(y, z, pitch, yaw):
+            rotation = wp.quat_from_axis_angle(wp.vec3(1, 0, 0), math.radians(pitch)) * wp.quat_from_axis_angle(
+                wp.vec3(0, 0, 1), math.radians(yaw)
+            )
+            body = builder.add_body(xform=wp.transform(wp.vec3(0, y, z), rotation))
+            builder.add_shape_box(body, hx=0.047, hy=0.032, hz=0.00035, cfg=material)
+
+        def pair(y, z, skew=0):
+            for side in (1, -1):
+                card(y - side * 0.01375, z, side * 65, side * skew)
+
+        pair(-0.035, 0.029)
+        pair(0.035, 0.029)
+        card(0, 0.05848, 0, 90)
+        pair(0, 0.08775, 0.5)
+        model = builder.finalize(device=_DEVICE)
+        solver = SolverSteel(model, iterations=4, contact_warmstart=True, deterministic=wp.DeterministicMode.RUN_TO_RUN)
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        state, output = model.state(), model.state()
+        control, contacts = model.control(), pipeline.contacts()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        start = state.body_q.numpy()[:, :3]
+        dt = 1 / 480
+        pipeline.collide(state, contacts, dt=dt)
+        with wp.ScopedCapture(device=model.device) as capture:
+            for _ in range(8):
+                pipeline.collide(state, contacts, dt=dt)
+                solver.step(state, output, control, contacts, dt)
+                state, output = output, state
+        for _ in range(120):
+            wp.capture_launch(capture.graph)
+        solver.check_constraint_capacity()
+        shift = np.linalg.norm(state.body_q.numpy()[:, :3] - start, axis=1)
+        self.assertLess(shift.max(), 0.005)
+
     def test_anchors_stop_tangential_drift_of_a_held_box(self):
         """Bound tangential drift in a tilted pinch while leaving flat-jaw behavior unaffected."""
+        for momentum in (False, True):
+            with self.subTest(momentum=momentum):
+                self._check_anchor_drift(momentum)
+
+    def _check_anchor_drift(self, momentum):
+        squeeze = functools.partial(_run_squeeze, nesterov_momentum=momentum)
         steps = int(3.0 / 0.005)
-        # The plain finite-iteration solve supplies a measurable drift control.
-        # Momentum alone also reduces the drift of the unanchored tilted box.
-        plain_drift, _, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.0, nesterov_momentum=False)
-        drift_off, _, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.0)
-        drift_on, solver_on, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.05)
-        drift_on_02, _, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.2)
-        self.assertGreater(
-            abs(plain_drift), 5.0e-4, f"plain tilted pinch should leak drift without anchors, got {plain_drift:.2e} m"
-        )
-        self.assertLessEqual(abs(drift_off), abs(plain_drift))
+        drift_off, _, _ = squeeze(5.0, steps, friction_anchor_beta=0.0)
+        drift_on, solver_on, _ = squeeze(5.0, steps, friction_anchor_beta=0.05)
+        drift_on_02, _, _ = squeeze(5.0, steps, friction_anchor_beta=0.2)
+        if not momentum:
+            self.assertGreater(
+                abs(drift_off), 5.0e-4, f"plain sweeps should leak drift without anchors, got {drift_off:.2e} m"
+            )
         self.assertLess(
             abs(drift_on),
             0.03 * abs(drift_off),
@@ -217,19 +263,19 @@ class TestSteelFrictionAnchors(unittest.TestCase):
         valid = solver_on._friction_patches.current.valid.numpy()
         self.assertGreater(int(valid.sum()), 0)
         # Sticky matching replays body-local witness points; anchors must still hold.
-        drift_sticky, _, _ = _run_squeeze(5.0, steps, matching="sticky", friction_anchor_beta=0.2)
+        drift_sticky, _, _ = squeeze(5.0, steps, matching="sticky", friction_anchor_beta=0.2)
         self.assertLess(abs(drift_sticky), 2.0e-5, f"anchored pinch (sticky matching) drifted {drift_sticky:.2e} m")
         # Two solver substeps per collision pass: anchors map one to one on the reused
         # contact buffer instead of through its stale match index.
-        drift_sub, _, _ = _run_squeeze(5.0, steps, substeps=2, friction_anchor_beta=0.2)
+        drift_sub, _, _ = squeeze(5.0, steps, substeps=2, friction_anchor_beta=0.2)
         self.assertLess(abs(drift_sub), 2.0e-5, f"anchored pinch with 2 substeps per collide drifted {drift_sub:.2e} m")
-        flat_off, _, _ = _run_squeeze(0.0, steps, friction_anchor_beta=0.0)
-        flat_on, _, _ = _run_squeeze(0.0, steps, friction_anchor_beta=0.05)
+        flat_off, _, _ = squeeze(0.0, steps, friction_anchor_beta=0.0)
+        flat_on, _, _ = squeeze(0.0, steps, friction_anchor_beta=0.05)
         self.assertLess(
             abs(flat_on), 0.03 * abs(drift_off), f"anchored flat pinch drifted {flat_on:.2e} m vs {drift_off:.2e} m"
         )
         self.assertLess(abs(flat_on), 5.0e-5, f"anchored flat pinch drifted {flat_on:.2e} m")
-        self.assertLess(abs(flat_off), 0.25 * abs(plain_drift))
+        self.assertLess(abs(flat_off), 0.25 * abs(drift_off))
 
     def test_anchors_hold_a_pinched_box_at_a_coarse_timestep(self):
         """Hold the tilted pinch at 60 Hz without re-anchoring below the Baumgarte equilibrium separation."""
@@ -698,8 +744,8 @@ def _solve_contact_block(device, tangent_mass, rhs, initial, capacity=32):
             # Compliance coefficients: no compliant rows.
             wp.zeros((1, 1), dtype=float, device=device),
             wp.zeros((1, 1), dtype=float, device=device),
-            # Nesterov momentum history: off.
-            wp.zeros((1, 1), dtype=float, device=device),
+            None,  # No momentum scratch.
+            None,  # No split-sweep velocity history.
             1,
             1.0,
             0,
@@ -880,15 +926,13 @@ def test_sliding_follows_each_modes_coulomb_update(test, device):
 
 
 def test_modes_select_distinct_kernels(test, device):
-    """Build one matrix-free kernel per mode and keep the default kernel's name."""
+    """Build one matrix-free kernel per friction mode and use fixed_normal by default."""
     model = _box_on_slope(device, 0.3, 0.5, articulated=False)
-    names = set()
-    for mode in MODES:
-        solver = SolverSteel(model, friction_mode=mode, friction_anchor_beta=0.0)
-        name = solver._pgs_solve_mf_gs_kernel.key.removesuffix("_momentum")
-        test.assertEqual(mode == "fixed_normal", not name.endswith(mode), name)
-        names.add(name)
-    test.assertEqual(len(names), len(MODES))
+    kernels = {
+        mode: SolverSteel(model, friction_mode=mode, friction_anchor_beta=0.0)._pgs_solve_mf_gs_kernel for mode in MODES
+    }
+    test.assertEqual(len(set(kernels.values())), len(MODES))
+    test.assertIs(SolverSteel(model, friction_anchor_beta=0.0)._pgs_solve_mf_gs_kernel, kernels["fixed_normal"])
 
 
 def test_unsupported_combinations_raise(test, device):
@@ -1041,8 +1085,8 @@ def _coulomb_newton_mf_block(device, block):
             wp.zeros((1, 1), dtype=float, device=device),
             wp.zeros((1, 1), dtype=float, device=device),
             wp.zeros((1, 4), dtype=float, device=device),
-            # Nesterov momentum history: off.
-            wp.zeros((1, 1), dtype=float, device=device),
+            None,  # No momentum scratch.
+            None,  # No split-sweep velocity history.
             1,
             1.0,
             0,
