@@ -12253,6 +12253,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_active = False
         self._propagation_colored = False
         self._contact_units_on = False
+        self._contact_units_request = None
         self._propagation_tree_sizes: list[int] = []
         self._propagation_tree_art_count: dict[int, int] = {}
         self._propagation_native_tree: dict[int, bool] = {}
@@ -12347,9 +12348,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             # row solve is CUDA-only; on CPU the colored mode runs the serial propagation sweep.
             self._propagation_colored = True
             self._propagation_needs_body_map = True
-            # Contact units (kernel override "contact_units"; see PROPAGATION_CONTACT_UNIT_BLOCKS): each contact keeps
-            # its rows' Jacobians and responses once, where the colored sweep visits it, instead of per row.
-            self._contact_units_on = bool(self._kernel_overrides.get("contact_units", False))
+            # Contact units (see PROPAGATION_CONTACT_UNIT_BLOCKS): each contact keeps its rows' Jacobians and responses
+            # once, where the colored sweep visits it, instead of per row. Kernel override "contact_units" forces them
+            # on or off; by default _allocate_propagation_buffers decides.
+            self._contact_units_request = self._kernel_overrides.get("contact_units")
 
         # Bodies of responding articulations, per solve world: the capacity of the body list.
         world_body_count = np.zeros(max(self._world_count, 1), dtype=np.int64)
@@ -12471,6 +12473,13 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_slot_counter = wp.zeros((worlds,), dtype=wp.int32, device=device)
         self._propagation_first_rejected_slot = wp.full((worlds,), _ROW_SLOT_UNBOUNDED, dtype=wp.int32, device=device)
         rows = self._propagation_max_constraints if self._propagation_active else 1
+        # Contact units by default from 256 worlds when every row would be a contact unit's (no closures, every contact
+        # with its friction pair): the sweep then reads a third of the bytes and the row Jacobians are placeholders.
+        # Fewer worlds are latency-bound, where they tie with the rows; closures would keep full-size row arrays.
+        request = self._contact_units_request
+        if request is None:
+            request = self._world_count >= 256 and not self._connect_count and self._contact_friction_gap_max is None
+        self._contact_units_on = bool(request) and self._propagation_colored and self._contact_units_supported(model)
         self._propagation_impulses = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         if not self._propagation_active:
             return
@@ -12482,10 +12491,14 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_body_list = wp.full((worlds, self._max_propagation_bodies), -1, dtype=wp.int32, device=device)
         self._propagation_body_a = wp.zeros((worlds, rows), dtype=wp.int32, device=device)
         self._propagation_body_b = wp.zeros((worlds, rows), dtype=wp.int32, device=device)
-        self._propagation_J_a = wp.zeros((worlds, rows, 6), dtype=wp.float32, device=device)
-        self._propagation_J_b = wp.zeros((worlds, rows, 6), dtype=wp.float32, device=device)
-        self._propagation_MiJt_a = wp.zeros((worlds, rows, 6), dtype=wp.float32, device=device)
-        self._propagation_MiJt_b = wp.zeros((worlds, rows, 6), dtype=wp.float32, device=device)
+        # Row Jacobians and responses. With contact units and neither closures nor normal-only contacts (a friction gap
+        # limit), every row is a contact unit's, which keeps them in the unit: placeholders.
+        unit_rows_only = self._contact_units_on and not self._connect_count and self._contact_friction_gap_max is None
+        jacobian_shape = (1, 1, 6) if unit_rows_only else (worlds, rows, 6)
+        self._propagation_J_a = wp.zeros(jacobian_shape, dtype=wp.float32, device=device)
+        self._propagation_J_b = wp.zeros(jacobian_shape, dtype=wp.float32, device=device)
+        self._propagation_MiJt_a = wp.zeros(jacobian_shape, dtype=wp.float32, device=device)
+        self._propagation_MiJt_b = wp.zeros(jacobian_shape, dtype=wp.float32, device=device)
         self._propagation_rhs = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._propagation_eff_mass_inv = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._propagation_row_type = wp.zeros((worlds, rows), dtype=wp.int32, device=device)
@@ -12849,6 +12862,45 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_max_constraints, self._max_propagation_bodies
                 )
 
+    def _colored_packed(self) -> bool:
+        """Whether the colored sweep reads each unit's rows from a packed per-unit record (test hook "colored_packed").
+
+        A few large worlds are latency-bound and gain from the packed records; many worlds lose to their traffic.
+        Rod trees read their rows faster unpacked at any world count: a color's units are consecutive row slots, so
+        the lanes' row loads coalesce while the packed records (one block per lane) do not.
+        """
+        overrides = self._kernel_overrides
+        return bool(overrides.get("colored_prefetch", True)) and bool(
+            overrides.get("colored_packed", self._world_count <= 16 and not self._rod_tree_sizes)
+        )
+
+    def _contact_units_supported(self, model) -> bool:
+        """Whether every propagation contact of this configuration can be a contact unit.
+
+        Contact units hold the rows of a contact that is a normal row and a friction pair at shared points, solved by
+        the prefetched straight-line colored sweep on CUDA; any other configuration keeps its contacts as rows.
+        """
+        overrides = self._kernel_overrides
+        return (
+            self._propagation_colored
+            and model.device.is_cuda
+            and bool(overrides.get("colored_prefetch", True))
+            and bool(overrides.get("colored_straight_line", True))
+            and not self._colored_packed()
+            and not bool(overrides.get("colored_staged", False))
+            and not self._contact_compliance
+            and self._friction_mode == "fixed_normal"
+            and not self._propagation_torsion_rows
+            and not self._free_rigid_angular_rows
+            and not self._friction_anchors_enabled
+            and (self._contact_shared_anchor or not self._contact_friction_shared_anchor)
+            and not self._velocity_iterations
+            and not self._ordered_rows
+            and not self._has_free_rigid_bodies
+            and not self._enable_sleeping
+            and (not self._propagation_same_articulation_rows or bool(overrides.get("propagation_refine_paths", True)))
+        )
+
     def _init_colored_kernels(self, model) -> None:
         """Resolve the coloring kernel and the colored sweep variant."""
         device_arch = model.device.arch
@@ -12866,9 +12918,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         # A few large worlds are latency-bound and gain from the packed records; many worlds lose to their traffic.
         # Rod trees read their rows faster unpacked at any world count: a color's units are consecutive row slots, so
         # the lanes' row loads coalesce while the packed records (one block per lane) do not.
-        packed = self._colored_prefetch and bool(
-            overrides.get("colored_packed", self._world_count <= 16 and not self._rod_tree_sizes)
-        )
+        packed = self._colored_packed()
         self._colored_worlds_per_block = 1 if staged else _COLORED_WORLDS_PER_BLOCK
         # With no more worlds than SMs the sweep is latency-bound: a block per world spreads a color's units over
         # all its warps instead of solving them 32 at a time.
@@ -12888,31 +12938,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
             )
         self._colored_staged = staged
-        # Contact units hold every contact's rows of the configurations whose contacts are all a normal row and a
-        # friction pair at shared points, solved by the prefetched straight-line sweep; any other keeps them as rows.
-        if self._contact_units_on and not (
-            self._colored_prefetch
-            and self._colored_straight_line
-            and not packed
-            and not staged
-            and model.device.is_cuda
-            and not self._contact_compliance
-            and self._friction_mode == "fixed_normal"
-            and not self._propagation_torsion_rows
-            and not self._free_rigid_angular_rows
-            and not self._friction_anchors_enabled
-            and not self._velocity_iterations
-            and not self._ordered_rows
-            and not self._has_free_rigid_bodies
-            and not self._enable_sleeping
-            and (not self._propagation_same_articulation_rows or self._propagation_path_joint is not None)
-        ):
-            self._contact_units_on = False
-            self._contact_units = wp.zeros(
-                (PROPAGATION_CONTACT_UNIT_BLOCKS * 4,), dtype=wp.float32, device=model.device
-            )
-            self._propagation_contact_unit = wp.zeros((1,), dtype=wp.int32, device=model.device)
-            self._propagation_row_contact = wp.full((1, 1), -1, dtype=wp.int32, device=model.device)
         # The sweep variant, which the fused latency loop builds again for one world per block.
         self._colored_sweep_options = {
             "prefetch": self._colored_prefetch,
