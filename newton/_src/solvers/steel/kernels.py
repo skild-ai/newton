@@ -8790,11 +8790,13 @@ def _spatial_row(values: wp.array2d[float], row: int):
 # PROPAGATION_CONTACT_UNIT_BLOCKS float4 blocks stored block-major (block q of unit p at q * units + p), so the lanes
 # of a warp read each block in one coalesced pass:
 #   0: normal (B to A), eff0   1: tangent0, mu   2: tangent1, kind   3: r_a, body a   4: r_b, body b
-#   5-13: the rows' responses [M_a rows 0-2, M_b rows 0-2] (6 floats each)
-# Row r is [d_r, r_a x d_r] on body a and its negative with r_b on body b. Kind 2 units read their stored responses;
-# kind 1 units (two articulations, override "contact_units_split") the bodies' split responses times the row. The
-# unit's rows keep their row slots and scalars; propagation_row_contact holds p * 4 + r for each.
-PROPAGATION_CONTACT_UNIT_BLOCKS = 14
+# Row r is [d_r, r_a x d_r] on body a and its negative with r_b on body b. A contact between two links of one
+# articulation (kind 2) stores its rows' exact responses [M_a rows 0-2, M_b rows 0-2] in a response slot
+# (PROPAGATION_CONTACT_RESPONSE_BLOCKS float4 blocks, block-major over the slots; contact_unit_response holds the
+# unit's slot); any other (kind 1) takes each body's split response times the row. The unit's rows keep their row
+# slots and scalars; propagation_row_contact holds p * 4 + r for each.
+PROPAGATION_CONTACT_UNIT_BLOCKS = 5
+PROPAGATION_CONTACT_RESPONSE_BLOCKS = 9
 
 
 @wp.func
@@ -8832,24 +8834,24 @@ def contact_unit_row(cu: wp.array[float], p: int, r: int, side: int):
 
 
 @wp.func
-def contact_unit_response(cu: wp.array[float], p: int, r: int, side: int):
-    """Stored response of row ``r`` of the contact unit at ``p`` on side ``side``."""
-    units = cu.shape[0] // (4 * PROPAGATION_CONTACT_UNIT_BLOCKS)
+def contact_response(responses: wp.array[float], slot: int, r: int, side: int):
+    """Stored response of row ``r`` on side ``side`` in response slot ``slot``."""
+    slots = responses.shape[0] // (4 * PROPAGATION_CONTACT_RESPONSE_BLOCKS)
     first = side * 18 + r * 6
     out = wp.spatial_vector()
     for k in range(6):
         j = first + k
-        out[k] = cu[((5 + j // 4) * units + p) * 4 + j % 4]
+        out[k] = responses[((j // 4) * slots + slot) * 4 + j % 4]
     return out
 
 
 @wp.func
-def contact_unit_store_response(cu: wp.array[float], p: int, r: int, side: int, v: wp.spatial_vector):
-    units = cu.shape[0] // (4 * PROPAGATION_CONTACT_UNIT_BLOCKS)
+def contact_response_store(responses: wp.array[float], slot: int, r: int, side: int, v: wp.spatial_vector):
+    slots = responses.shape[0] // (4 * PROPAGATION_CONTACT_RESPONSE_BLOCKS)
     first = side * 18 + r * 6
     for k in range(6):
         j = first + k
-        cu[((5 + j // 4) * units + p) * 4 + j % 4] = v[k]
+        responses[((j // 4) * slots + slot) * 4 + j % 4] = v[k]
 
 
 @wp.func
@@ -8873,12 +8875,25 @@ def propagation_row_J(
 
 @wp.func
 def propagation_row_M(
-    M: wp.array3d[float], row_contact: wp.array2d[int], cu: wp.array[float], world: int, i: int, side: int
+    M: wp.array3d[float],
+    row_contact: wp.array2d[int],
+    cu: wp.array[float],
+    unit_response: wp.array[int],
+    responses: wp.array[float],
+    body_response_split: wp.array3d[float],
+    body: int,
+    world: int,
+    i: int,
+    side: int,
 ):
-    """Row ``i``'s stored response on one side: from its contact unit or its row."""
+    """Row ``i``'s response on one side (body ``body >= 0``): stored, the body's split response times a contact
+    unit's row, or its row."""
     rc = propagation_row_unit(row_contact, world, i)
     if rc >= 0:
-        return contact_unit_response(cu, rc >> 2, rc & 3, side)
+        slot = unit_response[rc >> 2]
+        if slot >= 0:
+            return contact_response(responses, slot, rc & 3, side)
+        return _response_apply(body_response_split, body, contact_unit_row(cu, rc >> 2, rc & 3, side))
     return _spatial_row(M[world], i)
 
 
@@ -8886,16 +8901,20 @@ def propagation_row_M(
 def propagation_store_M(
     M: wp.array3d[float],
     row_contact: wp.array2d[int],
-    cu: wp.array[float],
+    unit_response: wp.array[int],
+    responses: wp.array[float],
     world: int,
     i: int,
     side: int,
     v: wp.spatial_vector,
 ):
-    """Store row ``i``'s response on one side: in its contact unit or its row."""
+    """Store row ``i``'s response on one side: in its contact unit's response slot (none for a unit that takes the
+    split responses) or its row."""
     rc = propagation_row_unit(row_contact, world, i)
     if rc >= 0:
-        contact_unit_store_response(cu, rc >> 2, rc & 3, side, v)
+        slot = unit_response[rc >> 2]
+        if slot >= 0:
+            contact_response_store(responses, slot, rc & 3, side, v)
     else:
         for k in range(6):
             M[world, i, k] = v[k]
@@ -8955,8 +8974,8 @@ def build_propagation_contact_rows(
     friction_combine: int,
     restitution_combine: int,
     use_contact_units: int,
-    unit_split: int,
     contact_unit: wp.array[int],
+    contact_unit_response: wp.array[int],
     # outputs
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
@@ -8985,8 +9004,8 @@ def build_propagation_contact_rows(
     With ``use_contact_units`` a contact whose three rows act at shared points is a contact unit instead: its directions,
     lever arms, friction coefficient and bodies go to its unit at ``contact_unit[c]`` (see
     PROPAGATION_CONTACT_UNIT_BLOCKS), its rows get ``p * 4 + r`` in ``propagation_row_contact`` and keep their
-    scalars, and it writes no row Jacobians. Its responses are stored (kind 2), or with ``unit_split`` taken from
-    the bodies' split responses when the contact joins two articulations (kind 1).
+    scalars, and it writes no row Jacobians. A unit with a response slot (``contact_unit_response``, see
+    :func:`map_propagation_contact_units`) stores its responses (kind 2); any other uses the bodies' split responses.
     """
     total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
     for c in range(wp.tid(), total_contacts, total_num_threads):
@@ -9128,9 +9147,10 @@ def build_propagation_contact_rows(
                 target += surface_contact_target(contact_surface_velocity, c, d)
             propagation_target_velocity[world, row] = target
         if unit >= 0:
-            kind = float(2.0)
-            if unit_split != 0 and not (art_a == art_b and art_a >= 0):
-                kind = 1.0
+            # A contact that stores its exact responses has a response slot (map_propagation_contact_units).
+            kind = float(1.0)
+            if contact_unit_response[unit] >= 0:
+                kind = 2.0
             ra = point_a_normal - com_a
             rb = point_b_normal - com_b
             contact_unit_set(contact_units, 0, unit, wp.vec4(normal[0], normal[1], normal[2], 0.0))
@@ -9523,6 +9543,8 @@ def propagation_momentum_apply(
     propagation_MiJt_b: wp.array3d[float],
     propagation_row_contact: wp.array2d[int],
     contact_units: wp.array[float],
+    contact_unit_response: wp.array[int],
+    contact_responses: wp.array[float],
     body_response_split: wp.array3d[float],
     # in/out
     propagation_impulses: wp.array2d[float],
@@ -9546,7 +9568,8 @@ def propagation_momentum_apply(
         if (rc & 3) != 0:
             return
         p = rc >> 2
-        stored = contact_unit_block(contact_units, 2, p)[3] == 2.0
+        slot = contact_unit_response[p]
+        stored = slot >= 0
         pa = wp.spatial_vector()
         pb = wp.spatial_vector()
         va = wp.spatial_vector()
@@ -9562,8 +9585,8 @@ def propagation_momentum_apply(
                 pa += contact_unit_row(contact_units, p, r, 0) * delta_r
                 pb += contact_unit_row(contact_units, p, r, 1) * delta_r
                 if stored:
-                    va += contact_unit_response(contact_units, p, r, 0) * delta_r
-                    vb += contact_unit_response(contact_units, p, r, 1) * delta_r
+                    va += contact_response(contact_responses, slot, r, 0) * delta_r
+                    vb += contact_response(contact_responses, slot, r, 1) * delta_r
         if not moved:
             return
         ba_c = propagation_body_a[world, i]
@@ -9975,8 +9998,10 @@ def compute_propagation_effective_mass_and_rhs(
     contact_speculative_scale: float,
     propagation_max_constraints: int,
     propagation_row_contact: wp.array2d[int],
+    contact_unit_response: wp.array[int],
     # outputs
     contact_units: wp.array[float],
+    contact_responses: wp.array[float],
     propagation_eff_mass_inv: wp.array2d[float],
     propagation_MiJt_a: wp.array3d[float],
     propagation_MiJt_b: wp.array3d[float],
@@ -10019,14 +10044,18 @@ def compute_propagation_effective_mass_and_rhs(
         for r in range(6):
             d_unsplit += ja[r] * exact_a[r]
             d += ja[r] * value_a[r]
-        propagation_store_M(propagation_MiJt_a, propagation_row_contact, contact_units, world, i, 0, value_a)
+        propagation_store_M(
+            propagation_MiJt_a, propagation_row_contact, contact_unit_response, contact_responses, world, i, 0, value_a
+        )
     if bb >= 0:
         exact_b = _response_apply(propagation_body_response, bb, jb)
         value_b = _response_apply(propagation_body_response_split, bb, jb)
         for r in range(6):
             d_unsplit += jb[r] * exact_b[r]
             d += jb[r] * value_b[r]
-        propagation_store_M(propagation_MiJt_b, propagation_row_contact, contact_units, world, i, 1, value_b)
+        propagation_store_M(
+            propagation_MiJt_b, propagation_row_contact, contact_unit_response, contact_responses, world, i, 1, value_b
+        )
     eff = float(0.0)
     if d > 0.0:
         eff = 1.0 / d
@@ -10157,6 +10186,9 @@ def accumulate_propagation_warmstart_body_impulses(
     propagation_max_constraints: int,
     propagation_row_contact: wp.array2d[int],
     contact_units: wp.array[float],
+    contact_unit_response: wp.array[int],
+    contact_responses: wp.array[float],
+    body_response_split: wp.array3d[float],
     # in/out
     propagation_body_qd: wp.array2d[float],
     propagation_body_impulses: wp.array2d[float],
@@ -10177,13 +10209,35 @@ def accumulate_propagation_warmstart_body_impulses(
     bb = propagation_body_b[world, row]
     if ba >= 0:
         ja = propagation_row_J(propagation_J_a, propagation_row_contact, contact_units, world, row, 0)
-        ma = propagation_row_M(propagation_MiJt_a, propagation_row_contact, contact_units, world, row, 0)
+        ma = propagation_row_M(
+            propagation_MiJt_a,
+            propagation_row_contact,
+            contact_units,
+            contact_unit_response,
+            contact_responses,
+            body_response_split,
+            ba,
+            world,
+            row,
+            0,
+        )
         for k in range(6):
             wp.atomic_add(propagation_body_qd, ba, k, ma[k] * impulse)
             wp.atomic_add(propagation_body_impulses, ba, k, ja[k] * impulse)
     if bb >= 0:
         jb = propagation_row_J(propagation_J_b, propagation_row_contact, contact_units, world, row, 1)
-        mb = propagation_row_M(propagation_MiJt_b, propagation_row_contact, contact_units, world, row, 1)
+        mb = propagation_row_M(
+            propagation_MiJt_b,
+            propagation_row_contact,
+            contact_units,
+            contact_unit_response,
+            contact_responses,
+            body_response_split,
+            bb,
+            world,
+            row,
+            1,
+        )
         for k in range(6):
             wp.atomic_add(propagation_body_qd, bb, k, mb[k] * impulse)
             wp.atomic_add(propagation_body_impulses, bb, k, jb[k] * impulse)
@@ -10414,25 +10468,72 @@ def fold_prescribed_propagation_sides(
     colored_rhs[world, i] = r
 
 
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    const unsigned mask = __activemask();
+    const unsigned taken = __ballot_sync(mask, flag != 0);
+    const int lane = threadIdx.x & 31;
+    const int leader = __ffs(mask) - 1;
+    int base = 0;
+    if (lane == leader && taken) base = atomicAdd(&counter.data[index], __popc(taken));
+    base = __shfl_sync(mask, base, leader);
+    return flag ? base + __popc(taken & ((1u << lane) - 1u)) : -1;
+#else
+    return flag ? wp::atomic_add(counter.data + index, 1) : -1;
+#endif
+""")
+def _warp_ordered_claim(flag: int, counter: wp.array[int], index: int) -> int: ...
+
+
 @wp.kernel(enable_backward=False)
 def map_propagation_contact_units(
     unit_max: int,
+    padded_unit_max: int,
     n_color_entries: int,
     contact_capacity: int,
     world_color_offsets: wp.array[int],
     unit_sorted_contact: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    unit_split: int,
+    response_capacity: int,
     # outputs
     contact_unit: wp.array[int],
+    contact_unit_response: wp.array[int],
+    contact_response_count: wp.array[int],
+    overflow: wp.array[wp.bool],
 ):
-    """Give each colored contact its unit's position, where the row builder writes its contact unit."""
+    """Give each colored contact its unit's position and, to a contact unit that stores its responses, a slot.
+
+    A contact between two links of one articulation (every contact without ``unit_split``) stores its exact row
+    responses. Each warp covers 32 consecutive units of one world (``padded_unit_max`` is a multiple of 32) and
+    claims its slots together, so slots follow the units' order and the sweep's lanes read them coalesced. A world
+    out of slots reports an overflow; its remaining units use the split responses.
+    """
     tid = wp.tid()
-    world = tid // unit_max
-    pos = tid - world * unit_max
-    if pos >= world_color_offsets[world * n_color_entries + n_color_entries - 1]:
-        return
-    c = unit_sorted_contact[tid]
-    if c >= 0 and c < contact_capacity:
-        contact_unit[c] = tid
+    world = tid // padded_unit_max
+    pos = tid - world * padded_unit_max
+    p = world * unit_max + pos
+    c = int(-1)
+    if pos < unit_max:
+        if pos < world_color_offsets[world * n_color_entries + n_color_entries - 1]:
+            c = unit_sorted_contact[p]
+            if c >= contact_capacity:
+                c = -1
+    store = int(0)
+    if c >= 0:
+        contact_unit[c] = p
+        if unit_split == 0 or (contact_art_a[c] == contact_art_b[c] and contact_art_a[c] >= 0):
+            store = 1
+    k = _warp_ordered_claim(store, contact_response_count, world)
+    if c >= 0:
+        slot = int(-1)
+        if store != 0:
+            if k < response_capacity:
+                slot = world * response_capacity + k
+            else:
+                overflow[world] = True
+        contact_unit_response[p] = slot
 
 
 @wp.kernel(enable_backward=False)
@@ -10452,6 +10553,7 @@ def gather_propagation_unit_meta(
     straight_line: int,
     propagation_row_contact: wp.array2d[int],
     contact_units: wp.array[float],
+    contact_unit_response: wp.array[int],
     # out
     unit_meta: wp.array[int],
     ring_overflow: wp.array[int],
@@ -10552,12 +10654,13 @@ def gather_propagation_unit_meta(
     ):
         standard = 2  # a lone contact row
     # A contact unit (always a standard unit) records its kind in bits 2-3 and its two bodies (prescribed sides
-    # folded out) in its unused patch-ring words, so the sweep issues all of its loads at once.
+    # folded out) and response slot in its unused patch-ring words, so the sweep issues all of its loads at once.
     rc = propagation_row_unit(propagation_row_contact, world, slot)
     if standard == 1 and rc >= 0 and n == 0 and member < 0:
         standard = 1 | (int(contact_unit_block(contact_units, 2, rc >> 2)[3]) << 2)
         unit_meta[base + 4] = ba
         unit_meta[base + 5] = bb
+        unit_meta[base + 6] = contact_unit_response[rc >> 2]
     unit_meta[base + 6 + PROPAGATION_UNIT_RING] = standard
 
 
@@ -11372,6 +11475,8 @@ def refine_same_articulation_propagation_rows_paths(
     propagation_J_b: wp.array3d[float],
     propagation_row_contact: wp.array2d[int],
     contact_units: wp.array[float],
+    contact_unit_response: wp.array[int],
+    contact_responses: wp.array[float],
     propagation_row_type: wp.array2d[int],
     propagation_row_mu: wp.array2d[float],
     pgs_cfm: float,
@@ -11435,6 +11540,8 @@ def refine_same_articulation_propagation_rows_paths(
             propagation_J_b,
             propagation_row_contact,
             contact_units,
+            contact_unit_response,
+            contact_responses,
             propagation_row_type,
             propagation_row_mu,
             pgs_cfm,
@@ -11495,6 +11602,8 @@ def _refine_chain_row(
     propagation_J_b: wp.array3d[float],
     propagation_row_contact: wp.array2d[int],
     contact_units: wp.array[float],
+    contact_unit_response: wp.array[int],
+    contact_responses: wp.array[float],
     propagation_row_type: wp.array2d[int],
     propagation_row_mu: wp.array2d[float],
     pgs_cfm: float,
@@ -11564,8 +11673,12 @@ def _refine_chain_row(
         sb = db
     d = pgs_cfm
     d_exact = pgs_cfm
-    propagation_store_M(propagation_MiJt_a, propagation_row_contact, contact_units, world, i, 0, sa)
-    propagation_store_M(propagation_MiJt_b, propagation_row_contact, contact_units, world, i, 1, sb)
+    propagation_store_M(
+        propagation_MiJt_a, propagation_row_contact, contact_unit_response, contact_responses, world, i, 0, sa
+    )
+    propagation_store_M(
+        propagation_MiJt_b, propagation_row_contact, contact_unit_response, contact_responses, world, i, 1, sb
+    )
     for r in range(6):
         d += fa[r] * sa[r] + fb[r] * sb[r]
         d_exact += fa[r] * da[r] + fb[r] * db[r]
@@ -11612,6 +11725,8 @@ def _refine_path_row(
     propagation_J_b: wp.array3d[float],
     propagation_row_contact: wp.array2d[int],
     contact_units: wp.array[float],
+    contact_unit_response: wp.array[int],
+    contact_responses: wp.array[float],
     propagation_row_type: wp.array2d[int],
     propagation_row_mu: wp.array2d[float],
     pgs_cfm: float,
@@ -11654,6 +11769,8 @@ def _refine_path_row(
             propagation_J_b,
             propagation_row_contact,
             contact_units,
+            contact_unit_response,
+            contact_responses,
             propagation_row_type,
             propagation_row_mu,
             pgs_cfm,
@@ -11846,8 +11963,12 @@ def _refine_path_row(
         sb = db
     d = pgs_cfm
     d_exact = pgs_cfm
-    propagation_store_M(propagation_MiJt_a, propagation_row_contact, contact_units, world, i, 0, sa)
-    propagation_store_M(propagation_MiJt_b, propagation_row_contact, contact_units, world, i, 1, sb)
+    propagation_store_M(
+        propagation_MiJt_a, propagation_row_contact, contact_unit_response, contact_responses, world, i, 0, sa
+    )
+    propagation_store_M(
+        propagation_MiJt_b, propagation_row_contact, contact_unit_response, contact_responses, world, i, 1, sb
+    )
     for r in range(6):
         d += ja[r] * sa[r] + jb[r] * sb[r]
         d_exact += ja[r] * da[r] + jb[r] * db[r]

@@ -91,6 +91,7 @@ def make_solver(
     *,
     contact_rows=32,
     contacts=None,
+    same_articulation_contacts=None,
     parallel_tree=False,
     enable_joint_limits=False,
     coupled_contact_passes=0,
@@ -118,6 +119,9 @@ def make_solver(
             propagation_constraint_max=contact_rows if propagation else None,
             # The colored sweep keeps one unit per contact (and per clamp closure) instead of one per row.
             propagation_contact_max=contacts if propagation else None,
+            # Contacts between two links of one rod that one world holds: from 256 worlds each keeps its exact row
+            # responses in a slot of this many, while every other contact rebuilds them from its bodies' responses.
+            propagation_same_articulation_contact_max=same_articulation_contacts if propagation else None,
             articulation_constraint_max=dense_rows,
             row_watermark=True,
             # Each step publishes its body state through the solver's own kinematics and the next step starts from

@@ -311,6 +311,8 @@ class Example:
             args,
             contacts=self.contacts_per_world,
             contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies),
+            # A cable touching itself: the task's peak, 266 contacts, with a quarter on top.
+            same_articulation_contacts=352,
             iterations=self.sim_iterations,
             # The obstacles push the bundle sideways: every sweep's impulses must reach the whole cable.
             propagation_interval=1,

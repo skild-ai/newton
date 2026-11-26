@@ -148,6 +148,8 @@ class Example:
             self.sim_iterations,
             contacts=self.contacts_per_world,
             contact_rows=3 * self.contacts_per_world,
+            # A cable touching itself: the task's peak, 606 contacts, with a quarter on top.
+            same_articulation_contacts=768,
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

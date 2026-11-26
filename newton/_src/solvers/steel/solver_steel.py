@@ -87,6 +87,7 @@ from .kernels import (
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
     PREELIM_MAX_ROWS,
     PROPAGATION_COLOR_TAIL,
+    PROPAGATION_CONTACT_RESPONSE_BLOCKS,
     PROPAGATION_CONTACT_UNIT_BLOCKS,
     PROPAGATION_UNIT_META,
     PROPAGATION_UNIT_RING,
@@ -1787,6 +1788,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     free_body_constraint_max = _ConstructionOption()
     propagation_constraint_max = _ConstructionOption()
     propagation_contact_max = _ConstructionOption()
+    propagation_same_articulation_contact_max = _ConstructionOption()
     warn_constraint_overflow = _StepOption(lambda name, value: bool(value))
     row_watermark = _ConstructionOption()
     coupled_contact_passes = _ConstructionOption()
@@ -2091,6 +2093,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         free_body_constraint_max: int = 512,
         propagation_constraint_max: int | None = None,
         propagation_contact_max: int | None = None,
+        propagation_same_articulation_contact_max: int | None = None,
         warn_constraint_overflow: bool = True,
         row_watermark: bool = False,
         coupled_contact_passes: int = 0,
@@ -2277,6 +2280,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 (default) keeps one unit per row. A step whose contacts exceed it leaves them unsolved and is
                 reported like a row overflow (:meth:`check_constraint_capacity`). At least 1; only with
                 ``articulated_contact_response="propagation"``.
+            propagation_same_articulation_contact_max: Contacts between two links of one articulation one world
+                holds with contact units (the colored propagation sweep's per-contact records, used from 256
+                worlds): such a contact stores its rows' exact responses, while a contact between two
+                articulations rebuilds them from its bodies' responses. ``None`` (default) reserves storage for
+                every contact. A step with more is reported like a row overflow
+                (:meth:`check_constraint_capacity`) and solves the excess with their bodies' responses. At least 1.
             warn_constraint_overflow: Print a device-side warning the first time a world
                 exceeds a row capacity. The warning does not synchronize the host and is
                 compatible with CUDA graph capture. The host contact torsion preparation
@@ -3046,6 +3055,15 @@ class SolverSteel(SolverBase, CouplingInterface):
             None if propagation_constraint_max is None else int(propagation_constraint_max)
         )
         self._propagation_contact_max = None if propagation_contact_max is None else int(propagation_contact_max)
+        self._propagation_same_articulation_contact_max = (
+            None
+            if propagation_same_articulation_contact_max is None
+            else int(propagation_same_articulation_contact_max)
+        )
+        if self._propagation_same_articulation_contact_max is not None and (
+            self._propagation_same_articulation_contact_max < 1
+        ):
+            raise ValueError("propagation_same_articulation_contact_max must be >= 1")
         if self._propagation_contact_max is not None:
             if articulated_contact_response == "immediate":
                 raise ValueError("propagation_contact_max requires articulated_contact_response='propagation'")
@@ -12530,6 +12548,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_body_response_split = wp.zeros((bodies, 6, 6), dtype=wp.float32, device=device)
         # Contact units (allocated with the colored sweep's units): none.
         self._contact_units = wp.zeros((PROPAGATION_CONTACT_UNIT_BLOCKS * 4,), dtype=wp.float32, device=device)
+        self._contact_unit_response = wp.full((1,), -1, dtype=wp.int32, device=device)
+        self._contact_responses = wp.zeros((PROPAGATION_CONTACT_RESPONSE_BLOCKS * 4,), dtype=wp.float32, device=device)
+        self._contact_response_count = wp.zeros((1,), dtype=wp.int32, device=device)
+        self._contact_response_capacity = 1
         self._propagation_contact_unit = wp.zeros((1,), dtype=wp.int32, device=device)
         self._propagation_row_contact = wp.full((1, 1), -1, dtype=wp.int32, device=device)
         self._propagation_body_qd = wp.zeros((bodies, 6), dtype=wp.float32, device=device)
@@ -12712,6 +12734,17 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._contact_units = wp.zeros(
                 (units * PROPAGATION_CONTACT_UNIT_BLOCKS * 4,), dtype=wp.float32, device=device
             )
+            # Each world's response slots for its contacts between two links of one articulation, the slot each
+            # unit took (-1: split responses) and the slots taken this step.
+            capacity = unit_max
+            if self._propagation_same_articulation_contact_max is not None:
+                capacity = min(capacity, self._propagation_same_articulation_contact_max)
+            self._contact_response_capacity = capacity
+            self._contact_unit_response = wp.full((units,), -1, dtype=wp.int32, device=device)
+            self._contact_responses = wp.zeros(
+                (worlds * capacity * PROPAGATION_CONTACT_RESPONSE_BLOCKS * 4,), dtype=wp.float32, device=device
+            )
+            self._contact_response_count = wp.zeros((worlds,), dtype=wp.int32, device=device)
             self._propagation_contact_unit = wp.zeros(
                 (max(self._max_contacts_alloc, 1),), dtype=wp.int32, device=device
             )
@@ -13018,6 +13051,8 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _propagation_clear_rows(self) -> None:
         """Reset the per-step propagation row and body state before the rows are allocated."""
         self._propagation_slot_counter.zero_()
+        if self._contact_units_on:
+            self._contact_response_count.zero_()
         self._propagation_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)
         if self._propagation_active:
             # Only the previous step's rows can hold values: zero those instead of the whole capacity.
@@ -13165,18 +13200,31 @@ class SolverSteel(SolverBase, CouplingInterface):
                 device=model.device,
             )
             if self._contact_units_on:
+                # One warp per 32 consecutive units of a world (see map_propagation_contact_units).
+                padded = 32 * ((self._propagation_unit_max + 31) // 32)
                 wp.launch(
                     map_propagation_contact_units,
-                    dim=self._world_count * self._propagation_unit_max,
+                    dim=self._world_count * padded,
                     inputs=[
                         self._propagation_unit_max,
+                        padded,
                         PROPAGATION_COLOR_TAIL + 2,
                         self._max_contacts_alloc,
                         self._color_world_offsets,
                         self._color_unit_sorted,
+                        self._contact_art_a,
+                        self._contact_art_b,
+                        int(self._kernel_overrides.get("contact_units_split", True)),
+                        self._contact_response_capacity,
                     ],
-                    outputs=[self._propagation_contact_unit],
+                    outputs=[
+                        self._propagation_contact_unit,
+                        self._contact_unit_response,
+                        self._contact_response_count,
+                        self.constraint_overflow,
+                    ],
                     device=model.device,
+                    block_dim=256,
                 )
             self._color_unit_meta_stale = True
         if contacts is not None:
@@ -13217,8 +13265,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._friction_combine_id,
                     self._restitution_combine_id,
                     int(self._contact_units_on),
-                    int(self._kernel_overrides.get("contact_units_split", False)),
                     self._propagation_contact_unit,
+                    self._contact_unit_response,
                 ],
                 outputs=[
                     self._propagation_body_a,
@@ -13909,9 +13957,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._contact_speculative_scale,
                 self._propagation_max_constraints,
                 self._propagation_row_contact,
+                self._contact_unit_response,
             ],
             outputs=[
                 self._contact_units,
+                self._contact_responses,
                 self._propagation_eff_mass_inv,
                 self._propagation_MiJt_a,
                 self._propagation_MiJt_b,
@@ -13964,6 +14014,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_J_b,
                     self._propagation_row_contact,
                     self._contact_units,
+                    self._contact_unit_response,
+                    self._contact_responses,
                     self._propagation_row_type,
                     self._propagation_row_mu,
                     self._cfm,
@@ -14511,7 +14563,17 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_MiJt_b,
                 impulses,
                 self._propagation_max_constraints,
-                *([] if self._ordered_rows else [self._propagation_row_contact, self._contact_units]),
+                *(
+                    []
+                    if self._ordered_rows
+                    else [
+                        self._propagation_row_contact,
+                        self._contact_units,
+                        self._contact_unit_response,
+                        self._contact_responses,
+                        self._propagation_body_response_split,
+                    ]
+                ),
             ],
             outputs=[self._propagation_body_qd, self._propagation_body_impulses],
             device=self.model.device,
@@ -14789,6 +14851,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_MiJt_b,
                     self._propagation_row_contact,
                     self._contact_units,
+                    self._contact_unit_response,
+                    self._contact_responses,
                     self._propagation_body_response_split,
                 ],
                 outputs=[
@@ -14859,7 +14923,17 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_MiJt_b,
                 self._momentum_delta,
                 self._propagation_max_constraints,
-                *([] if self._ordered_rows else [self._propagation_row_contact, self._contact_units]),
+                *(
+                    []
+                    if self._ordered_rows
+                    else [
+                        self._propagation_row_contact,
+                        self._contact_units,
+                        self._contact_unit_response,
+                        self._contact_responses,
+                        self._propagation_body_response_split,
+                    ]
+                ),
             ],
             outputs=[self._propagation_body_qd, self._propagation_body_impulses],
             device=device,
@@ -15199,6 +15273,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._color_unit_payload if self._color_unit_payload is not None else self._color_unit_friction_setup,
             self._color_ring_overflow,
             self._contact_units,
+            self._contact_responses,
             self._propagation_body_response_split,
         ]
 
@@ -15228,6 +15303,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 int(self._colored_straight_line),
                 self._propagation_row_contact,
                 self._contact_units,
+                self._contact_unit_response,
             ],
             outputs=[self._color_unit_meta, self._color_ring_overflow],
             device=device,
@@ -15249,6 +15325,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_MiJt_b,
                 self._propagation_row_contact,
                 self._contact_units,
+                self._contact_unit_response,
+                self._contact_responses,
+                self._propagation_body_response_split,
             ],
             outputs=[self._color_unit_friction_setup],
             device=device,
@@ -20245,6 +20324,7 @@ def _get_colored_friction_setup_kernel(
     MR = int(PROPAGATION_UNIT_META)
     FS = int(PROPAGATION_UNIT_FRICTION_SETUP)
     BL = int(PROPAGATION_CONTACT_UNIT_BLOCKS)
+    RB = int(PROPAGATION_CONTACT_RESPONSE_BLOCKS)
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const int world = tid / {U};
@@ -20265,20 +20345,43 @@ def _get_colored_friction_setup_kernel(
     float cross = 0.0f;
     const int unit_row = (propagation_row_contact.shape[1] > 1) ? propagation_row_contact.data[o1] : -1;
     if (unit_row >= 0) {{
-        // A contact unit: row 1 is [t0, r_a x t0] on body a (negated with r_b on body b), row 2's responses are
-        // stored at words 12-17 (a) and 30-35 (b) of its response blocks (PROPAGATION_CONTACT_UNIT_BLOCKS).
+        // A contact unit: row r is [d_r, r_a x d_r] on body a (negated with r_b on body b); row 2's responses come
+        // from the unit's response slot or are each body's split response times the row.
         const int p = unit_row >> 2;
         const int nu = (int)(contact_units.shape[0] / {4 * BL});
         const float* cu = contact_units.data;
         const float t[3] = {{cu[(nu + p) * 4], cu[(nu + p) * 4 + 1], cu[(nu + p) * 4 + 2]}};
+        const float s2[3] = {{cu[(2 * nu + p) * 4], cu[(2 * nu + p) * 4 + 1], cu[(2 * nu + p) * 4 + 2]}};
         const float ra[3] = {{cu[(3 * nu + p) * 4], cu[(3 * nu + p) * 4 + 1], cu[(3 * nu + p) * 4 + 2]}};
         const float rb[3] = {{cu[(4 * nu + p) * 4], cu[(4 * nu + p) * 4 + 1], cu[(4 * nu + p) * 4 + 2]}};
         const float ja[6] = {{t[0], t[1], t[2], ra[1] * t[2] - ra[2] * t[1], ra[2] * t[0] - ra[0] * t[2], ra[0] * t[1] - ra[1] * t[0]}};
         const float jb[6] = {{-t[0], -t[1], -t[2], -(rb[1] * t[2] - rb[2] * t[1]), -(rb[2] * t[0] - rb[0] * t[2]), -(rb[0] * t[1] - rb[1] * t[0])}};
+        float ma[6], mb[6];
+        const int slot = contact_unit_response.data[p];
+        if (slot >= 0) {{
+            const int ns = (int)(contact_responses.shape[0] / {4 * RB});
+            const float* cr = contact_responses.data;
+            for (int k = 0; k < 6; ++k) {{
+                const int wa = 12 + k, wb = 30 + k;
+                ma[k] = cr[((wa / 4) * ns + slot) * 4 + wa % 4];
+                mb[k] = cr[((wb / 4) * ns + slot) * 4 + wb % 4];
+            }}
+        }} else {{
+            const float j2a[6] = {{s2[0], s2[1], s2[2], ra[1] * s2[2] - ra[2] * s2[1], ra[2] * s2[0] - ra[0] * s2[2], ra[0] * s2[1] - ra[1] * s2[0]}};
+            const float j2b[6] = {{-s2[0], -s2[1], -s2[2], -(rb[1] * s2[2] - rb[2] * s2[1]), -(rb[2] * s2[0] - rb[0] * s2[2]), -(rb[0] * s2[1] - rb[1] * s2[0])}};
+            for (int i = 0; i < 6; ++i) {{
+                float va = 0.0f, vb = 0.0f;
+                for (int k = 0; k < 6; ++k) {{
+                    if (ba >= 0) va += body_response_split.data[ba * 36 + i * 6 + k] * j2a[k];
+                    if (bb >= 0) vb += body_response_split.data[bb * 36 + i * 6 + k] * j2b[k];
+                }}
+                ma[i] = va;
+                mb[i] = vb;
+            }}
+        }}
         for (int k = 0; k < 6; ++k) {{
-            const int wa = 12 + k, wb = 30 + k;
-            if (la >= 0) cross += ja[k] * cu[((5 + wa / 4) * nu + p) * 4 + wa % 4];
-            if (lb >= 0) cross += jb[k] * cu[((5 + wb / 4) * nu + p) * 4 + wb % 4];
+            if (la >= 0) cross += ja[k] * ma[k];
+            if (lb >= 0) cross += jb[k] * mb[k];
         }}
     }} else {{
         for (int k = 0; k < 6; ++k) {{
@@ -20310,6 +20413,9 @@ def _get_colored_friction_setup_kernel(
         propagation_MiJt_b: wp.array3d[float],
         propagation_row_contact: wp.array2d[int],
         contact_units: wp.array[float],
+        contact_unit_response: wp.array[int],
+        contact_responses: wp.array[float],
+        body_response_split: wp.array3d[float],
         unit_friction_setup: wp.array[float],
     ): ...
 
@@ -20327,6 +20433,9 @@ def _get_colored_friction_setup_kernel(
         propagation_MiJt_b: wp.array3d[float],
         propagation_row_contact: wp.array2d[int],
         contact_units: wp.array[float],
+        contact_unit_response: wp.array[int],
+        contact_responses: wp.array[float],
+        body_response_split: wp.array3d[float],
         unit_friction_setup: wp.array[float],
     ):
         tid = wp.tid()
@@ -20345,6 +20454,9 @@ def _get_colored_friction_setup_kernel(
             propagation_MiJt_b,
             propagation_row_contact,
             contact_units,
+            contact_unit_response,
+            contact_responses,
+            body_response_split,
             unit_friction_setup,
         )
 
@@ -21342,10 +21454,14 @@ def _colored_prefetch_unit_body(
                         p_Jb[r][5] = sb * (grb[0] * dy - grb[1] * dx);
                     }}
                     if (u_kind == 2) {{
+                        // The unit's response slot, carried in its record (gather_propagation_unit_meta).
+                        const float4* CR = reinterpret_cast<const float4*>(propagation_contact_responses.data);
+                        const int u_ns = (int)(propagation_contact_responses.shape[0] / {4 * int(PROPAGATION_CONTACT_RESPONSE_BLOCKS)});
+                        const int u_slot = um[6];
                         float um36[36];
                         #pragma unroll
                         for (int q = 0; q < 9; ++q) {{
-                            const float4 mq = __ldg(&CU[(5 + q) * u_nu + u_p]);
+                            const float4 mq = __ldg(&CR[q * u_ns + u_slot]);
                             um36[4 * q] = mq.x; um36[4 * q + 1] = mq.y; um36[4 * q + 2] = mq.z; um36[4 * q + 3] = mq.w;
                         }}
                         #pragma unroll
@@ -22143,6 +22259,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
         propagation_unit_payload: wp.array[float],
         propagation_ring_overflow: wp.array[int],
         propagation_contact_units: wp.array[float],
+        propagation_contact_responses: wp.array[float],
         propagation_body_response_split: wp.array3d[float],
         omega: float,
         regularize: int,
@@ -22182,6 +22299,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
         propagation_unit_payload: wp.array[float],
         propagation_ring_overflow: wp.array[int],
         propagation_contact_units: wp.array[float],
+        propagation_contact_responses: wp.array[float],
         propagation_body_response_split: wp.array3d[float],
         omega: float,
         regularize: int,
@@ -22222,6 +22340,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
             propagation_unit_payload,
             propagation_ring_overflow,
             propagation_contact_units,
+            propagation_contact_responses,
             propagation_body_response_split,
             omega,
             regularize,

@@ -224,6 +224,8 @@ class Example:
             args,
             contacts=self.contacts_per_world,
             contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies),
+            # A cable touching itself: the task's peak, 387 contacts, with a quarter on top.
+            same_articulation_contacts=512,
             iterations=self.sim_iterations,
         )
 

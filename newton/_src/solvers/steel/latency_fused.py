@@ -102,6 +102,7 @@ COLORED_FIELDS = (
     "unit_payload",
     "ring_overflow",
     "contact_units",
+    "contact_responses",
     "body_response_split",
 )
 
@@ -180,6 +181,7 @@ class ColoredArgs:
     unit_payload: wp.array[float]
     ring_overflow: wp.array[int]
     contact_units: wp.array[float]
+    contact_responses: wp.array[float]
     body_response_split: wp.array3d[float]
 
 
@@ -394,7 +396,7 @@ def get_fused_iteration_kernel(
                 colored.row_type, colored.row_parent, colored.row_mu, colored.torsion_first, colored.torsion_next,
                 colored.torsion_row_radius, colored.compliance_gamma, colored.row_order, colored.color_offsets,
                 colored.body_list, colored.body_count, colored.body_local_slot, colored.unit_meta,
-                colored.unit_friction_setup, colored.unit_payload, colored.ring_overflow, colored.contact_units,
+                colored.unit_friction_setup, colored.unit_payload, colored.ring_overflow, colored.contact_units, colored.contact_responses,
                 colored.body_response_split, omega, regularize,
                 friction_start_iteration, g, propagation_impulses, body_qd, body_impulses,
             )  # fmt: skip

@@ -180,6 +180,8 @@ class Example:
             # Three rows (normal and two tangents) per contact of the world's budget.
             contacts=self.contacts_per_world,
             contact_rows=3 * self.contacts_per_world,
+            # A cable touching itself: the task's peak, 5 contacts, with room to spare.
+            same_articulation_contacts=32,
             iterations=self.sim_iterations,
             rigid_body_contact_buffer_size=256,
             rigid_contact_history=True,
