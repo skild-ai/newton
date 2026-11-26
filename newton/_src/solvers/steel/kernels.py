@@ -1252,7 +1252,9 @@ def write_body_dynamics(
     com, inertia_origin = transform_com_inertia_terms(X_sm_local, mass, inertia)
     f_g_s = wp.spatial_vector(f_g, wp.cross(com, f_g))
 
-    if write_body_inertia != 0:
+    # A one-element stand-in when nothing reads the world inertias (SolverSteel._body_inertia_read); a kinematic free
+    # body, flagged free-rigid without response DOFs, still asks for its inertia.
+    if write_body_inertia != 0 and body < body_I_s.shape[0]:
         body_I_s[body] = assemble_com_spatial_inertia(mass, com, inertia_origin)
     if write_body_inertia_terms != 0:
         body_inertia_terms[body, 0] = com[0]

@@ -117,7 +117,11 @@ _FACTOR = (
         o.jid = o.flags >> 8;
         if (pre) {
             #pragma unroll
-            for (int c = 0; c < 6; ++c) { o.iw[c] = IW.data[k * 36 + r * 6 + c]; o.sinv[c] = SINV.data[k * 36 + r * 6 + c]; }
+            for (int c = 0; c < 6; ++c) {
+                // IW keeps the diagonal 3x3 blocks of the child's world inertia (the prelude).
+                o.iw[c] = ((c >= 3) == (r >= 3)) ? IW.data[k * 18 + rb * 3 + rr * 3 + (c >= 3 ? c - 3 : c)] : 0.0f;
+                o.sinv[c] = SINV.data[k * 36 + r * 6 + c];
+            }
         } else {
             o.q = body_q_com.data[o.child].q;
             const wp::mat_t<6, 6, wp::float32>& L = body_I_m.data[o.child];
@@ -2934,7 +2938,7 @@ _FACTOR_EPILOGUE = (
 
 # Factor prelude: everything a rod joint's step of the factorization needs that does not depend on its children,
 # one thread per joint, so the serial walk keeps only the recursion. Per walk slot k: the child's inertia in world
-# axes (IW, 36), the joint's diagonal terms (armature and implicit drive stiffness, KD, 6) and, for a full-rank
+# axes (IW, its two diagonal 3x3 blocks, 18), the joint's diagonal terms (armature and implicit drive stiffness, KD, 6) and, for a full-rank
 # joint, S^-1 (SINV, 36): with S invertible, I_hat^-1 U^T = S^-1, so the reduced inertia U D^-1 K I_hat^-1 U^T is
 # U D^-1 K S^-1 and needs no second inversion.
 _FACTOR_PRELUDE = r"""
@@ -2950,8 +2954,24 @@ _FACTOR_PRELUDE = r"""
     const int dc = flags & 7;
     const float* SF = propagation_joint_S_flat.data;
     const wp::mat_t<3, 3, wp::float32> R = wp::quat_to_matrix(wp::quat_inverse(body_q_com.data[child].q));
-    const wp::mat_t<6, 6, wp::float32>& L = body_I_m.data[child];
-    float* iw = IW.data + k * 36;
+    // The child's spatial inertia about its center of mass, blockdiag(m I, I_body) (compute_spatial_inertia).
+    wp::mat_t<6, 6, wp::float32> L;
+    {
+        const float mass = body_mass.data[child];
+        const wp::mat_t<3, 3, wp::float32>& Ib = body_inertia.data[child];
+        #pragma unroll
+        for (int r = 0; r < 6; ++r)
+            #pragma unroll
+            for (int col = 0; col < 6; ++col) L.data[r][col] = 0.0f;
+        #pragma unroll
+        for (int a = 0; a < 3; ++a) {
+            L.data[a][a] = mass;
+            #pragma unroll
+            for (int b = 0; b < 3; ++b) L.data[3 + a][3 + b] = Ib.data[a][b];
+        }
+    }
+    // Only the two diagonal 3x3 blocks: the off-diagonal blocks of a block-diagonal inertia stay exactly zero.
+    float* iw = IW.data + k * 18;
     #pragma unroll
     for (int r = 0; r < 6; ++r) {
         const int rb = r >= 3 ? 3 : 0;
@@ -2960,13 +2980,14 @@ _FACTOR_PRELUDE = r"""
         for (int col = 0; col < 6; ++col) {
             const int cb = col >= 3 ? 3 : 0;
             const int cc = col - cb;
+            if (cb != rb) continue;
             float v = 0.0f;
             #pragma unroll
             for (int a = 0; a < 3; ++a)
                 #pragma unroll
                 for (int b = 0; b < 3; ++b)
                     v += R.data[a][rr] * L.data[rb + a][cb + b] * R.data[b][cc];
-            iw[r * 6 + col] = v;
+            iw[rb * 3 + rr * 3 + cc] = v;
         }
     }
     const int aug_count = aug_row_counts.data[art];
@@ -3058,7 +3079,8 @@ def factor_prelude_kernel():
         aug_row_counts: wp.array[int],
         aug_row_dof_index: wp.array[int],
         aug_row_K: wp.array[float],
-        body_I_m: wp.array[wp.spatial_matrix],
+        body_mass: wp.array[float],
+        body_inertia: wp.array[wp.mat33],
         body_q_com: wp.array[wp.transform],
         IW: wp.array[float],
         KD: wp.array[float],
@@ -3077,7 +3099,8 @@ def factor_prelude_kernel():
         aug_row_counts: wp.array[int],
         aug_row_dof_index: wp.array[int],
         aug_row_K: wp.array[float],
-        body_I_m: wp.array[wp.spatial_matrix],
+        body_mass: wp.array[float],
+        body_inertia: wp.array[wp.mat33],
         body_q_com: wp.array[wp.transform],
         IW: wp.array[float],
         KD: wp.array[float],
@@ -3096,7 +3119,8 @@ def factor_prelude_kernel():
             aug_row_counts,
             aug_row_dof_index,
             aug_row_K,
-            body_I_m,
+            body_mass,
+            body_inertia,
             body_q_com,
             IW,
             KD,

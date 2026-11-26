@@ -3354,6 +3354,14 @@ class SolverSteel(SolverBase, CouplingInterface):
                 arts = self._group_to_art[size].numpy()
                 if len(arts) and bool(np.all(spatial[arts])):
                     self._tree_dynamics_sizes.add(int(size))
+        if self._rod_material is not None and all(
+            size in self._tree_dynamics_sizes for size in (*self._rod_material.layout, *self._rod_material.loop_groups)
+        ):
+            self._rod_material.release_rod_blocks(model.device)
+        # World spatial inertias feed only the dense mass matrix and the free-body rows.
+        self._body_inertia_read = self._has_free_rigid_bodies or any(
+            size not in self._tree_dynamics_sizes for size in self._size_groups
+        )
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
         self._allocate_paired_response_buffers(model)
@@ -3420,7 +3428,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
             # The factor prelude's per-slot terms (rod_tree._FACTOR_PRELUDE) and the walk slots it covers.
             jc = max(model.joint_count, 1)
-            self._rod_factor_IW = wp.zeros(jc * 36, dtype=wp.float32, device=model.device)
+            self._rod_factor_IW = wp.zeros(jc * 18, dtype=wp.float32, device=model.device)
             self._rod_factor_KD = wp.zeros(jc * 6, dtype=wp.float32, device=model.device)
             self._rod_factor_SINV = wp.zeros(jc * 36, dtype=wp.float32, device=model.device)
             self._rod_prelude = bool(self._kernel_overrides.get("rod_factor_prelude", True))
@@ -3537,12 +3545,21 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._rod_tree_chain_start = wp.array(
                 np.asarray(starts_list or [0], dtype=np.int32), dtype=wp.int32, device=model.device
             )
-            bc = max(model.body_count, 1)
+            # Rod trees of single chains (each joint hanging off the previous joint's child, from a root on the world)
+            # hand no wrench, twist change or twist to another chain: the factor's branch accumulators and the chain
+            # pass's body accumulators are then never indexed.
+            branching = self._rod_scan_only_sizes != set(self._rod_tree_sizes) or any(
+                len(per_art.get(int(art), (start,))) > 1
+                or int(m4[start, 1]) >= 0
+                or bool(np.any(m4[start:end, 3] & (32 | 64)))
+                for art, start, end in art_ranges
+            )
+            bc = max(model.body_count, 1) if branching else 1
             self._rod_tree_body_extra = wp.zeros((bc, 6), dtype=wp.float32, device=model.device)
             self._rod_tree_body_d = wp.zeros((bc, 6), dtype=wp.float32, device=model.device)
             self._rod_tree_body_o = wp.zeros((bc, 6), dtype=wp.float32, device=model.device)
-            self._rod_tree_branch = wp.zeros((max(model.body_count, 1), 36), dtype=wp.float32, device=model.device)
-            self._rod_tree_branch_p = wp.zeros((max(model.body_count, 1), 6), dtype=wp.float32, device=model.device)
+            self._rod_tree_branch = wp.zeros((bc, 36), dtype=wp.float32, device=model.device)
+            self._rod_tree_branch_p = wp.zeros((bc, 6), dtype=wp.float32, device=model.device)
             self._release_generic_tree_buffers(m4)
         # Fixed-signature stand-in for the compliant residual coefficients of solve kernels without compliance.
         self._compliance_off_gamma = wp.zeros((1, 1), dtype=float, device=model.device)
@@ -4023,10 +4040,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._mass_update_requested.fill_(1)
         if flags & ModelFlags.BODY_INERTIAL_PROPERTIES and self.model.body_count:
             # Re-derive the buffers baked from body_com/body_mass/body_inertia in
-            # _allocate_common_buffers so runtime mass randomization reaches FK and CRBA.
+            # _allocate_common_buffers so runtime mass randomization reaches FK and CRBA (a one-element stand-in
+            # when nothing reads the spatial inertias, see _release_generic_tree_buffers).
             wp.launch(
                 compute_spatial_inertia,
-                self.model.body_count,
+                min(self.model.body_count, self._body_I_m.shape[0]),
                 inputs=[self.model.body_inertia, self.model.body_mass],
                 outputs=[self._body_I_m],
                 device=self.model.device,
@@ -6788,6 +6806,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         if generic:
             return
         device = self.model.device
+        if self._rod_prelude and not self._body_inertia_read:
+            # The prelude forms the rod joints' inertias from the model's masses and inertias; only the factor
+            # without the prelude, the generic factor and the masked inertia refresh read the spatial copy.
+            self._body_I_m = wp.zeros((1,), dtype=wp.spatial_matrix, device=device)
         self._propagation_tree_Ia = wp.zeros((1, 6, 6), dtype=wp.float32, device=device)
         self._propagation_tree_D_chol = wp.zeros((1, 6, 6), dtype=wp.float32, device=device)
         self._propagation_tree_u_basis = wp.zeros((1, 6), dtype=wp.float32, device=device)
@@ -9581,7 +9603,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         target._joint_tau = wp.empty_like(model.joint_qd)
         target._joint_S_s = wp.empty((model.joint_dof_count,), dtype=wp.spatial_vector, device=model.device)
         target._body_q_com = wp.empty_like(model.body_q)
-        target._body_I_s = wp.empty((model.body_count,), dtype=wp.spatial_matrix, device=model.device)
+        inertias = model.body_count if getattr(self, "_body_inertia_read", True) else 1
+        target._body_I_s = wp.empty((inertias,), dtype=wp.spatial_matrix, device=model.device)
         target._body_v_s = wp.empty((model.body_count,), dtype=wp.spatial_vector, device=model.device)
         target._body_a_s = wp.empty((model.body_count,), dtype=wp.spatial_vector, device=model.device)
         target._body_f_s = wp.zeros((model.body_count,), dtype=wp.spatial_vector, device=model.device)
@@ -9642,7 +9665,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         else:
             stage3_qd = state_in.joint_qd
 
-        refresh_composite = (
+        refresh_composite = self._body_inertia_read and (
             (self._step % self._update_mass_matrix_interval) == 0
             or self._force_mass_update
             or self._rod_material is not None
@@ -9993,7 +10016,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             outputs=[self._mass_update_mask],
             device=model.device,
         )
-        if not global_flag:
+        if not global_flag and self._body_inertia_read:
             # Articulations refreshed between global rebuilds (reset or notifications)
             # need fresh body inertias.
             wp.launch(
@@ -12167,7 +12190,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         model.body_inertia,
                         self._is_free_rigid,
                         self._articulation_origin,
-                        1,
+                        int(self._body_inertia_read),
                         0,
                         model.body_world,
                         model.gravity,
@@ -12529,7 +12552,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         momentum_shape = (worlds, rows) if self._propagation_momentum else (1, 1)
         self._momentum_prev = wp.zeros(momentum_shape, dtype=wp.float32, device=device)
         self._momentum_start = wp.zeros(momentum_shape, dtype=wp.float32, device=device)
-        self._momentum_delta = wp.zeros(momentum_shape, dtype=wp.float32, device=device)
+        # The move to install is a separate pass only on the run-to-run ordered (or CPU) path; on CUDA the momentum
+        # step applies it directly (propagation_momentum_apply).
+        delta_shape = momentum_shape if self._ordered_rows or not device.is_cuda else (1, 1)
+        self._momentum_delta = wp.zeros(delta_shape, dtype=wp.float32, device=device)
         self._momentum_t = wp.ones(worlds if self._propagation_momentum else 1, dtype=wp.float32, device=device)
         self._momentum_beta = wp.zeros(worlds if self._propagation_momentum else 1, dtype=wp.float32, device=device)
         self._momentum_dot = wp.zeros((worlds if self._propagation_momentum else 1, 2), dtype=wp.float32, device=device)
@@ -13403,7 +13429,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                             self._aug_row_counts,
                             self._aug_row_dof_index,
                             self._aug_row_K,
-                            self._body_I_m,
+                            model.body_mass,
+                            model.body_inertia,
                             state_aug._body_q_com,
                         ],
                         outputs=[self._rod_factor_IW, self._rod_factor_KD, self._rod_factor_SINV],

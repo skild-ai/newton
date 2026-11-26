@@ -136,6 +136,7 @@ def _linearize(
     owners: wp.array[int],
     h: float,
     history: DahlHistory,
+    write_blocks: int,
     tau: wp.array[float],
     blocks: wp.array[wp.spatial_matrix],
     joint_blocks: wp.array[wp.spatial_matrix],
@@ -148,7 +149,8 @@ def _linearize(
         for i in range(lin + 3):
             tau[qd_start[joint] + i] = 0.0
     if not enabled[joint]:
-        blocks[r] = block
+        if write_blocks != 0:
+            blocks[r] = block
         if owners[joint] >= 0:
             joint_blocks[joint] = block
         return
@@ -183,7 +185,8 @@ def _linearize(
         load0 = wp.transpose(Jw0) * force0
         for i in range(3):
             tau[iv + i] += load0[i]
-        blocks[r] = block
+        if write_blocks != 0:
+            blocks[r] = block
         if owners[joint] >= 0:
             joint_blocks[joint] = block
         return
@@ -228,7 +231,8 @@ def _linearize(
     load = wp.transpose(J) * force
     for i in range(6):
         tau[iv + i] += load[i]
-    blocks[r] = block
+    if write_blocks != 0:
+        blocks[r] = block
     # The factor reads tree rods' blocks by joint index (scatter_joint_blocks).
     if owners[joint] >= 0:
         joint_blocks[joint] = block
@@ -737,6 +741,8 @@ class RodMaterial:
             self.history.initialized = wp.zeros(model.joint_count, dtype=bool, device=model.device)
         self.joints = wp.array(rods, dtype=int, device=model.device)
         self.blocks = wp.empty(len(rods), dtype=wp.spatial_matrix, device=model.device)
+        # Only the dense mass matrix reads the blocks by rod (augment); see release_rod_blocks.
+        self.write_blocks = True
         # The same blocks indexed by joint, for the articulated-body factorization of the propagation response.
         self.joint_blocks = wp.zeros(model.joint_count, dtype=wp.spatial_matrix, device=model.device)
         joint_art = model.joint_articulation.numpy()
@@ -876,6 +882,7 @@ class RodMaterial:
                 model.joint_articulation,
                 dt,
                 self.history,
+                int(self.write_blocks),
             ],
             outputs=[tau, self.blocks, self.joint_blocks],
             device=model.device,
@@ -901,6 +908,11 @@ class RodMaterial:
                 outputs=[cols],
                 device=model.device,
             )
+
+    def release_rod_blocks(self, device):
+        """Keep no per-rod blocks: no group assembles a dense mass matrix, so only the joint-indexed copy is read."""
+        self.blocks = wp.zeros(1, dtype=wp.spatial_matrix, device=device)
+        self.write_blocks = False
 
     def scatter_joint_blocks(self, model):
         """Each tree rod's material block at its joint index (other joints zero), as the linearization wrote it."""
