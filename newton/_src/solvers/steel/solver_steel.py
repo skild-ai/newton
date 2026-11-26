@@ -12842,7 +12842,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             device_arch, self._world_count, bodies
         )
         # A few large worlds are latency-bound and gain from the packed records; many worlds lose to their traffic.
-        packed = self._colored_prefetch and bool(overrides.get("colored_packed", self._world_count <= 16))
+        # Rod trees read their rows faster unpacked at any world count: a color's units are consecutive row slots, so
+        # the lanes' row loads coalesce while the packed records (one block per lane) do not.
+        packed = self._colored_prefetch and bool(
+            overrides.get("colored_packed", self._world_count <= 16 and not self._rod_tree_sizes)
+        )
         self._colored_worlds_per_block = 1 if staged else _COLORED_WORLDS_PER_BLOCK
         # With no more worlds than SMs the sweep is latency-bound: a block per world spreads a color's units over
         # all its warps instead of solving them 32 at a time.
