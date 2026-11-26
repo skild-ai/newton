@@ -6742,7 +6742,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[self._body_X_com],
                 device=model.device,
             )
-            self._body_I_c = wp.empty((model.body_count,), dtype=wp.spatial_matrix, device=model.device)
+            # Composite inertias feed only the dense mass matrix, which no tree-dynamics group assembles.
+            composite = any(size not in self._tree_dynamics_sizes for size in self._size_groups)
+            self._body_I_c = wp.empty(
+                (model.body_count if composite else 1,), dtype=wp.spatial_matrix, device=model.device
+            )
             inertia_term_count = 1
             self._body_inertia_terms = wp.empty((inertia_term_count, 12), dtype=wp.float32, device=model.device)
         else:
@@ -6911,12 +6915,12 @@ class SolverSteel(SolverBase, CouplingInterface):
         # Rows reserved by each contact: 1 (normal only) or 3 (normal and friction).
         self._contact_slots_needed = wp.zeros((max_contacts,), dtype=wp.int32, device=device)
         # Friction patches own their history, independently of collision contact matching.
-        # Row builders read a zero anchor displacement when patches are off.
+        # Row builders read a zero anchor displacement when patches are off (and no per-contact displacements).
         self._friction_patches = _FrictionPatchState(
             model,
             max_contacts,
             self._friction_anchors_enabled,
-            wp.zeros(max_contacts, dtype=wp.vec2, device=device),
+            wp.zeros(max_contacts if self._friction_anchors_enabled else 1, dtype=wp.vec2, device=device),
         )
         # The warm start matches each contact to its predecessor itself when the contacts carry no pipeline match,
         # so the collision pipeline needs no contact matching (and none of its sorted history).
@@ -12460,7 +12464,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_target_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._propagation_row_rebound_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         # Rebound bias of each row, kept for the velocity-only iterations.
-        self._propagation_restitution_bias = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
+        # Only the velocity-only iterations read a contact's frozen rebound target.
+        self._propagation_restitution_bias = wp.zeros(
+            (worlds, rows) if self._velocity_iterations else (1, 1), dtype=wp.float32, device=device
+        )
         # Loop closures always read their row weight (a rod closure's softness), so they keep the full buffer.
         self._propagation_row_w = wp.ones(
             (worlds, rows) if self._regularization_enabled or self._connect_count else (1, 1),
@@ -12667,7 +12674,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._color_world_unit_cursor = wp.zeros((worlds,), dtype=wp.int32, device=device)
         self._color_unit_meta = wp.zeros((units * PROPAGATION_UNIT_META,), dtype=wp.int32, device=device)
         # Rows past a unit's stored ring, listed per world: rows, not units.
-        self._color_ring_overflow = wp.zeros((worlds * rows,), dtype=wp.int32, device=device)
+        # Only friction patches chain contact rows into rings (link_patch_rows).
+        self._color_ring_overflow = wp.zeros(
+            (worlds * rows if self._friction_anchors_enabled else 1,), dtype=wp.int32, device=device
+        )
         self._color_ring_overflow_cursor = wp.zeros((worlds,), dtype=wp.int32, device=device)
         self._color_unit_friction_setup = wp.zeros(
             (units * PROPAGATION_UNIT_FRICTION_SETUP,), dtype=wp.float32, device=device

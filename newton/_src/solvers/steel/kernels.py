@@ -5742,7 +5742,11 @@ def prepare_world_contact_rows(
             world_row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
             world_row_parent[world, row] = slot
             world_row_mu[world, row] = mu
-            world_phi[world, row] = friction_patches.phi[c][k]
+            # Without friction anchors the displacements are a one-element zero stand-in.
+            patch_phi = float(0.0)
+            if c < friction_patches.phi.shape[0]:
+                patch_phi = friction_patches.phi[c][k]
+            world_phi[world, row] = patch_phi
             world_row_rebound_velocity[world, row] = 0.0
             world_target_velocity[world, row] = prescribed_relative_contact_target(
                 body_a,
@@ -7194,7 +7198,11 @@ def _build_mf_contact_row(
         else:
             mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
             mf_row_parent[world, row_idx] = slot
-            mf_phi[world, row_idx] = friction_anchor_beta * friction_patches.phi[c][row_offset - 1]
+            # Without friction anchors the displacements are a one-element zero stand-in.
+            patch_phi = float(0.0)
+            if c < friction_patches.phi.shape[0]:
+                patch_phi = friction_patches.phi[c][row_offset - 1]
+            mf_phi[world, row_idx] = friction_anchor_beta * patch_phi
             mf_row_rebound_velocity[world, row_idx] = 0.0
         if has_target_velocity != 0:
             target = prescribed_relative_contact_target(
@@ -8960,7 +8968,11 @@ def build_propagation_contact_rows(
             else:
                 propagation_row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
                 propagation_row_parent[world, row] = slot
-                propagation_phi[world, row] = friction_anchor_beta * friction_patches.phi[c][row_offset - 1]
+                # Without friction anchors the displacements are a one-element zero stand-in.
+                patch_phi = float(0.0)
+                if c < friction_patches.phi.shape[0]:
+                    patch_phi = friction_patches.phi[c][row_offset - 1]
+                propagation_phi[world, row] = friction_anchor_beta * patch_phi
                 propagation_row_rebound_velocity[world, row] = 0.0
             target = prescribed_relative_contact_target(
                 body_a,
@@ -9855,7 +9867,9 @@ def compute_propagation_effective_mass_and_rhs(
         else:
             bias = pgs_beta * propagation_phi[world, i] / dt
     propagation_rhs[world, i] = bias - target_velocity
-    propagation_restitution_bias[world, i] = restitution_bias
+    # A one-element stand-in without velocity-only iterations.
+    if world < propagation_restitution_bias.shape[0] and i < propagation_restitution_bias.shape[1]:
+        propagation_restitution_bias[world, i] = restitution_bias
     if row_type == PGS_CONSTRAINT_TYPE_CONNECT:
         propagation_row_w[world, i] = row_w
     elif contact_w < 1.0:
