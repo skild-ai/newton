@@ -3412,10 +3412,6 @@ class SolverSteel(SolverBase, CouplingInterface):
             # The rod-tree factor's propagation maps: per joint B = T (I - U D^-1 S^T), per DOF Q = -D^-1 U^T X.
             # The rod-tree factor's per-lane propagation records: backward [B row, W row], forward [B column,
             # Q row, S row, e] per joint (see rod_tree).
-            self._propagation_tree_BR = wp.zeros((max(model.joint_count, 1), 72), dtype=wp.float32, device=model.device)
-            self._propagation_tree_FR = wp.zeros(
-                (max(model.joint_count, 1), 144), dtype=wp.float32, device=model.device
-            )
             self._propagation_tree_CR = wp.zeros(
                 max(model.joint_count, 1) * _rod_tree.CHAIN_REC, dtype=wp.float32, device=model.device
             )
@@ -3475,10 +3471,12 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._rod_chain_flag = wp.array(chain, dtype=wp.int32, device=model.device)
             self._rod_chain_flag_np = chain.copy()
             self._rod_chain_any = bool(chain.any()) and bool(self._kernel_overrides.get("rod_chain_scan", True))
+            # Contracted iterations replace the propagation only without momentum (_launch_propagation_solve).
             self._rod_contracted = (
                 self._rod_chain_any
                 and self._rod_tree_kernels["response"]
                 and bool(self._kernel_overrides.get("rod_chain_contracted", True))
+                and not self._propagation_momentum
             )
             if not self._rod_chain_any:
                 self._rod_chain_flag.zero_()
@@ -3487,12 +3485,13 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._rod_body_chain_pos = wp.array(chain_pos, dtype=wp.int32, device=model.device)
             # Contracted chains (rod_tree._CONTRACT_PREP): each chain's active links, the maps between them and the
             # snapshot twists, so iterations update only the active links.
-            jc = max(model.joint_count, 1)
+            jc = max(model.joint_count, 1) if self._rod_contracted else 1
             self._rod_ctr_count = wp.zeros(max(model.articulation_count, 1), dtype=wp.int32, device=model.device)
             self._rod_ctr_pos = wp.zeros(jc, dtype=wp.int32, device=model.device)
             self._rod_ctr_body = wp.zeros(jc, dtype=wp.int32, device=model.device)
             self._rod_ctr_P = wp.zeros(jc * 36, dtype=wp.float32, device=model.device)
-            self._rod_ctr_a = wp.zeros(jc * 6, dtype=wp.float32, device=model.device)
+            # Passed through by the contract kernels and never read or written.
+            self._rod_ctr_a = wp.zeros(6, dtype=wp.float32, device=model.device)
             self._rod_ctr_qd0 = wp.zeros(jc * 6, dtype=wp.float32, device=model.device)
             # Every rod tree is taken by the chain propagation pass as its chains (rod_tree._CHAIN_PROPAGATE): the walk
             # positions where a chain starts (a joint not hanging off the previous one), per articulation, and the
@@ -3528,6 +3527,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 for size in self._rod_tree_sizes
                 if self._rod_scan_any and all(scan[int(a)] for a in self._propagation_tree_arts[size].numpy())
             }
+            # The six-lane walk records (BR, FR) repeat the chain records CR in another layout; only the walk of a
+            # group that does not take the chain scan reads them, and only the factor without the prelude writes them.
+            walk_records = not self._rod_prelude or self._rod_scan_only_sizes != set(self._rod_tree_sizes)
+            jr = max(model.joint_count, 1) if walk_records else 1
+            self._propagation_tree_BR = wp.zeros((jr, 72), dtype=wp.float32, device=model.device)
+            self._propagation_tree_FR = wp.zeros((jr, 144), dtype=wp.float32, device=model.device)
             self._rod_tree_chain_off = wp.array(off, dtype=wp.int32, device=model.device)
             self._rod_tree_chain_start = wp.array(
                 np.asarray(starts_list or [0], dtype=np.int32), dtype=wp.int32, device=model.device
@@ -3538,6 +3543,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._rod_tree_body_o = wp.zeros((bc, 6), dtype=wp.float32, device=model.device)
             self._rod_tree_branch = wp.zeros((max(model.body_count, 1), 36), dtype=wp.float32, device=model.device)
             self._rod_tree_branch_p = wp.zeros((max(model.body_count, 1), 6), dtype=wp.float32, device=model.device)
+            self._release_generic_tree_buffers(m4)
         # Fixed-signature stand-in for the compliant residual coefficients of solve kernels without compliance.
         self._compliance_off_gamma = wp.zeros((1, 1), dtype=float, device=model.device)
         if self._contact_compliance:
@@ -3915,7 +3921,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[self._joint_armature_device],
                 device=model.device,
             )
-        for size in self._size_groups:
+        for size in self._dense_row_sizes:
             wp.launch(
                 gather_group_armature,
                 (self._n_arts_by_size[size], size),
@@ -6763,6 +6769,33 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._aug_row_dof_index = wp.zeros((total_rows,), dtype=wp.int32, device=device)
         self._aug_row_K = wp.zeros((total_rows,), dtype=wp.float32, device=device)
 
+    def _release_generic_tree_buffers(self, meta4: np.ndarray) -> None:
+        """Replace the generic tree kernels' per-body buffers with stand-ins when only the rod kernels run.
+
+        The articulated inertias, Cholesky scratch and response bases (Ia, D_chol, u_basis) belong to the generic
+        factor and response, the spatial bias and accelerations (pA, qdd) also to the per-articulation refine and
+        the tree solve of stage 3, and the per-body deltas (body_delta) to branched joints (meta flag 64) and the
+        six-lane walk. Groups that are all rod trees on the rod kernels, refined along paths and taken by the chain
+        scan use none of them.
+        """
+        generic = any(size not in self._rod_tree_sizes for size in self._propagation_tree_sizes) or not all(
+            self._rod_tree_kernels.values()
+        )
+        if generic:
+            return
+        device = self.model.device
+        self._propagation_tree_Ia = wp.zeros((1, 6, 6), dtype=wp.float32, device=device)
+        self._propagation_tree_D_chol = wp.zeros((1, 6, 6), dtype=wp.float32, device=device)
+        self._propagation_tree_u_basis = wp.zeros((1, 6), dtype=wp.float32, device=device)
+        refined_by_articulation = self._propagation_same_articulation_rows and self._propagation_path_joint is None
+        if refined_by_articulation:
+            return
+        self._propagation_tree_pA = wp.zeros((1, 6), dtype=wp.float32, device=device)
+        self._propagation_tree_qdd = wp.zeros((1,), dtype=wp.float32, device=device)
+        branched = bool(np.any(meta4[:, 3] & 64)) if meta4.size else False
+        if not branched and self._rod_scan_only_sizes == set(self._rod_tree_sizes):
+            self._propagation_tree_body_delta = wp.zeros((1, 6), dtype=wp.float32, device=device)
+
     def _plan_row_free_sizes(self) -> frozenset:
         """Tree-dynamics groups no dense row reaches, which need no dense mass-matrix, factor or row buffers.
 
@@ -6840,8 +6873,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 else:
                     self._J_by_size[size] = self._Y_by_size[size] = stand_in
                     self._diag_by_size[size] = self._dummy_hinv_diag
-                self._tau_by_size[size] = wp.zeros((n_arts, size, 1), dtype=wp.float32, device=device)
-                self._qdd_by_size[size] = wp.zeros((n_arts, size, 1), dtype=wp.float32, device=device)
+                # Armature, tau and qdd feed only the dense factor and solve, which tree dynamics skips.
+                self._R_by_size[size] = wp.zeros((1, 1), dtype=wp.float32, device=device)
+                self._tau_by_size[size] = self._qdd_by_size[size] = stand_in
                 continue
             self._H_by_size[size] = wp.zeros((n_arts, size, size), dtype=wp.float32, device=device)
             self._L_by_size[size] = wp.zeros((n_arts, size, size), dtype=wp.float32, device=device)

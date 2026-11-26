@@ -478,7 +478,8 @@ def test_propagation_contracted_chain(test, device):
     """A chain with few contact-active links iterates on those links alone and ends where the full pass ends.
 
     The clamp of a long rod is its only row, so its chain contracts to one active link; the contracted
-    iterations and the propagation of their summed impulses must match propagating every iteration.
+    iterations and the propagation of their summed impulses must match propagating every iteration. Contracted
+    iterations run only without momentum, which the rod material otherwise turns on.
     """
     from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415
 
@@ -498,7 +499,12 @@ def test_propagation_contracted_chain(test, device):
             model = builder.finalize(device=device)
             with kernel_overrides({"rod_chain_contracted": contracted}):
                 solver = newton.solvers.SolverSteel(
-                    model, iterations=16, articulation_constraint_max=64, solve_mode=mode, **_PROPAGATION
+                    model,
+                    iterations=16,
+                    articulation_constraint_max=64,
+                    solve_mode=mode,
+                    propagation_momentum=False,
+                    **_PROPAGATION,
                 )
             test.assertEqual(solver._rod_contracted, contracted)
             a, b, control = model.state(), model.state(), model.control()
