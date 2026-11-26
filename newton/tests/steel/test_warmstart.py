@@ -646,10 +646,51 @@ def test_identity_warmstart_matches_cold_equilibrium(test, device):
     test.assertAlmostEqual(float(state_warm.joint_q.numpy()[0]), float(state_cold.joint_q.numpy()[0]), delta=1.0e-3)
 
 
-def test_identity_warmstart_requires_contact_matching(test, device):
-    """Reject stepping warm start with unmatched contacts instead of reusing impulses by slot index."""
-    with test.assertRaisesRegex(ValueError, "contact matching"):
-        _run_press(device, 3, {"contact_warmstart": True}, contact_matching=None)
+def test_warmstart_matches_contacts_without_pipeline_matching(test, device):
+    """Without pipeline matching the solver matches contacts itself: the press holds as with the pipeline's.
+
+    The stall pose and impulse ledger agree with the pipeline's body-frame matching, with and without friction
+    anchors.
+    """
+    steps = 240
+    stall = slice(120, None)
+    for anchors in ({}, {"friction_anchor_beta": 0.0}):
+        with test.subTest(anchors=anchors):
+            warm = {"contact_warmstart": True, **anchors}
+            lam_own, speed_own, state_own = _run_press(device, steps, warm, contact_matching=None)
+            lam_pipe, _speed_pipe, state_pipe = _run_press(device, steps, warm, contact_matching="latest")
+            test.assertTrue(np.isfinite(state_own.body_q.numpy()).all())
+            growth = lam_own[-10:].mean() / max(lam_own[stall][:10].mean(), 1e-12)
+            test.assertLess(growth, 1.25, f"warm-start impulse grew x{growth:.2f} at a stall")
+            test.assertLess(speed_own[stall].max(), 0.02)
+            np.testing.assert_allclose(lam_own[-10:].mean(), lam_pipe[-10:].mean(), rtol=0.05)
+            test.assertAlmostEqual(
+                float(state_own.joint_q.numpy()[0]), float(state_pipe.joint_q.numpy()[0]), delta=1.0e-3
+            )
+
+
+def test_own_contact_matching_finds_every_resting_contact(test, device):
+    """A box resting on the ground keeps all its contacts from step to step: each is matched, one to one."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.7))
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
+    builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7))
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    test.assertIsNone(contacts.rigid_contact_match_index)
+    solver = newton.solvers.SolverSteel(model, contact_warmstart=True, iterations=12, friction_anchor_beta=0.0)
+    test.assertIsNotNone(solver._contact_matcher)
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    for _ in range(60):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
+        state_0, state_1 = state_1, state_0
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    test.assertGreater(count, 0)
+    matches = solver._contact_matcher.match_index.numpy()[:count]
+    test.assertTrue(np.all(matches >= 0), f"unmatched resting contacts: {matches}")
+    test.assertEqual(len(set(matches.tolist())), count)
 
 
 def test_single_flag_enables_dense_and_mf_carry(test, device):
@@ -745,7 +786,8 @@ for _fn in (
     test_real_contact_insertion_moves_slots_without_cross_seeding,
     test_identity_warmstart_holds_static_press,
     test_identity_warmstart_matches_cold_equilibrium,
-    test_identity_warmstart_requires_contact_matching,
+    test_warmstart_matches_contacts_without_pipeline_matching,
+    test_own_contact_matching_finds_every_resting_contact,
     test_single_flag_enables_dense_and_mf_carry,
     test_both_row_families_seed_impulses_scaled_by_the_step_ratio,
     test_substeps_reuse_contacts_with_their_own_history,

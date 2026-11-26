@@ -197,8 +197,8 @@ class Example:
             builder.color()
         self.model = builder.finalize()
         contact_history = self.contact_mode == "alm-history"
-        # Native Steel warm-starts its contacts, which reads the matching.
-        contact_matching = "latest" if contact_history or self.clamps.steel else "disabled"
+        # VBD's contact history reads the matching; native Steel matches its contacts itself.
+        contact_matching = "latest" if contact_history else "disabled"
         # Contacts per world: the task makes none under Steel or VBD, so the budget's minimum.
         self.contacts_per_world = cable_solver.contact_budget(self.model, 0)
         self.collision_pipeline = newton.CollisionPipeline(

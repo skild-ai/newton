@@ -49,6 +49,7 @@ from .contact_angular_friction import (
     refresh_free_rigid_angular_friction,
     validate_free_rigid_angular_friction,
 )
+from .contact_matching import ContactMatcher as _ContactMatcher
 from .contact_torsion import (
     configure_contact_torsion,
     prepare_torsion_rows,
@@ -2434,9 +2435,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 with ``"interleaved"`` as well. Contact torsion and contact compliance require
                 ``"interleaved"``, and the sparse mass factors are selected only with ``"interleaved"``.
             contact_warmstart: Start each step from the previous step's contact impulses, matched
-                by contact identity through :attr:`~newton.Contacts.rigid_contact_match_index`,
-                so the :class:`~newton.CollisionPipeline` must be created with contact matching
-                enabled. Substeps that reuse a contact set without a collision pass seed each
+                by contact identity. A contact buffer that carries
+                :attr:`~newton.Contacts.rigid_contact_match_index` (a :class:`~newton.CollisionPipeline`
+                created with contact matching) is matched by the pipeline; otherwise the solver matches the
+                contacts itself, with the rules of the pipeline's body-frame matching at its default
+                thresholds, from about 88 bytes of history per contact slot. Substeps that reuse a contact set without a collision pass seed each
                 contact from its own previous substep. History carries across one collision
                 pass into the same :class:`~newton.Contacts` buffer when that pass matched
                 against the solved contact set
@@ -6889,6 +6892,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._friction_anchors_enabled,
             wp.zeros(max_contacts, dtype=wp.vec2, device=device),
         )
+        # The warm start matches each contact to its predecessor itself when the contacts carry no pipeline match,
+        # so the collision pipeline needs no contact matching (and none of its sorted history).
+        self._contact_matcher = (
+            _ContactMatcher(max_contacts, model.body_count, device) if self._contact_warmstart else None
+        )
         if self._contact_warmstart:
             # Previous step's first row of each (sorted) contact per row family, and its normal.
             self._ws_prev_dense_slot = wp.full((max_contacts,), -1, dtype=wp.int32, device=device)
@@ -8000,11 +8008,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 f"{contacts.rigid_contact_max} slots, but solver scratch was allocated for "
                 f"{self._max_contacts_alloc}. Set model.rigid_contact_max before constructing the solver."
             )
-        if self._contact_warmstart and contacts is not None and contacts.rigid_contact_match_index is None:
-            raise ValueError(
-                "contact_warmstart=True matches contacts across steps and requires a Contacts buffer created "
-                'with contact matching; create the CollisionPipeline with contact_matching="latest".'
-            )
         body_parent_f = state_out.body_parent_f
         if observables is not None and observables.is_requested(SolverBase.ObservableKind.BODY_PARENT_F):
             body_parent_f = observables.body_parent_f
@@ -8395,6 +8398,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             else:
                 self._friction_patches.previous.valid.zero_()
         if self._contact_warmstart:
+            if contacts is not None and contacts.rigid_contact_match_index is None:
+                self._contact_matcher.store(model, state_in, contacts)
             self._snapshot_warmstart(contacts, dt)
         if self._double_buffered:
             self._clear_double_buffer()
@@ -10644,8 +10649,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._contact_path,
                 self._contact_slot,
                 self._contact_world,
-                contacts.rigid_contact_match_index,
-                contacts.rigid_contact_match_generation,
+                contacts.rigid_contact_match_index
+                if contacts.rigid_contact_match_index is not None
+                else self._contact_matcher.match_index,
+                contacts.rigid_contact_match_generation
+                if contacts.rigid_contact_match_index is not None
+                else self._contact_matcher.match_generation,
                 prev_slot,
                 prev_impulses,
                 prev_type,
@@ -11229,6 +11238,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._sparse_diagonal_row_dof.fill_(-1)
 
         if contacts is not None and contacts.rigid_contact_max > 0:
+            if self._contact_matcher is not None and contacts.rigid_contact_match_index is None:
+                # Match the contacts to the set the last step solved before the rows seed from it.
+                self._contact_matcher.match(model, state_in, contacts, self._ws_history_generation)
             contact_build_threads = min(contacts.rigid_contact_max, _CONTACT_BUILD_THREAD_CAP)
             contact_geometry = [
                 contacts.rigid_contact_count,
@@ -11256,6 +11268,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     if self._free_rigid_angular_rows
                     else None,
                 )
+
             wp.launch(
                 allocate_world_contact_slots,
                 dim=contact_build_threads,

@@ -61,10 +61,13 @@ def budget(args, substeps, iterations, propagation=None):
 
 
 def pipeline_options(args):
-    """Collision-pipeline options a native Steel run needs: contact matching, which its contact warm starting reads,
-    in the bodies' frames so contacts that moving bodies carry together (a grasp) keep their match."""
-    if getattr(args, "solver", "vbd") == "steel":
-        return {"contact_matching": "latest", "contact_matching_body_frame": True}
+    """Collision-pipeline options a cable example needs for its solver.
+
+    Native Steel warm-starts its contacts from its own friction-patch history, which matches each contact to its
+    predecessor, so the pipeline needs no contact matching (and keeps none of its sorted history); VBD needs none
+    either.
+    """
+    del args
     return {}
 
 
@@ -121,9 +124,13 @@ def make_solver(
             # them instead of re-deriving them from the joint coordinates.
             reuse_kinematics=True,
             # Each step starts from the previous step's contact impulses, so a held grasp or a cable resting on a
-            # surface keeps its load instead of rebuilding it every substep (the pipeline matches contacts, see
+            # surface keeps its load instead of rebuilding it every substep (Steel matches the contacts itself, see
             # pipeline_options).
             contact_warmstart=True,
+            # Point friction: two tangent rows per contact, warm-started, without friction-patch anchors. Every
+            # cable task holds its grasps and passes its checks this way, and the patches' per-contact history
+            # would otherwise be Steel's largest buffer in contact-dense scenes.
+            friction_anchor_beta=0.0,
             # Rod trees propagate every third iteration, where the sweeps' momentum steps too; the sweeps' body
             # estimates carry the impulses between. Scenes that push long cables sideways propagate every one.
             propagation_interval=propagation_interval if propagation else 1,
