@@ -29,6 +29,11 @@ def kernel_overrides(overrides: Mapping[str, object]) -> Iterator[None]:
     (``"baumgarte"`` or ``"implicit"`` with ``closure_direct_timeconst`` [s] and
     ``closure_direct_dampratio``), ``closure_ds_threads`` (threads per world block),
     ``closure_ds_bc`` (update columns per pass) and ``closure_ds_timing`` (per-world phase times).
+    The sparse direct solve is correct on either mass solve, but on large looped mechanisms the dense Cholesky
+    mass solve dominates the step (the Hoberman flower at resolution 2, one world: 199 ms per frame against
+    2.37 ms with ``mass_solve="articulated_body"``), so pair it with the articulated-body solve there. Past the
+    device's shared memory for its tiled triangular solve (157 DOFs at 99 KiB per block), the Cholesky
+    mass solve raises :class:`ValueError` at construction and suggests the articulated-body solve.
     """
     token = _KERNEL_OVERRIDES.set(dict(overrides))
     try:

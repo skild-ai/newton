@@ -1,0 +1,1 @@
+Raise `ValueError` at `SolverSteel` construction when an articulation's Cholesky mass solve needs more shared memory for its tiled triangular solve than the device provides (above 157 DOFs at 99 KiB per block), naming the DOF count, the bytes needed and available, and suggesting the articulated-body mass solve; the first step previously failed to launch.

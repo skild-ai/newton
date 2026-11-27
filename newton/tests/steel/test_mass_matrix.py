@@ -4,6 +4,7 @@
 """Mass-matrix assembly, diagonal mass, refresh cadence and model notifications of SolverSteel."""
 
 import gc
+import math
 import unittest
 import weakref
 
@@ -1713,6 +1714,22 @@ def test_articulated_body_solve_rejects_joints_before_their_parent(test, device)
             SolverSteel(model)
 
 
+def test_cholesky_mass_solve_rejects_a_trisolve_past_shared_memory(test, device):
+    """A chain whose tiled triangular solve exceeds shared memory raises at construction and suggests the AB solve.
+
+    The tiled solve keeps the whole ``n x n`` float32 factor in shared memory and has no fallback kernel, so
+    without the check the first step fails to launch. The chain is the smallest whose factor alone exceeds the
+    device's per-block limit.
+    """
+    dofs = math.isqrt(int(device.max_shared_memory_per_block) // 4) + 1
+    model = _build_chain_model(device, num_links=dofs, num_worlds=1)
+    with test.assertRaisesRegex(ValueError, rf"{dofs}-DOF articulation .* mass_solve='articulated_body'"):
+        SolverSteel(model)
+    with kernel_overrides({"mass_solve": "articulated_body"}):
+        solver = SolverSteel(model)
+    test.assertIn(dofs, solver._articulated_body_sizes)
+
+
 class TestSteelArticulatedBodySolve(unittest.TestCase):
     pass
 
@@ -1727,13 +1744,12 @@ for _func in (
     test_articulated_body_solve_rejects_joints_before_their_parent,
 ):
     add_function_test(TestSteelArticulatedBodySolve, _func.__name__, _func, devices=get_test_devices())
-# The local and paired solves run on CUDA only.
-add_function_test(
-    TestSteelArticulatedBodySolve,
-    test_articulated_body_solve_keeps_local_and_paired_groups_on_cholesky.__name__,
+# The local and paired solves and the tiled triangular solve run on CUDA only.
+for _func in (
     test_articulated_body_solve_keeps_local_and_paired_groups_on_cholesky,
-    devices=get_cuda_test_devices(),
-)
+    test_cholesky_mass_solve_rejects_a_trisolve_past_shared_memory,
+):
+    add_function_test(TestSteelArticulatedBodySolve, _func.__name__, _func, devices=get_cuda_test_devices())
 
 
 if __name__ == "__main__":

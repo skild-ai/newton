@@ -1288,6 +1288,14 @@ def _estimate_cholesky_shared_memory(n_dofs: int) -> int:
     return 3 * matrix_bytes + vector_bytes
 
 
+def _estimate_trisolve_shared_memory(n_dofs: int, *, tile_threads: int) -> int:
+    """Estimate the complete tiled triangular-solve shared-memory footprint [B].
+
+    The factor and three vectors, plus the kernel's static reservation of four bytes per thread.
+    """
+    return _align_shared_memory(4 * n_dofs * n_dofs) + 3 * _align_shared_memory(4 * n_dofs) + 4 * tile_threads
+
+
 def _estimate_hinv_jt_shared_memory(n_dofs: int, constraint_count: int, *, tile_threads: int) -> int:
     """Estimate the complete tiled H-inverse shared-memory footprint [B]."""
     footprint = _align_shared_memory(4 * n_dofs * n_dofs)
@@ -3226,6 +3234,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._setup_paired_response(model)
         self._keep_dense_factor_groups_on_cholesky()
         self._hinv_jt_diag_sizes -= self._articulated_body_sizes
+        self._check_tiled_trisolve_fits(model)
 
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
@@ -9591,6 +9600,32 @@ class SolverSteel(SolverBase, CouplingInterface):
                     "mass_solve='articulated_body' requires every tree joint to follow its parent joint; "
                     f"joint {int(unordered[0])} of articulation {art} precedes its parent joint "
                     f"{int(joint_ancestor[unordered[0]])}"
+                )
+
+    def _check_tiled_trisolve_fits(self, model: Model) -> None:
+        """Reject a Cholesky group whose tiled triangular solve cannot fit the device's shared memory.
+
+        The tiled Cholesky factor and ``H^-1 J^T`` fall back to their per-thread kernels past the limit, but the
+        tiled triangular solve has no fallback and would fail at its first launch, so raise at construction.
+        """
+        if not model.device.is_cuda or self._trisolve_kernel == "loop":
+            return
+        available = int(getattr(model.device, "max_shared_memory_per_block", 0))
+        for size in self._size_groups:
+            if (
+                size in (self._sparse_mass_matrix_size, self._sparse_diagonal_response_size)
+                or self._execution_plan.use_diagonal_mass(size)
+                or size in self._articulated_body_sizes
+            ):
+                continue
+            if self._trisolve_kernel == "auto" and size <= self._small_dof_threshold:
+                continue
+            required = _estimate_trisolve_shared_memory(size, tile_threads=self._tile_threads)
+            if required > available:
+                raise ValueError(
+                    f"SolverSteel: the Cholesky mass solve of a {size}-DOF articulation needs {required} bytes of "
+                    f"shared memory for its tiled triangular solve, but {model.device} exposes {available} bytes "
+                    "per block; use mass_solve='articulated_body' (kernel_overrides) for articulations this large."
                 )
 
     def _keep_dense_factor_groups_on_cholesky(self) -> None:
