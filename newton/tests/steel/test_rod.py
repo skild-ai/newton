@@ -1099,6 +1099,40 @@ for mode in ("serial", "colored"):
         )
 
 
+def test_inextensible_tree_dynamics(test, device):
+    """Under the propagation response an inextensible rod tree steps from the articulated-body factorization, with
+    no dense mass matrix, and matches the dense solve of the same joint loads."""
+    from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415
+
+    results = {}
+    for tree in (True, False):
+        model, _bodies = _hanging_rod(device, inextensible=True)
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        with kernel_overrides({"tree_dynamics": tree}):
+            solver = newton.solvers.SolverSteel(
+                model,
+                articulated_contact_response="propagation",
+                articulation_constraint_max=256,
+                iterations=16,
+                deterministic=wp.DeterministicMode.RUN_TO_RUN,
+            )
+        test.assertEqual(bool(solver._tree_dynamics_sizes), tree)
+        a, b, control, contacts = model.state(), model.state(), model.control(), pipeline.contacts()
+        for _ in range(120):
+            pipeline.collide(a, contacts)
+            solver.step(a, b, control, contacts, 1.0 / 240.0)
+            a, b = b, a
+        test.assertLess(float(_junction_gaps(model, a).max()), 1.0e-5)
+        results[tree] = a.body_q.numpy()
+    test.assertTrue(np.all(np.isfinite(results[True])))
+    np.testing.assert_allclose(results[True][:, :3], results[False][:, :3], atol=2.0e-4)
+
+
+add_function_test(
+    TestSteelRod, "test_inextensible_tree_dynamics", test_inextensible_tree_dynamics, devices=get_cuda_test_devices()
+)
+
+
 def test_inextensible_long_chain_whip(test, device):
     """A long, light inextensible rod whipping under gravity stays bounded, as a stiff six-DOF rod does.
 

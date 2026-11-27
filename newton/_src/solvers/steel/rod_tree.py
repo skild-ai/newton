@@ -32,6 +32,8 @@ CHAIN_REC = 148
 # global memory in the same layout), and its block size: one warp per block.
 CHAIN_STAGE_MAX = 64
 CHAIN_BLOCK_DIM = 32
+# How the per-chain passes find their tree: one warp per chain of the launch.
+_GRID_TREE = "const int tree = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;\n    if (tree >= ntrees) return;"
 
 _PRELUDE = (
     "\n    #define TREES_PER_WARP "
@@ -51,11 +53,14 @@ _PRELUDE = (
     const int wib = threadIdx.x >> 5;
     __shared__ float shm[2][TREES_PER_WARP][4][36];
     auto bcast = [&](float val, int k) { return __shfl_sync(GMASK, val, src0 + k); };
-    auto gj = [&](float* m, float* inv) {
+    // Gauss-Jordan inverse of the 6x6 block whose rows the lanes hold. A block padded with identity past its
+    // first n rows and columns (a joint of n DOFs) needs only the first n pivots: the identity rows' are no-ops.
+    auto gj = [&](float* m, float* inv, int n = 6) {
         #pragma unroll
         for (int k = 0; k < 6; ++k) inv[k] = (k == r) ? 1.0f : 0.0f;
         #pragma unroll
         for (int c = 0; c < 6; ++c) {
+            if (c >= n) break;
             float pm[6], pi[6];
             #pragma unroll
             for (int k = 0; k < 6; ++k) { pm[k] = bcast(m[k], c); pi[k] = bcast(inv[k], c); }
@@ -223,7 +228,7 @@ _FACTOR = (
             #pragma unroll
             for (int b = 0; b < 6; ++b) if (b == r) d_row[b] += diag;
         }
-        gj(d_row, dinv);
+        gj(d_row, dinv, dc);
         if (r < dc) {
             #pragma unroll
             for (int b = 0; b < 6; ++b) propagation_tree_D_inv.data[cur.jid * 36 + r * 6 + b] = (b < dc) ? dinv[b] : 0.0f;
@@ -342,8 +347,8 @@ _FACTOR = (
             // Reduced inertia passed to the parent. With a full-rank joint it is U (D^-1 K I^-1) U^T, with
             // I = S^T I_a S and K = D - I the joint's own terms (material, armature, drives): no subtraction,
             // so a soft joint's near-cancelling I_a - U D^-1 U^T cannot lose the parent's inertia in single
-            // precision, and every inverse is of a positive-definite block. A joint with fewer DOFs keeps the
-            // subtracting form.
+            // precision, and every inverse is of a positive-definite block. A joint with fewer DOFs takes the
+            // Joseph form below, positive for the same reason.
             float red[6];
             if (dc == 6) {
                 float krow[6];
@@ -443,6 +448,11 @@ _FACTOR = (
                 #pragma unroll
                 for (int j = 0; j < 6; ++j) red[j] = 0.5f * (red[j] + X[j * 6 + r]);
             } else {
+                // A joint with fewer DOFs (an inextensible rod joint has three) in the Joseph form
+                // I_a - U D^-1 U^T = P I_a P^T + W K W^T, with W = U D^-1, P = I - W S^T and K = D - S^T I_a S:
+                // a sum of congruences of positive (semi)definite blocks. The subtracting form loses a thin
+                // link's tiny twist inertia against its mass in single precision, and over a long chain the
+                // articulated inertias stop being positive.
                 float w[6];
                 #pragma unroll
                 for (int b = 0; b < 6; ++b) {
@@ -451,13 +461,64 @@ _FACTOR = (
                     for (int a = 0; a < 6; ++a) v += u_row[a] * Z[a * 6 + b];
                     w[b] = v;
                 }
+                // Row r of P (X holds S by spatial row) and of K (DOF row r; zero past the joint's DOFs).
+                float prow[6];
                 #pragma unroll
                 for (int col = 0; col < 6; ++col) {
-                    float v = ia[col];
+                    float p = 0.0f;
                     #pragma unroll
-                    for (int b = 0; b < 6; ++b) v -= w[b] * Y[col * 6 + b];
+                    for (int b = 0; b < 6; ++b) p += w[b] * X[col * 6 + b];
+                    prow[col] = ((col == r) ? 1.0f : 0.0f) - p;
+                }
+                float krow[6];
+                #pragma unroll
+                for (int b = 0; b < 6; ++b) krow[b] = (r < dc) ? cur.m[b] : 0.0f;
+                if (r < dc) {
+                    float diag = cur.diag;
+                    for (int aug_i = 0; aug_i < (pre ? 0 : aug_count); ++aug_i) {
+                        const int row_index = art * max_dofs + aug_i;
+                        if (aug_row_dof_index.data[row_index] == cur.gd + r) {
+                            const float K = aug_row_K.data[row_index];
+                            if (K > 0.0f) diag += K;
+                        }
+                    }
+                    #pragma unroll
+                    for (int b = 0; b < 6; ++b) if (b == r) krow[b] += diag;
+                }
+                // V = I_a, Z = K (Z's D^-1 is spent), Y = W (U is spent).
+                __syncwarp(GMASK);
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) { V[r * 6 + c] = ia[c]; Z[r * 6 + c] = krow[c]; Y[r * 6 + c] = w[c]; }
+                __syncwarp(GMASK);
+                // Row r of P I_a and of W K.
+                float t[6], wk[6];
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) {
+                    float v = 0.0f, k = 0.0f;
+                    #pragma unroll
+                    for (int j = 0; j < 6; ++j) { v += prow[j] * V[j * 6 + c]; k += w[j] * Z[j * 6 + c]; }
+                    t[c] = v;
+                    wk[c] = k;
+                }
+                // X = P (S is spent).
+                __syncwarp(GMASK);
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) X[r * 6 + c] = prow[c];
+                __syncwarp(GMASK);
+                #pragma unroll
+                for (int col = 0; col < 6; ++col) {
+                    float v = 0.0f;
+                    #pragma unroll
+                    for (int c = 0; c < 6; ++c) v += t[c] * X[col * 6 + c] + wk[c] * Y[col * 6 + c];
                     red[col] = v;
                 }
+                // Symmetric part, as the full-rank form.
+                __syncwarp(GMASK);
+                #pragma unroll
+                for (int j = 0; j < 6; ++j) X[r * 6 + j] = red[j];
+                __syncwarp(GMASK);
+                #pragma unroll
+                for (int j = 0; j < 6; ++j) red[j] = 0.5f * (red[j] + X[j * 6 + r]);
             }
             const float ex = cur.e[0], ey = cur.e[1], ez = cur.e[2];
             // E = skew(e); Q = R Tv with Tv = [[I, -E], [0, I]].
@@ -2340,6 +2401,75 @@ def chain_refresh_kernel():
     rod_chain_refresh.__name__ = "rod_chain_refresh"
     rod_chain_refresh.__qualname__ = "rod_chain_refresh"
     return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(rod_chain_refresh)
+
+
+# The chain passes as device functions of one chain for a caller that owns the warp (the latency-fused loop):
+# their first argument is the tree's index in ``group_to_art`` instead of the tree count, and the propagation
+# reads its records from global memory (no staging), so its shared memory stays small beside the caller's.
+_FUSED_TREE = "const int tree = ntrees;  // the caller's tree index"
+
+
+@functools.cache
+def chain_propagate_native():
+    """``rod_chain_propagate`` for one chain, called by a warp of another kernel (see the latency-fused loop)."""
+    src = _CHAIN_PROPAGATE.replace(_GRID_TREE, _FUSED_TREE, 1)
+
+    @wp.func_native("\n    #define STAGE_MAX 1\n" + src)
+    def rod_chain_propagate_one(
+        ntrees: int,
+        joint_meta: wp.array[int],
+        group_to_art: wp.array[int],
+        chain_flag: wp.array[int],
+        articulation_active: wp.array[int],
+        art_to_world: wp.array[int],
+        cache_world_flag: wp.array[int],
+        articulation_joint_range: wp.array[int],
+        propagation_tree_BR: wp.array2d[float],
+        propagation_tree_FR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
+        tree_chain_off: wp.array[int],
+        tree_chain_start: wp.array[int],
+        tree_body_extra: wp.array2d[float],
+        tree_body_d: wp.array2d[float],
+        tree_body_o: wp.array2d[float],
+        propagation_tree_u: wp.array[float],
+        n_active: wp.array[int],
+        contract_max: int,
+        active_body: wp.array[int],
+        active_P: wp.array[float],
+        propagation_body_response: wp.array3d[float],
+        active_qd0: wp.array[float],
+        propagation_body_impulses: wp.array2d[float],
+        propagation_body_qd: wp.array2d[float],
+        v_out: wp.array[float],
+    ): ...
+
+    return rod_chain_propagate_one
+
+
+@functools.cache
+def chain_refresh_native():
+    """``rod_chain_refresh`` for one chain, called by a warp of another kernel (see the latency-fused loop)."""
+    src = _CHAIN_REFRESH.replace(_GRID_TREE, _FUSED_TREE, 1)
+
+    @wp.func_native(src)
+    def rod_chain_refresh_one(
+        ntrees: int,
+        joint_meta: wp.array[int],
+        group_to_art: wp.array[int],
+        chain_flag: wp.array[int],
+        articulation_active: wp.array[int],
+        articulation_joint_range: wp.array[int],
+        propagation_tree_FR: wp.array2d[float],
+        propagation_tree_CR: wp.array[float],
+        tree_chain_off: wp.array[int],
+        tree_chain_start: wp.array[int],
+        tree_body_o: wp.array2d[float],
+        v_out: wp.array[float],
+        propagation_body_qd: wp.array2d[float],
+    ): ...
+
+    return rod_chain_refresh_one
 
 
 _CHAIN_WORLD_TWISTS = r"""

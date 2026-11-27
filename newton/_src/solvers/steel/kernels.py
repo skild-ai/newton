@@ -9518,10 +9518,21 @@ def propagation_momentum_world(
 
 _MOMENTUM_STEP_THREADS = 256
 
-_MOMENTUM_STEP = """
+
+def _momentum_step_source(threads: int) -> str:
+    """The momentum step's CUDA for a block of ``threads`` threads (one world per block)."""
+    span = 1
+    while span < threads:
+        span <<= 1
+    return (
+        f"""
 #if defined(__CUDA_ARCH__)
-    __shared__ float s_red[256];
-    __shared__ float s_turn[256];
+    #define MS_THREADS {threads}
+    #define MS_SPAN {span}
+"""
+        + """
+    __shared__ float s_red[MS_THREADS];
+    __shared__ float s_turn[MS_THREADS];
     __shared__ float s_beta;
     const int t = threadIdx.x;
     const int world = blockIdx.x;
@@ -9532,7 +9543,7 @@ _MOMENTUM_STEP = """
     const size_t base = (size_t)world * mc;
     float dot = 0.0f;
     float turn = 0.0f;
-    for (int i = t; i < m; i += 256) {
+    for (int i = t; i < m; i += MS_THREADS) {
         const float lam = impulses.data[base + i];
         const float p = prev.data[base + i];
         const float y = start.data[base + i];
@@ -9542,8 +9553,8 @@ _MOMENTUM_STEP = """
     s_red[t] = dot;
     s_turn[t] = turn;
     __syncthreads();
-    for (int o = 128; o > 0; o >>= 1) {
-        if (t < o) {
+    for (int o = MS_SPAN / 2; o > 0; o >>= 1) {
+        if (t < o && t + o < MS_THREADS) {
             s_red[t] += s_red[t + o];
             s_turn[t] += s_turn[t + o];
         }
@@ -9564,6 +9575,28 @@ _MOMENTUM_STEP = """
     if (t == 0) momentum_beta.data[world] = s_beta;
 #endif
 """
+    )
+
+
+_MOMENTUM_STEP = _momentum_step_source(_MOMENTUM_STEP_THREADS)
+
+
+@cache
+def momentum_step_native(threads: int):
+    """The momentum step as a device function of a block of ``threads`` threads (the latency-fused loop)."""
+
+    @wp.func_native(_momentum_step_source(threads))
+    def propagation_momentum_step_block(
+        world_count: int,
+        count: wp.array[int],
+        start: wp.array2d[float],
+        impulses: wp.array2d[float],
+        prev: wp.array2d[float],
+        momentum_t: wp.array[float],
+        momentum_beta: wp.array[float],
+    ): ...
+
+    return propagation_momentum_step_block
 
 
 @wp.func_native(_MOMENTUM_STEP)
@@ -9594,11 +9627,11 @@ def propagation_momentum_step(
     _propagation_momentum_step_native(world_count, count, start, impulses, prev, momentum_t, momentum_beta)
 
 
-@wp.kernel
-def propagation_momentum_apply(
-    propagation_constraint_count: wp.array[int],
-    propagation_max_constraints: int,
-    momentum_beta: wp.array[float],
+@wp.func
+def propagation_momentum_apply_row(
+    world: int,
+    i: int,
+    beta: float,
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
     propagation_J_a: wp.array3d[float],
@@ -9622,11 +9655,6 @@ def propagation_momentum_apply(
     the summed response (stored, or its split response to the summed impulse), instead of a twist and an impulse
     per row.
     """
-    tid = wp.tid()
-    world = tid // propagation_max_constraints
-    i = tid - world * propagation_max_constraints
-    if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
-        return
     rc = propagation_row_unit(propagation_row_contact, world, i)
     if rc >= 0:
         if (rc & 3) != 0:
@@ -9641,7 +9669,7 @@ def propagation_momentum_apply(
         moved = bool(False)
         for r in range(3):
             lam_r = propagation_impulses[world, i + r]
-            delta_r = momentum_beta[world] * (lam_r - momentum_prev[world, i + r])
+            delta_r = beta * (lam_r - momentum_prev[world, i + r])
             momentum_prev[world, i + r] = lam_r
             if delta_r != 0.0:
                 moved = True
@@ -9669,7 +9697,7 @@ def propagation_momentum_apply(
                 wp.atomic_add(propagation_body_impulses, bb_c, k, pb[k])
         return
     lam = propagation_impulses[world, i]
-    delta = momentum_beta[world] * (lam - momentum_prev[world, i])
+    delta = beta * (lam - momentum_prev[world, i])
     momentum_prev[world, i] = lam
     if delta == 0.0:
         return
@@ -9683,6 +9711,56 @@ def propagation_momentum_apply(
         if bb >= 0:
             wp.atomic_add(propagation_body_qd, bb, k, propagation_MiJt_b[world, i, k] * delta)
             wp.atomic_add(propagation_body_impulses, bb, k, propagation_J_b[world, i, k] * delta)
+
+
+@wp.kernel
+def propagation_momentum_apply(
+    propagation_constraint_count: wp.array[int],
+    propagation_max_constraints: int,
+    momentum_beta: wp.array[float],
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_MiJt_a: wp.array3d[float],
+    propagation_MiJt_b: wp.array3d[float],
+    propagation_row_contact: wp.array2d[int],
+    contact_units: wp.array[float],
+    contact_unit_response: wp.array[int],
+    contact_responses: wp.array[float],
+    body_response_split: wp.array3d[float],
+    # in/out
+    propagation_impulses: wp.array2d[float],
+    momentum_prev: wp.array2d[float],
+    propagation_body_qd: wp.array2d[float],
+    propagation_body_impulses: wp.array2d[float],
+):
+    """Each row's :func:`propagation_momentum_apply_row`, one thread per row."""
+    tid = wp.tid()
+    world = tid // propagation_max_constraints
+    i = tid - world * propagation_max_constraints
+    if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
+        return
+    propagation_momentum_apply_row(
+        world,
+        i,
+        momentum_beta[world],
+        propagation_body_a,
+        propagation_body_b,
+        propagation_J_a,
+        propagation_J_b,
+        propagation_MiJt_a,
+        propagation_MiJt_b,
+        propagation_row_contact,
+        contact_units,
+        contact_unit_response,
+        contact_responses,
+        body_response_split,
+        propagation_impulses,
+        momentum_prev,
+        propagation_body_qd,
+        propagation_body_impulses,
+    )
 
 
 @wp.kernel
@@ -10017,26 +10095,6 @@ def build_propagation_connect_rows(
             propagation_row_rebound_velocity,
             propagation_impulses,
         )
-
-
-@wp.kernel
-def store_propagation_connect_impulses(
-    connect_world: wp.array[int],
-    connect_rows: wp.array[int],
-    contact_slot: wp.array[int],
-    virtual_base: int,
-    propagation_impulses: wp.array2d[float],
-    # outputs
-    connect_impulse: wp.array2d[float],
-):
-    """Keep each closure's solved impulses as the next step's starting point."""
-    k = wp.tid()
-    slot0 = contact_slot[virtual_base + k]
-    for r in range(6):
-        value = float(0.0)
-        if slot0 >= 0 and r < connect_rows[k]:
-            value = propagation_impulses[connect_world[k], slot0 + r]
-        connect_impulse[k, r] = value
 
 
 @wp.kernel

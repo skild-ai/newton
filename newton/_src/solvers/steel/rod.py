@@ -421,6 +421,7 @@ def _world_twists(
 @wp.kernel
 def _carry_twists(
     carried: wp.array[int],
+    skip: wp.array[int],
     active: wp.array[int],
     order: wp.array[int],
     starts: wp.array[int],
@@ -438,7 +439,7 @@ def _carry_twists(
 ):
     """Each body's COM twist from the step's motion basis (start-of-step pose) and its new joint velocities."""
     art = carried[wp.tid()]
-    if active[art] == 0:
+    if active[art] == 0 or skip[art] != 0:
         return
     for slot in range(starts[art], ends[art]):
         j = slot
@@ -778,11 +779,17 @@ class RodMaterial:
         if self.carried:
             self.carried_mask = wp.array(carried, dtype=bool, device=model.device)
             self.carried_articulations = wp.array(np.flatnonzero(carried), dtype=int, device=model.device)
+            self.carried_articulations_np = np.flatnonzero(carried)
+            self.no_skip_carried = wp.zeros(max(model.articulation_count, 1), dtype=int, device=model.device)
             self.carried_twist = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
             self.carried_accumulated = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
             self.carried_q = wp.full(model.joint_coord_count, float("nan"), dtype=float, device=model.device)
         self.all_spatial = bool(np.all(spatial))
         self.spatial_mask = spatial
+        # Rod trees the propagation response can step without a dense mass matrix: full-spatial ones (their
+        # velocities span each link's COM twist) and inextensible ones, which step from carried body momenta. The
+        # articulated-body factorization solves either from the same joint loads the dense solve would.
+        self.tree_mask = spatial | carried
         if self.world_twists:
             self.integrated = wp.array(spatial, dtype=bool, device=model.device)
             self.integrated_articulations = wp.array(np.flatnonzero(spatial), dtype=int, device=model.device)
@@ -1006,11 +1013,46 @@ class RodMaterial:
     def carry(self, solver, state, augmented, result):
         """Record the step's body twists (start-of-step basis, new joint velocities) and the state they go with."""
         m = solver.model
+        chain = getattr(solver, "_rod_chain_any", False)
+        if chain:
+            # Chain-shaped trees sum their twists with the warp scan the full-spatial rods use (any joint width).
+            from . import rod_tree  # noqa: PLC0415
+
+            wp.launch(
+                rod_tree.chain_world_twists_kernel(),
+                dim=rod_tree.chain_launch_dim(len(self.carried_articulations)),
+                inputs=[
+                    len(self.carried_articulations),
+                    self.carried_articulations,
+                    solver._rod_chain_flag,
+                    solver._dynamics_art_active,
+                    solver._propagation_joint_range,
+                    solver._rod_tree_meta,
+                    augmented._joint_S_s,
+                    result.joint_qd,
+                    state.body_q,
+                    m.body_com,
+                    solver._articulation_origin,
+                ],
+                outputs=[self.carried_twist],
+                block_dim=rod_tree.BLOCK_DIM,
+                device=m.device,
+            )
+        chain_np = getattr(solver, "_rod_chain_flag_np", None)
+        all_chains = chain and chain_np is not None and bool(np.all(chain_np[self.carried_articulations_np] != 0))
+        if not all_chains:
+            self._carry_walk(solver, state, augmented, result, chain)
+        wp.copy(self.carried_q, result.joint_q)
+
+    def _carry_walk(self, solver, state, augmented, result, chain):
+        """The serial walk of :meth:`carry` for the carried trees that are not chains."""
+        m = solver.model
         wp.launch(
             _carry_twists,
             dim=len(self.carried_articulations),
             inputs=[
                 self.carried_articulations,
+                solver._rod_chain_flag if chain else self.no_skip_carried,
                 solver._dynamics_art_active,
                 m._fk_joint_order,
                 m.articulation_start,
@@ -1027,7 +1069,6 @@ class RodMaterial:
             outputs=[self.carried_accumulated, self.carried_twist],
             device=m.device,
         )
-        wp.copy(self.carried_q, result.joint_q)
 
     def integrate(self, solver, state, augmented, result, velocity, dt):
         m = solver.model
