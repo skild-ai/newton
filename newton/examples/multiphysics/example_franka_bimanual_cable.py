@@ -306,7 +306,15 @@ class Example:
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
         self.world_count = max(1, int(args.world_count))
-        native_substeps, native_iterations = 8, 6
+        # Under the immediate response eight substeps of six iterations hold both grasps; the propagation response's
+        # split sweep needs 24 iterations and runs faster from cable_solver.ARM_PROPAGATION_WORLDS worlds. The knot
+        # keeps the immediate response: its virtual grips do not yet hold under propagation.
+        if args.contact_response is None and args.task == "knot":
+            args.contact_response = "immediate"
+        if self.native and cable_solver.arm_contact_response(args, self.world_count) == "propagation":
+            native_substeps, native_iterations = 8, 24
+        else:
+            native_substeps, native_iterations = 8, 6
         self.sim_substeps = (
             int(args.substeps) if args.substeps is not None else (native_substeps if self.native else 10)
         )
@@ -1282,7 +1290,7 @@ class Example:
     @staticmethod
     def create_parser():
         parser = cable_solver.create_parser(baseline="coupled")
-        parser.set_defaults(contact_response="immediate")
+        parser.set_defaults(contact_response=None)
         newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
         parser.add_argument("--task", choices=("twist", "wrap", "knot"), default="twist", help="Bimanual task.")

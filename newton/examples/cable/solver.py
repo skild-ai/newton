@@ -73,6 +73,19 @@ def pipeline_options(args):
     return {}
 
 
+ARM_PROPAGATION_WORLDS = 256
+"""World count from which the arm-and-cable examples default to the propagation response: below it the immediate
+response's exact rows hold a grasp at a small budget and run faster; from it the propagation response, at a larger
+budget, runs faster and in less memory."""
+
+
+def arm_contact_response(args, world_count):
+    """Resolve ``--contact-response`` for an arm-and-cable example: the user's choice, else by world count."""
+    if getattr(args, "contact_response", None) is None:
+        args.contact_response = "propagation" if world_count >= ARM_PROPAGATION_WORLDS else "immediate"
+    return args.contact_response
+
+
 def add_world_count_arg(parser):
     """Add ``--world-count``: the cable examples replicate their scene into that many independent worlds."""
     return newton.examples.add_world_count_arg(parser)

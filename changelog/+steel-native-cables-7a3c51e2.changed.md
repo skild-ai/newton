@@ -1,0 +1,1 @@
+The native Steel `franka_cable_ik_pick_place` and `franka_bimanual_cable` examples use the propagation contact response from 256 worlds (8 substeps of 16 iterations for one arm, 24 iterations for two) and the immediate response below; `--contact-response` still chooses either. The bimanual knot keeps the immediate response.

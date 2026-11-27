@@ -1858,12 +1858,26 @@ for scene, frames in (
             use_viewer=True,
             test_suffix=f"native_steel_{mode}",
         )
+# The propagation response, the default from cable_solver.ARM_PROPAGATION_WORLDS worlds, at one world.
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_franka_cable_ik_pick_place",
+    devices=cuda_test_devices,
+    test_options={"solver": "steel", "solve-mode": "colored", "contact-response": "propagation", "num-frames": 450},
+    use_viewer=True,
+    test_suffix="native_steel_propagation",
+)
 # The bimanual cable twist with MuJoCo arms and a VBD cable coupled through gripper proxies (with line-search room,
 # since MuJoCo prints a warning when it runs out), and both bimanual tasks natively under one Steel solver.
 for task, options, suffix in (
     ("twist", {"mujoco-ls-iterations": 50}, ""),
     ("twist", {"solver": "steel", "solve-mode": "colored"}, "_native_steel"),
     ("wrap", {"solver": "steel", "solve-mode": "colored"}, "_native_steel"),
+    (
+        "twist",
+        {"solver": "steel", "solve-mode": "colored", "contact-response": "propagation"},
+        "_native_steel_propagation",
+    ),
 ):
     add_example_test(
         TestMultiphysicsExamples,

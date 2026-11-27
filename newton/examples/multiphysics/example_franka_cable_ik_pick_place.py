@@ -113,9 +113,13 @@ class Example:
         self.sim_time = 0.0
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        # The native sweep revisits the jaw contacts in every iteration (coupled_contact_passes), so six
-        # substeps of four iterations hold the thin cable through the carry in every world.
-        native_substeps, native_iterations = 6, 4
+        # The native sweep revisits the jaw contacts in every iteration (coupled_contact_passes). Under the
+        # immediate response six substeps of four iterations hold the thin cable through the carry in every world;
+        # the propagation response's split sweep needs eight of sixteen.
+        if self.native_cable and cable_solver.arm_contact_response(args, int(args.world_count)) == "propagation":
+            native_substeps, native_iterations = 8, 16
+        else:
+            native_substeps, native_iterations = 6, 4
         # A Steel arm coupled to the VBD cable places it within the 1 cm check at 4 substeps of 12 iterations, at
         # the 4 cm and the 20 cm lift; MuJoCo arms keep 10 substeps.
         if self.native_cable:
@@ -619,9 +623,10 @@ class Example:
     @staticmethod
     def create_parser():
         parser = cable_solver.create_parser(baseline="coupled")
-        # The jaws pinch a light cable between two articulations; the immediate response's exact Gauss-Seidel
-        # holds it at a small budget, while the propagation response's split per-body sweep slips.
-        parser.set_defaults(contact_response="immediate")
+        # The jaws pinch a light cable between two articulations: the immediate response's exact Gauss-Seidel holds
+        # it at a small budget, the propagation response's split sweep at a larger one that runs faster from
+        # cable_solver.ARM_PROPAGATION_WORLDS worlds, so the default follows the world count.
+        parser.set_defaults(contact_response=None)
         newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
         parser.add_argument(
