@@ -4439,7 +4439,10 @@ def test_world_parent_closure_rows_are_translation_invariant(test, device):
         inv_norm = solver._connect_row_inv_norm.numpy()[world_closures, :3]
         phi = solver._phi.numpy()
         # The rows store the gap divided by |J|; |J| itself carries the world position's rounding, so compare the gap.
-        gap = [phi[w, slots[w] : slots[w] + 3] / inv_norm[w] for w in range(2)]
+        # An inert row stores phi = inv_norm = 0; it must be inert in both copies, and only active rows are compared.
+        active = inv_norm[0] > 0.0
+        np.testing.assert_array_equal(inv_norm[1] > 0.0, active)
+        gap = [phi[w, slots[w] : slots[w] + 3][active] / inv_norm[w][active] for w in range(2)]
         largest_gap = max(largest_gap, float(np.abs(gap[0]).max()))
         np.testing.assert_allclose(gap[1], gap[0], rtol=0.0, atol=1.0e-6)
         qd_out = out.joint_qd.numpy()
@@ -4524,7 +4527,9 @@ def test_second_root_closure_rows_are_translation_invariant(test, device):
         slots = solver._connect_slot.numpy()
         inv_norm = solver._connect_row_inv_norm.numpy()[:, :3]
         phi = solver._phi.numpy()
-        gap = [phi[w, slots[w] : slots[w] + 3] / inv_norm[w] for w in range(2)]
+        active = inv_norm[0] > 0.0
+        np.testing.assert_array_equal(inv_norm[1] > 0.0, active)
+        gap = [phi[w, slots[w] : slots[w] + 3][active] / inv_norm[w][active] for w in range(2)]
         largest_gap = max(largest_gap, float(np.abs(gap[0]).max()))
         np.testing.assert_allclose(gap[1], gap[0], rtol=0.0, atol=2.0e-7)
         qd_out = out.joint_qd.numpy()
