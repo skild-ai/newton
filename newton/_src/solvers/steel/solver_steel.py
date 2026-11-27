@@ -256,6 +256,7 @@ from .kernels import (
     solve_compact_diagonal_mass,
     solve_diagonal_mass,
     solve_propagation_tree_dynamics,
+    store_propagation_connect_impulses,
     subtract_arrays,
     trisolve_loop,
     update_body_qd_from_featherstone,
@@ -9338,6 +9339,23 @@ class SolverSteel(SolverBase, CouplingInterface):
                 )
 
             self._run_propagation(solve_propagation)
+            if self._connect_count:
+                wp.launch(
+                    store_propagation_connect_impulses,
+                    dim=self._connect_count,
+                    inputs=[
+                        self._connect_world,
+                        self._connect_rows,
+                        self._connect_joint,
+                        model.joint_enabled,
+                        model.joint_X_p,
+                        self._contact_slot,
+                        self._max_contacts_alloc,
+                        self._propagation_impulses,
+                    ],
+                    outputs=[self._propagation_connect_impulse, self._propagation_connect_anchor],
+                    device=model.device,
+                )
         else:
             self._launch_pgs_solve(
                 self._rhs,
@@ -12676,6 +12694,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             responds[: model.body_count][valid] = (counts[arts[valid]] > 0) & (prescribed_bodies[valid] == 0)
         self._propagation_body_responds = wp.array(responds, dtype=wp.int32, device=device)
         self._propagation_connect_impulse = wp.zeros((max(self._connect_count, 1), 6), dtype=wp.float32, device=device)
+        # The anchor each closure's kept impulses held (see build_propagation_connect_rows).
+        self._propagation_connect_anchor = wp.zeros(max(self._connect_count, 1), dtype=wp.transform, device=device)
         # Same-articulation rows walk their two bodies' paths to the root, one thread per row.
         self._propagation_path_joint = None
         if (
@@ -13369,9 +13389,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._contact_slot,
                     self._max_contacts_alloc,
                     self._propagation_connect_impulse,
-                    # Closure rows start cold: a driven closure's anchor moves between steps, and seeding its last
-                    # impulse destabilizes a taut chain held by two closures (the knot's virtual grippers).
-                    0,
+                    self._propagation_connect_anchor,
+                    int(self._contact_warmstart),
                 ],
                 outputs=[
                     self._propagation_body_a,
@@ -13413,7 +13432,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                         self._contact_slot,
                         self._max_contacts_alloc,
                         self._propagation_connect_impulse,
-                        0,
+                        int(self._contact_warmstart),
                         dt,
                     ],
                     outputs=[

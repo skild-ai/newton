@@ -9944,6 +9944,7 @@ def build_propagation_connect_rows(
     contact_slot: wp.array[int],
     virtual_base: int,
     connect_impulse: wp.array2d[float],
+    connect_anchor: wp.array[wp.transform],
     seed_impulses: int,
     # outputs
     propagation_body_a: wp.array2d[int],
@@ -9964,7 +9965,9 @@ def build_propagation_connect_rows(
     ``J_B = -[e, (p - x_B) x e]`` on the child, at the anchors' midpoint ``p`` when both bodies respond (no couple
     across an open closure) and at each body's own anchor otherwise. Rotation rows are pure couples
     ``[0, e]`` / ``[0, -e]`` with the immediate rows' errors. A prescribed parent (kinematic or the world) takes no
-    row side; its anchor velocity enters the target. Rows start from last step's impulses.
+    row side; its anchor velocity enters the target. Rows start from last step's impulses while the closure stays
+    where it was: one engaged afresh or re-anchored (a driven closure, such as a virtual gripper) starts cold, since
+    its last impulse held another constraint.
     """
     k = wp.tid()
     slot0 = contact_slot[virtual_base + k]
@@ -9987,6 +9990,12 @@ def build_propagation_connect_rows(
     if b_on:
         body_b = child
     live = joint_enabled[joint] and (a_on or b_on)
+    stored = connect_anchor[k]
+    here = joint_X_p[joint]
+    warm = live and seed_impulses != 0
+    for c in range(7):
+        if here[c] != stored[c]:
+            warm = False
 
     anchor_p = wp.transform_get_translation(joint_X_p[joint])
     p_a = anchor_p
@@ -10037,7 +10046,7 @@ def build_propagation_connect_rows(
             phi,
             target,
             slot0,
-            connect_impulse[k, axis] if live and seed_impulses != 0 else 0.0,
+            connect_impulse[k, axis] if warm else 0.0,
             propagation_body_a,
             propagation_body_b,
             propagation_J_a,
@@ -10082,7 +10091,7 @@ def build_propagation_connect_rows(
             phi,
             target,
             slot0,
-            connect_impulse[k, 3 + i] if live and seed_impulses != 0 else 0.0,
+            connect_impulse[k, 3 + i] if warm else 0.0,
             propagation_body_a,
             propagation_body_b,
             propagation_J_a,
@@ -10095,6 +10104,37 @@ def build_propagation_connect_rows(
             propagation_row_rebound_velocity,
             propagation_impulses,
         )
+
+
+@wp.kernel
+def store_propagation_connect_impulses(
+    connect_world: wp.array[int],
+    connect_rows: wp.array[int],
+    connect_joint: wp.array[int],
+    joint_enabled: wp.array[bool],
+    joint_X_p: wp.array[wp.transform],
+    contact_slot: wp.array[int],
+    virtual_base: int,
+    propagation_impulses: wp.array2d[float],
+    # outputs
+    connect_impulse: wp.array2d[float],
+    connect_anchor: wp.array[wp.transform],
+):
+    """Keep each closure's solved impulses, and the anchor they held, as the next step's starting point.
+
+    A released closure keeps none: its rows carry no Jacobian while released, so whatever they hold is no impulse of
+    the closure, and a closure that engages again starts cold.
+    """
+    k = wp.tid()
+    slot0 = contact_slot[virtual_base + k]
+    j = connect_joint[k]
+    enabled = joint_enabled[j]
+    for r in range(6):
+        value = float(0.0)
+        if enabled and slot0 >= 0 and r < connect_rows[k]:
+            value = propagation_impulses[connect_world[k], slot0 + r]
+        connect_impulse[k, r] = value
+    connect_anchor[k] = joint_X_p[j]
 
 
 @wp.kernel
