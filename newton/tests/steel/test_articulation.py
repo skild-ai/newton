@@ -5,6 +5,7 @@
 
 import functools
 import inspect
+import itertools
 import unittest
 import warnings
 
@@ -140,6 +141,50 @@ def test_rocker_follows_crank(test, device):
     # Parallel four-bar (equal crank and rocker lengths): the rocker angle tracks the crank angle.
     test.assertAlmostEqual(q[2], q[0], delta=0.08)
     test.assertGreater(abs(q[2]), 0.3, "rocker did not move: loop not transmitting")
+
+
+def test_nesterov_closure_velocity_matches_impulses(test, device):
+    """Two ball joints at opposite ends of a hinge pin constrain the same transverse motion."""
+    builder = _build_four_bar()
+    closure = builder.joint_count - 1
+    along_pin = wp.transform(wp.vec3(0.0, 0.04, 0.0), wp.quat_identity())
+    with test.assertWarnsRegex(newton.NewtonWarning, "another joint already connects these bodies"):
+        builder.add_joint_ball(
+            parent=builder.joint_parent[closure],
+            child=builder.joint_child[closure],
+            parent_xform=wp.transform_multiply(builder.joint_X_p[closure], along_pin),
+            child_xform=wp.transform_multiply(builder.joint_X_c[closure], along_pin),
+        )
+    model = builder.finalize(device=device)
+    state, control = model.state(), model.control()
+    q = state.joint_q.numpy()
+    q[:3] = (0.41, -0.7, 0.23)
+    state.joint_q.assign(q)
+    qd = state.joint_qd.numpy()
+    qd[:3] = (0.3, 0.2, 0.1)
+    state.joint_qd.assign(qd)
+    target = control.joint_target_q.numpy()
+    target[0] = 0.6
+    control.joint_target_q.assign(target)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    for iterations, schedule in itertools.product((16, 512), ("interleaved", "phased")):
+        with test.subTest(iterations=iterations, schedule=schedule):
+            solver = SolverSteel(model, iterations=iterations, row_schedule=schedule, nesterov_momentum=True)
+            solver.step(state, model.state(), control, None, 0.01)
+            count = int(solver._constraint_count.numpy()[0])
+            test.assertEqual(count, 6)
+            dofs = solver._world_dof_indices.numpy()[0]
+            response = solver._Y_world.numpy()[0, :count].astype(np.float64)
+            impulses = solver._impulses.numpy()[0, :count].astype(np.float64)
+            initial = solver._v_hat.numpy()[dofs].astype(np.float64)
+            # The redundant rows can carry opposing impulses. Scale the roundoff bound before cancellation.
+            scale = np.max(np.abs(initial) + np.abs(impulses) @ np.abs(response))
+            np.testing.assert_allclose(
+                solver._v_out.numpy()[dofs],
+                initial + impulses @ response,
+                atol=32 * np.finfo(np.float32).eps * scale,
+                rtol=0,
+            )
 
 
 def test_four_bar_capture_matches_eager(test, device):
@@ -4257,6 +4302,7 @@ class TestSteelRevoluteLoop(unittest.TestCase):
 
 
 for _name in (
+    "test_nesterov_closure_velocity_matches_impulses",
     "test_revolute_loop_world_hinge_holds_its_axis",
     "test_revolute_loop_spatial_loop_stays_rigid",
     "test_revolute_loop_pre_eliminates_five_rows",

@@ -123,6 +123,7 @@ def _rollout(device, scene, mode):
         solver = SolverSteel(
             model,
             solve_mode=mode[0],
+            nesterov_momentum=False,  # Compare the plain sweep implemented by both devices.
             articulated_contact_response=mode[1],
             iterations=12,
             enable_joint_limits=True,

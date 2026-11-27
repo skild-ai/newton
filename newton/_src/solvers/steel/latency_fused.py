@@ -16,8 +16,9 @@ exposes ``kernel.native``):
 * warp 1 + i: tree group ``i``, refresh and propagation of the world's articulations of that group, one
   after another;
 * the last warp: the free-rigid twist refresh and flush;
-* every warp: the colored sweep, where a color wider than one warp spreads over the block.
+* every warp: the momentum update and the colored sweep, where a color wider than one warp spreads over the block.
 
+Phased and per-pass sweeps use the same momentum update in a one-warp launch.
 Block barriers order the stages as the launch chain does. The device functions read the data written in
 the loop through plain loads after a barrier, so the results match the chain bit for bit.
 
@@ -27,11 +28,19 @@ which keeps its parameters under 4 KB: some drivers crash capturing a launch wit
 
 from __future__ import annotations
 
+from functools import cache
 from typing import Any
 
 import warp as wp
 
-from .kernels import WARP_DETERMINISM_OFF
+from .kernels import (
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PGS_CONSTRAINT_TYPE_TORSION,
+    WARP_DETERMINISM_OFF,
+    momentum_beta,
+    next_momentum_age,
+)
 
 # Tree groups one fused kernel can carry, one warp each.
 MAX_TREE_SLOTS = 4
@@ -71,6 +80,7 @@ ROW_FIELDS = (
     "dense_gamma",
     "mf_gamma",
     "momentum_scratch",
+    "split_previous_velocity",
 )
 
 # Fields in the order of ``SolverSteel._colored_sweep_inputs``, which fills them.
@@ -147,6 +157,7 @@ class RowArgs:
     dense_gamma: wp.array2d[float]
     mf_gamma: wp.array2d[float]
     momentum_scratch: wp.array2d[float]
+    split_previous_velocity: wp.array[float]
 
 
 @wp.struct
@@ -281,6 +292,200 @@ def warp_count(tree_slots: int) -> int:
     return 2 + tree_slots
 
 
+@wp.struct
+class MomentumRows:
+    """Impulses and row properties for one family in the world sweep."""
+
+    count: wp.array[int]
+    impulses: wp.array2d[float]
+    kind: wp.array2d[int]
+    parent: wp.array2d[int]
+
+
+@wp.struct
+class SplitSweep:
+    """Sweep history and the native row and velocity arrays it extrapolates."""
+
+    dense: MomentumRows
+    free: MomentumRows
+    prop: MomentumRows
+    prop_order: wp.array2d[int]
+    dofs: wp.array2d[int]
+    velocity: wp.array[float]
+    bodies: wp.array[int]
+    body_start: wp.array[int]
+    twist: wp.array2d[float]
+    prev_twist: wp.array2d[float]
+    prev_velocity: wp.array[float]
+    history: wp.array2d[wp.vec2]
+    age: wp.array[int]
+    anchor_sq: wp.array[float]
+
+
+# Dot product, squared correction and lookahead, primal motion, squared angular correction and displacement.
+_SweepProgress = wp.types.vector(length=6, dtype=wp.float32)
+
+
+@wp.func
+def _update_rows(
+    world: int,
+    lane: int,
+    stride: int,
+    rows: MomentumRows,
+    offset: int,
+    beta: float,
+    has_velocity_limits: bool,
+    h: SplitSweep,
+):
+    for i in range(lane, wp.min(rows.count[world], rows.impulses.shape[1]), stride):
+        x = rows.impulses[world, i]
+        e = float(0.0)
+        if beta != 0.0 and (not has_velocity_limits or rows.kind[world, i] != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT):
+            y = x + beta * (x - h.history[world, offset + i][0])
+            rows.impulses[world, i] = y
+            e = y - x
+        h.history[world, offset + i] = wp.vec2(x, e)
+
+
+@cache
+def get_split_momentum(warps: int, propagation: bool, torsion: bool, ordered: bool, patch_anchors: bool):
+    """Use the owner block to advance the iterate before its first row phase."""
+    stride = 32 * warps
+
+    @wp.func(module="unique")
+    def progress(
+        world: int, lane: int, rows: MomentumRows, offset: int, propagation_rows: bool, initial: bool, h: SplitSweep
+    ):
+        sums = _SweepProgress()
+        for row in range(lane, wp.min(rows.count[world], rows.impulses.shape[1]), 32):
+            i = row
+            if wp.static(ordered):
+                if propagation_rows:
+                    i = h.prop_order[world, row]
+            if wp.static(patch_anchors):
+                if initial:
+                    if rows.kind[world, i] == PGS_CONSTRAINT_TYPE_FRICTION:
+                        normal = rows.parent[world, i]
+                        if normal >= 0 and rows.parent[world, normal] >= 0:
+                            value = rows.impulses[world, i]
+                            sums[0] += value * value
+                    continue
+            if not propagation_rows:
+                if rows.kind[world, i] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+                    continue
+            previous = h.history[world, offset + i]
+            move = rows.impulses[world, i] - previous[0]
+            correction = move - previous[1]
+            sums[0] += correction * previous[1]
+            sums[1] += correction * correction
+            sums[2] += previous[1] * previous[1]
+            if wp.static(torsion):
+                if rows.kind[world, i] == PGS_CONSTRAINT_TYPE_TORSION:
+                    sums[4] += correction * correction
+                    sums[5] += move * move
+        return sums
+
+    # Sum in the same row order in the fused and per-pass launches so their
+    # coefficients match bit for bit. All warps update the impulses and velocities.
+    metric_count = 6 if torsion else 4
+    reduction_source = f"""
+#if defined(__CUDA_ARCH__)
+    if (threadIdx.x < 32) {{
+        #pragma unroll
+        for (int i = 0; i < {metric_count}; ++i)
+            for (int d = 16; d; d >>= 1) x[i] += __shfl_xor_sync(0xffffffff, x[i], d);
+    }}
+    #if {warps} > 1
+        __shared__ float result[{metric_count}];
+        if (threadIdx.x < {metric_count}) result[threadIdx.x] = x[threadIdx.x];
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < {metric_count}; ++i) x[i] = result[i];
+        __syncthreads();
+    #endif
+#endif
+    return x;
+"""
+
+    @wp.func_native(reduction_source)
+    def sum_progress(x: _SweepProgress) -> _SweepProgress: ...
+
+    @wp.func(module="unique")
+    def advance(world: int, lane: int, iteration: int, previous_age: int, friction_transition: bool, h: SplitSweep):
+        """Advance the complete iterate once, before its first row phase, including cached tree twists."""
+        free_offset = h.dense.impulses.shape[1]
+        prop_offset = free_offset + h.free.impulses.shape[1]
+        age = int(0)
+        beta = float(0.0)
+        if iteration > 0 or wp.static(patch_anchors):
+            sums = _SweepProgress()
+            if lane < 32:
+                initial = iteration == 0
+                if initial or previous_age > 1:
+                    sums = progress(world, lane, h.dense, 0, False, initial, h)
+                    sums += progress(world, lane, h.free, free_offset, False, initial, h)
+                    if wp.static(propagation):
+                        sums += progress(world, lane, h.prop, prop_offset, True, initial, h)
+                if iteration > 0:
+                    for i in range(lane, h.dofs.shape[1], 32):
+                        dof = h.dofs[world, i]
+                        if dof >= 0 and h.velocity[dof] != h.prev_velocity[dof]:
+                            sums[3] = 1.0
+                            break
+            sums = sum_progress(sums)
+            if wp.static(patch_anchors):
+                if iteration == 0 and lane == 0:
+                    h.anchor_sq[world] = sums[0]
+            if iteration > 0:
+                anchor_sq = float(0.0)
+                if wp.static(patch_anchors):
+                    anchor_sq = h.anchor_sq[world]
+                age = next_momentum_age(previous_age, sums[0], friction_transition or sums[3] == 0.0)
+                beta = momentum_beta(age, sums[0], sums[1], sums[2], sums[4], sums[5], anchor_sq)
+        _update_rows(world, lane, stride, h.dense, 0, beta, True, h)
+        _update_rows(world, lane, stride, h.free, free_offset, beta, True, h)
+        if wp.static(propagation):
+            _update_rows(world, lane, stride, h.prop, prop_offset, beta, False, h)
+        for i in range(lane, h.dofs.shape[1], stride):
+            dof = h.dofs[world, i]
+            if dof >= 0:
+                v = h.velocity[dof]
+                if beta != 0.0:
+                    h.velocity[dof] = v + beta * (v - h.prev_velocity[dof])
+                h.prev_velocity[dof] = v
+        if wp.static(propagation):
+            start = h.body_start[world]
+            for i in range(lane, 6 * (h.body_start[world + 1] - start), stride):
+                body = h.bodies[start + i // 6]
+                axis = i % 6
+                v = h.twist[body, axis]
+                if beta != 0.0:
+                    h.twist[body, axis] = v + beta * (v - h.prev_twist[body, axis])
+                h.prev_twist[body, axis] = v
+        if wp.static(warps > 1):
+            _block_sync()
+        return age
+
+    return advance
+
+
+@cache
+def get_advance_split_sweep(propagation: bool, torsion: bool, ordered: bool, patch_anchors: bool) -> wp.Kernel:
+    advance = get_split_momentum(1, propagation, torsion, ordered, patch_anchors)
+
+    @wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)
+    def advance_split_sweep(histories: wp.array[SplitSweep], iteration: int, friction_transition: bool):
+        world, lane = wp.tid()
+        age = int(0)
+        if iteration > 0:
+            age = histories[0].age[world]
+        age = advance(world, lane, iteration, age, friction_transition, histories[0])
+        if lane == 0:
+            histories[0].age[world] = age
+
+    return advance_split_sweep
+
+
 def get_fused_iteration_kernel(
     colored_native: Any,
     row_native: Any,
@@ -288,6 +493,11 @@ def get_fused_iteration_kernel(
     tree_natives: tuple[tuple[Any, Any, bool], ...],
     has_phase3: bool,
     has_phase5: bool,
+    warps: int,
+    momentum: bool = False,
+    torsion: bool = False,
+    ordered: bool = False,
+    patch_anchors: bool = False,
 ) -> wp.Kernel:
     """Build the fused loop kernel for one solver configuration.
 
@@ -298,6 +508,7 @@ def get_fused_iteration_kernel(
     """
     n_slots = len(tree_natives)
     free_warp = 1 + n_slots
+    advance_momentum = get_split_momentum(warps, True, torsion, ordered, patch_anchors) if momentum else None
 
     @wp.func(module="unique")
     def row_phase(
@@ -317,7 +528,7 @@ def get_fused_iteration_kernel(
             rows.drive_vel_multiplier, rows.drive_impulse_multiplier, rows.drive_max_impulse, rows.drive_vel_limit,
             rows.velocity_limit_slot, rows.velocity_limit_sign, rows.mf_constraint_count, rows.mf_contact_rows_end, rows.mf_meta, rows.mf_impulses, rows.mf_J_a,
             rows.mf_J_b, rows.mf_MiJt_a, rows.mf_MiJt_b, rows.mf_row_mu, rows.row_w, rows.mf_row_w,
-            rows.torsion_group, rows.torsion_row_radius, rows.dense_gamma, rows.mf_gamma, rows.momentum_scratch, 1, omega, regularize,
+            rows.torsion_group, rows.torsion_row_radius, rows.dense_gamma, rows.mf_gamma, rows.momentum_scratch, rows.split_previous_velocity, 1, omega, regularize,
             freeze_drive_rows, phase, friction_start_iteration, iteration, v_out,
         )  # fmt: skip
 
@@ -333,6 +544,7 @@ def get_fused_iteration_kernel(
         cache_max_bodies: int,
         colored: ColoredArgs,
         rows: RowArgs,
+        histories: wp.array[SplitSweep],
         cache: wp.array[CacheArgs],
         tree: wp.array[TreeArgs],
         slots: wp.array[TreeSlot],
@@ -347,8 +559,13 @@ def get_fused_iteration_kernel(
         world, t = wp.tid()
         warp_id = t // 32
         lane = t - warp_id * 32
+        momentum_age = int(0)
         for i in range(iterations):
             g = iteration_offset + i
+            if wp.static(momentum):
+                momentum_age = wp.static(advance_momentum)(
+                    world, t, i, momentum_age, g == friction_start_iteration, histories[0]
+                )
             # row phases 3 (internal rows) and 4 (dense and free-body contacts)
             if warp_id == 0:
                 if wp.static(has_phase3):
@@ -419,6 +636,9 @@ def get_fused_iteration_kernel(
             if wp.static(has_phase5):
                 if warp_id == 0:
                     row_phase(world, 5, rows, omega, regularize, freeze_drive_rows, friction_start_iteration, g, v_out)
+                # The next lookahead reads phase 5 across the whole block.
+                if wp.static(momentum):
+                    _block_sync()
 
     return wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)(
         steel_fused_propagation_loop

@@ -308,15 +308,17 @@ repository examples spend tuning effort, not a shared solver API.
        step can lose its contact matches; ``contact_matching_body_frame=True`` on
        the pipeline also matches contacts in their bodies' frames. ``contact_gap_gate`` and ``contact_speculative_scale`` bound
        the work and the closing allowance of speculative contacts.
-       The opt-in ``nesterov_momentum`` accelerates the serial sweep with
+       Steel enables ``nesterov_momentum`` by default on CUDA. CPU uses
+       plain Gauss-Seidel sweeps. At a fixed iteration count the two defaults
+       can produce different trajectories. Set ``nesterov_momentum=False`` on
+       CUDA to compare plain sweeps across devices. The accelerated sweeps use
        Nesterov momentum and restart, which can reduce the ``iterations``
        needed on stacks, large mass ratios and long chains. Velocity-limit rows
        are not extrapolated, so measure convergence on the scene before
-       lowering ``iterations``. It requires
-       ``articulated_contact_response="immediate"`` and
-       ``row_schedule="interleaved"``, and every world then runs the general
-       sweep with dense factors; the specialized sparse-factor, diagonal,
-       articulation-local and paired-factor solves are skipped.
+       lowering ``iterations``. Measure step time as well, since the per-sweep
+       cost depends on the scene and can be significant for colored free-body
+       piles. Each CUDA sweep keeps its row order, factorization
+       and specialized solver, including fused colored propagation.
        Experimental contact torsion adds spin friction to the contacts of
        articulated bodies whose shapes carry a positive
        ``steel:min_torsional_patch_radius`` (imported from
@@ -381,7 +383,7 @@ repository examples spend tuning effort, not a shared solver API.
        estimate (depending on the topology and the world count they can be
        faster or markedly slower); warm-started contacts
        (``contact_warmstart=True``), a finite ``contact_friction_gap_max``,
-       ``nesterov_momentum`` and shapes with a positive restitution coefficient
+       and shapes with a positive restitution coefficient
        keep the dense factors;
        ``parallel_tree`` traverses independent tree branches in parallel and is
        worth measuring on broad trees such as hands. The opt-in

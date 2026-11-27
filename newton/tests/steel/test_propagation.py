@@ -3605,6 +3605,7 @@ def _build_latency_scene(device):
     """Build ``N_WORLDS`` worlds with every latency-mode role, all touching the ground.
 
     Each world has a fixed-base revolute arm with limits, a ball-joint chain on a floating base and a stack of free boxes.
+    Set the root heights so the vertical chains reach the floor at their tips.
     """
     scene = newton.ModelBuilder()
     for _ in range(N_WORLDS):
@@ -3619,7 +3620,7 @@ def _build_latency_scene(device):
                     parent=prev,
                     child=link,
                     axis=wp.vec3(0.0, 1.0, 0.0),
-                    parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5 if i == 0 else -0.25), wp.quat_identity()),
+                    parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.02 if i == 0 else -0.25), wp.quat_identity()),
                     child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.12), wp.quat_identity()),
                     limit_lower=-0.6,
                     limit_upper=0.6,
@@ -3627,7 +3628,7 @@ def _build_latency_scene(device):
             )
             prev = link
         builder.add_articulation(joints)
-        hub = builder.add_link(xform=wp.transform(wp.vec3(0.6, 0.0, 0.5), wp.quat_identity()))
+        hub = builder.add_link(xform=wp.transform(wp.vec3(0.6, 0.0, 0.69), wp.quat_identity()))
         builder.add_shape_box(hub, hx=0.08, hy=0.08, hz=0.08)
         joints = [builder.add_joint_free(hub)]
         prev = hub
@@ -4001,6 +4002,8 @@ class TestSteelLatencyFused(unittest.TestCase):
             self_._latency_fused = True
             loop(self_, *args, **kwargs)
             fused = {k: v.numpy().copy() for k, v in _solver_arrays(self_).items()}
+            for name in ("_v_out", "_propagation_body_qd"):
+                self.assertTrue(np.isfinite(chain[name]).all() and np.isfinite(fused[name]).all(), name)
             for k, a in chain.items():
                 b = fused[k]
                 same = a.shape == b.shape and np.array_equal(
@@ -4015,10 +4018,14 @@ class TestSteelLatencyFused(unittest.TestCase):
             pipeline = newton.CollisionPipeline(model)
             contacts = pipeline.contacts()
             state_0, state_1, control = model.state(), model.state(), model.control()
-            for _ in range(60):
+            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+            for step in range(60):
                 state_0.clear_forces()
                 pipeline.collide(state_0, contacts)
                 solver.step(state_0, state_1, control, contacts, DT)
+                self.assertTrue(
+                    np.isfinite(state_1.body_qd.numpy()).all(), f"nonfinite body velocity at step {step + 1}"
+                )
                 state_0, state_1 = state_1, state_0
         self.assertEqual(len(checked), 3, "the scene never reached the loop with contacts")
         # The compared calls did work: the loop changed velocities and impulses.
@@ -4028,6 +4035,53 @@ class TestSteelLatencyFused(unittest.TestCase):
     def test_fused_loop_matches_per_pass_launches(self):
         """Match the per-pass launches with trees (a limited arm, a ball chain) and free boxes in every block role."""
         self._check_fused_matches(_build_latency_scene("cuda:0"), iterations=8, enable_joint_limits=True)
+
+    def test_fused_momentum_build_failure_is_reported(self):
+        """An accelerated fused solve reports its compilation error on the selected path."""
+        model = _build_latency_scene("cuda:0")
+        with patch.object(solver_steel.latency_fused, "get_fused_iteration_kernel") as build:
+            build.return_value.module.load.side_effect = RuntimeError("fused kernel load failed")
+            with self.assertRaisesRegex(RuntimeError, "could not compile Nesterov momentum"):
+                SolverSteel(model, **steel_mode_options("colored"), nesterov_momentum=True)
+        build.assert_called_once()
+
+    def test_fused_momentum_reduces_normal_velocity_residual(self):
+        """All eight loaded normal rows of a resting sphere tower should have zero relative velocity."""
+        builder = newton.ModelBuilder()
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.0, gap=0.002)
+        for i in range(8):
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05 + 0.1 * i), wp.quat_identity()))
+            builder.add_shape_sphere(body, radius=0.05, cfg=cfg)
+        builder.add_ground_plane(cfg=cfg)
+        model = builder.finalize(device="cuda:0")
+        state = model.state()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        self.assertEqual(contacts.rigid_contact_count.numpy()[0], model.body_count)
+
+        def residual(iterations, momentum):
+            solver = SolverSteel(
+                model,
+                **steel_mode_options("colored"),
+                contact_regularization=0.0,
+                iterations=iterations,
+                nesterov_momentum=momentum,
+                deterministic=wp.DeterministicMode.RUN_TO_RUN,
+            )
+            self.assertTrue(solver._latency_fused)
+            self.assertEqual(solver.nesterov_momentum, momentum is not False)
+            start, output = model.state(), model.state()
+            start.assign(state)
+            solver.step(start, output, model.control(), contacts, 1.0 / 60.0)
+            solver.check_constraint_capacity()
+            return np.max(np.abs(np.diff(output.body_qd.numpy()[:, 2], prepend=0.0)))
+
+        self.assertEqual(residual(2, False), residual(2, None))
+        plain = residual(16, False)
+        self.assertLess(plain, residual(10, False))
+        self.assertLess(residual(10, None), plain)
 
     def test_fused_loop_with_level_trees_matches(self):
         """Match the per-pass launches when hand trees take the level-walk refresh inside the fused loop."""
@@ -4084,6 +4138,8 @@ class TestSteelLatencyFused(unittest.TestCase):
         pipeline = newton.CollisionPipeline(model, deterministic=True)
         contacts = pipeline.contacts()
         state_0, state_1, control = model.state(), model.state(), model.control()
+
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
 
         def two_steps():
             for src, dst in ((state_0, state_1), (state_1, state_0)):

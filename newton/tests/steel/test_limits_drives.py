@@ -450,6 +450,10 @@ def test_propagation_solves_every_row_family(test, device):
                     types = sample["row_type"]
                     # Dense rows hold only the joint rows; every contact touching the link is a propagation row.
                     test.assertGreater(int(np.sum(types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)), 0, f"step {step}")
+                    limit_impulses = sample["impulses"][types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT]
+                    test.assertTrue(np.all(limit_impulses >= 0.0))
+                    if step == 0 and iterations == 1:
+                        test.assertGreater(limit_impulses.max(), 0.0)
                     test.assertTrue(
                         np.all(
                             (types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
@@ -462,8 +466,10 @@ def test_propagation_solves_every_row_family(test, device):
                     )
                     # The free body's contacts are propagation rows too.
                     test.assertEqual(int(np.sum(sample["mf_row_type"] == PGS_CONSTRAINT_TYPE_CONTACT)), 0)
-                limit_rows = np.flatnonzero(samples[0]["row_type"] == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
-                test.assertGreater(float(np.max(np.abs(samples[0]["impulses"][limit_rows]))), 0.0)
+                # The joint starts above its upper limit and moving outward. Ground contact can
+                # supply the inward correction on later sweeps, releasing the limit impulse.
+                test.assertLess(samples[0]["joint_qd"][0], 0.0)
+                test.assertLess(samples[0]["joint_q"][0], 0.2)
                 # The propagation and velocity-limit solves apply impulses too.
                 test.assertGreater(max(float(np.max(np.abs(s["propagation_impulses"]))) for s in samples), 0.0)
                 velocity_limit_impulses = [
