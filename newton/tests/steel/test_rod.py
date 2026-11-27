@@ -367,10 +367,15 @@ def test_propagation_contact_units(test, device):
         pipeline.collide(a, step_contacts)
         solver.step(a, b, control, step_contacts, 1.0 / 240.0)
         if enabled:
-            # Every contact row belongs to a contact unit.
+            # Every contact row belongs to a contact unit: per row, or implied when every row is a unit's.
             count = int(solver._propagation_constraint_count.numpy()[0])
             test.assertGreater(count, 0)
-            test.assertTrue(np.all(solver._propagation_row_contact.numpy()[0, :count] >= 0))
+            links = solver._propagation_row_contact.numpy()
+            if links.shape == (1, 1):
+                test.assertEqual(int(links[0, 0]), solver._propagation_unit_max)
+                test.assertEqual(count % 3, 0)
+            else:
+                test.assertTrue(np.all(links[0, :count] >= 0))
         results[enabled] = (b.body_q.numpy(), b.body_qd.numpy())
     np.testing.assert_allclose(results[True][0][:, :3], results[False][0][:, :3], atol=1.0e-6)
     np.testing.assert_allclose(results[True][1][:, :3], results[False][1][:, :3], atol=5.0e-4)

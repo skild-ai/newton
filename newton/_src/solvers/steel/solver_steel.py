@@ -12512,6 +12512,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         # Row Jacobians and responses. With contact units and neither closures nor normal-only contacts (a friction gap
         # limit), every row is a contact unit's, which keeps them in the unit: placeholders.
         unit_rows_only = self._contact_units_on and not self._connect_count and self._contact_friction_gap_max is None
+        self._unit_rows_only = unit_rows_only
         jacobian_shape = (1, 1, 6) if unit_rows_only else (worlds, rows, 6)
         self._propagation_J_a = wp.zeros(jacobian_shape, dtype=wp.float32, device=device)
         self._propagation_J_b = wp.zeros(jacobian_shape, dtype=wp.float32, device=device)
@@ -12522,9 +12523,11 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_row_type = wp.zeros((worlds, rows), dtype=wp.int32, device=device)
         self._propagation_row_parent = wp.full((worlds, rows), -1, dtype=wp.int32, device=device)
         self._propagation_row_mu = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
-        self._propagation_phi = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
+        # A contact unit keeps its normal row's gap and rebound target (contact_unit_phi / contact_unit_rebound).
+        scalar_shape = (1, 1) if unit_rows_only else (worlds, rows)
+        self._propagation_phi = wp.zeros(scalar_shape, dtype=wp.float32, device=device)
         self._propagation_target_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
-        self._propagation_row_rebound_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
+        self._propagation_row_rebound_velocity = wp.zeros(scalar_shape, dtype=wp.float32, device=device)
         # Rebound bias of each row, kept for the velocity-only iterations.
         # Only the velocity-only iterations read a contact's frozen rebound target.
         self._propagation_restitution_bias = wp.zeros(
@@ -12552,6 +12555,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._contact_responses = wp.zeros((PROPAGATION_CONTACT_RESPONSE_BLOCKS * 4,), dtype=wp.float32, device=device)
         self._contact_response_count = wp.zeros((1,), dtype=wp.int32, device=device)
         self._contact_response_capacity = 1
+        self._contact_unit_phi = wp.zeros((1,), dtype=wp.float32, device=device)
+        self._contact_unit_rebound = wp.zeros((1,), dtype=wp.float32, device=device)
         self._propagation_contact_unit = wp.zeros((1,), dtype=wp.int32, device=device)
         self._propagation_row_contact = wp.full((1, 1), -1, dtype=wp.int32, device=device)
         self._propagation_body_qd = wp.zeros((bodies, 6), dtype=wp.float32, device=device)
@@ -12666,7 +12671,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             all_rows = max(self._world_count * self._propagation_max_constraints, 1)
             threads = max(min(all_rows, 65536, (64 << 20) // (capacity * 28)), 32)
             self._propagation_body_depth = wp.array(depth, dtype=wp.int32, device=device)
-            self._propagation_same_rows = wp.zeros(all_rows, dtype=wp.int32, device=device)
+            # Contact units refine only the rows of the units with a response slot (three rows each).
+            listed = all_rows
+            if self._contact_units_on and self._propagation_same_articulation_contact_max is not None:
+                listed = min(all_rows, 3 * self._propagation_same_articulation_contact_max * self._world_count)
+            self._propagation_same_rows = wp.zeros(max(listed, 1), dtype=wp.int32, device=device)
             self._propagation_same_row_count = wp.zeros(1, dtype=wp.int32, device=device)
             self._propagation_path_joint = wp.zeros((capacity, threads), dtype=wp.int32, device=device)
             self._propagation_path_u = wp.zeros((capacity, threads, 6), dtype=wp.float32, device=device)
@@ -12748,7 +12757,14 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_contact_unit = wp.zeros(
                 (max(self._max_contacts_alloc, 1),), dtype=wp.int32, device=device
             )
-            self._propagation_row_contact = wp.full((worlds, rows), -1, dtype=wp.int32, device=device)
+            # Each row's unit link; with only contact units' rows it is implied (propagation_row_unit).
+            self._propagation_row_contact = (
+                wp.full((1, 1), unit_max, dtype=wp.int32, device=device)
+                if self._unit_rows_only
+                else wp.full((worlds, rows), -1, dtype=wp.int32, device=device)
+            )
+            self._contact_unit_phi = wp.zeros((units,), dtype=wp.float32, device=device)
+            self._contact_unit_rebound = wp.zeros((units,), dtype=wp.float32, device=device)
         self._color_body_used_mask = wp.zeros(
             (max(model.body_count, 1) * ((PROPAGATION_COLOR_TAIL + 31) // 32),), dtype=wp.int32, device=device
         )
@@ -13282,6 +13298,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_row_rebound_velocity,
                     self._propagation_row_contact,
                     self._contact_units,
+                    self._contact_unit_phi,
+                    self._contact_unit_rebound,
                 ],
                 device=model.device,
             )
@@ -13959,6 +13977,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_max_constraints,
                 self._propagation_row_contact,
                 self._contact_unit_response,
+                self._contact_unit_phi,
+                self._contact_unit_rebound,
             ],
             outputs=[
                 self._contact_units,
@@ -13984,6 +14004,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_body_a,
                     self._propagation_body_b,
                     self._propagation_max_constraints,
+                    self._propagation_row_contact,
+                    self._contact_unit_response,
                 ],
                 outputs=[self._propagation_same_rows, self._propagation_same_row_count],
                 device=model.device,
@@ -20344,7 +20366,11 @@ def _get_colored_friction_setup_kernel(
     const int la = (ba >= 0) ? propagation_body_local_slot.data[ba] : -1;
     const int lb = (bb >= 0) ? propagation_body_local_slot.data[bb] : -1;
     float cross = 0.0f;
-    const int unit_row = (propagation_row_contact.shape[1] > 1) ? propagation_row_contact.data[o1] : -1;
+    // The row's unit link (propagation_row_unit): per row, or implied when every row is a contact unit's.
+    const int implied_units = (propagation_row_contact.shape[1] > 1) ? 0 : propagation_row_contact.data[0];
+    const int unit_row = (propagation_row_contact.shape[1] > 1)
+        ? propagation_row_contact.data[o1]
+        : (implied_units > 0 ? (((world * implied_units + (o1 - base) / 3) << 2) | ((o1 - base) % 3)) : -1);
     if (unit_row >= 0) {{
         // A contact unit: row r is [d_r, r_a x d_r] on body a (negated with r_b on body b); row 2's responses come
         // from the unit's response slot or are each body's split response times the row.

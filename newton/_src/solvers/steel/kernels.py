@@ -8856,9 +8856,16 @@ def contact_response_store(responses: wp.array[float], slot: int, r: int, side: 
 
 @wp.func
 def propagation_row_unit(row_contact: wp.array2d[int], world: int, i: int):
-    """``p * 4 + r`` of a contact unit's row, or -1 (rows stored per row, or no contact units)."""
+    """``p * 4 + r`` of a contact unit's row, or -1 (a row of its own, or no contact units).
+
+    ``row_contact`` is per row, or a one-element array holding -1 (no contact units) or the units per world when
+    every row is a contact unit's: unit ``pos`` of a world then holds its rows ``3 pos`` to ``3 pos + 2``.
+    """
     if row_contact.shape[1] <= 1:
-        return -1
+        unit_max = row_contact[0, 0]
+        if unit_max <= 0:
+            return -1
+        return ((world * unit_max + i // 3) << 2) | (i % 3)
     return row_contact[world, i]
 
 
@@ -8989,6 +8996,8 @@ def build_propagation_contact_rows(
     propagation_row_rebound_velocity: wp.array2d[float],
     propagation_row_contact: wp.array2d[int],
     contact_units: wp.array[float],
+    contact_unit_phi: wp.array[float],
+    contact_unit_rebound: wp.array[float],
 ):
     """Build the body-space normal row and, when allocated, the two friction rows of every propagation contact.
 
@@ -9117,11 +9126,14 @@ def build_propagation_contact_rows(
             propagation_body_a[world, row] = response_body_a
             propagation_body_b[world, row] = response_body_b
             propagation_row_mu[world, row] = mu
+            # Without per-row gaps (every row a contact unit's) the unit keeps its normal row's.
+            per_row = propagation_phi.shape[1] > 1
             if row_offset == 0:
                 propagation_row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
                 propagation_row_parent[world, row] = -1
-                propagation_phi[world, row] = phi
-                propagation_row_rebound_velocity[world, row] = rebound_velocity
+                if per_row:
+                    propagation_phi[world, row] = phi
+                    propagation_row_rebound_velocity[world, row] = rebound_velocity
             else:
                 propagation_row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
                 propagation_row_parent[world, row] = slot
@@ -9129,8 +9141,9 @@ def build_propagation_contact_rows(
                 patch_phi = float(0.0)
                 if c < friction_patches.phi.shape[0]:
                     patch_phi = friction_patches.phi[c][row_offset - 1]
-                propagation_phi[world, row] = friction_anchor_beta * patch_phi
-                propagation_row_rebound_velocity[world, row] = 0.0
+                if per_row:
+                    propagation_phi[world, row] = friction_anchor_beta * patch_phi
+                    propagation_row_rebound_velocity[world, row] = 0.0
             target = prescribed_relative_contact_target(
                 body_a,
                 art_a,
@@ -9158,8 +9171,11 @@ def build_propagation_contact_rows(
             contact_unit_set(contact_units, 2, unit, wp.vec4(tangent1[0], tangent1[1], tangent1[2], kind))
             contact_unit_set(contact_units, 3, unit, wp.vec4(ra[0], ra[1], ra[2], float(response_body_a)))
             contact_unit_set(contact_units, 4, unit, wp.vec4(rb[0], rb[1], rb[2], float(response_body_b)))
-            for row_offset in range(3):
-                propagation_row_contact[world, slot + row_offset] = unit * 4 + row_offset
+            contact_unit_phi[unit] = phi
+            contact_unit_rebound[unit] = rebound_velocity
+            if propagation_row_contact.shape[1] > 1:
+                for row_offset in range(3):
+                    propagation_row_contact[world, slot + row_offset] = unit * 4 + row_offset
 
 
 @wp.kernel
@@ -9999,6 +10015,8 @@ def compute_propagation_effective_mass_and_rhs(
     propagation_max_constraints: int,
     propagation_row_contact: wp.array2d[int],
     contact_unit_response: wp.array[int],
+    contact_unit_phi: wp.array[float],
+    contact_unit_rebound: wp.array[float],
     # outputs
     contact_units: wp.array[float],
     contact_responses: wp.array[float],
@@ -10070,7 +10088,14 @@ def compute_propagation_effective_mass_and_rhs(
     row_type = propagation_row_type[world, i]
     target_velocity = propagation_target_velocity[world, i]
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        phi = propagation_phi[world, i]
+        phi = float(0.0)
+        rebound_velocity = float(0.0)
+        if rc >= 0:
+            phi = contact_unit_phi[rc >> 2]
+            rebound_velocity = contact_unit_rebound[rc >> 2]
+        else:
+            phi = propagation_phi[world, i]
+            rebound_velocity = propagation_row_rebound_velocity[world, i]
         if phi <= 0.0:
             # Speculative rows stay rigid so a closing contact reaches the surface.
             row_w = contact_w
@@ -10088,7 +10113,6 @@ def compute_propagation_effective_mass_and_rhs(
                 bias = wp.max(bias, -max_depen)
         else:
             bias = contact_speculative_scale * phi / dt
-        rebound_velocity = propagation_row_rebound_velocity[world, i]
         if rebound_velocity > 0.0:
             relative_incident = _spatial_row_dot(ja, jb, propagation_body_qd, ba, bb) - target_velocity
             if contact_restitution_fires(phi, relative_incident, dt):
@@ -10097,7 +10121,8 @@ def compute_propagation_effective_mass_and_rhs(
                 # An impact is impulsive, not a spring: keep the rebound exact.
                 row_w = 1.0
     elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
-        bias = propagation_phi[world, i] / dt
+        if rc < 0:
+            bias = propagation_phi[world, i] / dt
     elif row_type == PGS_CONSTRAINT_TYPE_CONNECT:
         # A rigid closure corrects its drift with the Baumgarte term; a rod closure (compliance gamma in the
         # row's mu) keeps its material bias and steps as a soft row, weight d / (d + gamma).
@@ -11406,12 +11431,14 @@ def clear_propagation_rows(
     if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
         return
     propagation_impulses[world, i] = 0.0
+    # A contact unit's rows hold no Jacobians or responses (they stay zero).
     if propagation_row_contact.shape[1] > 1:
         unit_row = propagation_row_contact[world, i] >= 0
         propagation_row_contact[world, i] = -1
-        # A contact unit's rows hold no Jacobians or responses (they stay zero).
         if unit_row:
             return
+    elif propagation_row_contact[0, 0] > 0:
+        return
     for k in range(6):
         propagation_J_a[world, i, k] = 0.0
         propagation_J_b[world, i, k] = 0.0
@@ -11427,6 +11454,8 @@ def collect_same_articulation_propagation_rows(
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
     propagation_max_constraints: int,
+    propagation_row_contact: wp.array2d[int],
+    contact_unit_response: wp.array[int],
     # outputs
     same_rows: wp.array[int],
     same_row_count: wp.array[int],
@@ -11444,6 +11473,10 @@ def collect_same_articulation_propagation_rows(
         return
     art = body_to_articulation[ba]
     if art < 0 or art != body_to_articulation[bb] or is_free_rigid[art] != 0:
+        return
+    # A contact unit without a response slot steps with the split responses: nothing to refine.
+    rc = propagation_row_unit(propagation_row_contact, world, i)
+    if rc >= 0 and contact_unit_response[rc >> 2] < 0:
         return
     slot = wp.atomic_add(same_row_count, 0, 1)
     if slot < same_rows.shape[0]:
