@@ -82,6 +82,7 @@ _KNOT_TAKE_UP = 0.14
 # knot, while the fingers (1.7) still hold it at 1.0. At 1.0 the knot's own friction outlasted the grips; the tie
 # keeps 1.0, which it needs to form.
 _KNOT_CABLE_MU = 0.3
+_KNOT_TENT = 0.14  # [m] the tie lifts the left leg this high for the end to pass under it
 _KNOT_FILTER_SPAN = 2  # cable links this far apart or closer never collide under the propagation response
 _KNOT_FINGER_MU = 1.7
 
@@ -307,6 +308,8 @@ class Track:
         if len(times) == 1:
             return self.positions[0], self.rotations[0], self.grips[0]
         a = (t - times[i]) / max(times[i + 1] - times[i], 1e-9)
+        if i == 0 and getattr(self, "ease_in", False):
+            a = a * a * (3.0 - 2.0 * a)  # a virtual gripper starts its link from rest
         pos = (1.0 - a) * self.positions[i] + a * self.positions[i + 1]
         rot = _nlerp(self.rotations[i], self.rotations[i + 1], a)
         grip = (1.0 - a) * self.grips[i] + a * self.grips[i + 1]
@@ -536,11 +539,14 @@ class Example:
     def _drive(self, link, times, points):
         """A virtual gripper on ``link`` through ``points`` [m] at ``times`` [s], eased between them."""
         track = Track()
+        track.ease_in = True
         track.times = [float(times[0])]
         track.start(points[0], (0.0, 0.0, 0.0, 1.0), 0.0)
         for t0, t1, p in zip(times[:-1], times[1:], points[1:], strict=True):
             track.to(t1 - t0, pos=p)
         self.drives.append((link, track))
+        # The links' positions when the grippers were planned: each pair's reach eases in from its distance then.
+        self._reach_from = (self.sim_time, self._cable_centerline())
 
     def _plan_tie_cross(self):
         """Pin the left end; drag the right end into a U toward the arms, then slide it under the left leg (lifted
@@ -560,7 +566,9 @@ class Example:
         # The left leg's link where the end passes under it lifts into a tent meanwhile.
         k = int(np.argmin(np.abs(pts[: n // 2, 1] - y_cross)))
         leg = pts[k]
-        tent = leg + np.array([0.0, 0.0, 0.10])
+        # The native knot's inextensible cable (add_rod's cap-less segment mass) needs the leg a little higher for
+        # the end to pass under it: 0.12 to 0.16 m tie in every run, 0.10 m misses most.
+        tent = leg + np.array([0.0, 0.0, _KNOT_TENT if self.inextensible else 0.10])
         self._drive(k, [t0 + 1.4, t0 + 2.0, t0 + 3.6, t0 + 4.0], [leg, tent, tent, leg + np.array([0.0, 0.0, 0.01])])
 
     def _plan_tie_thread(self):
@@ -617,7 +625,7 @@ class Example:
                 for k, tr in self.drives
                 if tr.times[0] <= time <= tr.times[-1]
             }
-            for k, p0 in self._reachable(active).items():
+            for k, p0 in self._reachable(active, time).items():
                 for w in range(self.world_count):
                     targets[substep, w * n + k] = p0
                     enabled[substep, w * n + k] = 1
@@ -741,7 +749,7 @@ class Example:
                 self.model, self.state_0, self.state_0.joint_q, self.state_0.joint_qd, indices=self._cable_arts
             )
 
-    def _reachable(self, targets):
+    def _reachable(self, targets, time=None):
         """Pull the grippers' targets [m] together until each pair lies within the cable between their links.
 
         An inextensible cable cannot reach two points farther apart than the length between the links held: the
@@ -757,7 +765,16 @@ class Example:
                 for b in links[a_i + 1 :]:
                     gap = targets[b] - targets[a]
                     dist = float(np.linalg.norm(gap))
-                    reach = 0.98 * self._link_spacing * (b - a)
+                    # 2% inside the length between the links, so an inextensible cable is never stretched; eased in
+                    # from the pair's distance when planned, as a straight cable's pinned ends pulled in 2% at once
+                    # kicked the chain.
+                    full = self._link_spacing * (b - a)
+                    reach = 0.98 * full
+                    if time is not None and getattr(self, "_reach_from", None) is not None:
+                        t0, pts = self._reach_from
+                        start = min(full, max(reach, float(np.linalg.norm(pts[b] - pts[a]))))
+                        x = min(max((time - t0) / 0.5, 0.0), 1.0)
+                        reach = start + (reach - start) * x * x * (3.0 - 2.0 * x)
                     if dist > reach:
                         shift = 0.5 * (dist - reach) * gap / dist
                         targets[a] = targets[a] + shift
