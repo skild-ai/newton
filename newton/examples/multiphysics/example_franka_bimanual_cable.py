@@ -327,11 +327,14 @@ class Example:
         self.sim_time = 0.0
         self.world_count = max(1, int(args.world_count))
         # Under the immediate response eight substeps of six iterations hold both grasps; the propagation response's
-        # split sweep needs 24 iterations and runs faster from cable_solver.ARM_PROPAGATION_WORLDS worlds. The knot
-        # keeps the immediate response: its virtual grips do not yet hold under propagation.
-        if args.contact_response is None and args.task == "knot":
-            args.contact_response = "immediate"
-        if self.native and cable_solver.arm_contact_response(args, self.world_count) == "propagation":
+        # split sweep needs 24 iterations and runs faster from cable_solver.ARM_PROPAGATION_WORLDS worlds. The knot's
+        # inextensible cable is one 168-DOF tree, which the immediate response solves densely: it takes the
+        # propagation response at any world count, the tree propagating every sweep, and 16 iterations hold its grips.
+        if args.contact_response is None and args.task == "knot" and self.native:
+            args.contact_response = "propagation"
+        if self.native and args.task == "knot" and args.contact_response == "propagation":
+            native_substeps, native_iterations = 8, 16
+        elif self.native and cable_solver.arm_contact_response(args, self.world_count) == "propagation":
             native_substeps, native_iterations = 8, 24
         else:
             native_substeps, native_iterations = 8, 6
@@ -341,6 +344,12 @@ class Example:
         if args.steel_iterations is None:
             args.steel_iterations = native_iterations if self.native else 24
         self.sim_dt = self.frame_dt / self.sim_substeps
+        # The knot's tie holds the cable with the virtual grippers' closures, which need fewer substeps than the
+        # jaws' friction grasp of the pull: six tie the knot in every run (five miss about one in ten).
+        tie_substeps = getattr(args, "tie_substeps", None)
+        knot_tie = 6 if self.native and self.task == "knot" and args.contact_response == "propagation" else None
+        self.tie_substeps = int(tie_substeps or knot_tie or self.sim_substeps)
+        self.tie_dt = self.frame_dt / self.tie_substeps
         self.use_graph = bool(args.graph_capture)
 
         self._plan_task()
@@ -590,10 +599,10 @@ class Example:
     def _grip_frame(self):
         """Every substep's virtual-gripper targets [m] and engagement for this frame, uploaded at once."""
         n = self.cable_bodies_per_world
-        targets = np.zeros((self.sim_substeps, len(self.grip_joints), 3), dtype=np.float32)
-        enabled = np.zeros((self.sim_substeps, len(self.grip_joints)), dtype=np.int32)
-        for substep in range(self.sim_substeps):
-            time = self.sim_time + substep * self.sim_dt
+        targets = np.zeros((self.tie_substeps, len(self.grip_joints), 3), dtype=np.float32)
+        enabled = np.zeros((self.tie_substeps, len(self.grip_joints)), dtype=np.int32)
+        for substep in range(self.tie_substeps):
+            time = self.sim_time + substep * self.tie_dt
             active = {
                 k: np.asarray(tr.sample(time)[0], dtype=np.float64)
                 for k, tr in self.drives
@@ -621,8 +630,8 @@ class Example:
             outputs=[self.control_joint_target_q, self.control_joint_target_qd],
             device=self.device,
         )
-        copy_last = self.use_graph and self.sim_substeps % 2 == 1
-        for substep in range(self.sim_substeps):
+        copy_last = self.use_graph and self.tie_substeps % 2 == 1
+        for substep in range(self.tie_substeps):
             self.state_0.clear_forces()
             wp.launch(
                 _apply_grips,
@@ -632,8 +641,8 @@ class Example:
                 device=self.device,
             )
             self.collision_pipeline.collide(self.state_0, self.contacts)
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-            if copy_last and substep == self.sim_substeps - 1:
+            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.tie_dt)
+            if copy_last and substep == self.tie_substeps - 1:
                 self.state_0.assign(self.state_1)
             else:
                 self.state_0, self.state_1 = self.state_1, self.state_0
@@ -1200,6 +1209,8 @@ class Example:
                 contact_rows=int(args.contact_rows) if args.contact_rows else 24 * self.cable_bodies_per_world + 128,
                 enable_joint_limits=True,
                 coupled_contact_passes=int(args.coupled_contact_passes),
+                # The knot's inextensible chain is rigidly coupled: every sweep's impulses must reach the whole tree.
+                propagation_interval=1 if self.task == "knot" else 3,
             )
             return
         if self.rigid_solver == "steel":
@@ -1394,6 +1405,9 @@ class Example:
             "--twist-roll", type=float, default=-3.0, help="Twist: each wrist's roll about the cable [rad]."
         )
         parser.add_argument("--substeps", type=int, default=None, help="Substeps per frame.")
+        parser.add_argument(
+            "--tie-substeps", type=int, default=None, help="Knot: substeps per frame while the virtual grippers tie it."
+        )
         parser.add_argument("--contact-rows", type=int, default=None, help="Native Steel: per-world contact rows.")
         parser.add_argument("--steel-iterations", type=int, default=None, help="Steel PGS iterations.")
         parser.add_argument("--vbd-iterations", type=int, default=20, help="VBD iterations per coupled substep.")
