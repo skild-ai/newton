@@ -175,7 +175,9 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 5, propagation=(2, 20))
+        # Native Steel: three substeps of 14 sweeps. At two, a cable squeezed between an obstacle and its neighbours
+        # can be flung sideways during loading and lose its bend, depending on the GPU's summation order.
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 5, propagation=(3, 14))
         self.update_step_interval = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
 
