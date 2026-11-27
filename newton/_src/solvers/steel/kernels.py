@@ -3512,6 +3512,7 @@ def prepare_articulation_augmented_drives(
     joint_effort_limit: wp.array[float],
     max_dofs: int,
     dt: float,
+    stiffness_theta: float,
     reset_tau: int,
     # outputs
     row_counts: wp.array[int],
@@ -3556,15 +3557,17 @@ def prepare_articulation_augmented_drives(
                 ke = joint_target_ke[dof_index]
                 kd = joint_target_kd[dof_index]
             # Preserve the existing rule that a nonpositive drive diagonal is skipped.
+            # Activity uses the backward-Euler diagonal, so it does not depend on theta.
             drive = augment_drives and type != JointType.BALL and (ke > 0.0 or kd > 0.0)
-            drive_K = ke * dt * dt + kd * dt
-            drive = drive and drive_K > 0.0
-            if not drive:
-                drive_K = 0.0
+            drive = drive and ke * dt * dt + kd * dt > 0.0
+            drive_K = float(0.0)
+            if drive:
+                # theta weights the end-of-step position in the spring force (1: backward Euler).
+                drive_K = stiffness_theta * ke * dt * dt + kd * dt
             # The explicit -damping * qd remains in tau. This diagonal makes
             # its velocity dependence implicit without applying drive limits.
             K = drive_K + wp.max(joint_damping[dof_index], 0.0) * dt
-            if K <= 0.0:
+            if not drive and K <= 0.0:
                 continue
 
             u0 = float(0.0)
@@ -3572,7 +3575,7 @@ def prepare_articulation_augmented_drives(
                 q = joint_q[coord_start + axis]
                 qd = joint_qd[dof_index]
                 target_pos = joint_target_pos[joint_target_q_start[joint_index] + axis]
-                u0 = -(ke * (q - target_pos + dt * qd) + kd * (qd - joint_target_vel[dof_index]))
+                u0 = -(ke * (q - target_pos + stiffness_theta * dt * qd) + kd * (qd - joint_target_vel[dof_index]))
                 effort_limit = joint_effort_limit[dof_index]
                 if effort_limit > 0.0:
                     u0 = wp.clamp(u0, -effort_limit, effort_limit)
@@ -3612,6 +3615,7 @@ def eval_augmented_drives(
     joint_effort_limit: wp.array[float],
     max_dofs: int,
     dt: float,
+    stiffness_theta: float,
     articulation_active: wp.array[int],
     row_counts: wp.array[int],
     row_dof_index: wp.array[int],
@@ -3642,6 +3646,7 @@ def eval_augmented_drives(
         joint_effort_limit,
         max_dofs,
         dt,
+        stiffness_theta,
         0,
         row_counts,
         row_dof_index,
@@ -3685,6 +3690,7 @@ def eval_rigid_tau_and_augmented_drives(
     joint_effort_limit: wp.array[float],
     max_dofs: int,
     dt: float,
+    stiffness_theta: float,
     articulation_active: wp.array[int],
     body_ft_s: wp.array[wp.spatial_vector],
     row_counts: wp.array[int],
@@ -3746,6 +3752,7 @@ def eval_rigid_tau_and_augmented_drives(
         joint_effort_limit,
         max_dofs,
         dt,
+        stiffness_theta,
         0,
         row_counts,
         row_dof_index,

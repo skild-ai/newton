@@ -250,7 +250,7 @@ repository examples spend tuning effort, not a shared solver API.
        ``enable_joint_velocity_limits``, ``velocity_limit_activation_fraction``,
        ``articulation_constraint_max``, ``free_body_constraint_max``,
        ``propagation_constraint_max``, ``warn_constraint_overflow``, ``drive_mode``,
-       ``fuse_joint_velocity_limits``, ``enable_bilateral_preelimination``,
+       ``drive_stiffness_theta``, ``fuse_joint_velocity_limits``, ``enable_bilateral_preelimination``,
        ``bilateral_preelimination_include_mimics``, ``friction_anchor_beta``,
        ``reuse_kinematics``,
        ``contact_regularization``, ``velocity_iterations``,
@@ -342,7 +342,17 @@ repository examples spend tuning effort, not a shared solver API.
        step can be captured, and ``check_constraint_capacity()`` reports input
        a captured step rejected.
        Joint drives are integrated implicitly by default, which keeps large
-       drive gains stable at ordinary ``dt``; ``drive_mode="rows"`` solves
+       drive gains stable at ordinary ``dt`` but removes a share of the
+       energy a drive stores every step, so a mechanism that flexes on impact
+       and springs back rebounds low at large ``dt``.
+       ``drive_stiffness_theta=0`` integrates the drive stiffness
+       symplectically instead (damping stays implicit), as MuJoCo integrates
+       position actuators; it conserves a modified energy instead of
+       dissipating it, but needs ``w * dt < 2`` with ``w = sqrt(ke / m_eff)``.
+       Intermediate values trade the two: an undamped mode's oscillation
+       envelope decays by ``1 / sqrt(1 + theta * (w * dt)^2)`` per step,
+       values of at least ``0.5`` are unconditionally stable, and values below
+       ``0.5`` need ``w * dt < 2 / sqrt(1 - 2 * theta)``. ``drive_mode="rows"`` solves
        them as PGS rows together with contacts and limits instead, and each
        driven DOF then uses one row of ``articulation_constraint_max``. Rows beyond ``articulation_constraint_max``
        (articulated bodies), ``free_body_constraint_max`` (free bodies) or
