@@ -2687,7 +2687,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 articulation and free body still propagates after each sweep: between passes each sweep moves a
                 body by its own split response, and repeated sweeps of a small articulation whose contacts oppose
                 each other (a latch squeezed in a socket) can build impulses that cancel in that estimate but not
-                in the articulation. 1 (default) propagates every iteration. At least 1.
+                in the articulation. Keep 1 for inextensible rods (3-DoF rod joints): their links are rigidly
+                coupled, and the split estimates between passes diverge on a tied knot. 1 (default) propagates every
+                iteration. At least 1.
             propagation_momentum: With ``articulated_contact_response="propagation"``, accelerate the sweeps
                 with Nesterov momentum: at each tree propagation but the last, the row impulses move on by a
                 growing share of their change since the previous one, and that propagation installs the velocity
