@@ -120,6 +120,17 @@ _SOURCE = (
         return __shfl_sync(0xffffffffu, v, 0);
     };
 
+    // Six sums of the 12 lanes' products in one butterfly, so their shuffles overlap instead of queueing.
+    auto reduce6 = [&](float* v) {
+        #pragma unroll
+        for (int o = 8; o > 0; o >>= 1) {
+            #pragma unroll
+            for (int q = 0; q < 6; ++q) v[q] += __shfl_xor_sync(0xffffffffu, v[q], o);
+        }
+        #pragma unroll
+        for (int q = 0; q < 6; ++q) v[q] = __shfl_sync(0xffffffffu, v[q], 0);
+    };
+
     // The row sweep accumulates a sibling row's residual and a pair's coupling in lane 0, body A's then body B's
     // component k for k = 0..5; these do the same, so the two sweeps round alike.
     auto seq_dot = [&](float x, float y, float acc, bool has_a, bool has_b) {
@@ -177,21 +188,24 @@ _SOURCE = (
         const float v = my_on ? s_qd[my_slot * 6 + k] : 0.0f;
         float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
         if (unit) {
-            // The row sweep's order: the normal row, then the pair against the twists the normal impulse moved.
-            const float s_n = reduce(cur.j[0] * v);
-            const bool has_a = cur.la >= 0, has_b = cur.lb >= 0;
-            const float c_12 = seq_dot(cur.j[1], cur.mi[2], 0.0f, has_a, has_b);
+            // The row sweep's order: the normal row, then the pair against the twists the normal impulse moved. The
+            // pair's residuals against those twists are j.(v + M^-1 j0 d0) = j.v + d0 (j.M^-1 j0), so every product
+            // the unit needs reduces at once, before the normal row solves.
+            float sums[6] = {cur.j[0] * v, cur.j[1] * v, cur.j[2] * v, my_on ? cur.j[1] * cur.mi[0] : 0.0f,
+                             my_on ? cur.j[2] * cur.mi[0] : 0.0f, my_on ? cur.j[1] * cur.mi[2] : 0.0f};
+            reduce6(sums);
+            const float s_n = sums[0];
+            const float c_12 = sums[5];
             float new_n = cur.imp[0];
             if (cur.eff[0] > 0.0f) {
                 new_n = cur.imp[0] + omega * (-(s_n + cur.rhs[0]) * cur.eff[0] * cur.w - (1.0f - cur.w) * cur.imp[0]);
                 if (new_n < 0.0f) new_n = 0.0f;
             }
             d0 = new_n - cur.imp[0];
-            const float v1 = v + cur.mi[0] * d0;
             float new_1 = 0.0f, new_2 = 0.0f;
             if (global_iter >= friction_start_iteration) {
-                const float s_1 = reduce(cur.j[1] * v1);
-                const float r_2 = seq_dot(cur.j[2], v1, cur.rhs[2], has_a, has_b);
+                const float s_1 = sums[1] + d0 * sums[3];
+                const float r_2 = cur.rhs[2] + sums[2] + d0 * sums[4];
                 float lambda_n = new_n;
                 for (int p = cur.pn; p >= 0 && p != i; p = propagation_row_parent.data[world_base + p])
                     lambda_n += propagation_impulses.data[world_base + p];
