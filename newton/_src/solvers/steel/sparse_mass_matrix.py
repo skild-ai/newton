@@ -364,7 +364,7 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
 #endif
     const bool valid = status.data[group] == 0;
     for (int entry = lane; entry < {nnz}; entry += stride) {{
-        Linv_group.data[group * {nnz} + entry] = valid ? inverse[entry] : NAN;
+        Linv_group.data[(long long)group * {nnz} + entry] = valid ? inverse[entry] : NAN;
     }}
 """
 
@@ -432,7 +432,7 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
     const int stride = 1;
 #endif
     const int n = indices.dof_count;
-    const int base = group * indices.nonzero_count;
+    const long long base = (long long)group * indices.nonzero_count;
     const int start = articulation_dof_start.data[group_to_art.data[group]];
     for (int row = lane; row < n; row += stride) {
         float value = 0.0f;

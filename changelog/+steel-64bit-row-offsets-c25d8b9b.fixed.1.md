@@ -1,0 +1,1 @@
+Raise `ValueError` when constructing `SolverSteel` with a world count and row capacities whose 32-bit indexed buffers would pass 2**31 elements (for example more than 699,050 worlds with free bodies at the default `free_body_constraint_max`), instead of wrapping their indices silently; the message names the buffer, the largest world count that fits, and the capacity to reduce.

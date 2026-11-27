@@ -137,7 +137,7 @@ def _get_sparse_contact_response_kernel(
 #if defined(__CUDA_ARCH__)
             __syncwarp(MASK);
 #endif
-            const int factor_base = group * 36;
+            const long long factor_base = (long long)group * 36;
             for (int node = lane; node < 6; node += stride) {
                 auto value = wp::vec3(0.0f);
                 for (int column = 0; column <= node; ++column) {
@@ -167,11 +167,11 @@ def _get_sparse_contact_response_kernel(
 #pragma unroll
                 for (int row = 0; row < 3; ++row) {
                     if (row >= row_count) continue;
-                    const int response_offset = (row_offset + row) * support_capacity;
+                    const long long response_offset = (long long)(row_offset + row) * support_capacity;
                     const float value = jacobian[row * $PLANE + node];
                     row_dof.data[response_offset + count + node] = offset + node;
                     row_factor.data[response_offset + count + node] = value;
-                    row_free_response.data[(row_offset + row) * row_free_response.shape[2] + count + node] = response.c[row];
+                    row_free_response.data[(long long)(row_offset + row) * row_free_response.shape[2] + count + node] = response.c[row];
                     norm.c[row] += value * response.c[row];
                 }
             }
@@ -201,7 +201,7 @@ def _get_sparse_contact_response_kernel(
 #if defined(__CUDA_ARCH__)
             __syncwarp(MASK);
 #endif
-            const int factor_base = group * inverse_factor.shape[1];
+            const long long factor_base = (long long)group * inverse_factor.shape[1];
             for (int node = lane; node < $N; node += stride) {
                 const unsigned long long bit = 1ull << node;
                 if ((mask & bit) == 0) continue;
@@ -225,7 +225,7 @@ def _get_sparse_contact_response_kernel(
 #pragma unroll
                 for (int row = 0; row < 3; ++row) {
                     if (row >= row_count) continue;
-                    const int response_offset = (row_offset + row) * support_capacity;
+                    const long long response_offset = (long long)(row_offset + row) * support_capacity;
                     row_dof.data[response_offset + index] = offset + node;
                     row_factor.data[response_offset + index] = value.c[row];
                     norm.c[row] += value.c[row] * value.c[row];
@@ -241,7 +241,7 @@ def _get_sparse_contact_response_kernel(
 #pragma unroll
     for (int row = 0; row < 3; ++row) {
         if (row >= row_count) continue;
-        const int response_offset = (row_offset + row) * support_capacity;
+        const long long response_offset = (long long)(row_offset + row) * support_capacity;
         for (int index = count + lane; index < support_capacity; index += stride) {
             row_dof.data[response_offset + index] = -1;
             row_factor.data[response_offset + index] = 0.0f;
@@ -463,7 +463,7 @@ def _get_sparse_contact_response_kernel(
     const int dofs = inverse_permutation.shape[0];
     const int capacity = row_type.shape[1];
     const int support_capacity = row_dof.shape[2];
-    const int factor_base = group * inverse_factor.shape[1];
+    const long long factor_base = (long long)group * inverse_factor.shape[1];
     for (int base = 0; base < 2 * dofs; base += width) {
         const int candidate = base + lane;
         const int local_dof = candidate >> 1;
@@ -528,7 +528,7 @@ def _get_sparse_contact_response_kernel(
             const int column = inverse_permutation.data[selected_dof];
             const unsigned long long support_mask = dof_mask.data[selected_dof];
             const int row_offset = world * capacity + row;
-            const int response_offset = row_offset * support_capacity;
+            const long long response_offset = (long long)row_offset * support_capacity;
             float norm = 0.0f;
             for (int node = lane; node < dofs; node += width) {
                 const unsigned long long bit = 1ull << node;

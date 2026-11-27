@@ -195,6 +195,7 @@ from .kernels import (
     local_solve_launch_gate,
     mark_propagation_bodies,
     mask_passive_spring_stiffness,
+    offset64,
     populate_connect_J_for_size,
     populate_joint_velocity_limit_J_for_size,
     populate_mimic_J_for_size,
@@ -405,6 +406,139 @@ def _validate_solve_mode(solve_mode, articulated_contact_response) -> None:
             "solve_mode='colored' colors the propagation contact rows and requires "
             "articulated_contact_response='propagation'; use solve_mode='serial' with "
             f"articulated_contact_response={articulated_contact_response!r}"
+        )
+
+
+_INT32_INDEX_MAX = 2**31 - 1
+_PROPAGATION_ROWS_OPTION = "propagation_constraint_max (default free_body_constraint_max + articulation_constraint_max)"
+
+
+def _check_int32_index_range(
+    *,
+    worlds: int,
+    dense_rows: int,
+    world_dofs: int,
+    dense_group_articulations: int = 0,
+    dense_gather_dofs: int = 0,
+    sparse_diagonal: bool = False,
+    free_body_rows: int = 0,
+    free_body_warmstart_bodies: int = 0,
+    propagation_rows: int = 0,
+    colored: bool = False,
+    colored_payload: bool = False,
+    cache_bodies: int = 0,
+    cache_dofs: int = 0,
+    tree_bodies: int = 0,
+    tree_joints: int = 0,
+    tree_dofs: int = 0,
+    tree_world_bodies: int = 0,
+    augmented_rows: int = 0,
+) -> None:
+    """Raise :class:`ValueError` if a buffer or launch that Steel indexes with 32-bit integers would overflow.
+
+    Per-world blocks of rows x DOFs and DOFs x DOFs use 64-bit offsets. The buffers checked here stay
+    32-bit because they grow only with worlds x rows or worlds x DOFs: native kernels index them with
+    ``int`` products that would wrap silently, and Warp rejects one-dimensional arrays and launches past
+    ``2**31 - 1`` elements only when they are allocated or launched. All sizes are Python integers, so the
+    check does no device work. A size of zero leaves its buffer out.
+
+    Args:
+        worlds: Solver worlds.
+        dense_rows: ``articulation_constraint_max``.
+        world_dofs: DOFs of the largest world.
+        dense_group_articulations: Articulations of the largest mass-matrix size group.
+        dense_gather_dofs: Largest ``articulations x DOFs`` of a size group whose rows are gathered into
+            the world rows, or zero when no gather runs.
+        sparse_diagonal: Whether the sparse-diagonal contact solve stores its row Jacobians.
+        free_body_rows: Free-body rows per world, or zero without free bodies.
+        free_body_warmstart_bodies: Free bodies per world listed for the contact warm start, or zero.
+        propagation_rows: Propagation rows per world, or zero without the propagation response.
+        colored: Whether the colored sweep stores its unit records.
+        colored_payload: Whether the colored sweep stores its packed unit payload.
+        cache_bodies: Cached response bodies per world, or zero without cached responses.
+        cache_dofs: DOFs of the largest articulation, the rows of each cached response.
+        tree_bodies: Bodies of the propagation tree buffers, or zero without the propagation response.
+        tree_joints: Joints of the propagation tree buffers.
+        tree_dofs: DOFs of the propagation tree buffers.
+        tree_world_bodies: Tree bodies of the largest world, the width of the propagation body lists.
+        augmented_rows: Articulations x DOFs of the largest articulation, the augmented drive rows.
+    """
+    worlds = int(worlds)
+    dense_rows = int(dense_rows)
+    propagation_rows = int(propagation_rows)
+    cache_bodies = int(cache_bodies)
+    dense = "articulation_constraint_max"
+    extents = (
+        ("dense row metadata (worlds x articulation_constraint_max)", worlds * dense_rows, dense),
+        (
+            "dense row launches (articulations of a size group x articulation_constraint_max)",
+            int(dense_group_articulations) * dense_rows,
+            dense,
+        ),
+        (
+            "dense J/Y gather launch (articulations x DOFs of a size group x articulation_constraint_max)",
+            int(dense_gather_dofs) * dense_rows,
+            dense,
+        ),
+        (
+            "sparse-diagonal row Jacobians (worlds x articulation_constraint_max x 4)",
+            worlds * dense_rows * 4 if sparse_diagonal else 0,
+            dense,
+        ),
+        ("per-world DOF maps (worlds x DOFs of the largest world)", worlds * int(world_dofs), "the DOFs per world"),
+        (
+            "free-body row Jacobians (worlds x free_body_constraint_max x 6)",
+            worlds * int(free_body_rows) * 6,
+            "free_body_constraint_max",
+        ),
+        (
+            "free-body warm-start body lists (worlds x free bodies per world x 6)",
+            worlds * int(free_body_warmstart_bodies) * 6,
+            "the free bodies per world",
+        ),
+        (
+            "propagation row Jacobians (worlds x propagation rows x 6)",
+            worlds * propagation_rows * 6,
+            _PROPAGATION_ROWS_OPTION,
+        ),
+        (
+            "colored-sweep unit records (worlds x propagation rows x 12)",
+            worlds * max(propagation_rows * int(PROPAGATION_UNIT_META), int(PROPAGATION_COLOR_TAIL) + 2)
+            if colored
+            else 0,
+            _PROPAGATION_ROWS_OPTION,
+        ),
+        (
+            "colored-sweep unit payload (worlds x propagation rows x 96)",
+            worlds * propagation_rows * PROPAGATION_UNIT_PAYLOAD if colored_payload else 0,
+            _PROPAGATION_ROWS_OPTION,
+        ),
+        (
+            "cached propagation responses (worlds x cached bodies x cached bodies x 36)",
+            worlds * cache_bodies * max(cache_bodies * 36, int(cache_dofs) * 6),
+            "propagation_cached_response_body_max",
+        ),
+        (
+            "propagation tree buffers (bodies x 36)",
+            max(int(tree_bodies) * 36, int(tree_joints) * 36, int(tree_dofs) * 6, worlds * int(tree_world_bodies)),
+            "the bodies per world",
+        ),
+        (
+            "augmented drive rows (articulations x DOFs of the largest articulation)",
+            int(augmented_rows),
+            "the DOFs per articulation",
+        ),
+    )
+    for buffer, count, option in extents:
+        if count <= _INT32_INDEX_MAX:
+            continue
+        per_world = -(-count // max(worlds, 1))
+        fit = _INT32_INDEX_MAX // per_world
+        fit = f"at most {fit:,} worlds fit" if fit else "not even one world fits"
+        raise ValueError(
+            f"SolverSteel: the {buffer} would hold {count:,} elements at {worlds:,} worlds, past the "
+            f"2**31 - 1 limit of their 32-bit indices ({per_world:,} per world, so {fit}). Simulate fewer "
+            f"worlds per solver (split the scene across several solvers) or reduce {option}."
         )
 
 
@@ -2717,6 +2851,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 Defaults to enabled on CUDA. CPU uses plain sweeps, so at a fixed iteration count the
                 device defaults can produce different trajectories. Pass ``False`` for plain Gauss-Seidel
                 sweeps on CUDA. Construction-only.
+
+        Raises:
+            ValueError: If the world count and the row capacities would pass the ``2**31 - 1`` elements of a
+                row buffer that Steel indexes with 32-bit integers, for example more than 699,050 worlds with
+                free bodies at the default ``free_body_constraint_max``. The message names the buffer, the
+                largest world count that fits and the capacity to reduce.
         """
         solve_mode, articulated_contact_response = _normalize_solve_mode(solve_mode, articulated_contact_response)
         _validate_solve_mode(solve_mode, articulated_contact_response)
@@ -3186,6 +3326,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._setup_local_solves(model)
         self._setup_paired_response(model)
 
+        self._check_index_range(model)
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
         self._allocate_paired_response_buffers(model)
@@ -5214,7 +5355,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 raise RuntimeError("Steel model plan must be built before articulation metadata")
 
             for i in range(model.articulation_count):
-                first_joint = articulation_start[i]
+                first_joint = int(articulation_start[i])
                 last_joint = int(self._model_plan.articulation_joint_end[i])
 
                 first_coord = joint_q_start[first_joint]
@@ -6403,6 +6544,41 @@ class SolverSteel(SolverBase, CouplingInterface):
         group_to_art = np.flatnonzero(self._model_plan.response_dof_count == size)
         expected_world = np.arange(len(group_to_art), dtype=articulation_world.dtype)
         return np.array_equal(articulation_world[group_to_art], expected_world)
+
+    def _check_index_range(self, model, *, colored_payload: bool = False) -> None:
+        """Check the 32-bit indexed buffers of this solver's capacities before allocating them.
+
+        The row capacities are fixed at construction; the colored sweep checks its packed payload again
+        when it decides to allocate it.
+        """
+        gather = (
+            self._sparse_mass_matrix_size is None
+            and not self._sparse_diagonal_contact_solve
+            and not self._jy_world_aliased
+            and not self._hinv_jt_writes_world
+        )
+        propagation = self._propagation_active
+        cached = propagation and bool(self._propagation_cached_warps)
+        _check_int32_index_range(
+            worlds=self._world_count,
+            dense_rows=self._articulation_constraint_max,
+            world_dofs=self._max_world_dofs,
+            dense_group_articulations=max(self._n_arts_by_size.values(), default=0),
+            dense_gather_dofs=max((n * size for size, n in self._n_arts_by_size.items()), default=0) if gather else 0,
+            sparse_diagonal=self._sparse_diagonal_contact_solve,
+            free_body_rows=self._free_body_constraint_max if self._has_free_rigid_bodies else 1,
+            free_body_warmstart_bodies=max(self._max_free_rigid_bodies_per_world, 1) if self._contact_warmstart else 0,
+            propagation_rows=self._propagation_max_constraints if propagation else 0,
+            colored=propagation and self._propagation_colored,
+            colored_payload=colored_payload,
+            cache_bodies=max(self._propagation_cache_max_bodies, 1) if cached else 0,
+            cache_dofs=max(self._articulation_max_dofs, 1),
+            tree_bodies=max(model.body_count, 1) if propagation else 0,
+            tree_joints=max(model.joint_count, 1) if propagation else 0,
+            tree_dofs=max(model.joint_dof_count, 1) if propagation else 0,
+            tree_world_bodies=self._max_propagation_bodies if propagation else 0,
+            augmented_rows=model.articulation_count * self._articulation_max_dofs if model.joint_count else 0,
+        )
 
     def _allocate_common_buffers(self, model):
         if model.joint_count:
@@ -12140,6 +12316,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         packed = self._colored_prefetch and bool(overrides.get("colored_packed", self._world_count <= 16))
         self._colored_worlds_per_block = 1 if staged else _COLORED_WORLDS_PER_BLOCK
         if packed or staged:
+            self._check_index_range(model, colored_payload=True)
             self._color_unit_payload = wp.zeros(
                 (max(self._world_count, 1) * rows * PROPAGATION_UNIT_PAYLOAD,), dtype=wp.float32, device=model.device
             )
@@ -13787,7 +13964,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
             const unsigned lower_lanes = lane == 0 ? 0u : ((1u << lane) - 1u);
             const int slot = first_slot + __popc(active_mask & lower_lanes);
             if (slot < max_constraints) {{
-                J_group.data[(group_idx * max_constraints + slot) * {size} + local_dof] = side == 0 ? 1.0f : -1.0f;
+                J_group.data[{offset64("group_idx * max_constraints + slot", size)} + local_dof] = side == 0 ? 1.0f : -1.0f;
                 const int row = world * max_constraints + slot;
                 world_row_type.data[row] = {PGS_CONSTRAINT_TYPE_JOINT_LIMIT};
                 world_row_parent.data[row] = -1;
@@ -13933,7 +14110,7 @@ def _get_joint_friction_warp_kernel(size: int, device_arch: str, warps_per_block
             const unsigned lower_lanes = lane == 0 ? 0u : ((1u << lane) - 1u);
             const int slot = first_slot + __popc(active_mask & lower_lanes);
             if (slot < max_constraints) {{
-                J_group.data[(group_idx * max_constraints + slot) * {size} + local_dof] = 1.0f;
+                J_group.data[{offset64("group_idx * max_constraints + slot", size)} + local_dof] = 1.0f;
                 const int row = world * max_constraints + slot;
                 world_row_type.data[row] = {PGS_CONSTRAINT_TYPE_JOINT_FRICTION};
                 world_row_parent.data[row] = -1;
@@ -14279,7 +14456,7 @@ def _get_crba_cholesky_warp_kernel(n_dofs: int, device_arch: str, *, warps_per_b
     __syncwarp();
 
     if (lane < {int(n_dofs)}) {{
-        const int factor_base = group * {matrix_elements};
+        const long long factor_base = {offset64("group", matrix_elements)};
 #pragma unroll
         for (int col = 0; col <= lane; ++col)
             L_group.data[factor_base + lane * {int(n_dofs)} + col] = factor[lane * {int(n_dofs)} + col];
@@ -14493,7 +14670,7 @@ def _get_inverse_cholesky_register_kernel(n_dofs: int, device_arch: str, *, lowe
     const int art = group_to_art.data[group];
     if (mass_update_mask.data[art] == 0) return;
 
-    const int factor_base = group * {n_dofs * n_dofs};
+    const long long factor_base = {offset64("group", n_dofs * n_dofs)};
     float column[{n_dofs}];
 #pragma unroll
     for (int i = 0; i < {n_dofs}; ++i) {{
@@ -14560,9 +14737,9 @@ def _get_paired_hinv_jt_kernel(
     __shared__ float s_secondary_Hinv[{secondary_dofs * secondary_dofs}];"""
     hinv_load = f"""
     for (int element = threadIdx.x; element < {primary_dofs * primary_dofs}; element += blockDim.x)
-        s_primary_Hinv[element] = primary_Hinv.data[primary_group * {primary_dofs * primary_dofs} + element];
+        s_primary_Hinv[element] = primary_Hinv.data[{offset64("primary_group", primary_dofs * primary_dofs)} + element];
     for (int element = threadIdx.x; element < {secondary_dofs * secondary_dofs}; element += blockDim.x)
-        s_secondary_Hinv[element] = secondary_Hinv.data[secondary_group * {secondary_dofs * secondary_dofs} + element];"""
+        s_secondary_Hinv[element] = secondary_Hinv.data[{offset64("secondary_group", secondary_dofs * secondary_dofs)} + element];"""
     factor_shared = ""
     factor_load = ""
     factor_world_declaration = ""
@@ -14589,9 +14766,9 @@ def _get_paired_hinv_jt_kernel(
     __shared__ float s_secondary_Linv[{secondary_dofs * secondary_dofs}];"""
         factor_load = f"""
     for (int element = threadIdx.x; element < {primary_dofs * primary_dofs}; element += blockDim.x)
-        s_primary_Linv[element] = primary_Linv.data[primary_group * {primary_dofs * primary_dofs} + element];
+        s_primary_Linv[element] = primary_Linv.data[{offset64("primary_group", primary_dofs * primary_dofs)} + element];
     for (int element = threadIdx.x; element < {secondary_dofs * secondary_dofs}; element += blockDim.x)
-        s_secondary_Linv[element] = secondary_Linv.data[secondary_group * {secondary_dofs * secondary_dofs} + element];"""
+        s_secondary_Linv[element] = secondary_Linv.data[{offset64("secondary_group", secondary_dofs * secondary_dofs)} + element];"""
         factor_world_declaration = "    const bool factor_world = world_mf_constraint_count.data[world] == 0;"
         response_calculation = f"""
         float y = 0.0f;
@@ -14649,14 +14826,14 @@ def _get_paired_hinv_jt_kernel(
     __syncthreads();
 
     for (int constraint = row_warp; constraint < n_constraints; constraint += {warps_per_block}) {{
-        const int world_row = (world * {max_constraints} + constraint) * {max_world_dofs};
+        const long long world_row = {offset64("world * " + str(max_constraints) + " + constraint", max_world_dofs)};
         float j = 0.0f;
         if (lane < {primary_dofs}) {{
-            const int row = (primary_group * {max_constraints} + constraint) * {primary_dofs};
+            const long long row = {offset64("primary_group * " + str(max_constraints) + " + constraint", primary_dofs)};
             j = primary_J.data[row + lane];
         }} else if (lane < {total_dofs}) {{
             const int secondary_lane = lane - {primary_dofs};
-            const int row = (secondary_group * {max_constraints} + constraint) * {secondary_dofs};
+            const long long row = {offset64("secondary_group * " + str(max_constraints) + " + constraint", secondary_dofs)};
             j = secondary_J.data[row + secondary_lane];
         }}
 
@@ -14818,14 +14995,14 @@ def _get_pgs_solve_paired_factor_kernel(
     if (m == 0 || world_mf_constraint_count.data[world] != 0) return;
 
     const int off = world * {M};
-    const int row_base = off * {D};
+    const long long row_base = {offset64("off", D)};
     const int dof_map_base = world * {D};
     const int primary_group = primary_group_by_world.data[world];
     const int secondary_group = secondary_group_by_world.data[world];
     const int primary_offset = primary_offset_by_world.data[world];
     const int secondary_offset = secondary_offset_by_world.data[world];
-    const int primary_matrix_base = primary_group * {P * P};
-    const int secondary_matrix_base = secondary_group * {S * S};
+    const long long primary_matrix_base = {offset64("primary_group", P * P)};
+    const long long secondary_matrix_base = {offset64("secondary_group", S * S)};
     float* s_lam = &s_lam_storage[world_slot * {M}];
     float* s_rhs = &s_rhs_storage[world_slot * {M}];
     float* s_diag = &s_diag_storage[world_slot * {M}];
@@ -15460,8 +15637,8 @@ def _get_pgs_solve_local_owned_kernel(
     const int secondary_art = candidate_secondary_articulations.data[candidate];
     if (articulation_world.data[secondary_art] != world) return;
     const int secondary_group = articulation_group_index.data[secondary_art];
-    const int secondary_group_j_base = secondary_group * {max_rows * paired_dofs};
-    const int secondary_group_l_base = secondary_group * {paired_dofs * paired_dofs};"""
+    const long long secondary_group_j_base = {offset64("secondary_group", max_rows * paired_dofs)};
+    const long long secondary_group_l_base = {offset64("secondary_group", paired_dofs * paired_dofs)};"""
         if paired_dofs
         else ""
     )
@@ -16197,8 +16374,8 @@ def _get_pgs_solve_local_owned_kernel(
     if (row_count == 0 || row_count > {local_rows}) return;
 
     const int world_row_base = world * {max_rows};
-    const int group_j_base = group * {max_rows * dofs};
-    const int group_l_base = group * {dofs * dofs};
+    const long long group_j_base = {offset64("group", max_rows * dofs)};
+    const long long group_l_base = {offset64("group", dofs * dofs)};
 {pair_setup}
 {shared_declarations}
 {mf_setup}
@@ -16754,7 +16931,7 @@ def _get_pgs_solve_mf_gs_kernel(
             }}
             const int i = vlim_base + vlim_first;
             float denom = s_diag_dense[i];
-            int row_base = jy_world_base + i * {D};
+            long long row_base = jy_world_base + i * {D};
             const int unit = i - vlim_lo < {U} ? s_vlim_unit[i - vlim_lo] : 0;
             float jv;
             if (unit > 0) {{
@@ -16793,7 +16970,7 @@ def _get_pgs_solve_mf_gs_kernel(
             float denom = s_diag_dense[i];
             if (denom <= 0.0f) continue;
             float qdot_max = s_drive_vel_limit_dense[i];
-            int row_base = jy_world_base + i * {D};
+            long long row_base = jy_world_base + i * {D};
             float my_sum = 0.0f;
             for (int d = lane; d < {D}; d += 32) my_sum += J_world.data[row_base + d] * s_v[d];
             float jv = warp_sum(my_sum);
@@ -16918,8 +17095,8 @@ def _get_pgs_solve_mf_gs_kernel(
                 if (lane == 0) s_pair_slot[i] = -1;
                 continue;
             }}
-            int row_base = jy_world_base + i * {D};
-            int sib_row_base = jy_world_base + (i + 1) * {D};
+            long long row_base = jy_world_base + i * {D};
+            long long sib_row_base = jy_world_base + (i + 1) * {D};
             float cross = 0.0f;
 {prologue_cross}
             cross = warp_sum(cross);
@@ -17018,7 +17195,7 @@ def _get_pgs_solve_mf_gs_kernel(
                     new_impulse = old_impulse;
                 }} else {{
                     int sib = parent_idx + 2;
-                    int sib_row_base = jy_world_base + sib * {D};
+                    long long sib_row_base = jy_world_base + sib * {D};
                     // A patch's normal rows form a cycle through their parent links; its
                     // anchors share the pooled normal load (a point contact links to -1).
                     float lambda_n = s_lam_dense[parent_idx];
@@ -17142,7 +17319,7 @@ def _get_pgs_solve_mf_gs_kernel(
         momentum_init = f"""
     float previous_velocity[{ELEMS_PER_LANE}];
     bool projected_limit = false;
-    float* mom_prev_d = &momentum_scratch.data[world * momentum_scratch.shape[1]];
+    float* mom_prev_d = &momentum_scratch.data[{offset64("world", "momentum_scratch.shape[1]")}];
     float* mom_prev_m = mom_prev_d + {M_D};
     float* mom_e_d = mom_prev_m + {M_MF};
     float* mom_e_m = mom_e_d + {M_D};
@@ -17260,7 +17437,7 @@ def _get_pgs_solve_mf_gs_kernel(
     int off_dense = world * {M_D};
     int off_mf = world * {M_MF};
     int off_meta = off_mf * 4;
-    int jy_world_base = world * {M_D} * {D};
+    long long jy_world_base = {offset64("world", M_D * D)};
     int mf6_base = world * {M_MF} * 6;
 
     __shared__ float s_v[{D}];
@@ -17305,7 +17482,7 @@ def _get_pgs_solve_mf_gs_kernel(
         for (int i = 0; i < dense_main_end; i++) {{
 {dense_consume}
             if (i + 1 < dense_main_end) {{
-                int next_jy_base = jy_world_base + (i + 1) * {D};
+                long long next_jy_base = jy_world_base + (i + 1) * {D};
 {dense_prefetch_next}
             }}
 
@@ -17816,7 +17993,7 @@ def _prefetch_streamed_dense_metadata(snippet: str) -> str:
         "            const int cur_row_type = pre_row_type, cur_row_parent = pre_row_parent;\n"
         "            const float cur_diag = pre_diag, cur_rhs = pre_rhs, cur_row_w = pre_row_w;\n",
     )
-    sweep = after_line(sweep, "int next_jy_base = ", loads("i + 1", " " * 16))
+    sweep = after_line(sweep, "long long next_jy_base = ", loads("i + 1", " " * 16))
     for source, register in (
         ("world_row_type.data[off_dense + i]", "cur_row_type"),
         ("world_row_parent.data[off_dense + i]", "cur_row_parent"),
@@ -24564,7 +24741,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     if (candidate_valid && batch_lane < {P}) {{
                         candidate_coord = dense_offset + batch_lane;
                         candidate_jacobian = dense_J.data[
-                            (dense_group * {M} + candidate_normal) * {P} + batch_lane];
+                            {offset64(f"dense_group * {M} + candidate_normal", P)} + batch_lane];
                     }} else if (candidate_valid && batch_lane <= {P + 1}) {{
                         const int sparse_slot = batch_lane - {P};
                         const int sparse_row = row_base + candidate_normal;
@@ -24709,7 +24886,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             float response = 0.0f;
             if (lane < {P}) {{
                 coord = dense_offset + lane;
-                const int dense_index = (dense_group * {M} + row) * {P} + lane;
+                const long long dense_index = {offset64(f"dense_group * {M} + row", P)} + lane;
                 jacobian = dense_J.data[dense_index];
                 response = dense_Y.data[dense_index];
             }} else if (lane <= {P + 1}) {{
@@ -24752,7 +24929,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 const int sibling_sparse_row = row_base + sibling;
                 if (lane < {P}) {{
                     sibling_coord = dense_offset + lane;
-                    const int sibling_dense_index = (dense_group * {M} + sibling) * {P} + lane;
+                    const long long sibling_dense_index = {offset64(f"dense_group * {M} + sibling", P)} + lane;
                     sibling_jacobian = dense_J.data[sibling_dense_index];
                     sibling_response = dense_Y.data[sibling_dense_index];
                     sibling_response_here = sibling_response;
@@ -24983,9 +25160,9 @@ _DENSE_BISECTION_FRICTION_SOURCE = """
                 if (i != i_t1) {
                     new_impulse = s_lam_dense[i];
                 } else {
-                    int n_row_base = jy_world_base + parent_idx * __D__;
-                    int t1_row_base = jy_world_base + i_t1 * __D__;
-                    int t2_row_base = jy_world_base + i_t2 * __D__;
+                    long long n_row_base = jy_world_base + parent_idx * __D__;
+                    long long t1_row_base = jy_world_base + i_t1 * __D__;
+                    long long t2_row_base = jy_world_base + i_t2 * __D__;
 
                     float target_vel_n = -s_rhs_dense[parent_idx];
                     float mu = s_mu_dense[i];

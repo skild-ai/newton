@@ -1,0 +1,1 @@
+Fix `SolverSteel` reading and writing outside its dense row and mass-matrix buffers at large world counts: native kernels now index these per-world blocks with 64-bit offsets, so scenes past 2**31 elements per buffer (for example more than 6,476 worlds of 921 rows x 360 DOFs, or 42,206 worlds of 320 rows x 159 DOFs) no longer return NaN, fault or silently corrupt the solve.
