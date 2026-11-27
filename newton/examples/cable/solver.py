@@ -3,6 +3,7 @@
 
 """Solver selection for examples that use Newton's rod material."""
 
+import copy
 import math
 
 import warp as wp
@@ -69,6 +70,34 @@ def pipeline_options(args):
     """
     del args
     return {}
+
+
+def add_world_count_arg(parser):
+    """Add ``--world-count``: the cable examples replicate their scene into that many independent worlds."""
+    return newton.examples.add_world_count_arg(parser)
+
+
+def replicate_worlds(template, args, clamps, *, ground=True, ground_cfg=None):
+    """Replicate a one-world ``template`` into ``--world-count`` worlds, over one shared ground plane if ``ground``.
+
+    Pin the template's fixtures with ``clamps`` (or pass ``None``) first; they are repeated for every world. Returns the builder to
+    finalize, the world count and ``expand``, which maps template body indices to every world's, world by world.
+    """
+    world_count = max(1, int(getattr(args, "world_count", 1) or 1))
+    builder = newton.ModelBuilder(up_axis=template.up_axis, gravity=template.gravity)
+    builder.rigid_gap = template.rigid_gap
+    builder.default_shape_cfg = copy.deepcopy(template.default_shape_cfg)
+    if ground:
+        builder.add_ground_plane(cfg=ground_cfg)
+    builder.replicate(template, copy_count=world_count)
+    stride = template.body_count
+    if clamps is not None:
+        clamps.replicate(world_count, stride, template.joint_count, template.articulation_count)
+
+    def expand(ids):
+        return [w * stride + int(i) for w in range(world_count) for i in ids]
+
+    return builder, world_count, expand
 
 
 def contact_budget(model, per_body, *, minimum=64):
@@ -214,6 +243,16 @@ class CableClamps:
         # Append closures only after the tree joint ranges are complete.
         for body in self.bodies:
             self.joints.append(builder.add_joint_fixed(-1, body, parent_xform=builder.body_q[body]))
+
+    def replicate(self, world_count, bodies, joints, articulations):
+        """Repeat the pins made on a one-world template for each of ``world_count`` replicated worlds.
+
+        ``bodies``, ``joints`` and ``articulations`` are the template's counts (each world's index stride).
+        """
+        self.bodies = [w * bodies + b for w in range(world_count) for b in self.bodies]
+        self.joints = [w * joints + j for w in range(world_count) for j in self.joints]
+        self.moving_roots = [w * bodies + b for w in range(world_count) for b in self.moving_roots]
+        self.root_articulations = [w * articulations + a for w in range(world_count) for a in self.root_articulations]
 
     def bind(self, model):
         if self.steel:

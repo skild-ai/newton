@@ -137,6 +137,18 @@ class Example:
                 }
             )
 
+        # ``--world-count`` copies of the sweep; each world's rings are checked as cases of their own.
+        builder, self.world_count, _expand = cable_solver.replicate_worlds(builder, args, None, ground=False)
+        stride = builder.body_count // self.world_count
+        self.cases = [
+            {
+                **case,
+                "label": case["label"] + (f" world {w}" if w else ""),
+                "bodies": [w * stride + b for b in case["bodies"]],
+            }
+            for w in range(self.world_count)
+            for case in self.cases
+        ]
         if getattr(args, "solver", "vbd") == "vbd":
             builder.color()
         self.model = builder.finalize()
@@ -422,6 +434,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = cable_solver.create_parser()
+    cable_solver.add_world_count_arg(parser)
     parser.set_defaults(num_frames=int(Example.FPS * Example.RUN_TIME))
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

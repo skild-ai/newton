@@ -274,7 +274,7 @@ class Example:
             self.obstacle_bodies.append(body)
             obstacle_init_z_list.append(float(z))
 
-        # Add ground plane
+        # Ground plane, shared by the ``--world-count`` copies of this world.
         ground_cfg = newton.ModelBuilder.ShapeConfig(
             density=builder.default_shape_cfg.density,
             kf=builder.default_shape_cfg.kf,
@@ -282,10 +282,17 @@ class Example:
             mu=1.0,
             restitution=builder.default_shape_cfg.restitution,
         )
-        builder.add_ground_plane(cfg=ground_cfg)
+        self.clamps.finish(builder)
+        builder, self.world_count, expand = cable_solver.replicate_worlds(
+            builder, args, self.clamps, ground_cfg=ground_cfg
+        )
+        stride = builder.body_count // self.world_count
+        self.cable_body_ids = [
+            [w * stride + b for b in ids] for w in range(self.world_count) for ids in self.cable_body_ids
+        ]
+        self.obstacle_bodies = expand(self.obstacle_bodies)
 
         # Color bodies for VBD solver
-        self.clamps.finish(builder)
         if not self.clamps.steel:
             builder.color()
 
@@ -310,7 +317,7 @@ class Example:
             self.model,
             args,
             contacts=self.contacts_per_world,
-            contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies),
+            contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies) // self.world_count,
             # A cable touching itself: the task's peak, 266 contacts, with a quarter on top.
             same_articulation_contacts=352,
             iterations=self.sim_iterations,
@@ -334,8 +341,8 @@ class Example:
         for i in range(num_obstacles):
             y = (+amplitude) if (i % 2 == 0) else (-amplitude)
             init_y_list.append(float(y))
-        self.obstacle_init_y = wp.array(init_y_list, dtype=float, device=self.solver.device)
-        self.obstacle_init_z = wp.array(obstacle_init_z_list, dtype=float, device=self.solver.device)
+        self.obstacle_init_y = wp.array(init_y_list * self.world_count, dtype=float, device=self.solver.device)
+        self.obstacle_init_z = wp.array(obstacle_init_z_list * self.world_count, dtype=float, device=self.solver.device)
 
         # Triangle wave parameters
         self.obstacle_amp_scale = 1.0
@@ -465,6 +472,7 @@ class Example:
     @staticmethod
     def create_parser():
         parser = cable_solver.create_parser()
+        cable_solver.add_world_count_arg(parser)
         parser.add_argument("--segments", type=int, default=40, help="Number of cable segments")
         parser.add_argument("--no-dahl", action="store_true", help="Disable Dahl friction (purely elastic)")
         parser.add_argument("--eps-max", type=float, default=2.0, help="Maximum plastic strain [rad]")

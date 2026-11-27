@@ -197,14 +197,18 @@ class Example:
             self.cable_bodies_list.append(rod_bodies)
             self.first_bodies.append(first_body)
 
-        # Create array of kinematic body indices
+        # Ground plane and ``--world-count`` copies of this world.
+        self.clamps.finish(builder)
+        builder, self.world_count, expand = cable_solver.replicate_worlds(builder, args, self.clamps)
+        kinematic_body_indices = expand(kinematic_body_indices)
+        self.cable_bodies_list = [
+            [w * builder.body_count // self.world_count + b for b in bodies]
+            for w in range(self.world_count)
+            for bodies in self.cable_bodies_list
+        ]
         self.kinematic_bodies = wp.array(kinematic_body_indices, dtype=wp.int32)
 
-        # Add ground plane
-        builder.add_ground_plane()
-
         # Color particles and rigid bodies for VBD solver
-        self.clamps.finish(builder)
         if not self.clamps.steel:
             builder.color()
 
@@ -223,7 +227,7 @@ class Example:
             self.model,
             args,
             contacts=self.contacts_per_world,
-            contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies),
+            contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies) // self.world_count,
             # A cable touching itself: the task's peak, 387 contacts, with a quarter on top.
             same_articulation_contacts=512,
             iterations=self.sim_iterations,
@@ -344,7 +348,7 @@ class Example:
 
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
-    viewer, args = newton.examples.init(cable_solver.create_parser())
+    viewer, args = newton.examples.init(cable_solver.add_world_count_arg(cable_solver.create_parser()))
 
     # Create example and run
     newton.examples.run(Example(viewer, args), args)

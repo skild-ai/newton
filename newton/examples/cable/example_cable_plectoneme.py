@@ -38,8 +38,8 @@ from newton.examples.cable import solver as cable_solver
 
 @wp.kernel
 def _drive_endpoints_kernel(
-    root_body: int,
-    tip_body: int,
+    root_bodies: wp.array[int],
+    tip_bodies: wp.array[int],
     root_pos: wp.vec3,
     tip_pos: wp.vec3,
     root_rest_rot: wp.quat,
@@ -60,6 +60,8 @@ def _drive_endpoints_kernel(
     root_pose = wp.transform(root_pos, root_rot)
     tip_pose = wp.transform(tip_pos, tip_rot)
 
+    root_body = root_bodies[wp.tid()]
+    tip_body = tip_bodies[wp.tid()]
     body_q0[root_body] = root_pose
     body_q1[root_body] = root_pose
     body_q0[tip_body] = tip_pose
@@ -166,9 +168,12 @@ class Example:
             builder.add_articulation(self.joints, label="plectoneme_articulation")
 
         self.clamps.finish(builder)
+        builder, self.world_count, expand = cable_solver.replicate_worlds(builder, args, self.clamps, ground=False)
         if not self.clamps.steel:
             builder.color()
         self.model = builder.finalize()
+        self.root_bodies = wp.array(expand([self.root_body]), dtype=int, device=self.model.device)
+        self.tip_bodies = wp.array(expand([self.tip_body]), dtype=int, device=self.model.device)
 
         # Contacts per world: the task's peak, 225 contacts, under Steel and VBD, with a quarter on top.
         self.contacts_per_world = cable_solver.contact_budget(self.model, 3.5)
@@ -181,7 +186,7 @@ class Example:
             self.model,
             args,
             contacts=self.contacts_per_world,
-            contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies),
+            contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies) // self.world_count,
             iterations=self.sim_iterations,
             rigid_contact_history=True,
             rigid_body_contact_buffer_size=1024,
@@ -201,7 +206,7 @@ class Example:
         # Symmetry-breaking seed at the mid body.
         mid = self.NUM_ELEMENTS // 2
         body_q_np = self.state_0.body_q.numpy()
-        body_q_np[self.bodies[mid], 1] += self.SEED_BODY_OFFSET_Y
+        body_q_np[expand([self.bodies[mid]]), 1] += self.SEED_BODY_OFFSET_Y
         self.state_0.body_q.assign(body_q_np)
         self.state_1.body_q.assign(body_q_np)
         if self.clamps.steel:
@@ -258,10 +263,10 @@ class Example:
     def _apply_command(self, substep: int) -> None:
         wp.launch(
             _drive_endpoints_kernel,
-            dim=1,
+            dim=self.world_count,
             inputs=[
-                self.root_body,
-                self.tip_body,
+                self.root_bodies,
+                self.tip_bodies,
                 wp.vec3(*self.root_rest_pos),
                 wp.vec3(*self.tip_rest_pos),
                 self.root_rest_rot,
@@ -333,6 +338,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = cable_solver.create_parser()
+    cable_solver.add_world_count_arg(parser)
     parser.add_argument("--iterations", dest="iterations", type=int, default=None)
     parser.add_argument("--substeps", dest="substeps", type=int, default=None)
     parser.set_defaults(num_frames=int(Example.FPS * Example.TOTAL_TIME))
