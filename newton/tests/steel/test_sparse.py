@@ -1100,9 +1100,9 @@ def test_sparse_diagonal_contact_friction_matches_general_owner(test, device):
             sparse = run(optimized)
             general = run(reference)
             test.assertGreater(int(optimized._constraint_count.numpy().max()), 0, "no contact rows were generated")
-            test.assertGreater(
-                float(np.abs(sparse[-1][1] - slick[-1][1]).max()), 1.0e-3, "friction did not change the sparse response"
-            )
+            # Friction changes the incoming slider's velocity at impact; that displacement persists after release.
+            test.assertGreater(np.max(np.abs(sparse[0][1] - slick[0][1])), 1.0e-3)
+            test.assertGreater(np.max(np.abs(sparse[-1][0] - slick[-1][0])), 1.0e-5)
             for step, ((sparse_q, sparse_qd), (general_q, general_qd)) in enumerate(zip(sparse, general, strict=True)):
                 np.testing.assert_allclose(
                     sparse_q, general_q, rtol=2.0e-5, atol=2.0e-6, err_msg=f"joint_q step {step}"
@@ -1701,24 +1701,28 @@ def _mixed_problem():
 class TestSteelSparsePGS(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
     def test_cuda_free_velocity_limit_is_stateless(self):
-        """Apply free-body velocity limits without undoing old impulses or applying relaxation."""
+        """Clamp the free x velocity independently of an accelerated y contact in the same world."""
         device = "cuda:0"
 
         def array(value, dtype=float):
             return wp.array(value, dtype=dtype, device=device)
 
-        meta = np.zeros((2, 4), dtype=np.int32)
+        meta = np.zeros((4, 4), dtype=np.int32)
         meta[:, 0] = 0xFFFF  # Active endpoint at offset zero; static endpoint -1.
-        meta[:, 1] = np.float32(0.5).view(np.int32)
-        meta[:, 3] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT | (-1 << MF_META_ROW_TYPE_BITS)
-        rows = np.zeros((2, 1, 6), dtype=np.float32)
-        rows[:, 0, 0] = 1.0
+        meta[::2, 1] = np.float32(1.0).view(np.int32)
+        meta[1::2, 1] = np.float32(0.5).view(np.int32)
+        meta[::2, 3] = PGS_CONSTRAINT_TYPE_CONTACT | (-1 << MF_META_ROW_TYPE_BITS)
+        meta[1::2, 3] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT | (-1 << MF_META_ROW_TYPE_BITS)
+        rows = np.zeros((2, 2, 6), dtype=np.float32)
+        rows[:, 0, 1] = 1.0
+        rows[:, 1, 0] = 1.0
         velocity = np.zeros((2, 6), dtype=np.float32)
         velocity[:, 0] = [-2.0, 2.0]
-        impulses = array([[3.0], [3.0]])
+        velocity[:, 1] = -2.0
+        impulses = array([[0.0, 3.0], [0.0, 3.0]])
         delta = wp.zeros((2, 6), device=device)
         wp.launch_tiled(
-            _get_pgs_solve_sparse_kernel(1, 6, 6, free_body_constraint_max=1),
+            _get_pgs_solve_sparse_kernel(1, 6, 6, free_body_constraint_max=2, nesterov_momentum=True),
             dim=[1],
             inputs=[
                 2,
@@ -1736,25 +1740,28 @@ class TestSteelSparsePGS(unittest.TestCase):
                 array(np.ones((2, 6)), int),
                 array(np.arange(12).reshape(2, 6), int),
                 array(velocity.reshape(-1)),
-                array([1, 1], int),
+                array([2, 2], int),
                 array(meta, int),
                 impulses,
                 array(rows),
                 array(np.zeros_like(rows)),
                 array(rows),
                 array(np.zeros_like(rows)),
-                array([[0.0], [0.0]]),
-                1,
+                array(np.zeros((2, 2))),
+                4,
                 0.4,
             ],
             outputs=[delta],
             block_dim=64,
             device=device,
         )
-        np.testing.assert_array_equal(impulses.numpy(), [[1.0], [0.0]])
-        expected = np.zeros((2, 6))
-        expected[0, 0] = 1.0
-        np.testing.assert_array_equal(delta.numpy(), expected)
+        result = delta.numpy()
+        # Four unrelaxed projections halve the negative x velocity four times.
+        np.testing.assert_array_equal(impulses.numpy()[:, 1], [0.125, 0.0])
+        np.testing.assert_array_equal(result[:, 0], [1.875, 0.0])
+        np.testing.assert_array_equal(result[:, 2:], 0.0)
+        self.assertEqual(result[0, 1], result[1, 1])
+        np.testing.assert_array_equal(impulses.numpy()[:, 0], result[:, 1])
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
     def test_cuda_free_patch_friction_pools_the_linked_normal_load(self):
@@ -2252,11 +2259,20 @@ def _step(case):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Sparse integrated solve requires CUDA")
 class TestSteelSparseSolver(unittest.TestCase):
-    def test_nesterov_momentum_bypasses_the_sparse_factor(self):
-        """Solve on the general sweep, which alone carries Nesterov momentum."""
-        model = _build_model()
-        self.assertEqual(_make_solver(model, True)._sparse_mass_matrix_size, 9)
-        self.assertIsNone(_make_solver(model, True, nesterov_momentum=True)._sparse_mass_matrix_size)
+    def test_nesterov_momentum_uses_sparse_factors(self):
+        """Keep the sparse owner and change its finite-budget solution only after extrapolation starts."""
+
+        def solve(iterations, momentum):
+            case = _case(True, free_count=1, boxes=True, iterations=iterations, nesterov_momentum=momentum)
+            self.assertEqual(case[1]._sparse_mass_matrix_size, 9)
+            _step(case)
+            return case[1]._impulses.numpy(), case[2].joint_qd.numpy()
+
+        for off, on in zip(solve(2, False), solve(2, True), strict=True):
+            np.testing.assert_array_equal(off, on)
+        for off, on in zip(solve(8, False), solve(8, True), strict=True):
+            self.assertTrue(np.all(np.isfinite(on)))
+            self.assertGreater(np.max(np.abs(off - on)), 1e-7)
 
     def test_heterogeneous_worlds_do_not_invent_joint_support(self):
         """Admit a robot-only world and a separate free-only world without oversized row support."""
@@ -2983,6 +2999,7 @@ class TestSteelLocalInternalSolve(unittest.TestCase):
             persistent_queue: bool = False,
             active_count: int = 2,
             dense_response_matrix: bool = False,
+            momentum: bool = False,
         ):
             variant_diagonal = wp.array(cfm, dtype=wp.float32, device=device)
             variant_impulses = wp.zeros((2, max_constraints), dtype=wp.float32, device=device)
@@ -2997,6 +3014,7 @@ class TestSteelLocalInternalSolve(unittest.TestCase):
                 lanes_per_world=lanes_per_world,
                 contact_capable=contact_capable,
                 dense_response_matrix=dense_response_matrix,
+                nesterov_momentum=momentum,
             )
             inputs = [candidate_articulations, candidate_articulations]
             if persistent_queue:
@@ -3067,6 +3085,19 @@ class TestSteelLocalInternalSolve(unittest.TestCase):
         for variant_outputs in numerical_variants + matrix_variants:
             for one_warp, variant in zip(one_warp_outputs, variant_outputs, strict=True):
                 np.testing.assert_allclose(variant, one_warp, rtol=0.0, atol=2.0e-6)
+
+        # Independent row-space response and velocity-space owners must extrapolate
+        # the same iterate, including when a warp is split between two solve worlds.
+        direct = launch_variant(1, contact_capable=False, momentum=True)
+        subwarp = launch_variant(
+            1, contact_capable=False, lanes_per_world=16, dense_response_matrix=True, momentum=True
+        )
+        for actual, expected in zip(subwarp, direct, strict=True):
+            np.testing.assert_allclose(actual, expected, rtol=0.0, atol=2.0e-6)
+        self.assertGreater(np.max(np.abs(direct[1] - one_warp_outputs[1])), 1.0e-7)
+        np.testing.assert_allclose(
+            direct[2][:dof_count] - velocity[:dof_count], direct[1][0, :2] @ response, rtol=0.0, atol=2.0e-6
+        )
 
         one_warp_queue = launch_variant(1, persistent_queue=True, active_count=1)
         two_warp_queue = launch_variant(2, persistent_queue=True, active_count=1)

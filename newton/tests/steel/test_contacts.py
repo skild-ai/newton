@@ -4374,7 +4374,7 @@ def test_nesterov_momentum_converges_a_tower_in_fewer_sweeps(test, device):
 
 
 def test_nesterov_momentum_on_articulated_rows(test, device):
-    """Accelerate dense articulated contact, joint-limit and velocity-limit rows on the general sweep only."""
+    """Preserve local ownership and accelerate the general sweep with articulated contacts and velocity limits."""
     builder = newton.ModelBuilder()
     builder.add_ground_plane()
     parent, joints = -1, []
@@ -4399,13 +4399,16 @@ def test_nesterov_momentum_on_articulated_rows(test, device):
     builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=4000.0))
     model = builder.finalize(device=device)
 
-    # The specialized owners have no momentum sweep, so the option must route around them.
-    test.assertTrue(SolverSteel(model)._local_internal_fast_path)
-    general = SolverSteel(model, nesterov_momentum=True)
-    for name in ("_local_internal_fast_path", "_paired_factor_coordinates", "_sparse_diagonal_contact_solve"):
-        test.assertFalse(getattr(general, name), name)
-    test.assertIsNone(general._sparse_mass_matrix_size)
-    test.assertIn("_momentum", general._pgs_solve_mf_gs_kernel.key)
+    plain_solver = SolverSteel(model, nesterov_momentum=False)
+    accelerated_solver = SolverSteel(model, nesterov_momentum=True)
+    test.assertTrue(plain_solver._local_internal_fast_path)
+    for name in (
+        "_local_internal_fast_path",
+        "_paired_factor_coordinates",
+        "_sparse_diagonal_contact_solve",
+        "_sparse_mass_matrix_size",
+    ):
+        test.assertEqual(getattr(plain_solver, name), getattr(accelerated_solver, name), name)
 
     error, _ = _momentum_solves(
         model, articulation_constraint_max=128, enable_joint_limits=True, enable_joint_velocity_limits=True

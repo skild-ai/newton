@@ -3158,6 +3158,44 @@ def test_colored_spin_decelerates_at_the_coulomb_rate_and_sticks(test, device):
     test.assertLess(np.max(np.abs(held["body_qd"][:, 5])), 1e-4)
 
 
+def test_colored_fingertips_hold_an_off_center_bar(test, device):
+    """Hold a bar against gravity's 0.094 N m torque with two 1 cm torsional patches."""
+    builder = newton.ModelBuilder()
+    for side in (-1, 1):
+        pose = wp.transform(wp.vec3(0, side * 0.022, 0.5), wp.quat_identity())
+        finger = builder.add_link(xform=pose)
+        builder.add_shape_sphere(finger, radius=0.012, cfg=newton.ModelBuilder.ShapeConfig(density=2700, mu=0.8))
+        joint = builder.add_joint_prismatic(
+            -1, finger, parent_xform=pose, axis=(0, side, 0), target_q=-0.004, target_ke=3000, target_kd=50
+        )
+        builder.add_articulation([joint])
+    bar = builder.add_body(xform=wp.transform(wp.vec3(0.08, 0, 0.5), wp.quat_identity()))
+    builder.add_shape_box(bar, hx=0.12, hy=0.01, hz=0.025, cfg=newton.ModelBuilder.ShapeConfig(density=500, mu=0.8))
+    model = builder.finalize(device=device)
+    for radius in (0.01, 0.0):
+        with test.subTest(radius=radius):
+            set_torsion_radius(model, radius)
+            solver = SolverSteel(
+                model, iterations=8, nesterov_momentum=True, contact_gap_gate=0.005, **_COLORED_TORSION
+            )
+            pipeline = newton.CollisionPipeline(model)
+            contacts, control = pipeline.contacts(), model.control()
+            state, output = model.state(), model.state()
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            tilt = []
+            for _ in range(21):
+                for _substep in range(4):
+                    pipeline.collide(state, contacts, dt=1 / 240)
+                    solver.step(state, output, control, contacts, 1 / 240)
+                    state, output = output, state
+                x, y, z, w = state.body_q.numpy()[bar, 3:]
+                tilt.append(np.degrees(np.arcsin(np.clip(2 * (x * z - w * y), -1.0, 1.0))))
+            if radius:
+                test.assertLess(np.max(np.abs(tilt)), 5.0)
+            else:
+                test.assertLess(np.min(tilt), -45.0)
+
+
 def test_colored_variants_track_plain_and_converge_to_immediate(test, device):
     """Match plain's three-foot spinner on every variant, close immediate's gap as sweeps rise, and act."""
     expected, _ = _spinner(device, "propagation", 32, 0.01, spin=4.0)
@@ -3230,30 +3268,36 @@ def test_colored_contact_order_changes_the_result_no_more_than_on_immediate(test
 
 def test_colored_serial_tail_hosts_the_group_after_its_members(test, device):
     """Solve a group whose members overflow a two-color cap in the serial tail, host last, on each variant."""
-    uncapped, *_ = fixture(0.01, device=device, spin=10.0, **_COLORED_TORSION)
-    for variant in ("packed", "block"):
-        with test.subTest(variant=variant):
-            with patch.object(solver_steel, "PROPAGATION_COLOR_TAIL", 2):
-                with _colored_variant(variant):
-                    _, solver, model, state, contacts = fixture(
-                        0.01, device=device, spin=10.0, step=False, **_COLORED_TORSION
-                    )
-                output = model.state()
-                solver.step(state, output, model.control(), contacts, 0.0025)
-            count = int(contacts.rigid_contact_count.numpy()[0])
-            slots = solver._contact_slot.numpy()[:count]
-            ((spin, members),) = _propagation_torsion_rows(solver).items()
-            contact_of = {int(slots[c]): c for c in range(count)}
-            colors = _contact_colors(solver)
-            tail = [contact_of[n] for n in members if colors[contact_of[n]] == 2]
-            host = max(contact_of[n] for n in members)
-            test.assertGreaterEqual(len(tail), 2)
-            test.assertIn(host, tail)
-            test.assertEqual(spin, _spare_rows(solver, count)[host])
-            # The tail solves its units in slot order, which places the host's rows after its members'.
-            test.assertEqual(int(slots[host]), max(int(slots[c]) for c in tail))
-            test.assertNotEqual(float(solver._propagation_impulses.numpy()[0, spin]), 0.0)
-            np.testing.assert_allclose(output.body_qd.numpy(), uncapped["body_qd"], rtol=0.0, atol=1.0e-5)
+    for initial_spin in (1.0, 10.0):
+        uncapped, reference, *_ = fixture(0.01, device=device, spin=initial_spin, **_COLORED_TORSION)
+        reference_spin = next(iter(_propagation_torsion_rows(reference)))
+        expected = float(reference._propagation_impulses.numpy()[0, reference_spin])
+        if initial_spin == 1.0:
+            # Sliding can consume the whole torsion budget at the higher speed.
+            test.assertGreater(abs(expected), 1.0e-6)
+        for variant in ("packed", "block"):
+            with test.subTest(variant=variant, initial_spin=initial_spin):
+                with patch.object(solver_steel, "PROPAGATION_COLOR_TAIL", 2):
+                    with _colored_variant(variant):
+                        _, solver, model, state, contacts = fixture(
+                            0.01, device=device, spin=initial_spin, step=False, **_COLORED_TORSION
+                        )
+                    output = model.state()
+                    solver.step(state, output, model.control(), contacts, 0.0025)
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                slots = solver._contact_slot.numpy()[:count]
+                ((spin, members),) = _propagation_torsion_rows(solver).items()
+                contact_of = {int(slots[c]): c for c in range(count)}
+                colors = _contact_colors(solver)
+                tail = [contact_of[n] for n in members if colors[contact_of[n]] == 2]
+                host = max(contact_of[n] for n in members)
+                test.assertGreaterEqual(len(tail), 2)
+                test.assertIn(host, tail)
+                test.assertEqual(spin, _spare_rows(solver, count)[host])
+                # The tail solves its units in slot order, which places the host's rows after its members'.
+                test.assertEqual(int(slots[host]), max(int(slots[c]) for c in tail))
+                test.assertAlmostEqual(float(solver._propagation_impulses.numpy()[0, spin]), expected, delta=1.0e-7)
+                np.testing.assert_allclose(output.body_qd.numpy(), uncapped["body_qd"], rtol=0.0, atol=1.0e-5)
 
 
 def test_colored_dropped_members_leave_the_highest_kept_host(test, device):
@@ -3549,6 +3593,7 @@ for _fn in (
     test_colored_sweeps_built_without_torsion_leave_it_unsolved,
     test_colored_longest_first_hosts_the_group_in_its_last_unit,
     test_colored_spin_decelerates_at_the_coulomb_rate_and_sticks,
+    test_colored_fingertips_hold_an_off_center_bar,
     test_colored_variants_track_plain_and_converge_to_immediate,
     test_colored_patch_impulse_matches_immediate,
     test_colored_contact_order_changes_the_result_no_more_than_on_immediate,
@@ -4266,8 +4311,8 @@ def _link_launch(kernel, inputs, friction_start, row_phase):
             arr(np.full(dense, _LINK_RADIUS, np.float32)),
             zeros(dense),
             zeros((worlds, 1)),
-            # Nesterov momentum history: off.
-            zeros((1, 1)),
+            None,  # No momentum scratch.
+            None,  # No split-sweep velocity history.
             6,
             1.0,
             0,

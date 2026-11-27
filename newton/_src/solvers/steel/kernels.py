@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import dataclass
 from functools import cache
 
 import warp as wp
@@ -20,6 +21,168 @@ from .friction_patches import WARP_DETERMINISM_OFF, FrictionPatches, warmstart_d
 
 # SolverSteel rejects models with ``requires_grad``, so no kernel needs an adjoint.
 wp.set_module_options({"enable_backward": False, **WARP_DETERMINISM_OFF})
+
+
+# All sweep owners use the projected correction dotted with the previous lookahead.
+# Changing the active operator (e.g. enabling friction) starts a fresh sequence.
+_MOMENTUM_AGE = "interrupted || dot < 0.0f ? 0 : previous_age + 1"
+_MOMENTUM_BETA = """
+    if (age < 2) return 0.0f;
+    float beta = static_cast<float>(age - 1) / static_cast<float>(age + 2);
+    // Anchors retain tangential traction across solves. Its common component
+    // in both directions regularizes the cosine around a loaded equilibrium.
+    dot += anchor_sq;
+    correction_sq += anchor_sq;
+    lookahead_sq += anchor_sq;
+    if (correction_sq > 0.0f && lookahead_sq > 0.0f) {
+        // Project the lookahead onto the last correction and back onto its direction.
+        const float cosine_sq = (dot / correction_sq) * (dot / lookahead_sq);
+        beta *= fminf(1.0f, cosine_sq);
+    }
+    // A torque impulse is measured in N m s. Limit its extrapolation by the
+    // angular correction itself, independently of the linear contact impulses.
+    if (beta * beta * torque_move_sq > torque_correction_sq)
+        beta = sqrtf(torque_correction_sq / torque_move_sq);
+    return beta;
+"""
+
+
+@wp.func_native(f"return {_MOMENTUM_AGE};")
+def next_momentum_age(previous_age: int, dot: float, interrupted: bool) -> int: ...
+
+
+@wp.func_native(_MOMENTUM_BETA)
+def momentum_beta(
+    age: int,
+    dot: float,
+    correction_sq: float,
+    lookahead_sq: float,
+    torque_correction_sq: float,
+    torque_move_sq: float,
+    anchor_sq: float,
+) -> float: ...
+
+
+@dataclass(frozen=True)
+class SweepField:
+    """A lane-strided vector in the sweep's own coordinates."""
+
+    value: str  # CUDA lvalue, indexed by i
+    count: str
+    capacity: int
+    impulse: bool = False
+    history: tuple[str, str] | None = None  # optional global previous value and lookahead
+    movable: str = "true"  # stateless velocity-limit rows keep their last clamp
+    torque: str = ""  # rows carrying angular impulses
+    patch_rows: tuple[str, str] | None = None  # row kind at i and parent at {row}
+
+
+def warp_momentum(
+    enabled: bool,
+    fields: list[SweepField],
+    *,
+    lanes: int = 32,
+    iteration: str = "iteration",
+    restart: str = "false",
+    check_response_roundoff: bool = False,
+    patch_anchors: bool = False,
+) -> tuple[str, str]:
+    """Emit a projected sweep's gradient restart and update its impulses and affine images together."""
+    if not enabled:
+        return "", ""
+    declarations = ["int momentum_age = 0;"]
+    anchor_load = []
+    products = []
+    motion = []
+    updates = []
+    for k, field in enumerate(fields):
+        if field.history is None:
+            slots = (field.capacity + lanes - 1) // lanes
+            declarations.append(f"float previous_{k}[{slots}];")
+            if field.impulse:
+                declarations.append(f"float extrap_{k}[{slots}];")
+            previous, extrap = f"previous_{k}[j]", f"extrap_{k}[j]"
+        else:
+            previous, extrap = field.history
+        loop = f"for (int i = lane, j = 0; i < {field.count}; i += {lanes}, ++j)"
+        if patch_anchors and field.patch_rows:
+            kind, parent = field.patch_rows
+            anchor_load.append(f"""{loop} if (({kind}) == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
+                const int normal = {parent.format(row="i")};
+                if (normal >= 0 && ({parent.format(row="normal")}) >= 0)
+                    anchor_sq += {field.value} * {field.value};
+            }}""")
+        if field.impulse:
+            torque_progress = ""
+            if field.torque:
+                torque_progress = f"""if ({field.torque}) {{
+                    torque_correction_sq += correction * correction;
+                    torque_move_sq += move * move;
+                }}"""
+            products.append(f"""{loop} {{
+                {f"if (!({field.movable})) continue;" if field.movable != "true" else ""}
+                const float move = {field.value} - {previous};
+                const float correction = move - {extrap};
+                dot += correction * {extrap};
+                correction_sq += correction * correction;
+                lookahead_sq += {extrap} * {extrap};
+                {torque_progress}
+            }}""")
+        else:
+            motion.append(f"{loop} moved |= {field.value} != {previous};")
+        roundoff = ""
+        if check_response_roundoff and field.impulse:
+            roundoff = f"""if (beta != 0.0f && ({field.movable})) {{
+                const float move = x - {previous};
+                const float lost = (y - x) - beta * move;
+                reapply_impulses |= (y == x && move != 0.0f) || fabsf(lost) > fabsf(move - {extrap});
+            }}"""
+        updates.append(f"""{loop} {{
+            const float x = {field.value};
+            const float y = beta != 0.0f && ({field.movable}) ? x + beta * (x - {previous}) : x;
+            {roundoff}
+            {previous} = x;
+            {f"{extrap} = y - x;" if field.impulse else ""}
+            if (beta != 0.0f) {field.value} = y;
+        }}""")
+    # Only a patch normal links to itself or another normal; point contacts have parent -1.
+    declarations.append("float anchor_sq = 0.0f;" if anchor_load else "constexpr float anchor_sq = 0.0f;")
+    seed = ""
+    if anchor_load:
+        seed = f"""if ({iteration} == 0) {{
+            {chr(10).join(anchor_load)}
+            for (int d = {lanes // 2}; d; d >>= 1)
+                anchor_sq += __shfl_xor_sync(MASK, anchor_sq, d, {lanes});
+        }}"""
+    metrics = ["dot", "correction_sq", "lookahead_sq"]
+    if any(field.torque for field in fields):
+        metrics.extend(("torque_correction_sq", "torque_move_sq"))
+    reductions = "\n".join(f"{name} += __shfl_xor_sync(MASK, {name}, d, {lanes});" for name in metrics)
+    step = f"""
+        {"bool reapply_impulses = false;" if check_response_roundoff else ""}
+        float beta = 0.0f;
+        {seed}
+        if ({iteration} > 0) {{
+            float dot = 0.0f, correction_sq = 0.0f, lookahead_sq = 0.0f;
+            float torque_correction_sq = 0.0f, torque_move_sq = 0.0f;
+            if (momentum_age > 1) {{
+                {chr(10).join(products)}
+                for (int d = {lanes // 2}; d; d >>= 1) {{ {reductions} }}
+            }}
+            // In a redundant system the impulses can still move in a null direction
+            // after every represented velocity has reached a fixed point.
+            bool moved = false;
+            {chr(10).join(motion)}
+            const bool interrupted = {restart} || !__any_sync(MASK, moved);
+            const int previous_age = momentum_age;
+            const int age = {_MOMENTUM_AGE};
+            beta = [&]() {{ {_MOMENTUM_BETA} }}();
+            momentum_age = age;
+        }}
+        {chr(10).join(updates)}
+        __syncwarp(MASK);
+"""
+    return "\n".join(declarations), step
 
 
 def _steel_module(name: str) -> wp.Module:

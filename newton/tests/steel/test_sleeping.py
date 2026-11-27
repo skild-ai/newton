@@ -711,7 +711,8 @@ def test_transient_divergence_is_reported(test, device):
 class _Run:
     def __init__(self, device, skip, interval, velocity_limits, graph, arm, options):
         self.model = _dynamics_scene(device, arm)
-        self.pipeline = newton.CollisionPipeline(self.model, rigid_contact_max=512)
+        # The bitwise comparison needs the same contact and row order in both runs.
+        self.pipeline = newton.CollisionPipeline(self.model, rigid_contact_max=512, deterministic=True)
         options = dict(options)
         overrides = options.pop("kernel_overrides", {})
         with kernel_overrides(overrides):
@@ -719,6 +720,7 @@ class _Run:
                 self.model,
                 **{
                     **PROFILE,
+                    "deterministic": wp.DeterministicMode.RUN_TO_RUN,
                     "update_mass_matrix_interval": interval,
                     "enable_joint_velocity_limits": velocity_limits,
                     **options,
