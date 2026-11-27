@@ -737,6 +737,14 @@ add_example_test(
 )
 add_example_test(
     TestCableExamples,
+    name="cable.example_cable_cross_slide_table",
+    devices=cuda_test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 540, "solver": "steel", "solve-mode": "colored"},
+    test_suffix="native_steel",
+)
+add_example_test(
+    TestCableExamples,
     name="cable.example_cable_initial_rest_pose",
     devices=test_devices,
     use_viewer=True,

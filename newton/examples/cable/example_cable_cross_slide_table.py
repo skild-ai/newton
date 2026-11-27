@@ -414,7 +414,9 @@ class Example:
         fps = 60
         self.frame_dt = 1.0 / fps
         self.sim_time = 0.0
-        self.sim_substeps, sim_iterations = cable_solver.budget(args, 10, 192 if self.clamps.steel else 5)
+        self.sim_substeps, sim_iterations = cable_solver.budget(
+            args, 10, 192 if self.clamps.steel else 5, propagation=(10, 64)
+        )
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         # Cable and mechanism dimensions.
@@ -761,6 +763,9 @@ class Example:
             enable_joint_limits=True,
             contact_rows=32 * math.ceil(row_budget / 32),
             iterations=sim_iterations,
+            # Every sweep's impulses reach the whole mechanism: between tree passes, many sweeps of the pulleys
+            # build impulses that cancel in their estimate but not in the articulation, and the loop diverges.
+            propagation_interval=1,
             rigid_contact_history=True,
             rigid_body_contact_buffer_size=256,
         )
@@ -944,10 +949,9 @@ class Example:
     @staticmethod
     def create_parser():
         parser = cable_solver.create_parser()
-        # The table moves only through cable tension wrapped around the pulleys. The immediate response's exact
-        # Gauss-Seidel over the whole mechanism tracks the commanded path; the propagation response's per-body
-        # sweep transmits that tension too slowly and the table drifts off the path at any affordable budget.
-        parser.set_defaults(contact_response="immediate")
+        # The table moves only through cable tension wrapped around the pulleys. The propagation response tracks
+        # the commanded path at 10 substeps of 64 iterations, propagating after every iteration, about five times
+        # faster than the immediate response's exact sweep (10 substeps of 192 iterations).
         return parser
 
 

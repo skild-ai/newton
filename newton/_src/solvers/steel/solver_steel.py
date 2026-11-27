@@ -28,6 +28,7 @@ from ..coupled.model_view import ModelView
 from ..solver import SolverBase
 from . import blocked_cholesky, latency_fused
 from . import contact_compliance as _contact_compliance
+from . import dense_trisolve as _dense_trisolve
 from . import rod_chain_fk as _rod_chain_fk
 from . import rod_tree as _rod_tree
 from . import serial_units as _serial_units
@@ -10553,6 +10554,25 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
 
     def _stage3_trisolve_loop(self, size: int, state_aug: State):
+        if self.model.device.is_cuda and 128 < size <= _dense_trisolve.MAX_DOFS:
+            # A large articulation (a cable mechanism of rod and other joints): one block per articulation instead of
+            # one thread walking all n^2 terms.
+            wp.launch_tiled(
+                _dense_trisolve.trisolve_block_kernel(),
+                dim=[self._n_arts_by_size[size]],
+                inputs=[
+                    self._L_by_size[size],
+                    self._group_to_art[size],
+                    self._articulation_dof_start,
+                    size,
+                    state_aug._joint_tau,
+                    self._dynamics_art_active,
+                ],
+                outputs=[state_aug._joint_qdd],
+                block_dim=_dense_trisolve.BLOCK_DIM,
+                device=self.model.device,
+            )
+            return
         wp.launch(
             trisolve_loop,
             dim=self._n_arts_by_size[size],
@@ -11917,6 +11937,28 @@ class SolverSteel(SolverBase, CouplingInterface):
                 ],
                 outputs=[self._Y_by_size[size], self._J_world, self._Y_world],
                 block_dim=256,
+                device=self.model.device,
+            )
+            return
+        if self.model.device.is_cuda and 128 < size <= _dense_trisolve.MAX_DOFS:
+            # A large articulation: each row's two substitutions in a block of its own.
+            wp.launch_tiled(
+                _dense_trisolve.hinv_jt_block_kernel(),
+                dim=[n_arts * self._articulation_constraint_max],
+                inputs=[
+                    self._L_by_size[size],
+                    self._J_by_size[size],
+                    self._group_to_art[size],
+                    self._art_to_world,
+                    world_dof_offset,
+                    self._constraint_count,
+                    size,
+                    self._articulation_constraint_max,
+                    n_arts,
+                    int(self._hinv_jt_writes_world),
+                ],
+                outputs=[self._Y_by_size[size], self._J_world, self._Y_world],
+                block_dim=_dense_trisolve.BLOCK_DIM,
                 device=self.model.device,
             )
             return

@@ -2409,3 +2409,106 @@ add_function_test(
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_block_trisolve_matches_loop(test, device):
+    """The block-parallel solve of L L^T qdd = tau agrees with the per-articulation loop for large articulations."""
+    from newton._src.solvers.steel import dense_trisolve  # noqa: PLC0415
+
+    rng = np.random.default_rng(3)
+    for n, arts in ((200, 3), (643, 1)):
+        L = np.tril(rng.uniform(-0.1, 0.1, size=(arts, n, n))).astype(np.float32)
+        for a in range(arts):
+            L[a][np.diag_indices(n)] = rng.uniform(0.5, 2.0, size=n)
+        tau = rng.normal(size=arts * n).astype(np.float32)
+        inputs = [
+            wp.array(L, dtype=float, device=device),
+            wp.array(np.arange(arts, dtype=np.int32), dtype=int, device=device),
+            wp.array(np.arange(arts + 1, dtype=np.int32) * n, dtype=int, device=device),
+            n,
+            wp.array(tau, dtype=float, device=device),
+            wp.ones(arts, dtype=int, device=device),
+        ]
+        loop = wp.zeros(arts * n, dtype=float, device=device)
+        block = wp.zeros(arts * n, dtype=float, device=device)
+        wp.launch(steel_kernels.trisolve_loop, dim=arts, inputs=inputs, outputs=[loop], device=device)
+        wp.launch_tiled(
+            dense_trisolve.trisolve_block_kernel(),
+            dim=[arts],
+            inputs=inputs,
+            outputs=[block],
+            block_dim=dense_trisolve.BLOCK_DIM,
+            device=device,
+        )
+        expected = np.concatenate([np.linalg.solve(L[a] @ L[a].T, tau[a * n : (a + 1) * n]) for a in range(arts)])
+        np.testing.assert_allclose(block.numpy(), loop.numpy(), rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(block.numpy(), expected, rtol=1e-3, atol=1e-4)
+
+
+add_function_test(
+    TestSteelLaunchConfig,
+    "test_block_trisolve_matches_loop",
+    test_block_trisolve_matches_loop,
+    devices=get_cuda_test_devices(),
+)
+
+
+def test_block_hinv_jt_matches_par_row(test, device):
+    """The block-parallel Y = H^-1 J^T of large articulations agrees with the per-row loop, world rows included."""
+    from newton._src.solvers.steel import dense_trisolve  # noqa: PLC0415
+
+    rng = np.random.default_rng(5)
+    n, arts, rows = 300, 2, 4
+    L = np.tril(rng.uniform(-0.1, 0.1, size=(arts, n, n))).astype(np.float32)
+    for a in range(arts):
+        L[a][np.diag_indices(n)] = rng.uniform(0.5, 2.0, size=n)
+    J = rng.normal(size=(arts, rows, n)).astype(np.float32)
+    counts = np.array([3, 4], dtype=np.int32)  # the first world uses 3 of its 4 rows
+    results = []
+    for block in (False, True):
+        Y = wp.zeros((arts, rows, n), dtype=float, device=device)
+        J_world = wp.zeros((arts, rows, n), dtype=float, device=device)
+        Y_world = wp.zeros((arts, rows, n), dtype=float, device=device)
+        inputs = [
+            wp.array(L, dtype=float, device=device),
+            wp.array(J, dtype=float, device=device),
+            wp.array(np.arange(arts, dtype=np.int32), dtype=int, device=device),
+            wp.array(np.arange(arts, dtype=np.int32), dtype=int, device=device),
+            wp.zeros(arts, dtype=int, device=device),
+            wp.array(counts, dtype=int, device=device),
+            n,
+            rows,
+            arts,
+            1,
+        ]
+        if block:
+            wp.launch_tiled(
+                dense_trisolve.hinv_jt_block_kernel(),
+                dim=[arts * rows],
+                inputs=inputs,
+                outputs=[Y, J_world, Y_world],
+                block_dim=dense_trisolve.BLOCK_DIM,
+                device=device,
+            )
+        else:
+            wp.launch(
+                steel_kernels.hinv_jt_par_row,
+                dim=arts * rows,
+                inputs=inputs,
+                outputs=[Y, J_world, Y_world],
+                device=device,
+            )
+        results.append((Y.numpy(), J_world.numpy(), Y_world.numpy()))
+    for loop, block in zip(results[0], results[1], strict=True):
+        np.testing.assert_allclose(block, loop, rtol=1e-4, atol=1e-5)
+    expected = np.linalg.solve(L[1] @ L[1].T, J[1, 2])
+    np.testing.assert_allclose(results[1][0][1, 2], expected, rtol=1e-3, atol=1e-4)
+    test.assertTrue(np.all(results[1][0][0, 3] == 0.0), "rows past the world's count stay untouched")
+
+
+add_function_test(
+    TestSteelLaunchConfig,
+    "test_block_hinv_jt_matches_par_row",
+    test_block_hinv_jt_matches_par_row,
+    devices=get_cuda_test_devices(),
+)
