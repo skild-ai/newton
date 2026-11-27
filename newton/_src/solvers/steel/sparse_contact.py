@@ -137,7 +137,7 @@ def _get_sparse_contact_response_kernel(
 #if defined(__CUDA_ARCH__)
             __syncwarp(MASK);
 #endif
-            const int factor_base = group * 36;
+            const long long factor_base = (long long)group * 36;
             for (int node = lane; node < 6; node += stride) {
                 auto value = wp::vec3(0.0f);
                 for (int column = 0; column <= node; ++column) {

@@ -17319,7 +17319,7 @@ def _get_pgs_solve_mf_gs_kernel(
         momentum_init = f"""
     float previous_velocity[{ELEMS_PER_LANE}];
     bool projected_limit = false;
-    float* mom_prev_d = &momentum_scratch.data[world * momentum_scratch.shape[1]];
+    float* mom_prev_d = &momentum_scratch.data[{offset64("world", "momentum_scratch.shape[1]")}];
     float* mom_prev_m = mom_prev_d + {M_D};
     float* mom_e_d = mom_prev_m + {M_MF};
     float* mom_e_m = mom_e_d + {M_D};
