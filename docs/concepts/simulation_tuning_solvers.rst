@@ -347,8 +347,12 @@ repository examples spend tuning effort, not a shared solver API.
        and springs back rebounds low at large ``dt``.
        ``drive_stiffness_theta=0`` integrates the drive stiffness
        symplectically instead (damping stays implicit), as MuJoCo integrates
-       position actuators; it keeps that energy but needs
-       ``dt * sqrt(ke / m_eff) < 2``. ``drive_mode="rows"`` solves
+       position actuators; it conserves a modified energy instead of
+       dissipating it, but needs ``w * dt < 2`` with ``w = sqrt(ke / m_eff)``.
+       Intermediate values trade the two: an undamped mode's oscillation
+       envelope decays by ``1 / sqrt(1 + theta * (w * dt)^2)`` per step,
+       values of at least ``0.5`` are unconditionally stable, and values below
+       ``0.5`` need ``w * dt < 2 / sqrt(1 - 2 * theta)``. ``drive_mode="rows"`` solves
        them as PGS rows together with contacts and limits instead, and each
        driven DOF then uses one row of ``articulation_constraint_max``. Rows beyond ``articulation_constraint_max``
        (articulated bodies), ``free_body_constraint_max`` (free bodies) or

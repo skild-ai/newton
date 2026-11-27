@@ -2856,15 +2856,18 @@ class SolverSteel(SolverBase, CouplingInterface):
                 sweeps on CUDA. Construction-only.
             drive_stiffness_theta: Weight ``theta`` in ``[0, 1]`` of the end-of-step position in the
                 spring force of ``drive_mode="augmented"`` drives,
-                ``-ke * (q + theta * dt * qd_next - target)``; damping stays implicit. ``1`` (the
-                default) is backward Euler: unconditionally stable, but each step removes the fraction
-                ``theta * (w * dt)^2 / (1 + theta * (w * dt)^2)`` of the energy of an undamped
-                drive-loaded mode of angular frequency ``w`` [rad/s], so a mechanism that flexes on
-                impact and springs back loses rebound energy in proportion to ``dt``. ``0`` is
-                symplectic Euler, as MuJoCo integrates position actuators: the mode keeps its energy,
-                and the step is stable while ``w * dt < 2``. Values in between scale the loss by
-                ``theta``. Values other than ``1`` require ``drive_mode="augmented"``; other values
-                raise :class:`ValueError`. Construction-only.
+                ``-ke * (q + theta * dt * qd_next - target)``; damping stays implicit. For an
+                undamped drive-loaded mode of angular frequency ``w`` [rad/s], let
+                ``c = 1 + theta * (w * dt)^2``. ``1`` (the default) is backward Euler: every step
+                removes exactly the fraction ``1 - 1 / c`` of the mode's energy, so a mechanism that
+                flexes on impact and springs back loses rebound energy in proportion to ``dt``. For
+                other values the loss in a single step depends on the state; while the mode
+                oscillates, its amplitude envelope decays by ``c^(-1/2)`` per step. ``0`` is
+                symplectic Euler, as MuJoCo integrates position actuators, and conserves a modified
+                energy in its stable range. Values of at least ``0.5`` are unconditionally stable;
+                below ``0.5`` the step needs ``w * dt < 2 / sqrt(1 - 2 * theta)``, which is
+                ``w * dt < 2`` at ``0``. Values other than ``1`` require ``drive_mode="augmented"``;
+                other values raise :class:`ValueError`. Construction-only.
 
         Raises:
             ValueError: If the world count and the row capacities would pass the ``2**31 - 1`` elements of a
