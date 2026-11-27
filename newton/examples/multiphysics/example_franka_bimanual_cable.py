@@ -33,6 +33,7 @@ from __future__ import annotations
 import itertools
 import math
 import os
+import warnings
 
 import numpy as np
 import warp as wp
@@ -1199,11 +1200,15 @@ class Example:
             # joint_X_p of a loop closure every step), so the link follows exactly, solved with the cable.
             for body in self.cable_bodies:
                 position = wp.transform_get_translation(builder.body_q[body])
-                self.grip_joints.append(
-                    builder.add_joint_ball(
-                        -1, body, parent_xform=wp.transform(position, wp.quat_identity()), enabled=False
+                with warnings.catch_warnings():
+                    # The rod root's FREE joint already connects it to the world; its grip is a loop closure on
+                    # the same pair by design, solved as a closure row only while engaged.
+                    warnings.filterwarnings("ignore", message=".*another joint already connects these bodies.*")
+                    self.grip_joints.append(
+                        builder.add_joint_ball(
+                            -1, body, parent_xform=wp.transform(position, wp.quat_identity()), enabled=False
+                        )
                     )
-                )
         if self.anchor:
             # The cable's start is fixed to the table.
             self.clamps.pin(builder, cable_body_start)
