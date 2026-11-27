@@ -2831,9 +2831,17 @@ class CollisionPipeline:
                 sorter=self._contact_sorter,
                 shape_world=model.shape_world,
                 world_count=model.world_count,
-                shape_index_bits=self._contact_sort_shape_index_bits,
+                # Key-sorted matching builds its own bare shape-pair keys (sub-key zero), with shape bits for every
+                # shape: the deterministic sort's layout is not computed without deterministic mode.
+                shape_index_bits=(
+                    max(1, (max(shape_count, 1) - 1).bit_length())
+                    if matching_by_keys
+                    else self._contact_sort_shape_index_bits
+                ),
                 # A split sort hands the matcher bare pair keys.
-                sub_key_bits=0 if self._contact_sort_split_pair_key else self._contact_sort_sub_key_bits,
+                sub_key_bits=0
+                if matching_by_keys or self._contact_sort_split_pair_key
+                else self._contact_sort_sub_key_bits,
                 pos_threshold=contact_matching_pos_threshold,
                 normal_dot_threshold=contact_matching_normal_dot_threshold,
                 contact_report=contact_report,

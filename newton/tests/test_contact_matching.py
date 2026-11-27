@@ -1750,6 +1750,8 @@ def test_key_sorted_matching_without_deterministic_mode(test, device):
         test.assertFalse(pipeline.deterministic)
         test.assertIsNone(pipeline._contact_sorter)
         test.assertTrue(pipeline._contact_matcher.orders_by_keys)
+        # The pair keys distinguish every shape, so each contact searches only its own pair's predecessors.
+        test.assertGreaterEqual(1 << pipeline._contact_matcher._shape_index_bits, model.shape_count)
         test.assertIsNotNone(pipeline.contacts().rigid_contact_match_index)
         # An explicit deterministic pipeline sorts the contacts and matches them as usual.
         sorted_pipeline = newton.CollisionPipeline(
