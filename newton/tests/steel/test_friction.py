@@ -843,25 +843,27 @@ DT = 1.0 / 240.0
 G = 9.81
 
 
-def _box_on_slope(device, slope_angle, mu, articulated):
-    """A box on the ground under gravity tilted by ``slope_angle``, free or on three prismatic joints."""
+def _box_on_slope(device, slope_angle, mu, articulated, half_extents=(0.1, 0.1, 0.1), rotating=False):
+    """A box on the ground under gravity tilted by ``slope_angle``, free or on a D6 joint.
+
+    The D6 joint has three prismatic axes, and three revolute axes as well when ``rotating``.
+    """
     builder = newton.ModelBuilder(gravity=(G * np.sin(slope_angle), 0.0, -G * np.cos(slope_angle)))
     builder.default_shape_cfg.mu = mu
-    xform = wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity())
+    hx, hy, hz = half_extents
+    xform = wp.transform(wp.vec3(0.0, 0.0, hz), wp.quat_identity())
     if articulated:
         link = builder.add_link(xform=xform)
-        builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_shape_box(link, hx=hx, hy=hy, hz=hz)
         axis = newton.ModelBuilder.JointDofConfig
+        axes = [axis(axis=newton.Axis.X), axis(axis=newton.Axis.Y), axis(axis=newton.Axis.Z)]
         joint = builder.add_joint_d6(
-            -1,
-            link,
-            linear_axes=[axis(axis=newton.Axis.X), axis(axis=newton.Axis.Y), axis(axis=newton.Axis.Z)],
-            parent_xform=xform,
+            -1, link, linear_axes=axes, angular_axes=list(axes) if rotating else [], parent_xform=xform
         )
         builder.add_articulation([joint])
     else:
         body = builder.add_body(xform=xform)
-        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_shape_box(body, hx=hx, hy=hy, hz=hz)
     builder.add_ground_plane()
     return builder.finalize(device=device)
 
@@ -892,12 +894,38 @@ def test_every_mode_holds_inside_the_cone(test, device):
                 test.assertAlmostEqual(height, 0.1, delta=1.0e-3)
 
 
-def test_sliding_follows_each_modes_coulomb_update(test, device):
-    """Slide outside the friction cone: exact for current and coulomb_newton, approximate for bisection.
+def test_coupled_modes_hold_near_the_cone_boundary(test, device):
+    """Hold a slab at 97% of its friction limit, free and on a six-axis D6 joint.
 
-    ``g (sin a - mu cos a)`` is the exact sliding acceleration. The bisection modes solve the normal
-    impulse to a fixed tolerance per sweep and slide slightly faster on free bodies; the de Saxce bias
-    also lifts a sliding free body off the ground.
+    A contact off the center of mass has an anisotropic tangent block; each bisection probe must minimize the
+    tangent quadratic on the friction disk, since scaling the sticking impulse onto it lets the slab slide away.
+    """
+    mu, ratio, steps = 0.5, 0.97, 240
+    for articulated in (False, True):
+        for mode in MODES:
+            with test.subTest(articulated=articulated, mode=mode):
+                model = _box_on_slope(
+                    device, math.atan(ratio * mu), mu, articulated, half_extents=(0.12, 0.08, 0.06), rotating=True
+                )
+                solver = SolverSteel(model, friction_mode=mode, friction_anchor_beta=0.0)
+                pipeline = newton.CollisionPipeline(model)
+                contacts = pipeline.contacts()
+                state_0, state_1 = model.state(), model.state()
+                newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+                start = state_0.body_q.numpy()[0, :3].copy()
+                control = model.control()
+                for _ in range(steps):
+                    pipeline.collide(state_0, contacts)
+                    solver.step(state_0, state_1, control, contacts, DT)
+                    state_0, state_1 = state_1, state_0
+                slip = float(np.linalg.norm(state_0.body_q.numpy()[0, :3] - start))
+                test.assertLess(slip, 1.0e-3)
+
+
+def test_sliding_follows_each_modes_coulomb_update(test, device):
+    """Slide outside the friction cone at ``g (sin a - mu cos a)``, the exact sliding acceleration, in every mode.
+
+    The de Saxce bias also lifts a sliding free body off the ground.
     """
     slope_angle, mu, steps = 0.6, 0.3, 120
     expected = G * (np.sin(slope_angle) - mu * np.cos(slope_angle)) * steps * DT
@@ -906,19 +934,12 @@ def test_sliding_follows_each_modes_coulomb_update(test, device):
         for mode in MODES:
             results[(articulated, mode)] = _slide_friction_mode(device, mode, slope_angle, mu, articulated, steps)
     for articulated in (False, True):
-        for mode in ("fixed_normal", "coulomb_newton"):
+        for mode in MODES:
             with test.subTest(articulated=articulated, mode=mode):
                 velocity, height = results[(articulated, mode)]
                 test.assertAlmostEqual(float(velocity[0]), expected, delta=0.005 * expected)
-                test.assertAlmostEqual(height, 0.1, delta=1.0e-3)
-    for mode in ("bisection", "bisection_desaxce"):
-        with test.subTest(articulated=True, mode=mode):
-            velocity, height = results[(True, mode)]
-            test.assertAlmostEqual(float(velocity[0]), expected, delta=0.005 * expected)
-        with test.subTest(articulated=False, mode=mode):
-            velocity, height = results[(False, mode)]
-            test.assertGreater(float(velocity[0]), expected)
-            test.assertAlmostEqual(float(velocity[0]), expected, delta=0.08 * expected)
+                if articulated or mode != "bisection_desaxce":
+                    test.assertAlmostEqual(height, 0.1, delta=1.0e-3)
     # The de Saxce bias raises the normal target velocity of a sliding free-body contact.
     test.assertAlmostEqual(results[(False, "bisection")][1], 0.1, delta=1.0e-4)
     test.assertGreater(results[(False, "bisection_desaxce")][1], 0.1 + 1.0e-3)
@@ -956,6 +977,9 @@ def test_unsupported_combinations_raise(test, device):
                 SolverSteel(model, friction_mode=mode, friction_anchor_beta=0.0, contact_compliance=True)
             with test.assertRaisesRegex(NotImplementedError, "friction_mode"):
                 SolverSteel(model, friction_mode=mode, articulated_contact_response="propagation")
+            if mode != "coulomb_newton":
+                with test.assertRaisesRegex(ValueError, "contact_warmstart"):
+                    SolverSteel(model, friction_mode=mode, friction_anchor_beta=0.0, contact_warmstart=True)
 
 
 def test_sparse_factors_require_the_current_mode(test, device):
@@ -995,21 +1019,36 @@ _ZERO_LOAD_BLOCKS = {
 }
 
 
-@wp.func_native(
-    "#if defined(__CUDA_ARCH__)\n"
-    + FRICTION_PAIR_CUDA
-    + coupled_contact_cuda("coulomb_newton")
-    + """
+_COLORED_BLOCK_SOLVE = """
     const float* b = block.data;
     float n, t1, t2;
-    contact_block_solve(b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], 0.0f, b[9], 0.0f, 0.0f, 0.0f, n, t1, t2);
+    contact_block_solve(b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], 0.0f, b[9], b[10], b[11], b[12], n, t1, t2);
     out.data[0] = n;
     out.data[1] = t1;
     out.data[2] = t2;
 #endif
 """
+
+
+@wp.func_native(
+    "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA + coupled_contact_cuda("coulomb_newton") + _COLORED_BLOCK_SOLVE
 )
 def _coulomb_newton_block_native(block: wp.array[float], out: wp.array[float]): ...
+
+
+@wp.func_native(
+    "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA + coupled_contact_cuda("bisection") + _COLORED_BLOCK_SOLVE
+)
+def _bisection_block_native(block: wp.array[float], out: wp.array[float]): ...
+
+
+@wp.func_native(
+    "#if defined(__CUDA_ARCH__)\n"
+    + FRICTION_PAIR_CUDA
+    + coupled_contact_cuda("bisection_desaxce")
+    + _COLORED_BLOCK_SOLVE
+)
+def _bisection_desaxce_block_native(block: wp.array[float], out: wp.array[float]): ...
 
 
 @wp.kernel
@@ -1017,17 +1056,39 @@ def _coulomb_newton_block_kernel(block: wp.array[float], out: wp.array[float]):
     _coulomb_newton_block_native(block, out)
 
 
-def _coulomb_newton_colored_block(device, block):
-    """Solve one block with the colored sweep's ``contact_block_solve`` from zero impulses."""
+@wp.kernel
+def _bisection_block_kernel(block: wp.array[float], out: wp.array[float]):
+    _bisection_block_native(block, out)
+
+
+@wp.kernel
+def _bisection_desaxce_block_kernel(block: wp.array[float], out: wp.array[float]):
+    _bisection_desaxce_block_native(block, out)
+
+
+_COLORED_BLOCK_KERNELS = {
+    "coulomb_newton": _coulomb_newton_block_kernel,
+    "bisection": _bisection_block_kernel,
+    "bisection_desaxce": _bisection_desaxce_block_kernel,
+}
+
+
+def _colored_block(device, block, friction_mode="coulomb_newton"):
+    """Solve one block with the colored sweep's ``contact_block_solve``; omitted old impulses are zero."""
     out = wp.zeros(3, dtype=float, device=device)
+    padded = np.zeros(13, dtype=np.float32)
+    padded[: len(block)] = block
     wp.launch(
-        _coulomb_newton_block_kernel, dim=1, inputs=[wp.array(block, dtype=float, device=device), out], device=device
+        _COLORED_BLOCK_KERNELS[friction_mode],
+        dim=1,
+        inputs=[wp.array(padded, dtype=float, device=device), out],
+        device=device,
     )
     return out.numpy()
 
 
-def _coulomb_newton_mf_block(device, block):
-    """Solve one free-body contact block with the matrix-free kernel's Coulomb Newton update from zero impulses.
+def _mf_block(device, block, friction_mode="coulomb_newton"):
+    """Solve one free-body contact block with the matrix-free kernel's coupled update; omitted old impulses are zero.
 
     Unit Jacobians ``J = e_i`` with responses ``M^-1 J^T = G e_i`` give the rows the Delassus block ``G``, and the
     body's velocity is ``u``. The contact row has no diagonal, so only the coupled update moves it.
@@ -1045,7 +1106,9 @@ def _coulomb_newton_mf_block(device, block):
     meta[0, :3, 3] = np.array(row_types, dtype=np.int64) | (
         np.array([-1, 0, 0], dtype=np.int64) << MF_META_ROW_TYPE_BITS
     )
-    impulses = wp.zeros((1, 4), dtype=float, device=device)
+    old = np.zeros(4, dtype=np.float32)
+    old[: len(block) - 10] = block[10:13]
+    impulses = wp.array([old], dtype=float, device=device)
     velocity = np.zeros(6, dtype=np.float32)
     velocity[:3] = u
     kernel = _get_pgs_solve_mf_gs_kernel(
@@ -1055,7 +1118,7 @@ def _coulomb_newton_mf_block(device, block):
         wp.get_device(device).arch,
         has_dense_velocity_limit_rows=False,
         shared_metadata=True,
-        friction_mode="coulomb_newton",
+        friction_mode=friction_mode,
     )
     wp.launch_tiled(
         kernel,
@@ -1105,11 +1168,316 @@ def _coulomb_newton_mf_block(device, block):
 def test_coulomb_newton_normal_impulse_stays_nonnegative(test, device):
     """Keep the coupled Coulomb Newton normal impulse at or above zero where the root search ends below zero load."""
     for name, block in _ZERO_LOAD_BLOCKS.items():
-        for route, solve in (("colored", _coulomb_newton_colored_block), ("serial", _coulomb_newton_mf_block)):
+        for route, solve in (("colored", _colored_block), ("serial", _mf_block)):
             with test.subTest(block=name, route=route):
                 normal, *tangent = solve(device, np.array(block, dtype=np.float32))
                 test.assertGreaterEqual(normal, 0.0)
                 test.assertLessEqual(float(np.linalg.norm(tangent)), block[9] * normal * (1.0 + 1.0e-6))
+
+
+# Contact blocks whose sticking impulse leaves the friction disk along an anisotropic tangent block.
+# Values: u_n, u_t1, u_t2, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2, G_t2t2, mu.
+_SLIDING_BLOCKS = {
+    "decoupled": (-0.5, 1.0, 0.3, 1.0, 0.0, 0.0, 1.0, 0.6, 0.5, 0.5),
+    "coupled": (-0.5, 0.8, -0.4, 1.2, 0.3, -0.2, 0.9, -0.5, 0.6, 0.6),
+}
+
+
+def _disk_minimizer(tangent_block, velocity, radius):
+    """Minimize ``0.5 x^T A x + velocity^T x`` over ``|x| <= radius`` in float64."""
+    eigenvalues, basis = np.linalg.eigh(tangent_block)
+    rotated = -basis.T @ velocity
+    # A singular block skips the direct solve; the shifted search below also reaches its interior minimizer.
+    if eigenvalues.min() > 0.0 and np.linalg.norm(rotated / eigenvalues) <= radius:
+        return basis @ (rotated / eigenvalues)
+    lo, hi = 0.0, np.linalg.norm(rotated) / radius
+    for _ in range(200):
+        alpha = 0.5 * (lo + hi)
+        lo, hi = (alpha, hi) if np.linalg.norm(rotated / (eigenvalues + alpha)) > radius else (lo, alpha)
+    return basis @ (rotated / (eigenvalues + hi))
+
+
+def _bisection_reference(block, desaxce):
+    """The normal impulse whose disk-minimizing tangent pair zeroes the normal velocity, in float64."""
+    u_n, u_t, (g_nn, *g_nt), (g_11, g_12, g_22), mu = block[0], np.array(block[1:3]), block[3:6], block[6:9], block[9]
+    g_nt, tangent_block = np.array(g_nt), np.array([[g_11, g_12], [g_12, g_22]])
+    target = mu * np.linalg.norm(u_t) if desaxce else 0.0
+
+    def solve(normal):
+        tangent = _disk_minimizer(tangent_block, u_t + g_nt * normal, mu * normal)
+        return u_n + g_nn * normal + g_nt @ tangent - target, tangent
+
+    lo, hi = 0.0, 100.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if solve(mid)[0] < 0.0 else (lo, mid)
+    return np.array([hi, *solve(hi)[1]])
+
+
+def _first_load_reference(block, desaxce):
+    """The frictionless load and its disk-minimizing tangent pair, which a jammed search without a root keeps."""
+    u_n, u_t, (g_nn, *g_nt), (g_11, g_12, g_22), mu = block[0], np.array(block[1:3]), block[3:6], block[6:9], block[9]
+    normal = ((mu * np.linalg.norm(u_t) if desaxce else 0.0) - u_n) / g_nn
+    tangent = _disk_minimizer(np.array([[g_11, g_12], [g_12, g_22]]), u_t + np.array(g_nt) * normal, mu * normal)
+    return np.array([normal, *tangent])
+
+
+def test_bisection_solves_the_tangent_pair_on_the_disk(test, device):
+    """Match the bisection modes' coupled update to the disk minimizer at the root normal impulse."""
+    for mode in ("bisection", "bisection_desaxce"):
+        for name, block in _SLIDING_BLOCKS.items():
+            expected = _bisection_reference(block, mode == "bisection_desaxce")
+            for route, solve in (("colored", _colored_block), ("serial", _mf_block)):
+                with test.subTest(mode=mode, block=name, route=route):
+                    result = solve(device, np.array(block, dtype=np.float32), mode)
+                    np.testing.assert_allclose(result, expected, rtol=1.0e-4, atol=1.0e-5)
+
+
+# An ill-conditioned block whose coupled sticking solution lies well inside the cone, reached from nonzero impulses.
+# Values: u_n, u_t1, u_t2, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2, G_t2t2, mu, old impulses (normal, tangent 1, tangent 2).
+_ILL_CONDITIONED_STICKING_BLOCK = (
+    *(25.8318977356, -25.1314468384, 32.4639778137),
+    *(28.9735565186, -27.5162124634, 35.8052368164, 26.2391510010, -34.0760879517, 44.3519554138),
+    1.08889448643,
+    *(0.362457841635, -0.0915545076132, 0.380765765905),
+)
+
+
+def test_bisection_leaves_an_ill_conditioned_sticking_contact_at_rest(test, device):
+    """Reach the sticking solution of an ill-conditioned block: the contact's velocity ends at zero."""
+    block = np.array(_ILL_CONDITIONED_STICKING_BLOCK, dtype=np.float32)
+    g_nn, g_nt1, g_nt2, g_11, g_12, g_22 = block[3:9].astype(np.float64)
+    delassus = np.array([[g_nn, g_nt1, g_nt2], [g_nt1, g_11, g_12], [g_nt2, g_12, g_22]])
+    for route, solve in (("colored", _colored_block), ("serial", _mf_block)):
+        with test.subTest(route=route):
+            result = solve(device, block, "bisection").astype(np.float64)
+            velocity = block[:3].astype(np.float64) + delassus @ (result - block[10:13].astype(np.float64))
+            test.assertLess(float(np.abs(velocity).max()), 1.0e-3)
+
+
+# Blocks whose tangent impulse cancels the normal one and sticks at every load, so no load zeroes u_n.
+# Values: u_n, u_t1, u_t2, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2, G_t2t2, mu.
+_JAMMED_BLOCKS = {
+    "singular": (-0.5, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.2),
+    "near_singular": (-0.5, 0.0, 0.0, 1.0000005, 1.0, 0.0, 1.0, 0.0, 1.0, 1.2),
+    # Sticking pairs exactly on the cone, with a regular and a rank-one tangent block.
+    "on_the_cone": (-1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0),
+    "rank_one_on_the_cone": (-1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0),
+    # A rank-one jam that also slips off its axis: the disk solve has no root at any load.
+    "rank_one_slipping_off_axis": (-1.0, 0.0, 0.1, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+    # The same jam slipping just slower than its limit: the residual tends to -1.85e-5 and never reaches zero.
+    "rank_one_slipping_under_its_limit": (-0.001, 0.0, 0.0017, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+    # The residual tends to -1.04e-3 of the gap, below float32 rounding of its terms past 1e4 times the first load.
+    "rank_one_slipping_near_its_limit": (-1.0, 0.0, 1.7303188, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+    # Near rank one, the second tangent eigenvalue bounds the off-axis impulse: the residual peaks below zero.
+    "near_rank_one_slipping": (-0.001, 0.0, 0.001733, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-6, 2.0),
+    # Regular near-singular blocks: the probe sticks again only at a load near 1e4 times the frictionless one.
+    "stiff_slipping_off_axis": (-1.0, 0.0, 0.1, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-5, 2.0),
+    "stiffer_slipping_off_axis": (-1.0, 0.0, 0.1, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-4, 2.0),
+    "stiff_slipping_under_its_limit": (-0.001, 0.0, 0.0017, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-5, 2.0),
+    "stiffer_slipping_under_its_limit": (-0.001, 0.0, 0.0017, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0e-4, 2.0),
+    # Exactly rank two: the first row is the sum of the others, so the Schur complement is zero, but float32
+    # cofactors leave it slightly positive, and any root taken from it is false.
+    "rank_two_sticking": (-1.0, -0.49995, -0.49995, 4712.0, 1548.0, 3164.0, 1275.0, 273.0, 2891.0, 4.0),
+    "rank_two_sticking_b": (-1.0, -0.49995, -0.49995, 7973.0, 3543.0, 4430.0, 3726.0, -183.0, 4613.0, 4.0),
+    "rank_two_sticking_c": (-1.0, -0.49995, -0.49995, 3325.0, 1123.0, 2202.0, 943.0, 180.0, 2022.0, 4.0),
+}
+
+
+def test_bisection_keeps_a_jammed_contact_near_the_frictionless_load(test, device):
+    """Stop the bisection search at most at the frictionless load on a block that has no root."""
+    for mode in ("bisection", "bisection_desaxce"):
+        for name, block in _JAMMED_BLOCKS.items():
+            for route, solve in (("colored", _colored_block), ("serial", _mf_block)):
+                with test.subTest(mode=mode, block=name, route=route):
+                    normal, *tangent = solve(device, np.array(block, dtype=np.float32), mode)
+                    bias = block[9] * float(np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
+                    test.assertLessEqual(normal, (bias - block[0]) / block[3] * (1.0 + 1.0e-5))
+                    test.assertLessEqual(float(np.linalg.norm(tangent)), block[9] * normal * (1.0 + 1.0e-6))
+
+
+# The slipping jam with a positive normal complement s has a root near 0.95 / s times its first load. Roots up to
+# 2^15 times that load are solved, unless the residual at the cap is within rounding; past it the search keeps the
+# first load. Values as in _JAMMED_BLOCKS.
+_ROOT_WITHIN_CAP_BLOCKS = {
+    "complement_9e-5": (-1.0, 0.0, 0.1, 1.00009, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+    "complement_3.5e-5": (-1.0, 0.0, 0.1, 1.000035, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+}
+_ROOT_PAST_CAP_BLOCKS = {
+    "complement_2.5e-5": (-1.0, 0.0, 0.1, 1.000025, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+    "complement_2^-20": (-1.0, 0.0, 0.1, 1.0 + 2.0**-20, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+    # A sticking jam whose linear residual reaches zero near 2.1e5 times the first load.
+    "sticking_complement_2^-21": (-1.0, -0.9, 0.0, 1.0 + 2.0**-21, 1.0, 0.0, 1.0, 0.0, 1.0, 2.0),
+}
+
+
+def test_bisection_solves_a_jammed_root_within_the_cap(test, device):
+    """Solve the far root of a nearly jammed block when it lies within 2^15 times the first load."""
+    for mode in ("bisection", "bisection_desaxce"):
+        for name, block in _ROOT_WITHIN_CAP_BLOCKS.items():
+            with test.subTest(mode=mode, block=name):
+                normal, tangent1, tangent2 = (float(v) for v in _mf_block(device, np.array(block, np.float32), mode))
+                bias = block[9] * float(np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
+                residual = block[0] + block[3] * normal + block[4] * tangent1 + block[5] * tangent2 - bias
+                test.assertGreater(normal, 1.0e3)
+                test.assertLessEqual(abs(residual), 1.0e-6 * normal)
+
+
+def test_bisection_keeps_the_first_load_past_the_root_cap(test, device):
+    """Keep the frictionless load and its disk pair on a nearly jammed block whose root lies beyond 2^15 times it."""
+    for mode in ("bisection", "bisection_desaxce"):
+        for name, block in _ROOT_PAST_CAP_BLOCKS.items():
+            with test.subTest(mode=mode, block=name):
+                expected = _first_load_reference(block, mode == "bisection_desaxce")
+                result = _mf_block(device, np.array(block, dtype=np.float32), mode)
+                np.testing.assert_allclose(result, expected, rtol=1.0e-4, atol=1.0e-5)
+
+
+# Jams that stick at the first probe with a small positive complement, regular and rank one. Their sticking residual,
+# u_n - u_t1 + (G_nn - 1) n, has a root at 209.75, but a complement this small is at float32 rounding on a jammed block,
+# so the search keeps the first load.
+_STICKING_COMPLEMENT_BLOCKS = {
+    "regular": (-1.0, -0.9999, 0.0, 1.0 + 2.0**-21, 1.0, 0.0, 1.0, 0.0, 1.0, 2.0),
+    "rank_one": (-1.0, -0.9999, 0.0, 1.0 + 2.0**-21, 1.0, 0.0, 1.0, 0.0, 0.0, 2.0),
+}
+
+
+def test_bisection_keeps_the_first_load_of_a_sticking_jam(test, device):
+    """Keep the first load and its disk pair on a jam that sticks there, even with a slightly positive complement."""
+    for mode in ("bisection", "bisection_desaxce"):
+        for name, block in _STICKING_COMPLEMENT_BLOCKS.items():
+            with test.subTest(mode=mode, block=name):
+                expected = _first_load_reference(block, mode == "bisection_desaxce")
+                result = _mf_block(device, np.array(block, dtype=np.float32), mode)
+                np.testing.assert_allclose(result, expected, rtol=1.0e-4, atol=1.0e-5)
+
+
+# A jam whose sliding direction turns with the load: its residual starts flat but has a root, 0.232005 at rank one
+# (from tan(theta) = 1.74378288 and mu = 2). The second tangent eigenvalue shifts it slightly.
+_TURNING_SLIP_BLOCKS = {
+    eps: (-0.001, 1.0, 1.74378288, 1.0, 1.0, 0.0, 1.0, 0.0, eps, 2.0) for eps in (0.0, 1.0e-5, 1.0e-4)
+}
+
+
+def test_bisection_finds_the_root_of_a_jam_whose_slip_turns(test, device):
+    """Reach the root of a jam whose residual is flat at the first probe but rises as the slip turns."""
+    for eps, block in _TURNING_SLIP_BLOCKS.items():
+        with test.subTest(eps=eps):
+            normal, tangent1, _ = (float(v) for v in _mf_block(device, np.array(block, np.float32), "bisection"))
+            expected = 0.232005 if eps == 0.0 else _bisection_reference(block, False)[0]
+            test.assertAlmostEqual(normal, expected, delta=1.0e-4 * expected)
+            test.assertLessEqual(abs(block[0] + normal + tangent1), 1.0e-5 * normal)
+
+
+# Blocks whose second tangent direction barely responds but slips at 1 m/s: friction must still oppose that slip,
+# alone and alongside slip on the first direction.
+# Values: u_n, u_t1, u_t2, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2, G_t2t2, mu.
+_STIFF_SLIPPING_BLOCKS = {
+    "along_the_stiff_direction": (-1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0e-7, 0.5),
+    "oblique": (-1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0e-7, 0.5),
+}
+
+
+def test_bisection_keeps_friction_on_a_stiff_slipping_direction(test, device):
+    """Oppose real slip along a tangent direction with a rounding-level response, as the disk minimizer does."""
+    for mode in ("bisection", "bisection_desaxce"):
+        for name, block in _STIFF_SLIPPING_BLOCKS.items():
+            with test.subTest(mode=mode, block=name):
+                expected = _bisection_reference(block, mode == "bisection_desaxce")
+                result = _mf_block(device, np.array(block, dtype=np.float32), mode)
+                np.testing.assert_allclose(result, expected, rtol=1.0e-4, atol=1.0e-5)
+
+
+def _one_dof_contact_force(model, mode, joint_f=None, steps=120, **solver_kwargs):
+    """Step ``model`` and return its reported contact force [N], averaged over the last quarter of the steps."""
+    solver = SolverSteel(model, friction_mode=mode, friction_anchor_beta=0.0, **solver_kwargs)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    observables = solver.observables({newton.solvers.SolverBase.ObservableKind.CONTACT_F}, contacts=contacts)
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    control = model.control()
+    if joint_f is not None:
+        control.joint_f.fill_(joint_f)
+    forces = []
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, DT, observables=observables)
+        state_0, state_1 = state_1, state_0
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        forces.append(observables.contact_f.numpy()[:count, :3].sum(axis=0))
+    return np.mean(forces[-steps // 4 :], axis=0)
+
+
+def _hinged_rod(device, mu, interference, yaw):
+    """A link on a revolute joint, pivot 0.3 m up, whose sphere tip touches the ground 0.1 m ahead.
+
+    The joint axis is +Y yawed by ``yaw`` about +Z. Statics give ``0.1 N + 0.3 T = 0.1 m g``, so friction locks
+    the rod for ``mu >= 1/3``.
+    """
+    builder = newton.ModelBuilder()
+    builder.default_shape_cfg.mu = mu
+    builder.add_ground_plane()
+    pivot = wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), yaw))
+    link = builder.add_link(xform=pivot)
+    radius = 0.02
+    tip = wp.transform(wp.vec3(0.1, 0.0, radius - 0.3 - interference), wp.quat_identity())
+    builder.add_shape_sphere(link, xform=tip, radius=radius)
+    builder.add_articulation([builder.add_joint_revolute(-1, link, axis=newton.Axis.Y, parent_xform=pivot)])
+    return builder.finalize(device=device)
+
+
+def test_bisection_bounds_the_normal_force_on_a_hinged_rod(test, device):
+    """Keep the reported forces of a one-DoF link near its frictionless load where friction locks it.
+
+    The rod's tangent block has rank one, and its coupled sticking solution leaves the contact approaching at
+    every load: the search must not raise the load toward the stop tolerance, and the reported friction must
+    balance the rod's statics. A self-locked load grows with every sweep in each mode, so it is compared on plain
+    sweeps.
+    """
+    plain = {"nesterov_momentum": False}
+    for yaw in (0.0, 1.0):
+        locked = _hinged_rod(device, mu=1.0, interference=0.002, yaw=yaw)
+        weight = float(locked.body_mass.numpy()[0]) * G
+        reference = abs(_one_dof_contact_force(locked, "fixed_normal", **plain)[2]) / weight
+        test.assertGreater(reference, 100.0)
+        resting = _hinged_rod(device, mu=0.5, interference=0.0, yaw=yaw)
+        for mode in ("bisection", "bisection_desaxce"):
+            for case, model in (("locked with interference", locked), ("resting", resting)):
+                with test.subTest(yaw=yaw, mode=mode, case=case):
+                    force = _one_dof_contact_force(model, mode, **(plain if model is locked else {})) / weight
+                    normal, friction = abs(force[2]), float(np.linalg.norm(force[:2]))
+                    if model is locked:
+                        test.assertAlmostEqual(normal, reference, delta=0.05 * reference)
+                    else:
+                        test.assertAlmostEqual(normal, 1.0, delta=0.05)
+                    test.assertAlmostEqual(friction, abs(normal - 1.0) / 3.0, delta=0.01 * normal)
+
+
+def test_bisection_reports_no_friction_without_tangential_mobility(test, device):
+    """Report no friction on a slider pressed square onto a wall, on the dense rows and the colored sweep.
+
+    The slider's axis is yawed off the world axes so that rounding leaves its tangent block a tiny response.
+    """
+    yaw = 0.3
+    normal = np.array([np.cos(yaw), np.sin(yaw), 0.0])
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.default_shape_cfg.mu = 0.5
+    rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), yaw)
+    radius, half_thickness = 0.05, 0.05
+    wall = (radius + half_thickness) * normal + np.array([0.0, 0.0, 0.3])
+    builder.add_shape_box(-1, xform=wp.transform(wp.vec3(*wall), rotation), hx=half_thickness, hy=0.5, hz=0.5)
+    frame = wp.transform(wp.vec3(0.0, 0.0, 0.3), rotation)
+    link = builder.add_link(xform=frame)
+    builder.add_shape_sphere(link, radius=radius)
+    builder.add_articulation([builder.add_joint_prismatic(-1, link, axis=newton.Axis.X, parent_xform=frame)])
+    model = builder.finalize(device=device)
+    for response in ("immediate", "colored"):
+        with test.subTest(response=response):
+            force = _one_dof_contact_force(model, "bisection", joint_f=1.0, **_response_options(response))
+            pressed = float(force @ normal)
+            test.assertAlmostEqual(abs(pressed), 1.0, delta=1.0e-3)
+            test.assertLess(float(np.linalg.norm(force - pressed * normal)), 1.0e-3)
 
 
 class TestSteelFrictionMode(unittest.TestCase):
@@ -1126,6 +1494,17 @@ for _fn in (
     test_unsupported_combinations_raise,
     test_sparse_factors_require_the_current_mode,
     test_coulomb_newton_normal_impulse_stays_nonnegative,
+    test_coupled_modes_hold_near_the_cone_boundary,
+    test_bisection_solves_the_tangent_pair_on_the_disk,
+    test_bisection_leaves_an_ill_conditioned_sticking_contact_at_rest,
+    test_bisection_keeps_a_jammed_contact_near_the_frictionless_load,
+    test_bisection_keeps_friction_on_a_stiff_slipping_direction,
+    test_bisection_solves_a_jammed_root_within_the_cap,
+    test_bisection_keeps_the_first_load_past_the_root_cap,
+    test_bisection_keeps_the_first_load_of_a_sticking_jam,
+    test_bisection_finds_the_root_of_a_jam_whose_slip_turns,
+    test_bisection_bounds_the_normal_force_on_a_hinged_rod,
+    test_bisection_reports_no_friction_without_tangential_mobility,
 ):
     add_function_test(TestSteelFrictionMode, _fn.__name__, _fn, devices=cuda_devices)
 
