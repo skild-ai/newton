@@ -199,7 +199,7 @@ class TestSteelFrictionAnchors(unittest.TestCase):
         """Hold two inclined cards on a bridge supported by two other pairs for two seconds."""
         builder = newton.ModelBuilder()
         builder.rigid_gap = 0.002
-        material = newton.ModelBuilder.ShapeConfig(mu=0.7, density=0.002 / (0.094 * 0.064 * 0.0007))
+        material = newton.ModelBuilder.ShapeConfig(mu=0.6, density=0.002 / (0.094 * 0.064 * 0.0007))
         builder.add_ground_plane(cfg=material)
 
         def card(y, z, pitch, yaw):
