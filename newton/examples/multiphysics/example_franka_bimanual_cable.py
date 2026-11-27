@@ -72,12 +72,14 @@ KNOT_OPEN = 0.04  # the knot's regrasps open wide: the cable lies within a few c
 _KNOT_TIE_TIME = 8.5
 # From the start of the pull to the hands closing on the ends (1.2 + 0.5 + 0.3 + 0.5) [s].
 _KNOT_GRAB_CLOSE = 2.5
-_KNOT_PULL_TIME = 8.1  # 1.2 + 0.5 + 0.3 + 0.5 + 0.3 + 0.6 + 4.0 + 0.3 + 0.4
+_KNOT_PULL_TIME = 10.1  # 1.2 + 0.5 + 0.3 + 0.5 + 0.3 + 0.6 + 6.0 + 0.3 + 0.4
+_KNOT_CINCH_TIME = 6.0  # [s] the slow pull that cinches the knot: at 4 s its peak tension slipped a jaw in about 1 run of 200
 _KNOT_GRIP_IN = 8  # links from each end where the hands take the cable
 _KNOT_GRIP_CLEAR = 0.07  # [m] from the gripped link to any other strand of cable
 # [m] of cable the cinched overhand knot keeps (its loop alone takes ~11 cm of this 12 mm cable). Pulling farther
-# apart only loads the grips and the knot's contacts.
-_KNOT_TAKE_UP = 0.14
+# apart only loads the grips and the knot's contacts: at 0.14 m the cinch's peak tension squeezed the cable out of a
+# jaw in about one run of 200; 0.16 m (with the slower cinch) none in 200, and the knot still renders cinched.
+_KNOT_TAKE_UP = 0.16
 # From the grasp on (friction combines by average): the cable slides on itself (0.3) so the pull can cinch the
 # knot, while the fingers (1.7) still hold it at 1.0. At 1.0 the knot's own friction outlasted the grips; the tie
 # keeps 1.0, which it needs to form.
@@ -930,7 +932,7 @@ class Example:
         lift = np.array([0.0, 0.0, 0.03])
         # A gentle start: the first centimetre slowly, so the tension does not jump from nothing.
         both(0.6, {"pos": ea + 0.01 * oa + lift}, {"pos": eb + 0.01 * ob + lift})
-        both(4.0, {"pos": ea + pull * oa + lift}, {"pos": eb + pull * ob + lift})  # slow: the knot cinches
+        both(_KNOT_CINCH_TIME, {"pos": ea + pull * oa + lift}, {"pos": eb + pull * ob + lift})  # slow: the knot cinches
         # Ease off a centimetre: the knot stays cinched and the grips stop holding the peak tension.
         ease = pull - 0.01
         both(0.3, {"pos": ea + ease * oa + lift}, {"pos": eb + ease * ob + lift})
