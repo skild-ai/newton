@@ -1,0 +1,1 @@
+The `franka_cable_ik_pick_place` example steps a Steel arm coupled to the VBD cable (`--rigid-solver steel`) at 4 substeps of 12 iterations by default instead of 10 of 24; it places the cable within the 1 cm check at the 4 cm and the 20 cm lift, about twice as fast.

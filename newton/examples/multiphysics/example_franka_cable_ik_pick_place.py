@@ -116,10 +116,15 @@ class Example:
         # The native sweep revisits the jaw contacts in every iteration (coupled_contact_passes), so six
         # substeps of four iterations hold the thin cable through the carry in every world.
         native_substeps, native_iterations = 6, 4
-        default_substeps = native_substeps if self.native_cable else 10
+        # A Steel arm coupled to the VBD cable places it within the 1 cm check at 4 substeps of 12 iterations, at
+        # the 4 cm and the 20 cm lift; MuJoCo arms keep 10 substeps.
+        if self.native_cable:
+            default_substeps = native_substeps
+        else:
+            default_substeps = 4 if args.rigid_solver == "steel" else 10
         self.sim_substeps = default_substeps if args.substeps is None else max(1, int(args.substeps))
         if args.steel_iterations is None:
-            args.steel_iterations = native_iterations if self.native_cable else 24
+            args.steel_iterations = native_iterations if self.native_cable else 12
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.use_graph = bool(args.graph_capture)
         self.world_count = max(1, int(args.world_count))
@@ -627,7 +632,7 @@ class Example:
             "--substeps",
             type=int,
             default=None,
-            help="Substeps per frame (native Steel: 6; 10 for the coupled solver).",
+            help="Substeps per frame (native Steel: 6; coupled: 4 with a Steel arm, 10 with MuJoCo).",
         )
         parser.add_argument(
             "--carry-height",
@@ -657,7 +662,7 @@ class Example:
             "--steel-iterations",
             type=int,
             default=None,
-            help="Steel PGS iterations (native: 4; 24 coupled).",
+            help="Steel PGS iterations (native: 4; 12 coupled).",
         )
         parser.add_argument(
             "--coupled-contact-passes",
