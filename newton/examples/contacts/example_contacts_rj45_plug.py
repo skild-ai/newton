@@ -244,7 +244,9 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 6
+        # Native Steel's propagation response holds the latch at 3 substeps of 8 sweeps as at 6 of 12 (the plug backs
+        # out 0.34 mm against a 2 mm tolerance either way).
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 6, 12, propagation=(3, 8))
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.clamps = cable_solver.CableClamps(args)
@@ -445,7 +447,7 @@ class Example:
             contact_rows=3 * self.contacts_per_world
             + 6 * len(self.clamps.bodies) // self.world_count
             + self.model.joint_dof_count // max(self.model.world_count, 1),
-            iterations=12,
+            iterations=self.sim_iterations,
             rigid_body_contact_buffer_size=256,
         )
 
