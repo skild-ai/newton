@@ -169,6 +169,8 @@ class Example:
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             **capacity,
+            # Native Steel: every world grasps alike (a sorted contact stream for Steel's deterministic mode).
+            deterministic=self.native_cable,
             **cable_solver.pipeline_options(args),
         )
         self.contacts = self.collision_pipeline.contacts()
@@ -182,6 +184,7 @@ class Example:
                 # Contact rows are reserved per world, including jaw patches and limits.
                 contact_rows=24 * self.payload_segments + 64,
                 enable_joint_limits=True,
+                deterministic=True,
             )
         else:
             payload_name = "vbd" if self.payload_kind == "vbd-cable" else "xpbd"

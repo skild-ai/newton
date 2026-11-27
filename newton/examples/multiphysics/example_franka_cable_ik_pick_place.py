@@ -152,6 +152,8 @@ class Example:
             broad_phase="explicit",
             shape_pairs_filtered=None if self.native_cable else self._ground_shape_pairs(),
             **capacity,
+            # Native Steel: every world grasps alike (a sorted contact stream for Steel's deterministic mode).
+            deterministic=self.native_cable,
             **cable_solver.pipeline_options(args),
         )
         self.contacts = self.collision_pipeline.contacts()
@@ -348,6 +350,7 @@ class Example:
                 contact_rows=24 * self.payload_segments + 64,
                 enable_joint_limits=True,
                 coupled_contact_passes=int(args.coupled_contact_passes),
+                deterministic=True,
             )
             return
         if self.rigid_solver == "steel":

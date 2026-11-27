@@ -125,6 +125,7 @@ def make_solver(
     enable_joint_limits=False,
     coupled_contact_passes=0,
     propagation_interval=3,
+    deterministic=False,
     **vbd_options,
 ):
     if getattr(args, "solver", "vbd") == "steel":
@@ -170,6 +171,9 @@ def make_solver(
             parallel_tree=parallel_tree,
             enable_joint_limits=enable_joint_limits,
             coupled_contact_passes=coupled_contact_passes,
+            # Rows reserved in a fixed order: with a deterministic collision pipeline every world of a replicated
+            # scene then steps bitwise alike, run to run (cheap with few contacts per world, as in a grasp).
+            deterministic=wp.DeterministicMode.RUN_TO_RUN if deterministic else None,
         )
     return newton.solvers.SolverVBD(model, iterations=iterations, **vbd_options)
 
