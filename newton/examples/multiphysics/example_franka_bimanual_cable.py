@@ -81,6 +81,7 @@ _KNOT_TAKE_UP = 0.14
 # knot, while the fingers (1.7) still hold it at 1.0. At 1.0 the knot's own friction outlasted the grips; the tie
 # keeps 1.0, which it needs to form.
 _KNOT_CABLE_MU = 0.3
+_KNOT_FILTER_SPAN = 2  # cable links this far apart or closer never collide under the propagation response
 _KNOT_FINGER_MU = 1.7
 
 # Knot cable: Dahl bending friction (saturated plastic curvature [rad], memory length [rad]).
@@ -351,6 +352,12 @@ class Example:
         knot_tie = 6 if self.native and self.task == "knot" and args.contact_response == "propagation" else None
         self.tie_substeps = int(tie_substeps or knot_tie or self.sim_substeps)
         self.tie_dt = self.frame_dt / self.tie_substeps
+        # Under the propagation response the knot's cable ignores contact between links two apart: on the bent
+        # cable they touch at the bend, where the rod joints already keep them apart, and the contact's exact
+        # response through the two 3-DoF joints between them is nearly singular (a body went non-finite in about
+        # one run of 100; none in 300 with the filter).
+        knot_filter = self.native and self.task == "knot" and args.contact_response == "propagation"
+        self.cable_filter_span = _KNOT_FILTER_SPAN if knot_filter else 1
         self.use_graph = bool(args.graph_capture)
 
         self._plan_task()
@@ -1180,6 +1187,11 @@ class Example:
         self.cable_bodies = list(range(cable_body_start, builder.body_count))
         self.cable_joints = list(range(cable_joint_start, builder.joint_count))
         self.cable_bodies_per_world = len(self.cable_bodies)
+        for i, body_i in enumerate(self.cable_bodies):
+            for body_j in self.cable_bodies[i + 2 : i + self.cable_filter_span + 1]:
+                for shape_i in builder.body_shapes.get(body_i, []):
+                    for shape_j in builder.body_shapes.get(body_j, []):
+                        builder.add_shape_collision_filter_pair(int(shape_i), int(shape_j))
         self.grip_joints = []
         if self.inextensible:
             # Virtual grippers: a released ball closure from the world to each cable link. One is engaged and
