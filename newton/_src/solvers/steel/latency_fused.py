@@ -243,10 +243,42 @@ class TreeSlot:
 
 
 @wp.struct
+class MomentumRows:
+    """Impulses and row properties for one family in the world sweep."""
+
+    count: wp.array[int]
+    impulses: wp.array2d[float]
+    kind: wp.array2d[int]
+    parent: wp.array2d[int]
+
+
+@wp.struct
+class SplitSweep:
+    """Sweep history and the native row and velocity arrays it extrapolates."""
+
+    dense: MomentumRows
+    free: MomentumRows
+    prop: MomentumRows
+    prop_order: wp.array2d[int]
+    dofs: wp.array2d[int]
+    velocity: wp.array[float]
+    bodies: wp.array[int]
+    body_start: wp.array[int]
+    twist: wp.array2d[float]
+    prev_twist: wp.array2d[float]
+    prev_velocity: wp.array[float]
+    history: wp.array2d[wp.vec2]
+    age: wp.array[int]
+    anchor_sq: wp.array[float]
+
+
+@wp.struct
 class ExtraArgs:
     """The optional stages' arrays in one struct, so they cost the launch one parameter: the rod chains (their
     articulations by world and what ``rod_tree.chain_*_native`` read) and the Nesterov momentum."""
 
+    split: wp.array[SplitSweep]  # SolverSteel(nesterov_momentum=True)'s sweep history
+    body_to_articulation: wp.array[int]
     rod_group_to_art: wp.array[int]
     rod_world_offsets: wp.array[int]
     rod_world_groups: wp.array[int]
@@ -331,36 +363,6 @@ def _cache_snapshot(
 def warp_count(tree_slots: int, rods: bool = False) -> int:
     """Warps per block: the row warp, one per tree group, the rod-chain warp (with rods) and the free-body warp."""
     return 2 + tree_slots + int(rods)
-
-
-@wp.struct
-class MomentumRows:
-    """Impulses and row properties for one family in the world sweep."""
-
-    count: wp.array[int]
-    impulses: wp.array2d[float]
-    kind: wp.array2d[int]
-    parent: wp.array2d[int]
-
-
-@wp.struct
-class SplitSweep:
-    """Sweep history and the native row and velocity arrays it extrapolates."""
-
-    dense: MomentumRows
-    free: MomentumRows
-    prop: MomentumRows
-    prop_order: wp.array2d[int]
-    dofs: wp.array2d[int]
-    velocity: wp.array[float]
-    bodies: wp.array[int]
-    body_start: wp.array[int]
-    twist: wp.array2d[float]
-    prev_twist: wp.array2d[float]
-    prev_velocity: wp.array[float]
-    history: wp.array2d[wp.vec2]
-    age: wp.array[int]
-    anchor_sq: wp.array[float]
 
 
 # Dot product, squared correction and lookahead, primal motion, squared angular correction and displacement.
@@ -615,13 +617,11 @@ def get_fused_iteration_kernel(
         cache_max_bodies: int,
         colored: ColoredArgs,
         rows: RowArgs,
-        histories: wp.array[SplitSweep],
         cache: wp.array[CacheArgs],
         tree: wp.array[TreeArgs],
         slots: wp.array[TreeSlot],
         extra: wp.array[ExtraArgs],
         articulation_active: wp.array[int],
-        body_to_articulation: wp.array[int],
         propagation_impulses: wp.array2d[float],
         body_qd: wp.array2d[float],
         body_impulses: wp.array2d[float],
@@ -644,7 +644,7 @@ def get_fused_iteration_kernel(
             g = iteration_offset + i
             if wp.static(split_momentum):
                 momentum_age = wp.static(advance_momentum)(
-                    world, t, i, momentum_age, g == friction_start_iteration, histories[0]
+                    world, t, i, momentum_age, g == friction_start_iteration, extra[0].split[0]
                 )
             # propagation_interval: the rod trees propagate every ``every``-th sweep and after the last, and the
             # momentum steps with them (the sweeps' body estimates carry the impulses in between).
@@ -731,7 +731,7 @@ def get_fused_iteration_kernel(
                 if warp_id == 0:
                     wp.static(gemv_native)(
                         world, world_count, cache[0].world_flag, cache[0].body_count, colored.body_list,
-                        cache[0].art_eligible, body_to_articulation, tree[0].articulation_joint_range,
+                        cache[0].art_eligible, extra[0].body_to_articulation, tree[0].articulation_joint_range,
                         tree[0].joint_qd_start, cache[0].R, cache[0].B, cache[0].qd_base, body_impulses, body_qd,
                         v_out,
                     )  # fmt: skip

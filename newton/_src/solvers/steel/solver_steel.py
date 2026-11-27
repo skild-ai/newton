@@ -11982,7 +11982,7 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         elif self._propagation_active and self._connect_count:
             # No contacts: the loop closures still fill the propagation rows.
-            self._propagation_build_rows(state_in, state_aug, None, 0, dt)
+            self._propagation_build_rows(state_in, state_aug, None, 0, dt, None)
 
         if mf_active:
             # Contact rows precede the free-body velocity-limit rows in each world.
@@ -15499,6 +15499,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         extra.free_bodies = int_array(bodies)
         extra.free_dof_start = int_array(dof_start)
         extra.every = int(self._propagation_interval) if rod_sizes else 1
+        extra.body_to_articulation = self._body_to_articulation
+        if self._split_momentum is not None:
+            extra.split = self._split_momentum
         if rod_sizes:
             rod_arts = np.concatenate([self._propagation_tree_arts[size].numpy() for size in rod_sizes])
             rod_arts = rod_arts[np.argsort(art_world[rod_arts], kind="stable")]
@@ -15657,11 +15660,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 int(self._propagation_cache_max_bodies),
                 colored,
                 rows,
-                self._split_momentum,
                 *self._latency_fused_static,
                 # Sleeping is set up after the fused kernel, so its tree activity is passed per launch.
                 self._propagation_tree_activity,
-                self._body_to_articulation,
             ],
             outputs=[
                 self._propagation_impulses,
