@@ -58,6 +58,18 @@ from .contact_torsion import (
 from .cpu_fallback import pgs_solve_mf_gs_cpu, pgs_solve_propagation_contact_cpu, reject_cpu_unsupported_features
 from .friction import FRICTION_PAIR_CUDA, coupled_contact_cuda
 from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
+from .implicit_velocity import (
+    LEVEL_THREADS,
+    add_free_root_transport_derivative,
+    add_lagged_velocity_terms,
+    build_level_schedule,
+    drop_velocity_terms_in_contact,
+    eval_velocity_derivative_product,
+    eval_velocity_derivative_product_levels,
+    flag_discontinuous_articulations,
+    flag_worlds_with_active_contacts,
+    store_velocity_derivative_correction,
+)
 from .kernels import (
     CONNECT_MAX_ROWS,
     CONTACT_GENERATION_NONE,
@@ -1847,6 +1859,7 @@ class SolverSteel(SolverBase, CouplingInterface):
     free_rigid_rolling_friction = _ConstructionOption()
     deterministic = _ConstructionOption()
     nesterov_momentum = _ConstructionOption()
+    velocity_terms_theta = _ConstructionOption()
 
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
@@ -2146,6 +2159,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         free_rigid_rolling_friction: float | None = None,
         deterministic: wp.DeterministicMode | None = None,
         nesterov_momentum: bool | None = None,
+        velocity_terms_theta: float = 0.0,
     ):
         """Create a Steel solver for a finalized model.
 
@@ -2746,6 +2760,21 @@ class SolverSteel(SolverBase, CouplingInterface):
                 Defaults to enabled on CUDA. CPU uses plain sweeps, so at a fixed iteration count the
                 device defaults can produce different trajectories. Pass ``False`` for plain Gauss-Seidel
                 sweeps on CUDA. Construction-only.
+            velocity_terms_theta: Weight ``theta`` in ``[0, 1]`` of the end-of-step velocity in the
+                velocity-product forces of the inverse dynamics (Coriolis, centrifugal, gyroscopic), in
+                first-order form: each step measures ``-theta * dt * H^-1 D (qd - qd_0)``, with ``D`` the
+                derivative of the joint bias force ``c(q, qd)`` with respect to ``qd`` at the start-of-step
+                velocity ``qd_0`` and ``qd`` the solved velocity, and adds it to the next step's unconstrained
+                prediction. That step's constraint solve projects it, so every loop closure and contact still
+                meets its velocity target at the end of each step; the one-step delay changes the step by
+                ``O(dt^3)``. ``0`` (the default) keeps the explicit bias and adds no work. ``1`` is the
+                linearization of MuJoCo's ``implicit`` integrator. Both leave a fast closed loop with a
+                frequency error first order in ``dt``, of equal size and opposite sign; ``0.5`` cancels it. On
+                a four-bar swinging for 10 s at a 1.04 ms step the crank angle error is 17 deg at ``0``, 17 deg
+                at ``1`` and 0.6 deg at ``0.5``. A nonzero ``theta`` costs one more inverse-dynamics pass and
+                mass solve per step. The delayed correction applies only to articulations whose input velocity
+                is, bitwise, the one the previous step published; a reset or a written velocity drops it.
+                Single free rigid bodies keep their own gyroscopic update. Construction-only.
         """
         solve_mode, articulated_contact_response = _normalize_solve_mode(solve_mode, articulated_contact_response)
         _validate_solve_mode(solve_mode, articulated_contact_response)
@@ -2867,6 +2896,46 @@ class SolverSteel(SolverBase, CouplingInterface):
         if drive_mode not in ("augmented", "rows"):
             raise ValueError(f"drive_mode must be 'augmented' or 'rows', got {drive_mode!r}")
         self._drive_mode = drive_mode
+        velocity_terms_theta = float(velocity_terms_theta)
+        if not 0.0 <= velocity_terms_theta <= 1.0:
+            raise ValueError(f"velocity_terms_theta must be in [0, 1], got {velocity_terms_theta}")
+        self._velocity_terms_theta = velocity_terms_theta
+        self._ivt_buffers = None
+        # Contact gating (override, experimental): "gate" keeps the explicit bias in worlds where a contact row
+        # carries a positive normal impulse, by dropping their delayed correction; "lag" (default) applies it.
+        self._ivt_mode = str(self._kernel_overrides.get("velocity_terms_mode", "lag"))
+        if self._ivt_mode not in ("lag", "gate"):
+            raise ValueError("velocity_terms_mode must be one of ['gate', 'lag']")
+        # D x kernel (override): "serial" (one thread per articulation), "levels" (one block per articulation,
+        # one barrier per tree level, CUDA only) or "auto", resolved after the world mapping: levels on CUDA when
+        # some articulation averages at least two joints per tree level.
+        self._ivt_kernel = str(self._kernel_overrides.get("velocity_terms_kernel", "auto"))
+        if self._ivt_kernel not in ("serial", "levels", "auto"):
+            raise ValueError("velocity_terms_kernel must be one of ['auto', 'levels', 'serial']")
+        if self._ivt_kernel == "levels" and not model.device.is_cuda:
+            raise NotImplementedError("velocity_terms_kernel='levels' requires a CUDA device")
+        if velocity_terms_theta > 0.0 and model.articulation_count and model.joint_dof_count:
+            dofs, bodies = model.joint_dof_count, max(model.body_count, 1)
+            self._ivt_buffers = {
+                # Scratch of the D x pass.
+                "qd_probe": wp.zeros(dofs, dtype=wp.float32, device=model.device),
+                "S_probe": wp.zeros(dofs, dtype=wp.spatial_vector, device=model.device),
+                "v_probe": wp.zeros(bodies, dtype=wp.spatial_vector, device=model.device),
+                "a_probe": wp.zeros(bodies, dtype=wp.spatial_vector, device=model.device),
+                "f_plus": wp.zeros(bodies, dtype=wp.spatial_vector, device=model.device),
+                "f_minus": wp.zeros(bodies, dtype=wp.spatial_vector, device=model.device),
+                "tau": wp.zeros(dofs, dtype=wp.float32, device=model.device),
+                "dv": wp.zeros(dofs, dtype=wp.float32, device=model.device),
+                # The previous step's correction, as an acceleration for the next predictor.
+                "lag_acc": wp.zeros(dofs, dtype=wp.float32, device=model.device),
+                "art_flag": wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device),
+                # NaN never compares equal, so the first step applies no delayed correction.
+                "qd_published": wp.full(dofs, float("nan"), dtype=wp.float32, device=model.device),
+            }
+            if self._ivt_mode == "gate":
+                self._ivt_buffers["world_flag"] = wp.zeros(
+                    max(int(model.world_count), 1), dtype=wp.int32, device=model.device
+                )
         self._has_drive_rows = drive_mode == "rows" and model.joint_dof_count > 0
         # The fused clamp replaces the velocity-limit rows of driven DOFs, so it only
         # engages where both exist; an inf activation fraction disables velocity limits.
@@ -3282,6 +3351,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._closure_direct_sparse = closure_direct_sparse.DirectSparseBuffers(self)
         self._allocate_mf_buffers(model)
         self._allocate_sparse_diagonal_buffers(model)
+        if self._ivt_buffers is not None:
+            self._setup_velocity_terms(model)
         # Contact rows keep row_parent for their friction/patch load linkage; torsion keeps
         # its own group membership.
         self._contact_torsion_group = wp.full(
@@ -7957,55 +8028,30 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         # Stage 3: unconstrained acceleration and velocity prediction.
         self._profile_stage("unconstrained_velocity")
-        state_aug._joint_qdd.zero_()
-        for size in self._for_sizes():
-            if size == self._sparse_mass_matrix_size:
-                wp.launch(
-                    solve_sparse_mass_matrix,
-                    dim=self._n_arts_by_size[size] * 32,
-                    inputs=[
-                        self._group_to_art[size],
-                        self._articulation_dof_start,
-                        self._sparse_mass_matrix_indices,
-                        self._sparse_Linv,
-                        state_aug._joint_tau,
-                        self._dynamics_art_active,
-                    ],
-                    outputs=[self._sparse_mass_matrix_scratch, state_aug._joint_qdd],
-                    block_dim=128,
-                    device=model.device,
-                )
-                continue
-            if size == self._sparse_diagonal_response_size:
-                wp.launch(
-                    solve_compact_diagonal_mass,
-                    dim=self._n_arts_by_size[size] * size,
-                    inputs=[
-                        self._diagonal_inverse_mass,
-                        self._group_to_art[size],
-                        self._articulation_dof_start,
-                        size,
-                        state_aug._joint_tau,
-                        self._dynamics_art_active,
-                    ],
-                    outputs=[state_aug._joint_qdd],
-                    device=model.device,
-                )
-                continue
-            if self._execution_plan.use_diagonal_mass(size):
-                self._stage3_solve_diagonal(size, state_aug)
-                continue
-            if size in self._articulated_body_sizes:
-                self._stage3_solve_articulated_body(size, state_aug)
-                continue
-            use_tiled = self._trisolve_kernel == "tiled" or (
-                self._trisolve_kernel == "auto" and size > self._small_dof_threshold
+        lagged = self._ivt_buffers is not None
+        if lagged:
+            # Articulations that do not continue from the previous step's published velocity drop its correction.
+            buf = self._ivt_buffers
+            buf["art_flag"].zero_()
+            wp.launch(
+                flag_discontinuous_articulations,
+                dim=model.joint_dof_count,
+                inputs=[buf["dof_art"], state_in.joint_qd, buf["qd_published"]],
+                outputs=[buf["art_flag"]],
+                device=model.device,
             )
-            if use_tiled:
-                self._stage3_trisolve_tiled(size, state_aug)
-            else:
-                self._stage3_trisolve_loop(size, state_aug)
+            lag_inputs = [buf["dof_art"], buf["art_flag"]]
+            lag_masks = [self._kinematic_dof_mask, self._dynamics_dof_active]
+        self._stage3_mass_solve(state_aug)
         self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
+        if lagged:
+            wp.launch(
+                add_lagged_velocity_terms,
+                dim=model.joint_dof_count,
+                inputs=[*lag_inputs, buf["lag_acc"], *lag_masks, dt],
+                outputs=[self._v_hat],
+                device=model.device,
+            )
         if self._joint_friction_load_active:
             self._stage3_joint_friction_load(state_in, state_aug)
 
@@ -8017,6 +8063,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         has_contacts = contacts is not None and contacts.rigid_contact_max > 0
         self._profile_stage("solve")
         self._solve_matrix_free(state_in, state_aug, contacts, dt)
+        if self._ivt_buffers is not None:
+            self._profile_stage("velocity_terms")
+            self._apply_implicit_velocity_terms(state_in, state_aug, stage3_qd, dt)
 
         # Stage 7: convert the solved velocity to accelerations, integrate and publish.
         self._profile_stage("integrate")
@@ -8089,6 +8138,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._stage7_update_kinematics(state_out)
         if self._sleeping is not None:
             self._sleeping.finish(state_in, state_out, state_aug, dt)
+        if self._ivt_buffers is not None:
+            wp.copy(self._ivt_buffers["qd_published"], state_out.joint_qd)
         if computed_parent_f is not None:
             published = {}
             for target in (body_parent_f, state_out.body_parent_f):
@@ -10373,6 +10424,204 @@ class SolverSteel(SolverBase, CouplingInterface):
             block_dim=self._serial_block_dim(model.articulation_count),
             device=model.device,
         )
+
+    def _apply_implicit_velocity_terms(
+        self, state_in: State, state_aug: State, velocity_start: wp.array, dt: float
+    ) -> None:
+        """Store ``theta * H^-1 (d tau / d qd) (v_out - velocity_start)`` for the next step's predictor (see
+        :mod:`implicit_velocity`)."""
+        model = self.model
+        buf = self._ivt_buffers
+        common = [
+            model.articulation_start,
+            self._articulation_joint_end,
+            model.joint_type,
+            model.joint_parent,
+            model.joint_child,
+            model.joint_q_start,
+            model.joint_qd_start,
+            state_in.joint_q,
+            model.joint_axis,
+            model.joint_dof_dim,
+            model.joint_X_p,
+            state_in.body_q,
+            state_aug._body_q_com,
+            model.body_mass,
+            model.body_inertia,
+            self._articulation_origin,
+            self._body_to_articulation,
+            self._is_free_rigid,
+            self._dynamics_art_active,
+            velocity_start,
+            self._v_out,
+        ]
+        probes = [buf["qd_probe"], buf["S_probe"], buf["v_probe"], buf["a_probe"], buf["f_plus"], buf["f_minus"]]
+        if self._ivt_kernel == "levels":
+            sched = buf["levels"]
+            wp.launch_tiled(
+                eval_velocity_derivative_product_levels,
+                dim=[model.articulation_count],
+                inputs=[
+                    sched["art_level_start"],
+                    sched["level_joint_start"],
+                    sched["level_joints"],
+                    sched["child_start"],
+                    sched["child_joints"],
+                    *common,
+                    LEVEL_THREADS,
+                    *probes,
+                    buf["joint_wrench"],
+                    state_aug._body_I_s,
+                    self._body_inertia_terms,
+                ],
+                outputs=[buf["tau"]],
+                block_dim=LEVEL_THREADS,
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                eval_velocity_derivative_product,
+                dim=model.articulation_count,
+                inputs=[*common, *probes, state_aug._body_I_s, self._body_inertia_terms],
+                outputs=[buf["tau"]],
+                block_dim=self._serial_block_dim(model.articulation_count),
+                device=model.device,
+            )
+        # Reuse stage 3's mass solves on the derivative force; the stage's own tau and qdd stay untouched.
+        tau, qdd = state_aug._joint_tau, state_aug._joint_qdd
+        state_aug._joint_tau, state_aug._joint_qdd = buf["tau"], buf["dv"]
+        try:
+            self._stage3_mass_solve(state_aug)
+        finally:
+            state_aug._joint_tau, state_aug._joint_qdd = tau, qdd
+        if self._free_root_joint_count:
+            # The predictor adds the free roots' transport w x v outside the bias; differentiate it too.
+            self._add_free_root_transport_derivative(velocity_start, buf["dv"])
+        # Keep theta H^-1 (dtau/dqd) x (with this step's H) as an acceleration for the next predictor.
+        wp.launch(
+            store_velocity_derivative_correction,
+            dim=model.joint_dof_count,
+            inputs=[buf["dv"], self._kinematic_dof_mask, self._dynamics_dof_active, self._velocity_terms_theta],
+            outputs=[buf["lag_acc"]],
+            device=model.device,
+        )
+        if self._ivt_mode == "gate" and self._world_count > 0:
+            buf["world_flag"].zero_()
+            wp.launch(
+                flag_worlds_with_active_contacts,
+                dim=self._impulses.shape,
+                inputs=[self._constraint_count, self._row_type, self._impulses, int(PGS_CONSTRAINT_TYPE_CONTACT)],
+                outputs=[buf["world_flag"]],
+                device=model.device,
+            )
+            wp.launch(
+                drop_velocity_terms_in_contact,
+                dim=model.joint_dof_count,
+                inputs=[buf["dof_art"], self._art_to_world, buf["world_flag"]],
+                outputs=[buf["lag_acc"]],
+                device=model.device,
+            )
+
+    def _add_free_root_transport_derivative(self, velocity_start: wp.array, out: wp.array) -> None:
+        """Add the free roots' transport derivative along ``v_out - velocity_start`` to ``out`` (accelerations)."""
+        model = self.model
+        wp.launch(
+            add_free_root_transport_derivative,
+            dim=self._free_root_joint_count,
+            inputs=[
+                self._free_root_joint_indices,
+                model.joint_qd_start,
+                self._kinematic_joint_mask,
+                model.joint_child,
+                self._body_to_articulation,
+                self._is_free_rigid,
+                self._dynamics_joint_active,
+                velocity_start,
+                self._v_out,
+            ],
+            outputs=[out],
+            device=model.device,
+        )
+
+    def _setup_velocity_terms(self, model) -> None:
+        """Map each tree DOF to its articulation for the continuity check of the delayed correction, resolve
+        ``velocity_terms_kernel="auto"`` and build the level schedule the level kernel reads."""
+        # Loop-closure joints past the tree end belong to no articulation and get no correction.
+        dof_art = np.full(max(model.joint_dof_count, 1), -1, dtype=np.int32)
+        qd_start = model.joint_qd_start.numpy()
+        starts, ends = model.articulation_start.numpy(), self._articulation_joint_end.numpy()
+        for art in range(model.articulation_count):
+            dof_art[qd_start[starts[art]] : qd_start[ends[art]]] = art
+        self._ivt_buffers["dof_art"] = wp.array(dof_art, dtype=wp.int32, device=model.device)
+        host = None
+        if self._ivt_kernel == "auto":
+            self._ivt_kernel = "serial"
+            if model.device.is_cuda:
+                host = build_level_schedule(model, ends)
+                levels = np.diff(host["art_level_start"][: model.articulation_count + 1])
+                joints = ends[: model.articulation_count] - starts[: model.articulation_count]
+                if np.any(joints >= 2 * np.maximum(levels, 1)):
+                    self._ivt_kernel = "levels"
+        if self._ivt_kernel == "levels":
+            if host is None:
+                host = build_level_schedule(model, ends)
+            device = model.device
+            self._ivt_buffers["levels"] = {k: wp.array(v, dtype=wp.int32, device=device) for k, v in host.items()}
+            self._ivt_buffers["joint_wrench"] = wp.zeros(
+                max(model.joint_count, 1), dtype=wp.spatial_vector, device=device
+            )
+
+    def _stage3_mass_solve(self, state_aug: State) -> None:
+        """Solve ``H joint_qdd = joint_tau`` for every articulation group with stage 2's factors."""
+        model = self.model
+        state_aug._joint_qdd.zero_()
+        for size in self._for_sizes():
+            if size == self._sparse_mass_matrix_size:
+                wp.launch(
+                    solve_sparse_mass_matrix,
+                    dim=self._n_arts_by_size[size] * 32,
+                    inputs=[
+                        self._group_to_art[size],
+                        self._articulation_dof_start,
+                        self._sparse_mass_matrix_indices,
+                        self._sparse_Linv,
+                        state_aug._joint_tau,
+                        self._dynamics_art_active,
+                    ],
+                    outputs=[self._sparse_mass_matrix_scratch, state_aug._joint_qdd],
+                    block_dim=128,
+                    device=model.device,
+                )
+                continue
+            if size == self._sparse_diagonal_response_size:
+                wp.launch(
+                    solve_compact_diagonal_mass,
+                    dim=self._n_arts_by_size[size] * size,
+                    inputs=[
+                        self._diagonal_inverse_mass,
+                        self._group_to_art[size],
+                        self._articulation_dof_start,
+                        size,
+                        state_aug._joint_tau,
+                        self._dynamics_art_active,
+                    ],
+                    outputs=[state_aug._joint_qdd],
+                    device=model.device,
+                )
+                continue
+            if self._execution_plan.use_diagonal_mass(size):
+                self._stage3_solve_diagonal(size, state_aug)
+                continue
+            if size in self._articulated_body_sizes:
+                self._stage3_solve_articulated_body(size, state_aug)
+                continue
+            use_tiled = self._trisolve_kernel == "tiled" or (
+                self._trisolve_kernel == "auto" and size > self._small_dof_threshold
+            )
+            if use_tiled:
+                self._stage3_trisolve_tiled(size, state_aug)
+            else:
+                self._stage3_trisolve_loop(size, state_aug)
 
     def _stage3_compute_v_hat(self, state_in: State, state_aug: State, dt: float, stage3_qd: wp.array):
         """Predict the unconstrained velocity ``v_hat = qd + dt * qdd``."""
