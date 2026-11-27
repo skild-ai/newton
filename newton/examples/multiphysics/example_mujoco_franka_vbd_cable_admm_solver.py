@@ -133,6 +133,9 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.use_graph = bool(args.graph_capture)
         self.world_count = max(1, int(args.world_count))
+        if self.native_cable:
+            # The propagation response holds this grasp at the same budget and runs faster from 1,024 worlds.
+            cable_solver.arm_contact_response(args, self.world_count, threshold=1024)
         self.payload_kind = args.payload_kind or ("vbd-cable" if self.native_cable else "xpbd-chain")
         self.rigid_solver = str(args.rigid_solver)
         self.payload_segments = max(2, int(args.payload_segments))
@@ -670,7 +673,7 @@ class Example:
         parser = cable_solver.create_parser(baseline="coupled")
         # The jaws pinch the cable between two articulations, which the immediate response's exact Gauss-Seidel
         # holds at a small budget (as in franka_cable_ik_pick_place).
-        parser.set_defaults(contact_response="immediate")
+        parser.set_defaults(contact_response=None)
         newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=8)

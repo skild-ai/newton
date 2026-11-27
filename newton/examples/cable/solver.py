@@ -79,10 +79,10 @@ response's exact rows hold a grasp at a small budget and run faster; from it the
 budget, runs faster and in less memory."""
 
 
-def arm_contact_response(args, world_count):
+def arm_contact_response(args, world_count, threshold=ARM_PROPAGATION_WORLDS):
     """Resolve ``--contact-response`` for an arm-and-cable example: the user's choice, else by world count."""
     if getattr(args, "contact_response", None) is None:
-        args.contact_response = "propagation" if world_count >= ARM_PROPAGATION_WORLDS else "immediate"
+        args.contact_response = "propagation" if world_count >= threshold else "immediate"
     return args.contact_response
 
 
