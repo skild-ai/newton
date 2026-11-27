@@ -301,6 +301,8 @@ class Example:
         self.knot_handoff = not args.knot_control
         self.clamps = cable_solver.CableClamps(args)
         self.native = getattr(args, "solver", "coupled") == "steel"
+        # Levenberg-Marquardt iterations per frame, warm-started from the previous frame's solution.
+        self.ik_iterations = max(1, int(args.ik_iterations))
         self.rigid_solver = args.rigid_solver
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -910,7 +912,7 @@ class Example:
         self.ik_fingers = wp.array([targets[p % 2][2] for p in range(problems)], dtype=float, device=device)
         self.ik_q = wp.array(np.tile(self.initial_q, (self.world_count, 1)), dtype=float, device=device)
         self.ik_solver = self._make_ik_solver(problems, self.ik_positions, self.ik_rotations)
-        self.ik_iters = 24
+        self.ik_iters = self.ik_iterations
         self.control_joint_target_q = self.control.joint_target_q.reshape((self.world_count, -1))
         self.control_joint_target_qd = self.control.joint_target_qd.reshape((self.world_count, -1))
         self.ik_previous_q = wp.clone(self.ik_q)
@@ -1319,6 +1321,7 @@ class Example:
             default=True,
             help="Disable graph capture.",
         )
+        parser.add_argument("--ik-iterations", type=int, default=8, help="IK iterations per frame (warm-started).")
         return parser
 
 

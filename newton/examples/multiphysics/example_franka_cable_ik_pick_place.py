@@ -109,6 +109,8 @@ def _find_label_index(labels: list[str], suffix: str) -> int:
 class Example:
     def __init__(self, viewer, args):
         self.native_cable = getattr(args, "solver", "coupled") == "steel"
+        # Levenberg-Marquardt iterations per frame, warm-started from the previous frame's solution.
+        self.ik_iterations = max(1, int(args.ik_iterations))
         self.viewer = viewer
         self.sim_time = 0.0
         self.fps = 60
@@ -484,7 +486,7 @@ class Example:
             lambda_initial=0.05,
             jacobian_mode=ik.IKJacobianType.ANALYTIC,
         )
-        self.ik_iters = 24
+        self.ik_iters = self.ik_iterations
 
     # ------------------------------------------------------------------
     # Keyframes
@@ -685,6 +687,7 @@ class Example:
             default=True,
             help="Disable graph capture.",
         )
+        parser.add_argument("--ik-iterations", type=int, default=8, help="IK iterations per frame (warm-started).")
         return parser
 
 
