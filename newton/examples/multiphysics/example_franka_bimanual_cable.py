@@ -329,11 +329,12 @@ class Example:
         # Under the immediate response eight substeps of six iterations hold both grasps; the propagation response's
         # split sweep needs 24 iterations and runs faster from cable_solver.ARM_PROPAGATION_WORLDS worlds. The knot's
         # inextensible cable is one 168-DOF tree, which the immediate response solves densely: it takes the
-        # propagation response at any world count, the tree propagating every sweep, and 16 iterations hold its grips.
+        # propagation response at any world count, the tree propagating every sweep; 20 iterations hold its grips in every
+        # run (16 lose one in about 40).
         if args.contact_response is None and args.task == "knot" and self.native:
             args.contact_response = "propagation"
         if self.native and args.task == "knot" and args.contact_response == "propagation":
-            native_substeps, native_iterations = 8, 16
+            native_substeps, native_iterations = 8, 20
         elif self.native and cable_solver.arm_contact_response(args, self.world_count) == "propagation":
             native_substeps, native_iterations = 8, 24
         else:
