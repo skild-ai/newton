@@ -1858,10 +1858,10 @@ for scene, frames in (
             use_viewer=True,
             test_suffix=f"native_steel_{mode}",
         )
-# The bimanual cable twist with MuJoCo arms and a VBD cable coupled through gripper proxies, and both bimanual tasks
-# natively under one Steel solver. (The coupled wrap can print MuJoCo line-search warnings.)
+# The bimanual cable twist with MuJoCo arms and a VBD cable coupled through gripper proxies (with line-search room,
+# since MuJoCo prints a warning when it runs out), and both bimanual tasks natively under one Steel solver.
 for task, options, suffix in (
-    ("twist", {}, ""),
+    ("twist", {"mujoco-ls-iterations": 50}, ""),
     ("twist", {"solver": "steel", "solve-mode": "colored"}, "_native_steel"),
     ("wrap", {"solver": "steel", "solve-mode": "colored"}, "_native_steel"),
 ):
