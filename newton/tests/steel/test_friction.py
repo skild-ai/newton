@@ -1187,7 +1187,8 @@ def _disk_minimizer(tangent_block, velocity, radius):
     """Minimize ``0.5 x^T A x + velocity^T x`` over ``|x| <= radius`` in float64."""
     eigenvalues, basis = np.linalg.eigh(tangent_block)
     rotated = -basis.T @ velocity
-    if np.linalg.norm(rotated / eigenvalues) <= radius:
+    # A singular block skips the direct solve; the shifted search below also reaches its interior minimizer.
+    if eigenvalues.min() > 0.0 and np.linalg.norm(rotated / eigenvalues) <= radius:
         return basis @ (rotated / eigenvalues)
     lo, hi = 0.0, np.linalg.norm(rotated) / radius
     for _ in range(200):
@@ -1211,6 +1212,14 @@ def _bisection_reference(block, desaxce):
         mid = 0.5 * (lo + hi)
         lo, hi = (mid, hi) if solve(mid)[0] < 0.0 else (lo, mid)
     return np.array([hi, *solve(hi)[1]])
+
+
+def _first_load_reference(block, desaxce):
+    """The frictionless load and its disk-minimizing tangent pair, which a jammed search without a root keeps."""
+    u_n, u_t, (g_nn, *g_nt), (g_11, g_12, g_22), mu = block[0], np.array(block[1:3]), block[3:6], block[6:9], block[9]
+    normal = ((mu * np.linalg.norm(u_t) if desaxce else 0.0) - u_n) / g_nn
+    tangent = _disk_minimizer(np.array([[g_11, g_12], [g_12, g_22]]), u_t + np.array(g_nt) * normal, mu * normal)
+    return np.array([normal, *tangent])
 
 
 def test_bisection_solves_the_tangent_pair_on_the_disk(test, device):
@@ -1315,13 +1324,13 @@ def test_bisection_solves_a_jammed_root_within_the_cap(test, device):
 
 
 def test_bisection_keeps_the_first_load_past_the_root_cap(test, device):
-    """Keep the frictionless load on a nearly jammed block whose root lies beyond 2^15 times it."""
+    """Keep the frictionless load and its disk pair on a nearly jammed block whose root lies beyond 2^15 times it."""
     for mode in ("bisection", "bisection_desaxce"):
         for name, block in _ROOT_PAST_CAP_BLOCKS.items():
             with test.subTest(mode=mode, block=name):
-                normal, *_ = _mf_block(device, np.array(block, dtype=np.float32), mode)
-                bias = block[9] * float(np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
-                test.assertLessEqual(float(normal), (bias - block[0]) / block[3] * (1.0 + 1.0e-5))
+                expected = _first_load_reference(block, mode == "bisection_desaxce")
+                result = _mf_block(device, np.array(block, dtype=np.float32), mode)
+                np.testing.assert_allclose(result, expected, rtol=1.0e-4, atol=1.0e-5)
 
 
 # Jams that stick at the first probe with a small positive complement, regular and rank one. Their sticking residual,
@@ -1334,13 +1343,13 @@ _STICKING_COMPLEMENT_BLOCKS = {
 
 
 def test_bisection_keeps_the_first_load_of_a_sticking_jam(test, device):
-    """Keep the first load of a jam that sticks there, even when its Schur complement is slightly positive."""
+    """Keep the first load and its disk pair on a jam that sticks there, even with a slightly positive complement."""
     for mode in ("bisection", "bisection_desaxce"):
         for name, block in _STICKING_COMPLEMENT_BLOCKS.items():
             with test.subTest(mode=mode, block=name):
-                normal, *_ = _mf_block(device, np.array(block, dtype=np.float32), mode)
-                bias = block[9] * float(np.linalg.norm(block[1:3])) if mode == "bisection_desaxce" else 0.0
-                test.assertLessEqual(float(normal), (bias - block[0]) / block[3] * (1.0 + 1.0e-5))
+                expected = _first_load_reference(block, mode == "bisection_desaxce")
+                result = _mf_block(device, np.array(block, dtype=np.float32), mode)
+                np.testing.assert_allclose(result, expected, rtol=1.0e-4, atol=1.0e-5)
 
 
 # A jam whose sliding direction turns with the load: its residual starts flat but has a root, 0.232005 at rank one
@@ -1360,18 +1369,23 @@ def test_bisection_finds_the_root_of_a_jam_whose_slip_turns(test, device):
             test.assertLessEqual(abs(block[0] + normal + tangent1), 1.0e-5 * normal)
 
 
-# A block whose second tangent direction barely responds but slips at 1 m/s: friction must still oppose that slip.
+# Blocks whose second tangent direction barely responds but slips at 1 m/s: friction must still oppose that slip,
+# alone and alongside slip on the first direction.
 # Values: u_n, u_t1, u_t2, G_nn, G_nt1, G_nt2, G_t1t1, G_t1t2, G_t2t2, mu.
-_STIFF_SLIPPING_BLOCK = (-1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0e-7, 0.5)
+_STIFF_SLIPPING_BLOCKS = {
+    "along_the_stiff_direction": (-1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0e-7, 0.5),
+    "oblique": (-1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0e-7, 0.5),
+}
 
 
 def test_bisection_keeps_friction_on_a_stiff_slipping_direction(test, device):
     """Oppose real slip along a tangent direction with a rounding-level response, as the disk minimizer does."""
-    block = np.array(_STIFF_SLIPPING_BLOCK, dtype=np.float32)
     for mode in ("bisection", "bisection_desaxce"):
-        with test.subTest(mode=mode):
-            expected = _bisection_reference(_STIFF_SLIPPING_BLOCK, mode == "bisection_desaxce")
-            np.testing.assert_allclose(_mf_block(device, block, mode), expected, rtol=1.0e-4, atol=1.0e-5)
+        for name, block in _STIFF_SLIPPING_BLOCKS.items():
+            with test.subTest(mode=mode, block=name):
+                expected = _bisection_reference(block, mode == "bisection_desaxce")
+                result = _mf_block(device, np.array(block, dtype=np.float32), mode)
+                np.testing.assert_allclose(result, expected, rtol=1.0e-4, atol=1.0e-5)
 
 
 def _one_dof_contact_force(model, mode, joint_f=None, steps=120, **solver_kwargs):
