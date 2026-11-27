@@ -1876,15 +1876,15 @@ add_example_test(
     test_suffix="native_steel_propagation",
 )
 # The bimanual cable twist with MuJoCo arms and a VBD cable coupled through gripper proxies (with line-search room,
-# since MuJoCo prints a warning when it runs out), and both bimanual tasks natively under one Steel solver.
+# since MuJoCo prints a warning when it runs out), and every bimanual task natively under one Steel solver, with
+# both contact responses.
+_NATIVE = {"solver": "steel", "solve-mode": "colored"}
 for task, options, suffix in (
     ("twist", {"mujoco-ls-iterations": 50}, ""),
-    ("twist", {"solver": "steel", "solve-mode": "colored"}, "_native_steel"),
-    ("wrap", {"solver": "steel", "solve-mode": "colored"}, "_native_steel"),
-    (
-        "twist",
-        {"solver": "steel", "solve-mode": "colored", "contact-response": "propagation"},
-        "_native_steel_propagation",
+    *(
+        (task, {**_NATIVE, "contact-response": response}, f"_native_steel_{response}")
+        for task in ("twist", "wrap", "knot")
+        for response in ("immediate", "propagation")
     ),
 ):
     add_example_test(
