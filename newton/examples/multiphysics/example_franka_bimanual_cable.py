@@ -76,8 +76,9 @@ _KNOT_PULL_TIME = 8.1  # 1.2 + 0.5 + 0.3 + 0.5 + 0.3 + 0.6 + 4.0 + 0.3 + 0.4
 _KNOT_GRIP_IN = 8  # links from each end where the hands take the cable
 _KNOT_GRIP_CLEAR = 0.07  # [m] from the gripped link to any other strand of cable
 # [m] of cable the cinched overhand knot keeps (its loop alone takes ~11 cm of this 12 mm cable). Pulling farther
-# apart only loads the grips and the knot's contacts.
-_KNOT_TAKE_UP = 0.14
+# apart only loads the grips and the knot's contacts: at 0.14 m the cinch's peak tension squeezed the cable out of a
+# jaw in about one run of 200, at 0.18 m none in 200.
+_KNOT_TAKE_UP = 0.18
 # From the grasp on (friction combines by average): the cable slides on itself (0.3) so the pull can cinch the
 # knot, while the fingers (1.7) still hold it at 1.0. At 1.0 the knot's own friction outlasted the grips; the tie
 # keeps 1.0, which it needs to form.
