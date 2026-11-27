@@ -20436,7 +20436,9 @@ def _get_color_propagation_prebuild_kernel(
     CH = min(512, OS)  # units staged in shared memory per chunk of the serial passes
     SORT_CAP = min(4096, OS)  # units a world may have for the sort to run on packed keys in shared memory
     # Without the length rank the sort key is the contact index alone: 32-bit keys, twice as many in the same buffer.
-    SORT_CAP32 = 0 if longest_first else min(2 * SORT_CAP, OS)
+    # It parks each contact's unit in contact_slot, which the row-order permutation (preserve_row_order) reads as
+    # the contact's original slot, so that permutation takes the packed sort.
+    SORT_CAP32 = 0 if longest_first or preserve_row_order else min(2 * SORT_CAP, OS)
     # One raw buffer: the sort's keys first, then the masks and the staged chunks.
     RAW_WORDS = max(2 * SORT_CAP, max(MBW, 1) * SW + 4 * CH)
     # A color costs its longest unit, so longest_first sorts longer units first to share colors. The
@@ -20500,7 +20502,7 @@ def _get_color_propagation_prebuild_kernel(
 
     JS = color_prebuild_scratch_stride(M, MBW)
     par_block = (
-        _COLOR_PREBUILD_PARALLEL.replace("@SC32@", str(SORT_CAP32 if not (rotating or preserve_row_order) else 0))
+        _COLOR_PREBUILD_PARALLEL.replace("@SC32@", str(SORT_CAP32 if not rotating else 0))
         .replace("@JS@", str(JS))
         .replace("@M@", str(M))
         .replace("@CH@", str(CH))
