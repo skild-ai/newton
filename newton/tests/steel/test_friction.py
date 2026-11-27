@@ -1432,18 +1432,20 @@ def test_bisection_bounds_the_normal_force_on_a_hinged_rod(test, device):
 
     The rod's tangent block has rank one, and its coupled sticking solution leaves the contact approaching at
     every load: the search must not raise the load toward the stop tolerance, and the reported friction must
-    balance the rod's statics.
+    balance the rod's statics. A self-locked load grows with every sweep in each mode, so it is compared on plain
+    sweeps.
     """
+    plain = {"nesterov_momentum": False}
     for yaw in (0.0, 1.0):
         locked = _hinged_rod(device, mu=1.0, interference=0.002, yaw=yaw)
         weight = float(locked.body_mass.numpy()[0]) * G
-        reference = abs(_one_dof_contact_force(locked, "fixed_normal")[2]) / weight
+        reference = abs(_one_dof_contact_force(locked, "fixed_normal", **plain)[2]) / weight
         test.assertGreater(reference, 100.0)
         resting = _hinged_rod(device, mu=0.5, interference=0.0, yaw=yaw)
         for mode in ("bisection", "bisection_desaxce"):
             for case, model in (("locked with interference", locked), ("resting", resting)):
                 with test.subTest(yaw=yaw, mode=mode, case=case):
-                    force = _one_dof_contact_force(model, mode) / weight
+                    force = _one_dof_contact_force(model, mode, **(plain if model is locked else {})) / weight
                     normal, friction = abs(force[2]), float(np.linalg.norm(force[:2]))
                     if model is locked:
                         test.assertAlmostEqual(normal, reference, delta=0.05 * reference)
