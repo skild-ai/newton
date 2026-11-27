@@ -12889,6 +12889,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_phi = wp.zeros(scalar_shape, dtype=wp.float32, device=device)
         self._propagation_target_velocity = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._propagation_row_rebound_velocity = wp.zeros(scalar_shape, dtype=wp.float32, device=device)
+        self._propagation_row_max_depenetration_velocity = wp.zeros(scalar_shape, dtype=wp.float32, device=device)
         # Rebound bias of each row, kept for the velocity-only iterations.
         # Only the velocity-only iterations read a contact's frozen rebound target.
         self._propagation_restitution_bias = wp.zeros(
@@ -12918,6 +12919,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._contact_response_capacity = 1
         self._contact_unit_phi = wp.zeros((1,), dtype=wp.float32, device=device)
         self._contact_unit_rebound = wp.zeros((1,), dtype=wp.float32, device=device)
+        self._contact_unit_max_depenetration_velocity = wp.zeros((1,), dtype=wp.float32, device=device)
         self._propagation_contact_unit = wp.zeros((1,), dtype=wp.int32, device=device)
         self._propagation_row_contact = wp.full((1, 1), -1, dtype=wp.int32, device=device)
         self._propagation_body_qd = wp.zeros((bodies, 6), dtype=wp.float32, device=device)
@@ -13129,6 +13131,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
             self._contact_unit_phi = wp.zeros((units,), dtype=wp.float32, device=device)
             self._contact_unit_rebound = wp.zeros((units,), dtype=wp.float32, device=device)
+            self._contact_unit_max_depenetration_velocity = wp.zeros((units,), dtype=wp.float32, device=device)
         self._color_body_used_mask = wp.zeros(
             (max(model.body_count, 1) * ((PROPAGATION_COLOR_TAIL + 31) // 32),), dtype=wp.int32, device=device
         )
@@ -13660,6 +13663,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_contact_unit,
                     self._contact_unit_response,
                     recovery_phi,
+                    self._rigid_body_max_depenetration_velocity,
                 ],
                 outputs=[
                     self._propagation_body_a,
@@ -13676,6 +13680,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._contact_units,
                     self._contact_unit_phi,
                     self._contact_unit_rebound,
+                    self._propagation_row_max_depenetration_velocity,
+                    self._contact_unit_max_depenetration_velocity,
                 ],
                 device=model.device,
             )
@@ -14345,7 +14351,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_target_velocity,
                 self._propagation_row_rebound_velocity,
                 self._propagation_body_qd,
-                self._rigid_body_max_depenetration_velocity,
+                self._propagation_row_max_depenetration_velocity,
                 self._cfm,
                 self._baumgarte,
                 self._contact_w,
@@ -14356,6 +14362,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._contact_unit_response,
                 self._contact_unit_phi,
                 self._contact_unit_rebound,
+                self._contact_unit_max_depenetration_velocity,
             ],
             outputs=[
                 self._contact_units,

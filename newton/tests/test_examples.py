@@ -2385,7 +2385,13 @@ for mode in ("colored", "serial"):
         TestUSDDependentExamples,
         name="contacts.example_contacts_rj45_plug",
         devices=cuda_test_devices,
-        test_options={"usd_required": True, "solver": "steel", "solve-mode": mode, "insert": True, "num-frames": 240},
+        test_options={
+            "requires": ("pxr.Usd",),
+            "solver": "steel",
+            "solve-mode": mode,
+            "insert": True,
+            "num-frames": 240,
+        },
         use_viewer=True,
         test_suffix=f"native_steel_insert_{mode}",
     )

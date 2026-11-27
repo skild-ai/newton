@@ -9461,6 +9461,7 @@ def build_propagation_contact_rows(
     contact_unit: wp.array[int],
     contact_unit_response: wp.array[int],
     recovery_phi: wp.array[float],
+    rigid_body_max_depenetration_velocity: wp.array[float],
     # outputs
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
@@ -9476,6 +9477,8 @@ def build_propagation_contact_rows(
     contact_units: wp.array[float],
     contact_unit_phi: wp.array[float],
     contact_unit_rebound: wp.array[float],
+    propagation_row_max_depenetration_velocity: wp.array2d[float],
+    contact_unit_max_depenetration_velocity: wp.array[float],
 ):
     """Build the body-space normal row and, when allocated, the two friction rows of every propagation contact.
 
@@ -9620,6 +9623,10 @@ def build_propagation_contact_rows(
                 if per_row:
                     propagation_phi[world, row] = phi
                     propagation_row_rebound_velocity[world, row] = rebound_velocity
+                    # The bound follows the contact's bodies, kinematic or static sides included.
+                    propagation_row_max_depenetration_velocity[world, row] = contact_max_depenetration_velocity(
+                        body_a, body_b, rigid_body_max_depenetration_velocity
+                    )
             else:
                 if per_layout:
                     propagation_row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
@@ -9659,6 +9666,9 @@ def build_propagation_contact_rows(
             contact_unit_set(contact_units, 3, unit, wp.vec4(ra[0], ra[1], ra[2], float(response_body_a)))
             contact_unit_set(contact_units, 4, unit, wp.vec4(rb[0], rb[1], rb[2], float(response_body_b)))
             contact_unit_phi[unit] = phi
+            contact_unit_max_depenetration_velocity[unit] = contact_max_depenetration_velocity(
+                body_a, body_b, rigid_body_max_depenetration_velocity
+            )
             contact_unit_rebound[unit] = rebound_velocity
             if propagation_row_contact.shape[1] > 1:
                 for row_offset in range(3):
@@ -10591,7 +10601,7 @@ def compute_propagation_effective_mass_and_rhs(
     propagation_target_velocity: wp.array2d[float],
     propagation_row_rebound_velocity: wp.array2d[float],
     propagation_body_qd: wp.array2d[float],
-    rigid_body_max_depenetration_velocity: wp.array[float],
+    propagation_row_max_depenetration_velocity: wp.array2d[float],
     pgs_cfm: float,
     pgs_beta: float,
     contact_w: float,
@@ -10602,6 +10612,7 @@ def compute_propagation_effective_mass_and_rhs(
     contact_unit_response: wp.array[int],
     contact_unit_phi: wp.array[float],
     contact_unit_rebound: wp.array[float],
+    contact_unit_max_depenetration_velocity: wp.array[float],
     # outputs
     contact_units: wp.array[float],
     contact_responses: wp.array[float],
@@ -10675,18 +10686,20 @@ def compute_propagation_effective_mass_and_rhs(
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
         phi = float(0.0)
         rebound_velocity = float(0.0)
+        bound = float(wp.inf)
         if rc >= 0:
             phi = contact_unit_phi[rc >> 2]
             rebound_velocity = contact_unit_rebound[rc >> 2]
+            bound = contact_unit_max_depenetration_velocity[rc >> 2]
         else:
             phi = propagation_phi[world, i]
             rebound_velocity = propagation_row_rebound_velocity[world, i]
+            bound = propagation_row_max_depenetration_velocity[world, i]
         if phi <= 0.0:
             # Speculative rows stay rigid so a closing contact reaches the surface.
             row_w = contact_w
         if phi < 0.0:
             bias = pgs_beta * phi / dt
-            bound = contact_max_depenetration_velocity(ba, bb, rigid_body_max_depenetration_velocity)
             if wp.isfinite(bound):
                 bias = wp.max(bias, -bound)
         else:
