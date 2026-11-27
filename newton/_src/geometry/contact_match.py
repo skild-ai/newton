@@ -104,6 +104,7 @@ import warp as wp
 
 from ..core.reset import reset_world_selected
 from ..core.types import Devicelike
+from .contact_data import make_contact_sort_key_with_bits
 from .contact_sort import SORT_KEY_SENTINEL
 
 if TYPE_CHECKING:
@@ -244,7 +245,10 @@ class _MatchData:
     shape_world: wp.array[wp.int32]
     world_count: int
 
-    # Current frame (sorted).
+    # Current frame (sorted keys). With ``has_order`` the contact arrays stay in buffer order and
+    # ``new_order[i]`` names the buffer row of sorted entry ``i``; otherwise entry ``i`` is row ``i``.
+    new_order: wp.array[wp.int32]
+    has_order: int
     new_keys: wp.array[wp.int64]
     new_point0: wp.array[wp.vec3]
     new_point1: wp.array[wp.vec3]
@@ -264,7 +268,8 @@ class _MatchData:
     # Initialised to _CLAIM_SENTINEL each frame; race with atomic_min.
     prev_claim: wp.array[wp.int64]
 
-    # Per-new candidate prev index (final value resolved in pass 2).
+    # Per-new candidate prev index by sorted entry (final value resolved in pass 2); the match index itself
+    # without ``has_order``.
     match_index: wp.array[wp.int32]
     # Id of the buffer being written, and the generation of that buffer that
     # ``match_index`` refers to (single element).
@@ -284,6 +289,9 @@ def _match_contacts_kernel(data: _MatchData):
     a packed claim on it via ``wp.atomic_min``.
     """
     tid = wp.tid()
+    row = tid
+    if data.has_order != 0:
+        row = data.new_order[tid]
     if tid == 0:
         # Previous-frame indices name rows of this buffer only if it wrote that frame.
         if data.prev_frame[0] == data.buffer_id:
@@ -300,8 +308,8 @@ def _match_contacts_kernel(data: _MatchData):
         data.match_index[tid] = MATCH_NOT_FOUND
         return
 
-    shape0 = data.new_shape0[tid]
-    shape1 = data.new_shape1[tid]
+    shape0 = data.new_shape0[row]
+    shape1 = data.new_shape1[row]
     if reset_world_selected(data.shape_world[shape0], data.reset_world_mask, data.world_count) or reset_world_selected(
         data.shape_world[shape1], data.reset_world_mask, data.world_count
     ):
@@ -314,22 +322,22 @@ def _match_contacts_kernel(data: _MatchData):
     # shape 1).  Matches the quantity persisted by ``_save_sorted_state_kernel``
     # for the previous frame, so both sides of ``diff`` below measure the same
     # physical quantity.
-    p0 = data.new_point0[tid]
-    bid0 = data.shape_body[data.new_shape0[tid]]
+    p0 = data.new_point0[row]
+    bid0 = data.shape_body[shape0]
     if bid0 == -1:
         p0w = p0
     else:
         p0w = wp.transform_point(data.body_q[bid0], p0)
 
-    p1 = data.new_point1[tid]
-    bid1 = data.shape_body[data.new_shape1[tid]]
+    p1 = data.new_point1[row]
+    bid1 = data.shape_body[shape1]
     if bid1 == -1:
         p1w = p1
     else:
         p1w = wp.transform_point(data.body_q[bid1], p1)
 
     new_pos_w = 0.5 * (p0w + p1w)
-    new_n = data.new_normal[tid]
+    new_n = data.new_normal[row]
     new_n0 = new_n
     new_n1 = new_n
     if data.has_body_frame != 0:
@@ -383,7 +391,11 @@ def _match_contacts_kernel(data: _MatchData):
         # 32 bits.  Using the sort key (instead of ``tid``) keeps the
         # winner invariant under the non-deterministic unsorted slot
         # assignment that the narrow phase gives us via ``wp.atomic_add``.
-        wp.atomic_min(data.prev_claim, best_idx, _pack_claim(best_dist_sq, target_key))
+        # Unsorted contacts carry no per-contact sub-key, so their buffer row breaks the tie.
+        tie = target_key
+        if data.has_order != 0:
+            tie = wp.int64(row)
+        wp.atomic_min(data.prev_claim, best_idx, _pack_claim(best_dist_sq, tie))
     else:
         # Pair range exists but no contact within thresholds.
         data.match_index[tid] = MATCH_BROKEN
@@ -423,6 +435,52 @@ def _resolve_claims_kernel(
         match_index[tid] = MATCH_BROKEN
 
 
+@wp.kernel(enable_backward=False)
+def _resolve_ordered_claims_kernel(
+    candidate: wp.array[wp.int32],
+    order: wp.array[wp.int32],
+    prev_claim: wp.array[wp.int64],
+    prev_row: wp.array[wp.int32],
+    new_count: wp.array[wp.int32],
+    match_index: wp.array[wp.int32],
+):
+    """Pass 2 of key-sorted matching: write each buffer row's match as a row of the previous buffer.
+
+    Entry ``tid`` is sorted entry ``tid`` (buffer row ``order[tid]``); a winning candidate becomes the
+    buffer row the previous frame's contact occupied.
+    """
+    tid = wp.tid()
+    row = order[tid]
+    if tid >= new_count[0]:
+        match_index[row] = MATCH_NOT_FOUND
+        return
+    cand = candidate[tid]
+    if cand < wp.int32(0):
+        match_index[row] = cand
+    elif (prev_claim[cand] & wp.int64(0xFFFFFFFF)) == (wp.int64(row) & wp.int64(0xFFFFFFFF)):
+        match_index[row] = prev_row[cand]
+    else:
+        match_index[row] = MATCH_BROKEN
+
+
+@wp.kernel(enable_backward=False)
+def _prepare_order_keys_kernel(
+    contact_count: wp.array[wp.int32],
+    shape0: wp.array[wp.int32],
+    shape1: wp.array[wp.int32],
+    shape_index_bits: int,
+    sub_key_bits: int,
+    keys: wp.array[wp.int64],
+    rows: wp.array[wp.int32],
+):
+    """Shape-pair keys (sub-key zero) of the unsorted contacts, and their rows, for key-sorted matching."""
+    i = wp.tid()
+    rows[i] = wp.int32(i)
+    keys[i] = SORT_KEY_SENTINEL
+    if i < contact_count[0] and i < shape0.shape[0]:
+        keys[i] = make_contact_sort_key_with_bits(shape0[i], shape1[i], 0, shape_index_bits, sub_key_bits)
+
+
 # ------------------------------------------------------------------
 # Save sorted state kernel
 # ------------------------------------------------------------------
@@ -443,6 +501,10 @@ class _SaveStateData:
     """
 
     src_keys: wp.array[wp.int64]
+    # With ``has_order`` entry ``i`` reads buffer row ``src_order[i]`` and saves it in ``dst_prev_row``.
+    src_order: wp.array[wp.int32]
+    has_order: int
+    dst_prev_row: wp.array[wp.int32]
     src_point0: wp.array[wp.vec3]
     src_point1: wp.array[wp.vec3]
     src_offset0: wp.array[wp.vec3]
@@ -498,23 +560,27 @@ def _save_sorted_state_kernel(data: _SaveStateData, reset_world_mask: wp.array[w
         data.dst_claim[i] = _CLAIM_SENTINEL
         if data.has_report != 0:
             data.dst_prev_was_matched[i] = wp.int32(0)
+        row = i
+        if data.has_order != 0:
+            row = data.src_order[i]
+            data.dst_prev_row[i] = row
 
-        p0 = data.src_point0[i]
-        bid0 = data.shape_body[data.src_shape0[i]]
+        p0 = data.src_point0[row]
+        bid0 = data.shape_body[data.src_shape0[row]]
         if bid0 == -1:
             p0w = p0
         else:
             p0w = wp.transform_point(data.body_q[bid0], p0)
 
-        p1 = data.src_point1[i]
-        bid1 = data.shape_body[data.src_shape1[i]]
+        p1 = data.src_point1[row]
+        bid1 = data.shape_body[data.src_shape1[row]]
         if bid1 == -1:
             p1w = p1
         else:
             p1w = wp.transform_point(data.body_q[bid1], p1)
 
         data.dst_pos_world[i] = 0.5 * (p0w + p1w)
-        n = data.src_normal[i]
+        n = data.src_normal[row]
         data.dst_normal[i] = n
 
         if data.has_sticky != 0 or data.has_body_frame != 0:
@@ -530,8 +596,8 @@ def _save_sorted_state_kernel(data: _SaveStateData, reset_world_mask: wp.array[w
             data.dst_normal0_body[i] = n0
             data.dst_normal1_body[i] = n1
         if data.has_sticky != 0:
-            data.dst_offset0_body[i] = data.src_offset0[i]
-            data.dst_offset1_body[i] = data.src_offset1[i]
+            data.dst_offset0_body[i] = data.src_offset0[row]
+            data.dst_offset1_body[i] = data.src_offset1[row]
 
 
 # ------------------------------------------------------------------
@@ -703,7 +769,7 @@ class ContactMatcher:
 
     Args:
         capacity: Maximum number of contacts (must match :class:`ContactSorter`).
-        sorter: The :class:`ContactSorter` producing the sorted contact stream.
+        sorter: The :class:`ContactSorter` producing the sorted contact stream, or ``None`` with ``order_by_keys``.
         shape_world: Per-shape world ids, with ``-1`` for global shapes.
         world_count: Number of local worlds.
         shape_index_bits: Number of sort-key bits reserved for each shape index.
@@ -722,6 +788,10 @@ class ContactMatcher:
             :meth:`replay_matched`, which replays the owned previous normal.
             When ``False`` these attributes are ``None`` and no extra kernel
             launches are added.
+        order_by_keys: Match a contact buffer left in narrow-phase order: :meth:`sort_keys` sorts only the
+            contacts' shape-pair keys with their rows (24 bytes per contact slot), and the match index names
+            rows of the previous frame's buffer (4 more bytes per slot). Ties between equally close contacts go
+            to the lower row. Supports neither ``sticky`` nor ``contact_report``.
         body_frame: Also match contacts whose witness points and normal stayed
             within the thresholds in their own bodies' frames (contacts two bodies
             carry together). Allocates the body-frame points (shared with sticky)
@@ -733,7 +803,7 @@ class ContactMatcher:
         self,
         capacity: int,
         *,
-        sorter: ContactSorter,
+        sorter: ContactSorter | None,
         shape_world: wp.array[wp.int32],
         world_count: int,
         shape_index_bits: int,
@@ -743,8 +813,13 @@ class ContactMatcher:
         contact_report: bool = False,
         sticky: bool = False,
         body_frame: bool = False,
+        order_by_keys: bool = False,
         device: Devicelike = None,
     ):
+        if order_by_keys and (sticky or contact_report):
+            raise ValueError("order_by_keys supports neither sticky matching nor contact_report")
+        if sorter is None and not order_by_keys:
+            raise ValueError("ContactMatcher needs a sorter unless order_by_keys is set")
         with wp.ScopedDevice(device):
             self._capacity = capacity
             self._pos_threshold_sq = pos_threshold * pos_threshold
@@ -757,6 +832,19 @@ class ContactMatcher:
             self._pair_sub_key_mask = wp.int64((1 << sub_key_bits) - 1)
             self._pair_key_stride = wp.int64(1 << sub_key_bits)
             self._reset_world_mask = wp.zeros(self._world_count + 1, dtype=wp.bool)
+            self._order_by_keys = bool(order_by_keys)
+            if order_by_keys:
+                # Radix-sort buffers of the keys and rows (the second halves are the sort's scratch), each sorted
+                # entry's candidate, and the buffer row of each saved entry.
+                self._order_keys = wp.full(2 * capacity, SORT_KEY_SENTINEL, dtype=wp.int64)
+                self._order_rows = wp.zeros(2 * capacity, dtype=wp.int32)
+                self._candidate = wp.zeros(capacity, dtype=wp.int32)
+                self._prev_row = wp.zeros(capacity, dtype=wp.int32)
+            else:
+                self._order_keys = None
+                self._order_rows = wp.zeros(1, dtype=wp.int32)
+                self._candidate = None
+                self._prev_row = wp.zeros(1, dtype=wp.int32)
 
             # Init with the sort-key sentinel so a debugger dump of the buffer
             # before the first save_sorted_state does not look like valid keys
@@ -827,6 +915,36 @@ class ContactMatcher:
         return self._body_frame
 
     @property
+    def orders_by_keys(self) -> bool:
+        """Whether the matcher sorts only keys and leaves the contact buffer in narrow-phase order."""
+        return self._order_by_keys
+
+    def sort_keys(
+        self,
+        contact_count: wp.array[wp.int32],
+        shape0: wp.array[wp.int32],
+        shape1: wp.array[wp.int32],
+        device: Devicelike = None,
+    ) -> tuple[wp.array[wp.int64], wp.array[wp.int32]]:
+        """Sort the unsorted contacts' shape-pair keys with their rows, for ``order_by_keys`` matching.
+
+        Returns:
+            The sorted keys and, for each sorted entry, its contact row; pass them to :meth:`match` and
+            :meth:`save_sorted_state` as ``sort_keys``/``sorted_keys`` and ``order``.
+        """
+        if not self._order_by_keys:
+            raise RuntimeError("sort_keys requires a ContactMatcher created with order_by_keys=True")
+        wp.launch(
+            _prepare_order_keys_kernel,
+            dim=self._capacity,
+            inputs=[contact_count, shape0, shape1, self._shape_index_bits, self._sub_key_bits],
+            outputs=[self._order_keys, self._order_rows],
+            device=device,
+        )
+        wp.utils.radix_sort_pairs(self._order_keys, self._order_rows, self._capacity)
+        return self._order_keys[: self._capacity], self._order_rows[: self._capacity]
+
+    @property
     def is_sticky(self) -> bool:
         """Whether sticky-mode full-record buffers are allocated."""
         return self._sticky
@@ -894,6 +1012,7 @@ class ContactMatcher:
         *,
         buffer_id: int,
         match_generation_out: wp.array[wp.int32],
+        order: wp.array[wp.int32] | None = None,
         device: Devicelike = None,
     ) -> None:
         """Match current sorted contacts against last frame's sorted contacts.
@@ -925,9 +1044,16 @@ class ContactMatcher:
                 contact generation of this buffer that ``match_index_out``
                 refers to, or ``-1`` when the previous frame was saved from
                 another buffer or never saved.
+            order: With ``order_by_keys``, the rows :meth:`sort_keys` returned: the contact arrays stay in
+                buffer order, entry ``r`` of ``match_index_out`` belongs to buffer row ``r``, and a nonnegative
+                value is a row of the previous frame's buffer.
             device: Device to launch on.
         """
+        if (order is not None) != self._order_by_keys:
+            raise ValueError("pass order exactly when the matcher was created with order_by_keys=True")
         data = _MatchData()
+        data.new_order = order if order is not None else self._order_rows
+        data.has_order = 1 if order is not None else 0
         data.prev_keys = self._prev_sorted_keys
         data.prev_pos_world = self._prev_pos_world
         data.prev_normal = self._prev_normal
@@ -951,7 +1077,7 @@ class ContactMatcher:
         data.new_count = contact_count
         data.body_q = body_q
         data.shape_body = shape_body
-        data.match_index = match_index_out
+        data.match_index = self._candidate if order is not None else match_index_out
         data.buffer_id = int(buffer_id)
         data.match_generation = match_generation_out
         data.prev_claim = self._prev_claim
@@ -961,6 +1087,15 @@ class ContactMatcher:
         data.pair_key_stride = self._pair_key_stride
 
         wp.launch(_match_contacts_kernel, dim=self._capacity, inputs=[data], device=device)
+        if order is not None:
+            wp.launch(
+                _resolve_ordered_claims_kernel,
+                dim=self._capacity,
+                inputs=[self._candidate, order, self._prev_claim, self._prev_row, contact_count],
+                outputs=[match_index_out],
+                device=device,
+            )
+            return
         wp.launch(
             _resolve_claims_kernel,
             dim=self._capacity,
@@ -991,6 +1126,7 @@ class ContactMatcher:
         contact_generation: wp.array[wp.int32],
         sorted_offset0: wp.array[wp.vec3] | None = None,
         sorted_offset1: wp.array[wp.vec3] | None = None,
+        order: wp.array[wp.int32] | None = None,
         device: Devicelike = None,
     ) -> None:
         """Save current frame's sorted contacts for next-frame matching.
@@ -1020,10 +1156,17 @@ class ContactMatcher:
             contact_generation: That buffer's single-element contact generation.
             sorted_offset0, sorted_offset1: Required when sticky is enabled;
                 ignored otherwise.
+            order: With ``order_by_keys``, the rows :meth:`sort_keys` returned; the contact arrays are then in
+                buffer order.
             device: Device to launch on.
         """
+        if (order is not None) != self._order_by_keys:
+            raise ValueError("pass order exactly when the matcher was created with order_by_keys=True")
         data = _SaveStateData()
         data.src_keys = sorted_keys
+        data.src_order = order if order is not None else self._order_rows
+        data.has_order = 1 if order is not None else 0
+        data.dst_prev_row = self._prev_row
         data.src_point0 = sorted_point0
         data.src_point1 = sorted_point1
         data.src_shape0 = sorted_shape0

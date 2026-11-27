@@ -1826,6 +1826,7 @@ class CollisionPipeline:
         contact_matching_pos_threshold: float = 0.0005,
         contact_matching_body_frame: bool = False,
         contact_matching_normal_dot_threshold: float = 0.995,
+        contact_matching_sort: Literal["contacts", "keys"] = "contacts",
         contact_report: bool = False,
         verify_buffers: bool = True,
         contact_reduction_hashtable_size_factor: float = 0.25,
@@ -1996,6 +1997,16 @@ class CollisionPipeline:
                 Defaults to ``False``.
             contact_matching_normal_dot_threshold: Minimum dot product between
                 old and new contact normals for a match.
+            contact_matching_sort: What contact matching sorts. ``"contacts"``
+                (default) sorts the contact buffer itself, which implies
+                ``deterministic=True``. ``"keys"`` sorts only the contacts'
+                shape-pair keys with their buffer rows and leaves the buffer in
+                narrow-phase order, without deterministic mode: about 28 bytes
+                per contact slot instead of sorted copies of the contacts, and
+                :attr:`Contacts.rigid_contact_match_index` then names rows of
+                the previous frame's buffer. Supports ``"latest"`` matching
+                (with ``contact_matching_body_frame``) but not ``"sticky"`` or
+                ``contact_report``.
             contact_report: Allocate ``rigid_contact_new_indices`` /
                 ``rigid_contact_new_count`` / ``rigid_contact_broken_indices``
                 / ``rigid_contact_broken_count`` on the :class:`Contacts`
@@ -2055,6 +2066,13 @@ class CollisionPipeline:
             )
         matching_enabled = contact_matching != "disabled"
         matching_sticky = contact_matching == "sticky"
+        if contact_matching_sort not in ("contacts", "keys"):
+            raise ValueError(f"contact_matching_sort must be 'contacts' or 'keys', got {contact_matching_sort!r}")
+        matching_by_keys = matching_enabled and contact_matching_sort == "keys" and not deterministic
+        if matching_by_keys and (matching_sticky or contact_report):
+            raise ValueError(
+                'contact_matching_sort="keys" supports neither contact_matching="sticky" nor contact_report'
+            )
         if contact_report and not matching_enabled:
             raise ValueError('contact_report=True requires contact_matching != "disabled"')
         if contact_matching_body_frame and not matching_enabled:
@@ -2074,8 +2092,8 @@ class CollisionPipeline:
                 f"got {speculative_contact_gap_max!r}"
             )
 
-        # Any non-disabled matching mode implies deterministic sorting.
-        if matching_enabled:
+        # Matching that sorts the contacts implies deterministic sorting.
+        if matching_enabled and not matching_by_keys:
             deterministic = True
 
         mode_from_broad_phase: str | None = None
@@ -2735,6 +2753,7 @@ class CollisionPipeline:
         self.contact_matching = contact_matching
         self._matching_enabled = matching_enabled
         self._matching_sticky = matching_sticky
+        self._matching_by_keys = matching_by_keys
         self.contact_report = contact_report
         if matching_enabled:
             self._contact_matcher = ContactMatcher(
@@ -2749,6 +2768,7 @@ class CollisionPipeline:
                 contact_report=contact_report,
                 sticky=matching_sticky,
                 body_frame=bool(contact_matching_body_frame),
+                order_by_keys=matching_by_keys,
                 device=device,
             )
         else:
@@ -3501,10 +3521,21 @@ class CollisionPipeline:
             )
 
         # Match the sorted stream against the previous frame: entry i belongs to
-        # final row i, and its value is a row of the previous sorted stream.
+        # final row i, and its value is a row of the previous sorted stream. Key-sorted
+        # matching leaves the buffer unsorted and matches rows through the sorted keys.
+        match_keys = match_order = None
         if self._contact_matcher is not None:
+            if self._matching_by_keys:
+                match_keys, match_order = self._contact_matcher.sort_keys(
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    device=self.device,
+                )
+            else:
+                match_keys = self._contact_sorter.sorted_keys_view
             self._contact_matcher.match(
-                sort_keys=self._contact_sorter.sorted_keys_view,
+                sort_keys=match_keys,
                 contact_count=contacts.rigid_contact_count,
                 point0=contacts.rigid_contact_point0,
                 point1=contacts.rigid_contact_point1,
@@ -3516,6 +3547,7 @@ class CollisionPipeline:
                 match_index_out=contacts.rigid_contact_match_index,
                 buffer_id=self._contact_matcher.buffer_id(contacts),
                 match_generation_out=contacts.rigid_contact_match_generation,
+                order=match_order,
                 device=self.device,
             )
         elif contacts.rigid_contact_match_index is not None:
@@ -3605,7 +3637,7 @@ class CollisionPipeline:
                 else {}
             )
             self._contact_matcher.save_sorted_state(
-                sorted_keys=self._contact_sorter.sorted_keys_view,
+                sorted_keys=match_keys,
                 contact_count=contacts.rigid_contact_count,
                 sorted_point0=contacts.rigid_contact_point0,
                 sorted_point1=contacts.rigid_contact_point1,
@@ -3616,6 +3648,7 @@ class CollisionPipeline:
                 shape_body=model.shape_body,
                 buffer_id=self._contact_matcher.buffer_id(contacts),
                 contact_generation=contacts.contact_generation,
+                order=match_order,
                 device=self.device,
                 **sticky_offsets,
             )

@@ -64,11 +64,12 @@ def budget(args, substeps, iterations, propagation=None):
 def pipeline_options(args):
     """Collision-pipeline options a cable example needs for its solver.
 
-    Native Steel warm-starts its contacts from its own friction-patch history, which matches each contact to its
-    predecessor, so the pipeline needs no contact matching (and keeps none of its sorted history); VBD needs none
-    either.
+    Native Steel warm-starts each contact from its predecessor, which the pipeline matches in the bodies' frames, so
+    contacts that moving bodies carry together (a grasp) keep their match. The pipeline sorts only the contacts' keys
+    for it, without sorting the contacts or deterministic mode. VBD needs no matching.
     """
-    del args
+    if getattr(args, "solver", "vbd") == "steel":
+        return {"contact_matching": "latest", "contact_matching_body_frame": True, "contact_matching_sort": "keys"}
     return {}
 
 
@@ -158,7 +159,7 @@ def make_solver(
             # them instead of re-deriving them from the joint coordinates.
             reuse_kinematics=True,
             # Each step starts from the previous step's contact impulses, so a held grasp or a cable resting on a
-            # surface keeps its load instead of rebuilding it every substep (Steel matches the contacts itself, see
+            # surface keeps its load instead of rebuilding it every substep (the pipeline matches the contacts, see
             # pipeline_options).
             contact_warmstart=True,
             # Point friction: two tangent rows per contact, warm-started, without friction-patch anchors. Every

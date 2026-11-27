@@ -1,0 +1,1 @@
+Add `contact_matching_sort` to `CollisionPipeline`: `"keys"` matches contacts across frames by sorting only their shape-pair keys with their buffer rows, without sorting the contact buffer or turning on deterministic mode, and `Contacts.rigid_contact_match_index` then names rows of the previous frame's buffer.
