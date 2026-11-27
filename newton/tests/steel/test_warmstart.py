@@ -120,6 +120,9 @@ def _gather_rows(
             wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device=device),
             wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device=device),
             wp.full((1, max_c), 100.0, dtype=wp.float32, device=device),
+            # No contact units: per-row layouts and friction coefficients.
+            wp.full((1, 1), -1, dtype=wp.int32, device=device),
+            wp.zeros(20, dtype=wp.float32, device=device),
             decay,
             dt_scale,
             # The previous step is 1, so the step ratio is dt_scale; generation 1 of
@@ -872,6 +875,8 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
                 wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3),
                 wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3),
                 wp.full((1, max_c), 100.0, dtype=wp.float32),
+                wp.full((1, 1), -1, dtype=wp.int32),  # no contact units
+                wp.zeros(20, dtype=wp.float32),
                 0.75,
                 4.0,  # dt; the previous step below is 1, so the step ratio is 4
                 wp.ones(1, dtype=float),

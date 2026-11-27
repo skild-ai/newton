@@ -10740,6 +10740,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 contacts.rigid_contact_normal,
                 self._ws_prev_contact_normal,
                 row_mu,
+                self._propagation_row_contact if route == 2 else self._no_row_contact,
+                self._contact_units,
                 self._contact_warmstart_decay,
                 dt,
                 self._ws_history_dt,
@@ -12499,6 +12501,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             request = self._world_count >= 256 and not self._connect_count and self._contact_friction_gap_max is None
         self._contact_units_on = bool(request) and self._propagation_colored and self._contact_units_supported(model)
         self._propagation_impulses = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
+        # Row families without contact units (the warm-start gather reads these for every family).
+        self._no_row_contact = wp.full((1, 1), -1, dtype=wp.int32, device=device)
+        self._contact_units = wp.zeros((PROPAGATION_CONTACT_UNIT_BLOCKS * 4,), dtype=wp.float32, device=device)
         if not self._propagation_active:
             return
 
@@ -12520,9 +12525,12 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._propagation_MiJt_b = wp.zeros(jacobian_shape, dtype=wp.float32, device=device)
         self._propagation_rhs = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
         self._propagation_eff_mass_inv = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
-        self._propagation_row_type = wp.zeros((worlds, rows), dtype=wp.int32, device=device)
-        self._propagation_row_parent = wp.full((worlds, rows), -1, dtype=wp.int32, device=device)
-        self._propagation_row_mu = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
+        # Every row a contact unit's: its type and parent are implied and its unit holds the friction coefficient
+        # (propagation_row_type_of, propagation_row_parent_of, propagation_row_mu_of).
+        layout_shape = (1, 1) if unit_rows_only else (worlds, rows)
+        self._propagation_row_type = wp.zeros(layout_shape, dtype=wp.int32, device=device)
+        self._propagation_row_parent = wp.full(layout_shape, -1, dtype=wp.int32, device=device)
+        self._propagation_row_mu = wp.zeros(layout_shape, dtype=wp.float32, device=device)
         # A contact unit keeps its normal row's gap and rebound target (contact_unit_phi / contact_unit_rebound).
         scalar_shape = (1, 1) if unit_rows_only else (worlds, rows)
         self._propagation_phi = wp.zeros(scalar_shape, dtype=wp.float32, device=device)
@@ -12544,8 +12552,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         if self._contact_warmstart:
             self._ws_prev_propagation_impulses = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
-            self._ws_prev_propagation_row_type = wp.full((worlds, rows), -1, dtype=wp.int32, device=device)
-            self._ws_prev_propagation_row_parent = wp.full((worlds, rows), -1, dtype=wp.int32, device=device)
+            self._ws_prev_propagation_row_type = wp.full(layout_shape, -1, dtype=wp.int32, device=device)
+            self._ws_prev_propagation_row_parent = wp.full(layout_shape, -1, dtype=wp.int32, device=device)
         # Per body: exact and split 6x6 center-of-mass responses, live twist and the impulse accumulated in a sweep.
         self._propagation_body_response = wp.zeros((bodies, 6, 6), dtype=wp.float32, device=device)
         self._propagation_body_response_split = wp.zeros((bodies, 6, 6), dtype=wp.float32, device=device)

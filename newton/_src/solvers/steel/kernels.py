@@ -6547,6 +6547,8 @@ def _transport_warmstart_contact(
     row_type: wp.array2d[int],
     row_parent: wp.array2d[int],
     row_mu: wp.array2d[float],
+    row_contact: wp.array2d[int],
+    contact_units: wp.array[float],
     impulses: wp.array2d[float],
 ):
     """Rotate a carried tangent impulse into the current tangent frame and clamp it to the current cone.
@@ -6561,10 +6563,10 @@ def _transport_warmstart_contact(
     if slot + 2 >= count:
         return
     if (
-        row_type[world, slot + 1] != PGS_CONSTRAINT_TYPE_FRICTION
-        or row_type[world, slot + 2] != PGS_CONSTRAINT_TYPE_FRICTION
-        or row_parent[world, slot + 1] != slot
-        or row_parent[world, slot + 2] != slot
+        propagation_row_type_of(row_type, world, slot + 1) != PGS_CONSTRAINT_TYPE_FRICTION
+        or propagation_row_type_of(row_type, world, slot + 2) != PGS_CONSTRAINT_TYPE_FRICTION
+        or propagation_row_parent_of(row_parent, world, slot + 1) != slot
+        or propagation_row_parent_of(row_parent, world, slot + 2) != slot
     ):
         return
 
@@ -6574,7 +6576,7 @@ def _transport_warmstart_contact(
     tangent_world = impulses[world, slot + 1] * old_t0 + impulses[world, slot + 2] * old_t1
     tangent = wp.vec2(wp.dot(tangent_world, new_t0), wp.dot(tangent_world, new_t1))
     magnitude = wp.length(tangent)
-    radius = wp.max(row_mu[world, slot + 1] * normal_impulse, 0.0)
+    radius = wp.max(propagation_row_mu_of(row_mu, row_contact, contact_units, world, slot + 1) * normal_impulse, 0.0)
     if not wp.isfinite(magnitude) or radius <= 0.0:
         tangent = wp.vec2(0.0)
     elif magnitude > radius:
@@ -6652,6 +6654,8 @@ def gather_contact_warmstart(
     contact_normal: wp.array[wp.vec3],
     previous_normal: wp.array[wp.vec3],
     row_mu: wp.array2d[float],
+    row_contact: wp.array2d[int],
+    contact_units: wp.array[float],
     decay: float,
     dt: float,
     history: wp.array[float],
@@ -6708,8 +6712,8 @@ def gather_contact_warmstart(
         return
 
     if (
-        row_type[world, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT
-        and prev_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
+        propagation_row_type_of(row_type, world, new_slot) == PGS_CONSTRAINT_TYPE_CONTACT
+        and propagation_row_type_of(prev_row_type, world, prev_slot) == PGS_CONSTRAINT_TYPE_CONTACT
     ):
         impulses[world, new_slot] = decay * dt_scale * prev_impulses[world, prev_slot]
     for r in range(1, 3):
@@ -6718,10 +6722,10 @@ def gather_contact_warmstart(
         if (
             new_r < count
             and prev_r < max_constraints
-            and row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION
-            and row_parent[world, new_r] == new_slot
-            and prev_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
-            and prev_row_parent[world, prev_r] == prev_slot
+            and propagation_row_type_of(row_type, world, new_r) == PGS_CONSTRAINT_TYPE_FRICTION
+            and propagation_row_parent_of(row_parent, world, new_r) == new_slot
+            and propagation_row_type_of(prev_row_type, world, prev_r) == PGS_CONSTRAINT_TYPE_FRICTION
+            and propagation_row_parent_of(prev_row_parent, world, prev_r) == prev_slot
         ):
             impulses[world, new_r] = decay * dt_scale * prev_impulses[world, prev_r]
 
@@ -6734,6 +6738,8 @@ def gather_contact_warmstart(
         row_type,
         row_parent,
         row_mu,
+        row_contact,
+        contact_units,
         impulses,
     )
 
@@ -6778,6 +6784,9 @@ def snapshot_row_warmstart(
     """Save one row family's impulses and row layout; a step without contacts carries nothing."""
     world, row = wp.tid()
     prev_impulses[world, row] = impulses[world, row]
+    # One-element layouts: every row a contact unit's, whose layout is implied.
+    if prev_row_type.shape[1] <= 1:
+        return
     if has_contacts != 0:
         prev_row_type[world, row] = row_type[world, row]
         prev_row_parent[world, row] = row_parent[world, row]
@@ -6811,8 +6820,9 @@ def reset_row_warmstart(
         if not selected:
             return
     prev_impulses[world, row] = 0.0
-    prev_row_type[world, row] = -1
-    prev_row_parent[world, row] = -1
+    if prev_row_type.shape[1] > 1:
+        prev_row_type[world, row] = -1
+        prev_row_parent[world, row] = -1
 
 
 @wp.kernel
@@ -8928,6 +8938,39 @@ def propagation_store_M(
 
 
 @wp.func
+def propagation_row_type_of(row_type: wp.array2d[int], world: int, i: int):
+    """Row ``i``'s type; a one-element ``row_type`` means every row is a contact unit's (contact, then its pair)."""
+    if row_type.shape[1] <= 1:
+        if i % 3 == 0:
+            return PGS_CONSTRAINT_TYPE_CONTACT
+        return PGS_CONSTRAINT_TYPE_FRICTION
+    return row_type[world, i]
+
+
+@wp.func
+def propagation_row_parent_of(row_parent: wp.array2d[int], world: int, i: int):
+    """Row ``i``'s parent; a one-element ``row_parent`` means every row is a contact unit's."""
+    if row_parent.shape[1] <= 1:
+        if i % 3 == 0:
+            return -1
+        return i - i % 3
+    return row_parent[world, i]
+
+
+@wp.func
+def propagation_row_mu_of(
+    row_mu: wp.array2d[float], row_contact: wp.array2d[int], cu: wp.array[float], world: int, i: int
+):
+    """Row ``i``'s friction coefficient; a one-element ``row_mu`` means its contact unit holds it."""
+    if row_mu.shape[1] <= 1:
+        rc = propagation_row_unit(row_contact, world, i)
+        if rc < 0:
+            return float(0.0)
+        return contact_unit_block(cu, 1, rc >> 2)[3]
+    return row_mu[world, i]
+
+
+@wp.func
 def _com_edge(propagation_body_com_rel: wp.array2d[float], child: int, parent: int):
     """Return the vector from the parent's to the child's center of mass."""
     return wp.vec3(
@@ -9113,30 +9156,35 @@ def build_propagation_contact_rows(
                 contact_friction_shared_anchor,
                 friction_patches,
             )
-            if response_body_a >= 0 and unit < 0:
+            if response_body_a >= 0 and unit < 0 and row < propagation_J_a.shape[1]:
                 ang_a = wp.cross(row_point_a - com_a, d)
                 for k in range(3):
                     propagation_J_a[world, row, k] = d[k]
                     propagation_J_a[world, row, 3 + k] = ang_a[k]
-            if response_body_b >= 0 and unit < 0:
+            if response_body_b >= 0 and unit < 0 and row < propagation_J_b.shape[1]:
                 ang_b = wp.cross(row_point_b - com_b, d)
                 for k in range(3):
                     propagation_J_b[world, row, k] = -d[k]
                     propagation_J_b[world, row, 3 + k] = -ang_b[k]
             propagation_body_a[world, row] = response_body_a
             propagation_body_b[world, row] = response_body_b
-            propagation_row_mu[world, row] = mu
+            if propagation_row_mu.shape[1] > 1:
+                propagation_row_mu[world, row] = mu
             # Without per-row gaps (every row a contact unit's) the unit keeps its normal row's.
             per_row = propagation_phi.shape[1] > 1
+            # Without per-row layouts (every row a contact unit's) the types and parents are implied.
+            per_layout = propagation_row_type.shape[1] > 1
             if row_offset == 0:
-                propagation_row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
-                propagation_row_parent[world, row] = -1
+                if per_layout:
+                    propagation_row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
+                    propagation_row_parent[world, row] = -1
                 if per_row:
                     propagation_phi[world, row] = phi
                     propagation_row_rebound_velocity[world, row] = rebound_velocity
             else:
-                propagation_row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
-                propagation_row_parent[world, row] = slot
+                if per_layout:
+                    propagation_row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
+                    propagation_row_parent[world, row] = slot
                 # Without friction anchors the displacements are a one-element zero stand-in.
                 patch_phi = float(0.0)
                 if c < friction_patches.phi.shape[0]:
@@ -9281,7 +9329,7 @@ def accumulate_propagation_body_activity(
     i = tid - world * propagation_max_constraints
     if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
         return
-    if propagation_row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
+    if propagation_row_type_of(propagation_row_type, world, i) != PGS_CONSTRAINT_TYPE_CONTACT:
         return
     lam = propagation_impulses[world, i]
     if lam <= 0.0:
@@ -10085,7 +10133,7 @@ def compute_propagation_effective_mass_and_rhs(
     bias = float(0.0)
     restitution_bias = float(0.0)
     row_w = float(1.0)
-    row_type = propagation_row_type[world, i]
+    row_type = propagation_row_type_of(propagation_row_type, world, i)
     target_velocity = propagation_target_velocity[world, i]
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
         phi = float(0.0)
@@ -10612,12 +10660,12 @@ def gather_propagation_unit_meta(
     unit_meta[base + 2] = lb
     n = int(0)
     member = int(-1)
-    if row_type[world, slot] == PGS_CONSTRAINT_TYPE_CONTACT:
-        member = row_parent[world, slot]
+    if propagation_row_type_of(row_type, world, slot) == PGS_CONSTRAINT_TYPE_CONTACT:
+        member = propagation_row_parent_of(row_parent, world, slot)
         while member >= 0 and member != slot and n < PROPAGATION_UNIT_RING:
             unit_meta[base + 4 + n] = member
             n += 1
-            member = row_parent[world, member]
+            member = propagation_row_parent_of(row_parent, world, member)
     for q in range(n, PROPAGATION_UNIT_RING):
         unit_meta[base + 4 + q] = -1
     # Past the stored members: -1 when the ring closed within them.
@@ -10632,7 +10680,7 @@ def gather_propagation_unit_meta(
         walk = member
         while walk >= 0 and walk != slot:
             count += 1
-            walk = row_parent[world, walk]
+            walk = propagation_row_parent_of(row_parent, world, walk)
         offset = wp.atomic_add(ring_overflow_cursor, world, count)
         if offset + count <= propagation_max_constraints and offset < (1 << 20) and count < 1024:
             walk = member
@@ -10640,22 +10688,25 @@ def gather_propagation_unit_meta(
             while walk >= 0 and walk != slot:
                 ring_overflow[world * propagation_max_constraints + offset + q] = walk
                 q += 1
-                walk = row_parent[world, walk]
+                walk = propagation_row_parent_of(row_parent, world, walk)
             overflow = offset | (count << 20)
     unit_meta[base + 7 + PROPAGATION_UNIT_RING] = overflow
     # Rows of the unit: its first row and the friction and free-body angular rows following it, then its contact
     # torsion row.
-    m = wp.min(constraint_count[world], int(row_type.shape[1]))
+    m = wp.min(constraint_count[world], propagation_max_constraints)
     rows = int(1)
     while slot + rows < m and (
-        row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_FRICTION
-        or row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING
-        or row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_CONTACT_SPIN
-        or (row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_CONNECT and row_parent[world, slot + rows] == slot)
+        propagation_row_type_of(row_type, world, slot + rows) == PGS_CONSTRAINT_TYPE_FRICTION
+        or propagation_row_type_of(row_type, world, slot + rows) == PGS_CONSTRAINT_TYPE_CONTACT_ROLLING
+        or propagation_row_type_of(row_type, world, slot + rows) == PGS_CONSTRAINT_TYPE_CONTACT_SPIN
+        or (
+            propagation_row_type_of(row_type, world, slot + rows) == PGS_CONSTRAINT_TYPE_CONNECT
+            and propagation_row_parent_of(row_parent, world, slot + rows) == slot
+        )
     ):
         rows += 1
     torsion = int(0)
-    if slot + rows < m and row_type[world, slot + rows] == PGS_CONSTRAINT_TYPE_TORSION:
+    if slot + rows < m and propagation_row_type_of(row_type, world, slot + rows) == PGS_CONSTRAINT_TYPE_TORSION:
         torsion = 1
     unit_meta[base + 5 + PROPAGATION_UNIT_RING] = rows + torsion
     # Straight-line kinds: a contact row with its friction pair on the unit's two bodies, or a lone contact row.
@@ -10664,17 +10715,20 @@ def gather_propagation_unit_meta(
     if (
         straight_line != 0
         and rows == 3
-        and row_type[world, slot] == PGS_CONSTRAINT_TYPE_CONTACT
+        and propagation_row_type_of(row_type, world, slot) == PGS_CONSTRAINT_TYPE_CONTACT
         and (la != lb or la < 0)
     ):
-        if row_parent[world, slot + 1] == slot and row_parent[world, slot + 2] == slot:
+        if (
+            propagation_row_parent_of(row_parent, world, slot + 1) == slot
+            and propagation_row_parent_of(row_parent, world, slot + 2) == slot
+        ):
             if body_a[world, slot + 1] == ba and body_b[world, slot + 1] == bb:
                 if body_a[world, slot + 2] == ba and body_b[world, slot + 2] == bb:
                     standard = 1
     if (
         straight_line != 0
         and rows == 1
-        and row_type[world, slot] == PGS_CONSTRAINT_TYPE_CONTACT
+        and propagation_row_type_of(row_type, world, slot) == PGS_CONSTRAINT_TYPE_CONTACT
         and (la != lb or la < 0)
     ):
         standard = 2  # a lone contact row
@@ -11722,7 +11776,7 @@ def _refine_chain_row(
     rc = propagation_row_unit(propagation_row_contact, world, i)
     if rc >= 0 and (rc & 3) == 0:
         contact_unit_set_word(contact_units, 0, rc >> 2, 3, propagation_eff_mass_inv[world, i])
-    if propagation_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONNECT:
+    if propagation_row_type_of(propagation_row_type, world, i) == PGS_CONSTRAINT_TYPE_CONNECT:
         gamma = propagation_row_mu[world, i]
         if gamma > 0.0 and d > 0.0:
             propagation_row_w[world, i] = d / (d + gamma)
@@ -12017,7 +12071,7 @@ def _refine_path_row(
     rc = propagation_row_unit(propagation_row_contact, world, i)
     if rc >= 0 and (rc & 3) == 0:
         contact_unit_set_word(contact_units, 0, rc >> 2, 3, propagation_eff_mass_inv[world, i])
-    if propagation_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONNECT:
+    if propagation_row_type_of(propagation_row_type, world, i) == PGS_CONSTRAINT_TYPE_CONNECT:
         # A rod closure's softness against this row's own diagonal.
         gamma = propagation_row_mu[world, i]
         if gamma > 0.0 and d > 0.0:
