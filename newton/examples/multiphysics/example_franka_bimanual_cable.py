@@ -884,6 +884,12 @@ class Example:
                 yaw -= math.pi
             grips.append((e, yaw, out))
         (ea, ya, oa), (eb, yb, ob) = grips
+        # The cable still settles while the hands come down: the hands servo to the links' live positions before
+        # the jaws close, as a controller watching the cable would (a link drifting 2 cm left a jaw closing on
+        # nothing).
+        now = self.sim_time
+        self._knot_grasp = ((self.track_a, ia, ea.copy()), (self.track_b, ib, eb.copy()))
+        self.replans += [(now + 1.5, self._servo_knot_grasp), (now + 1.9, self._servo_knot_grasp)]
         both = self._both
         both(1.2, {"pos": ea + up, "rot": down(ya)}, {"pos": eb + up, "rot": down(yb)})
         both(0.5, {"pos": ea}, {"pos": eb})
@@ -912,6 +918,19 @@ class Example:
         ease = pull - 0.01
         both(0.3, {"pos": ea + ease * oa + lift}, {"pos": eb + ease * ob + lift})
         both(0.4)
+
+    def _servo_knot_grasp(self):
+        """Shift each hand's remaining keyframes in the table plane by how far its link has moved since planning."""
+        pts = self._cable_centerline()
+        grasp = []
+        for track, idx, planned in self._knot_grasp:
+            shift = pts[idx] - planned
+            shift[2] = 0.0
+            for j, time in enumerate(track.times):
+                if time > self.sim_time:
+                    track.positions[j] = track.positions[j] + shift
+            grasp.append((track, idx, planned + shift))
+        self._knot_grasp = tuple(grasp)
 
     @staticmethod
     def _resample(path, spacing):
