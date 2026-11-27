@@ -331,7 +331,7 @@ class Example:
         # split sweep needs 24 iterations and runs faster from cable_solver.ARM_PROPAGATION_WORLDS worlds. The knot keeps
         # the immediate response at any world count: it holds every grip (100 of 100 runs, about 21 ms per frame at one
         # world), while under the propagation response (8 substeps of 20 iterations, the tree propagating every sweep,
-        # about 17 ms) a jaw loses the cable in about 2 runs of 100.
+        # about 16 ms) a jaw still loses the cable in about 1 run of 300.
         if args.contact_response is None and args.task == "knot" and self.native:
             args.contact_response = "immediate"
         if self.native and args.task == "knot" and args.contact_response == "propagation":
