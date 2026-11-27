@@ -854,12 +854,10 @@ class Example:
         rot_obj = ik.IKObjectiveRotation(
             link_index=self.hand_body, link_offset_rotation=wp.quat_identity(), target_rotations=rotations
         )
-        lower = np.tile(self.ik_model.joint_limit_lower.numpy()[:FRANKA_COORDS], problems)
-        upper = np.tile(self.ik_model.joint_limit_upper.numpy()[:FRANKA_COORDS], problems)
-        device = self.ik_model.device
+        # One limit per DoF of the IK arm, shared by every problem.
         limits = ik.IKObjectiveJointLimit(
-            joint_limit_lower=wp.array(lower, dtype=float, device=device),
-            joint_limit_upper=wp.array(upper, dtype=float, device=device),
+            joint_limit_lower=self.ik_model.joint_limit_lower,
+            joint_limit_upper=self.ik_model.joint_limit_upper,
             weight=10.0,
         )
         return ik.IKSolver(

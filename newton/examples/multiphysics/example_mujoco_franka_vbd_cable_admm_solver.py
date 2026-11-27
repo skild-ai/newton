@@ -519,11 +519,11 @@ class Example:
             link_offset_rotation=wp.quat_identity(),
             target_rotations=self.ik_target_rotations,
         )
-        joint_limit_lower = wp.clone(self.model.joint_limit_lower.reshape((self.world_count, -1))[:, : self.n_coords])
-        joint_limit_upper = wp.clone(self.model.joint_limit_upper.reshape((self.world_count, -1))[:, : self.n_coords])
+        # One limit per DoF of the IK arm, shared by every world's problem (limits tiled per world would add a
+        # residual row per world and outgrow the tiled solve's shared memory with many worlds).
         self.joint_limits_obj = ik.IKObjectiveJointLimit(
-            joint_limit_lower=joint_limit_lower.flatten(),
-            joint_limit_upper=joint_limit_upper.flatten(),
+            joint_limit_lower=self.ik_model.joint_limit_lower,
+            joint_limit_upper=self.ik_model.joint_limit_upper,
             weight=10.0,
         )
         self.ik_solver = ik.IKSolver(
