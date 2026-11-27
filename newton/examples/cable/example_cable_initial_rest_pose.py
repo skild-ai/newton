@@ -58,7 +58,8 @@ class Example:
 
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 5, 5, propagation=(4, 8))
+        # Native Steel: two substeps of eight sweeps relax both cables to the same shapes as four of eight.
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 5, 5, propagation=(2, 8))
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
 
