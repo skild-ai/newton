@@ -3079,6 +3079,15 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_max_constraints = self._free_body_constraint_max + self._requested_dense_max_constraints
         else:
             self._propagation_max_constraints = self._requested_dense_max_constraints
+        if articulated_contact_response != "immediate":
+            # The propagation kernels index a row's Jacobian floats with 32-bit offsets (world * rows + row) * 6.
+            limit = (2**31 - 1) // (6 * max(int(model.world_count), 1))
+            if self._propagation_max_constraints > limit:
+                raise ValueError(
+                    f"{self._propagation_max_constraints} propagation rows per world over {model.world_count} worlds "
+                    f"exceed the {limit} rows per world that 32-bit row indices address; lower "
+                    "propagation_constraint_max"
+                )
         if propagation_color_order == "rotating" and self._propagation_max_constraints >= _ROTATING_WALK_PRIMES[0]:
             raise ValueError(
                 f"propagation_color_order='rotating' supports fewer than {_ROTATING_WALK_PRIMES[0]} propagation "
@@ -12946,6 +12955,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             and bool(overrides.get("colored_straight_line", True))
             and not self._colored_packed()
             and not bool(overrides.get("colored_staged", False))
+            # The warp sweep, which stages a world's body twists in shared memory (the block sweep keeps rows).
+            and self._max_propagation_bodies * _COLORED_WORLDS_PER_BLOCK * 48 <= _COLORED_STAGING_BYTES
             and not self._contact_compliance
             and self._friction_mode == "fixed_normal"
             and not self._propagation_torsion_rows
@@ -13020,6 +13031,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 **self._colored_sweep_options,
             )
         else:
+            if self._contact_units_on:
+                raise RuntimeError("contact units need the warp colored sweep (_contact_units_supported)")
             # A world per block; with no more worlds than SMs, a wide block takes a color's units in fewer rounds.
             self._colored_block_dim = (
                 _COLORED_WIDE_BLOCK_DIM

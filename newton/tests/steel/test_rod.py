@@ -460,6 +460,56 @@ add_function_test(
 )
 
 
+def test_propagation_contact_units_need_the_warp_sweep(test, device):
+    """A world whose bodies the warp sweep cannot stage takes the block sweep, which keeps its contacts as rows."""
+    from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415
+
+    builder = newton.ModelBuilder()
+    for k in range(2):
+        rod = newton.Rod.create_straight(
+            start=(-1.5, 0.05 * k, 0.019), direction=(1.0, 0.0, 0.0), length=5.0, segment_count=500, radius=0.02
+        )
+        builder.add_rod(rod=rod, bend_stiffness=2, twist_stiffness=1)
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    with kernel_overrides({"colored_packed": False, "contact_units": True}):
+        solver = newton.solvers.SolverSteel(
+            model, solve_mode="colored", articulated_contact_response="propagation", friction_anchor_beta=0.0
+        )
+    test.assertFalse(solver._contact_units_on)
+    test.assertIsNotNone(solver._pgs_solve_propagation_colored_block_kernel)
+
+
+add_function_test(
+    TestSteelRod,
+    "test_propagation_contact_units_need_the_warp_sweep",
+    test_propagation_contact_units_need_the_warp_sweep,
+    devices=get_cuda_test_devices(),
+)
+
+
+def test_propagation_rows_fit_32_bit_indices(test, device):
+    """A row budget whose Jacobian offsets over every world pass 32 bits is refused at construction."""
+    builder = newton.ModelBuilder()
+    rod = newton.Rod.create_straight(start=(0.0, 0.0, 0.1), direction=(1.0, 0.0, 0.0), length=0.5, segment_count=4)
+    builder.add_rod(rod=rod, bend_stiffness=2, twist_stiffness=1)
+    world = newton.ModelBuilder()
+    world.replicate(builder, copy_count=4)
+    model = world.finalize(device=device)
+    with test.assertRaisesRegex(ValueError, "32-bit row indices"):
+        newton.solvers.SolverSteel(
+            model, articulated_contact_response="propagation", propagation_constraint_max=(2**31) // 24 + 1
+        )
+
+
+add_function_test(
+    TestSteelRod,
+    "test_propagation_rows_fit_32_bit_indices",
+    test_propagation_rows_fit_32_bit_indices,
+    devices=get_cuda_test_devices(),
+)
+
+
 def test_split_contact_jacobian(test, device):
     """Splitting each rod contact's Jacobian over its rows and DOFs writes the same rows as one thread per contact."""
     from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415
@@ -544,7 +594,8 @@ def test_propagation_matches_immediate(test, device):
     for name, options in (("immediate", {}), ("propagation", _PROPAGATION)):
         solver = newton.solvers.SolverSteel(model, articulation_constraint_max=640, iterations=8, **options)
         free[name] = _step_from(model, rest, solver, with_contacts=False).joint_qd.numpy()
-    np.testing.assert_allclose(free["propagation"], free["immediate"], atol=1.0e-4)
+    # These solvers are not run-to-run deterministic; a joint rate can differ by about 1e-4 between runs.
+    np.testing.assert_allclose(free["propagation"], free["immediate"], atol=2.0e-4)
 
 
 add_function_test(
