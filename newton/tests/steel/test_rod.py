@@ -1133,6 +1133,48 @@ add_function_test(
 )
 
 
+def test_inextensible_fused_loop(test, device):
+    """With one world the latency-fused loop carries the rod chains, closure rows and momentum in one launch per
+    solve, its parameters fit the 4 KB a CUDA graph can capture, and it steps like the per-pass launches."""
+    from newton._src.solvers.steel._testing import kernel_overrides  # noqa: PLC0415
+    from newton.tests.steel.test_propagation import _kernel_param_bytes  # noqa: PLC0415
+
+    # Run to run identical without momentum (ordered rows step the momentum in row order, which the loop does not).
+    results = {}
+    for fused, momentum in ((True, False), (False, False), (True, True)):
+        model, bodies = _hanging_rod(device, inextensible=True)
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        with kernel_overrides({"propagation_latency_fused": fused}):
+            solver = newton.solvers.SolverSteel(
+                model,
+                solve_mode="colored",
+                articulated_contact_response="propagation",
+                articulation_constraint_max=256,
+                iterations=16,
+                propagation_interval=1,
+                propagation_momentum=momentum,
+                deterministic=None if momentum else wp.DeterministicMode.RUN_TO_RUN,
+            )
+        test.assertEqual(solver._latency_fused, fused)
+        if fused:
+            test.assertLessEqual(_kernel_param_bytes(solver._latency_fused_kernel), 4096)
+        a, b, control, contacts = model.state(), model.state(), model.control(), pipeline.contacts()
+        for _ in range(120):
+            pipeline.collide(a, contacts)
+            solver.step(a, b, control, contacts, 1.0 / 240.0)
+            a, b = b, a
+        results[fused, momentum] = a.body_q.numpy()
+    for key in ((True, False), (True, True)):
+        test.assertTrue(np.all(np.isfinite(results[key])))
+        test.assertLess(float(results[key][int(bodies[-1]), 2]), 0.05)  # it swung down onto the ground
+    np.testing.assert_allclose(results[True, False][:, :3], results[False, False][:, :3], atol=1.0e-4)
+
+
+add_function_test(
+    TestSteelRod, "test_inextensible_fused_loop", test_inextensible_fused_loop, devices=get_cuda_test_devices()
+)
+
+
 def test_inextensible_long_chain_whip(test, device):
     """A long, light inextensible rod whipping under gravity stays bounded, as a stiff six-DOF rod does.
 

@@ -230,9 +230,13 @@ class TreeSlot:
 
 
 @wp.struct
-class RodArgs:
-    """Arrays the rod-chain refresh and propagation read (``rod_tree.chain_*_native``)."""
+class ExtraArgs:
+    """The optional stages' arrays in one struct, so they cost the launch one parameter: the rod chains (their
+    articulations by world and what ``rod_tree.chain_*_native`` read) and the Nesterov momentum."""
 
+    rod_group_to_art: wp.array[int]
+    rod_world_offsets: wp.array[int]
+    rod_world_groups: wp.array[int]
     joint_meta: wp.array[int]
     chain_flag: wp.array[int]
     cache_world_flag: wp.array[int]
@@ -250,35 +254,26 @@ class RodArgs:
     active_P: wp.array[float]
     response: wp.array3d[float]
     active_qd0: wp.array[float]
-
-
-@wp.struct
-class MomentumArgs:
-    """Nesterov momentum of the propagation rows (``SolverSteel(propagation_momentum=True)``), per world."""
-
-    start: wp.array2d[float]
-    prev: wp.array2d[float]
-    t: wp.array[float]
-    beta: wp.array[float]
+    momentum_start: wp.array2d[float]
+    momentum_prev: wp.array2d[float]
+    momentum_t: wp.array[float]
+    momentum_beta: wp.array[float]
     row_contact: wp.array2d[int]
     unit_response: wp.array[int]
-
-
-@wp.struct
-class FreeArgs:
-    """Free-rigid bodies per world (CSR) and their first DOFs."""
-
-    world_offsets: wp.array[int]
-    bodies: wp.array[int]
-    dof_start: wp.array[int]
+    # Free-rigid bodies per world (CSR) and their first DOFs.
+    free_world_offsets: wp.array[int]
+    free_bodies: wp.array[int]
+    free_dof_start: wp.array[int]
+    # propagation_interval of the rod trees (1 without rods).
+    every: int
 
 
 @wp.func
-def _free_refresh(world: int, lane: int, free: FreeArgs, v_out: wp.array[float], body_qd: wp.array2d[float]):
+def _free_refresh(world: int, lane: int, free: ExtraArgs, v_out: wp.array[float], body_qd: wp.array2d[float]):
     """``refresh_propagation_free_body_qd_from_vout`` for one world's free-rigid bodies."""
-    for i in range(free.world_offsets[world] + lane, free.world_offsets[world + 1], 32):
-        body = free.bodies[i]
-        dof = free.dof_start[i]
+    for i in range(free.free_world_offsets[world] + lane, free.free_world_offsets[world + 1], 32):
+        body = free.free_bodies[i]
+        dof = free.free_dof_start[i]
         for r in range(6):
             body_qd[body, r] = v_out[dof + r]
 
@@ -287,15 +282,15 @@ def _free_refresh(world: int, lane: int, free: FreeArgs, v_out: wp.array[float],
 def _free_flush(
     world: int,
     lane: int,
-    free: FreeArgs,
+    free: ExtraArgs,
     body_qd: wp.array2d[float],
     body_impulses: wp.array2d[float],
     v_out: wp.array[float],
 ):
     """``flush_propagation_free_body_qd_to_vout`` for one world's free-rigid bodies."""
-    for i in range(free.world_offsets[world] + lane, free.world_offsets[world + 1], 32):
-        body = free.bodies[i]
-        dof = free.dof_start[i]
+    for i in range(free.free_world_offsets[world] + lane, free.free_world_offsets[world + 1], 32):
+        body = free.free_bodies[i]
+        dof = free.free_dof_start[i]
         for r in range(6):
             v_out[dof + r] = body_qd[body, r]
             body_impulses[body, r] = 0.0
@@ -344,6 +339,8 @@ def get_fused_iteration_kernel(
     ``None`` without cached responses. Launch with ``dim=[world_count]`` and ``32 * warp_count(...)`` threads.
     """
     n_slots = len(tree_natives)
+    # Without generalized or free-body rows (every articulation a rod tree) the row phases are compiled out.
+    has_rows = row_native is not None
     has_rods = rod_natives is not None
     # The rod chains' warp (one warp walks its world's chains, one after another) and the free bodies' after it.
     rod_warp = 1 + n_slots
@@ -354,7 +351,7 @@ def get_fused_iteration_kernel(
     momentum_step = momentum_step_native(block_threads) if momentum else None
 
     @wp.func(module="unique")
-    def row_phase(
+    def row_phase_impl(
         world: int,
         phase: int,
         rows: RowArgs,
@@ -375,6 +372,23 @@ def get_fused_iteration_kernel(
             freeze_drive_rows, phase, friction_start_iteration, iteration, v_out,
         )  # fmt: skip
 
+    @wp.func(module="unique")
+    def row_phase(
+        world: int,
+        phase: int,
+        rows: RowArgs,
+        omega: float,
+        regularize: int,
+        freeze_drive_rows: int,
+        friction_start_iteration: int,
+        iteration: int,
+        v_out: wp.array[float],
+    ):
+        if wp.static(has_rows):
+            row_phase_impl(
+                world, phase, rows, omega, regularize, freeze_drive_rows, friction_start_iteration, iteration, v_out
+            )
+
     def steel_fused_propagation_loop(
         world_count: int,
         iterations: int,
@@ -384,17 +398,13 @@ def get_fused_iteration_kernel(
         regularize: int,
         freeze_drive_rows: int,
         force_refresh: int,
-        every: int,
         cache_max_bodies: int,
         colored: ColoredArgs,
         rows: RowArgs,
         cache: wp.array[CacheArgs],
         tree: wp.array[TreeArgs],
         slots: wp.array[TreeSlot],
-        free: wp.array[FreeArgs],
-        rod_slot: wp.array[TreeSlot],
-        rod: wp.array[RodArgs],
-        mom: wp.array[MomentumArgs],
+        extra: wp.array[ExtraArgs],
         articulation_active: wp.array[int],
         body_to_articulation: wp.array[int],
         propagation_impulses: wp.array2d[float],
@@ -406,12 +416,13 @@ def get_fused_iteration_kernel(
         warp_id = t // 32
         lane = t - warp_id * 32
         rows_n = wp.min(colored.constraint_count[world], propagation_impulses.shape[1])
+        every = extra[0].every
         if wp.static(momentum):
             # The solve's start: the previous point is the warm start, and the sequence restarts.
             for r in range(t, rows_n, wp.static(block_threads)):
-                mom[0].prev[world, r] = propagation_impulses[world, r]
+                extra[0].momentum_prev[world, r] = propagation_impulses[world, r]
             if t == 0:
-                mom[0].t[world] = 1.0
+                extra[0].momentum_t[world] = 1.0
             _block_sync()
         for i in range(iterations):
             g = iteration_offset + i
@@ -448,20 +459,19 @@ def get_fused_iteration_kernel(
             if wp.static(has_rods):
                 # Rod trees stepped by their factorization keep their twists between sweeps: refresh once.
                 if warp_id == wp.static(rod_warp) and (wp.static(rod_refresh_every) or i == 0):
-                    rs = rod_slot[0]
-                    for k in range(rs.world_offsets[world], rs.world_offsets[world + 1]):
+                    for k in range(extra[0].rod_world_offsets[world], extra[0].rod_world_offsets[world + 1]):
                         wp.static(rod_refresh)(
-                            rs.world_groups[k], rod[0].joint_meta, rs.group_to_art, rod[0].chain_flag,
-                            articulation_active, tree[0].articulation_joint_range, rod[0].FR, rod[0].CR,
-                            rod[0].chain_off, rod[0].chain_start, rod[0].body_o, v_out, body_qd,
+                            extra[0].rod_world_groups[k], extra[0].joint_meta, extra[0].rod_group_to_art, extra[0].chain_flag,
+                            articulation_active, tree[0].articulation_joint_range, extra[0].FR, extra[0].CR,
+                            extra[0].chain_off, extra[0].chain_start, extra[0].body_o, v_out, body_qd,
                         )  # fmt: skip
             if warp_id == wp.static(free_warp):
-                _free_refresh(world, lane, free[0], v_out, body_qd)
+                _free_refresh(world, lane, extra[0], v_out, body_qd)
             if wp.static(momentum):
                 # The impulses a block of sweeps starts from: the momentum's restart test reads them.
                 if every == 1 or i % every == 0:
                     for r in range(t, rows_n, wp.static(block_threads)):
-                        mom[0].start[world, r] = propagation_impulses[world, r]
+                        extra[0].momentum_start[world, r] = propagation_impulses[world, r]
             _block_sync()
             # The snapshot overlaps the sweep's start: the sweep only stages the twists in shared memory before
             # a block barrier that warp 0 reaches after the snapshot.
@@ -483,17 +493,17 @@ def get_fused_iteration_kernel(
                 if propagates and not last:
                     # The momentum's move joins the sweep's pending impulses, so the propagation installs both.
                     wp.static(momentum_step)(
-                        world_count, colored.constraint_count, mom[0].start, propagation_impulses, mom[0].prev,
-                        mom[0].t, mom[0].beta,
+                        world_count, colored.constraint_count, extra[0].momentum_start, propagation_impulses, extra[0].momentum_prev,
+                        extra[0].momentum_t, extra[0].momentum_beta,
                     )  # fmt: skip
                     _block_sync()
-                    beta = mom[0].beta[world]
+                    beta = extra[0].momentum_beta[world]
                     for r in range(t, rows_n, wp.static(block_threads)):
                         propagation_momentum_apply_row(
                             world, r, beta, colored.body_a, colored.body_b, colored.J_a, colored.J_b,
-                            colored.MiJt_a, colored.MiJt_b, mom[0].row_contact, colored.contact_units,
-                            mom[0].unit_response, colored.contact_responses, colored.body_response_split,
-                            propagation_impulses, mom[0].prev, body_qd, body_impulses,
+                            colored.MiJt_a, colored.MiJt_b, extra[0].row_contact, colored.contact_units,
+                            extra[0].unit_response, colored.contact_responses, colored.body_response_split,
+                            propagation_impulses, extra[0].momentum_prev, body_qd, body_impulses,
                         )  # fmt: skip
                     _block_sync()
             # The GEMV, the trees and the free bodies own disjoint DOFs, bodies and impulses.
@@ -517,18 +527,17 @@ def get_fused_iteration_kernel(
                         )  # fmt: skip
             if wp.static(has_rods):
                 if warp_id == wp.static(rod_warp) and propagates:
-                    rs = rod_slot[0]
-                    for k in range(rs.world_offsets[world], rs.world_offsets[world + 1]):
+                    for k in range(extra[0].rod_world_offsets[world], extra[0].rod_world_offsets[world + 1]):
                         wp.static(rod_propagate)(
-                            rs.world_groups[k], rod[0].joint_meta, rs.group_to_art, rod[0].chain_flag,
-                            articulation_active, tree[0].art_to_world, rod[0].cache_world_flag,
-                            tree[0].articulation_joint_range, rod[0].BR, rod[0].FR, rod[0].CR, rod[0].chain_off,
-                            rod[0].chain_start, rod[0].body_extra, rod[0].body_d, rod[0].body_o, rod[0].u,
-                            rod[0].n_active, 0, rod[0].active_body, rod[0].active_P, rod[0].response,
-                            rod[0].active_qd0, body_impulses, body_qd, v_out,
+                            extra[0].rod_world_groups[k], extra[0].joint_meta, extra[0].rod_group_to_art, extra[0].chain_flag,
+                            articulation_active, tree[0].art_to_world, extra[0].cache_world_flag,
+                            tree[0].articulation_joint_range, extra[0].BR, extra[0].FR, extra[0].CR, extra[0].chain_off,
+                            extra[0].chain_start, extra[0].body_extra, extra[0].body_d, extra[0].body_o, extra[0].u,
+                            extra[0].n_active, 0, extra[0].active_body, extra[0].active_P, extra[0].response,
+                            extra[0].active_qd0, body_impulses, body_qd, v_out,
                         )  # fmt: skip
             if warp_id == wp.static(free_warp):
-                _free_flush(world, lane, free[0], body_qd, body_impulses, v_out)
+                _free_flush(world, lane, extra[0], body_qd, body_impulses, v_out)
             _block_sync()
             # row phase 5 (velocity limits); warp 0 runs it before the next iteration's phases 3 and 4
             if wp.static(has_phase5):

@@ -15052,8 +15052,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             and self._propagation_colored
             and self._pgs_solve_propagation_colored_warp_kernel is not None
             and not self._colored_staged
-            and self._pgs_solve_mf_gs_kernels
-            and 0 not in self._pgs_solve_mf_gs_kernels
+            # Row phases ride along unless no articulation has generalized rows (every one a rod tree).
+            and (
+                self._max_world_dofs == 0 or (self._pgs_solve_mf_gs_kernels and 0 not in self._pgs_solve_mf_gs_kernels)
+            )
             and not self._local_internal_fast_path
             and not self._paired_factor_coordinates
             and self._sparse_mass_matrix_size is None
@@ -15083,6 +15085,12 @@ class SolverSteel(SolverBase, CouplingInterface):
         art_world = self._art_to_world.numpy()
         rod_sizes = [size for size in self._propagation_tree_sizes if size in self._rod_tree_sizes]
         slots = [size for size in self._propagation_tree_sizes if size not in self._rod_tree_sizes]
+        # One warp walks a world's rod chains in turn: many cables per world run faster as the per-pass grid, a warp
+        # per chain (seven cables of a bundle take twice as long fused).
+        if rod_sizes:
+            rod_arts = np.concatenate([self._propagation_tree_arts[size].numpy() for size in rod_sizes])
+            if np.bincount(np.maximum(art_world[rod_arts], 0)).max() > _LATENCY_MAX_ARTS_PER_GROUP:
+                return
         if len(slots) > latency_fused.MAX_TREE_SLOTS or not all(self._propagation_native_tree[size] for size in slots):
             return
         # A group's articulations of one world share its warp in turn; many per world run faster as the
@@ -15125,10 +15133,6 @@ class SolverSteel(SolverBase, CouplingInterface):
             slot.world_offsets = int_array(np.searchsorted(worlds[order], world_edges))
             slot.world_groups = int_array(order)
             tree_slots.append(slot)
-        free = latency_fused.FreeArgs()
-        free.world_offsets = int_array(np.searchsorted(body_world[bodies], world_edges))
-        free.bodies = int_array(bodies)
-        free.dof_start = int_array(dof_start)
         tree = latency_fused.TreeArgs()
         tree.art_to_world = self._art_to_world
         tree.dense_contact_world_flag = self._dense_contact_world_flag
@@ -15148,42 +15152,44 @@ class SolverSteel(SolverBase, CouplingInterface):
         tree.com_rel = self._propagation_body_com_rel
         tree.U = self._propagation_tree_U
         tree.D_inv = self._propagation_tree_D_inv
-        # The rod warp's chains, by world: every rod group's articulations in one list.
-        rod_slot = latency_fused.TreeSlot()
-        rod = latency_fused.RodArgs()
+        # The optional stages: the rod warp's chains by world (every rod group's articulations in one list) and
+        # the momentum.
+        extra = latency_fused.ExtraArgs()
+        extra.free_world_offsets = int_array(np.searchsorted(body_world[bodies], world_edges))
+        extra.free_bodies = int_array(bodies)
+        extra.free_dof_start = int_array(dof_start)
+        extra.every = int(self._propagation_interval) if rod_sizes else 1
         if rod_sizes:
             rod_arts = np.concatenate([self._propagation_tree_arts[size].numpy() for size in rod_sizes])
             rod_arts = rod_arts[np.argsort(art_world[rod_arts], kind="stable")]
-            rod_slot.group_to_art = int_array(rod_arts)
-            rod_slot.guard_flag = self._propagation_cache_guard_off
-            rod_slot.world_offsets = int_array(np.searchsorted(art_world[rod_arts], world_edges))
-            rod_slot.world_groups = int_array(np.arange(len(rod_arts)))
+            extra.rod_group_to_art = int_array(rod_arts)
+            extra.rod_world_offsets = int_array(np.searchsorted(art_world[rod_arts], world_edges))
+            extra.rod_world_groups = int_array(np.arange(len(rod_arts)))
             cached = any(size in self._propagation_cached_kernels for size in rod_sizes)
-            rod.joint_meta = self._rod_tree_meta
-            rod.chain_flag = self._rod_scan_flag
-            rod.cache_world_flag = self._propagation_cache_world_flag if cached else self._propagation_cache_guard_off
-            rod.BR = self._propagation_tree_BR
-            rod.FR = self._propagation_tree_FR
-            rod.CR = self._propagation_tree_CR
-            rod.chain_off = self._rod_tree_chain_off
-            rod.chain_start = self._rod_tree_chain_start
-            rod.body_extra = self._rod_tree_body_extra
-            rod.body_d = self._rod_tree_body_d
-            rod.body_o = self._rod_tree_body_o
-            rod.u = self._propagation_tree_u
-            rod.n_active = self._rod_ctr_count if self._rod_contracted else self._rod_chain_flag
-            rod.active_body = self._rod_ctr_body
-            rod.active_P = self._rod_ctr_P
-            rod.response = self._propagation_body_response
-            rod.active_qd0 = self._rod_ctr_qd0
-        mom = latency_fused.MomentumArgs()
+            extra.joint_meta = self._rod_tree_meta
+            extra.chain_flag = self._rod_scan_flag
+            extra.cache_world_flag = self._propagation_cache_world_flag if cached else self._propagation_cache_guard_off
+            extra.BR = self._propagation_tree_BR
+            extra.FR = self._propagation_tree_FR
+            extra.CR = self._propagation_tree_CR
+            extra.chain_off = self._rod_tree_chain_off
+            extra.chain_start = self._rod_tree_chain_start
+            extra.body_extra = self._rod_tree_body_extra
+            extra.body_d = self._rod_tree_body_d
+            extra.body_o = self._rod_tree_body_o
+            extra.u = self._propagation_tree_u
+            extra.n_active = self._rod_ctr_count if self._rod_contracted else self._rod_chain_flag
+            extra.active_body = self._rod_ctr_body
+            extra.active_P = self._rod_ctr_P
+            extra.response = self._propagation_body_response
+            extra.active_qd0 = self._rod_ctr_qd0
         if self._propagation_momentum:
-            mom.start = self._momentum_start
-            mom.prev = self._momentum_prev
-            mom.t = self._momentum_t
-            mom.beta = self._momentum_beta
-            mom.row_contact = self._propagation_row_contact
-            mom.unit_response = self._contact_unit_response
+            extra.momentum_start = self._momentum_start
+            extra.momentum_prev = self._momentum_prev
+            extra.momentum_t = self._momentum_t
+            extra.momentum_beta = self._momentum_beta
+            extra.row_contact = self._propagation_row_contact
+            extra.unit_response = self._contact_unit_response
         cache = latency_fused.CacheArgs()
         cache.world_flag = self._propagation_cache_world_flag
         cache.body_count = self._propagation_cache_body_count
@@ -15195,15 +15201,12 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._latency_fused_kernel = kernel
         self._latency_fused_block_dim = 32 * latency_fused.warp_count(len(slots), bool(rod_sizes))
         # The structs hold the only references to their per-world tables.
-        self._latency_fused_structs = (cache, tree, tree_slots, free, rod_slot, rod, mom)
+        self._latency_fused_structs = (cache, tree, tree_slots, extra)
         self._latency_fused_static = (
             wp.array([cache], dtype=latency_fused.CacheArgs, device=device),
             wp.array([tree], dtype=latency_fused.TreeArgs, device=device),
             wp.array(tree_slots or [latency_fused.TreeSlot()], dtype=latency_fused.TreeSlot, device=device),
-            wp.array([free], dtype=latency_fused.FreeArgs, device=device),
-            wp.array([rod_slot], dtype=latency_fused.TreeSlot, device=device),
-            wp.array([rod], dtype=latency_fused.RodArgs, device=device),
-            wp.array([mom], dtype=latency_fused.MomentumArgs, device=device),
+            wp.array([extra], dtype=latency_fused.ExtraArgs, device=device),
         )
         self._latency_fused = True
 
@@ -15233,10 +15236,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         has_internal_rows, has_velocity_limits = self._internal_row_phases()
         interleaved = self._row_schedule != "contact_then_internal"
         # Streaming the free-body impulses frees shared memory for the other stages and keeps the results.
-        rows = self._pgs_solve_mf_gs_kernel_for_phase(stream_mf_lambda=True)
+        rows = self._pgs_solve_mf_gs_kernel_for_phase(stream_mf_lambda=True) if self._max_world_dofs else None
         kernel = latency_fused.get_fused_iteration_kernel(
             colored.native,
-            rows.native,
+            rows.native if rows is not None else None,
             gemv,
             tuple(
                 (
@@ -15283,8 +15286,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         for name, value in zip(latency_fused.COLORED_FIELDS, values, strict=True):
             setattr(colored, name, value)
         rows = latency_fused.RowArgs()
-        for name, value in zip(latency_fused.ROW_FIELDS, self._mf_gs_inputs(rhs), strict=True):
-            setattr(rows, name, value)
+        if self._max_world_dofs:
+            for name, value in zip(latency_fused.ROW_FIELDS, self._mf_gs_inputs(rhs), strict=True):
+                setattr(rows, name, value)
         wp.launch_tiled(
             self._latency_fused_kernel,
             dim=[self._world_count],
@@ -15297,7 +15301,6 @@ class SolverSteel(SolverBase, CouplingInterface):
                 int(regularize),
                 int(freeze_drive_rows),
                 int(force_refresh),
-                int(self._propagation_interval) if self._rod_tree_sizes else 1,
                 int(self._propagation_cache_max_bodies),
                 colored,
                 rows,
