@@ -177,8 +177,11 @@ class Example:
 
         # Contacts per world: the task's peak, 225 contacts, under Steel and VBD, with a quarter on top.
         self.contacts_per_world = cable_solver.contact_budget(self.model, 3.5)
+        # VBD's contact history reads latest matching (sorted contacts); native Steel's warm start needs only the
+        # key-sorted match (cable_solver.pipeline_options).
+        matching = cable_solver.pipeline_options(args) if self.clamps.steel else {"contact_matching": "latest"}
         self.collision_pipeline = newton.CollisionPipeline(
-            self.model, contact_matching="latest", rigid_contact_max=self.contacts_per_world * self.model.world_count
+            self.model, rigid_contact_max=self.contacts_per_world * self.model.world_count, **matching
         )
         self.contacts = self.collision_pipeline.contacts()
         self.clamps.bind(self.model)

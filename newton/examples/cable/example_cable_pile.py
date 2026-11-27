@@ -169,8 +169,15 @@ class Example:
         # Size persistent contact history before graph capture.
         # Contacts per world: the task's peak, 2,873 contacts, under Steel and VBD, with a quarter on top.
         self.contacts_per_world = cable_solver.contact_budget(self.model, 0.9)
+        # VBD's contact history reads sticky matching (sorted contacts); native Steel's warm start needs only the
+        # key-sorted match (cable_solver.pipeline_options).
+        matching = (
+            cable_solver.pipeline_options(args)
+            if getattr(args, "solver", "vbd") == "steel"
+            else {"contact_matching": "sticky"}
+        )
         self.collision_pipeline = newton.CollisionPipeline(
-            self.model, contact_matching="sticky", rigid_contact_max=self.contacts_per_world * self.model.world_count
+            self.model, rigid_contact_max=self.contacts_per_world * self.model.world_count, **matching
         )
         self.contacts = self.collision_pipeline.contacts()
 
