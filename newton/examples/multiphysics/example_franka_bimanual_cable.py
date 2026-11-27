@@ -164,6 +164,24 @@ def _scatter_targets(
     joint_target_q[world, base + coords - 1] = fingers[p]
 
 
+@wp.kernel
+def _apply_grips(
+    substep: int,
+    grip_joints: wp.array[int],
+    targets: wp.array2d[wp.vec3],
+    enabled: wp.array2d[wp.int32],
+    joint_enabled: wp.array[wp.bool],
+    joint_X_p: wp.array[wp.transform],
+):
+    # One virtual-gripper closure per thread: engaged at this substep's target, or released.
+    i = wp.tid()
+    j = grip_joints[i]
+    on = enabled[substep, i] != 0
+    joint_enabled[j] = on
+    if on:
+        joint_X_p[j] = wp.transform(targets[substep, i], wp.transform_get_rotation(joint_X_p[j]))
+
+
 def _find_label_index(labels: list[str], suffix: str) -> int:
     for index, label in enumerate(labels):
         if label.endswith(suffix):
@@ -569,8 +587,75 @@ class Example:
             [end, end + np.array([0.0, 0.0, 0.10]), hop, dip, under, under],
         )
 
+    def _grip_frame(self):
+        """Every substep's virtual-gripper targets [m] and engagement for this frame, uploaded at once."""
+        n = self.cable_bodies_per_world
+        targets = np.zeros((self.sim_substeps, len(self.grip_joints), 3), dtype=np.float32)
+        enabled = np.zeros((self.sim_substeps, len(self.grip_joints)), dtype=np.int32)
+        for substep in range(self.sim_substeps):
+            time = self.sim_time + substep * self.sim_dt
+            active = {
+                k: np.asarray(tr.sample(time)[0], dtype=np.float64)
+                for k, tr in self.drives
+                if tr.times[0] <= time <= tr.times[-1]
+            }
+            for k, p0 in self._reachable(active).items():
+                for w in range(self.world_count):
+                    targets[substep, w * n + k] = p0
+                    enabled[substep, w * n + k] = 1
+        if not hasattr(self, "_grip_targets"):
+            self._grip_joint_ids = wp.array(self.grip_joints, dtype=int, device=self.device)
+            self._grip_targets = wp.array(targets, dtype=wp.vec3, device=self.device)
+            self._grip_enabled = wp.array(enabled, dtype=wp.int32, device=self.device)
+        else:
+            self._grip_targets.assign(targets)
+            self._grip_enabled.assign(enabled)
+
+    def _simulate_tie(self):
+        """The tie's frame on the device: the hands' IK, then the virtual grippers before every substep."""
+        self.ik_solver.step(self.ik_q, self.ik_q, iterations=self.ik_iters)
+        wp.launch(
+            _scatter_targets,
+            dim=2 * self.world_count,
+            inputs=[self.ik_q, self.ik_fingers, FRANKA_COORDS, 1.0 / self.frame_dt, self.ik_previous_q],
+            outputs=[self.control_joint_target_q, self.control_joint_target_qd],
+            device=self.device,
+        )
+        copy_last = self.use_graph and self.sim_substeps % 2 == 1
+        for substep in range(self.sim_substeps):
+            self.state_0.clear_forces()
+            wp.launch(
+                _apply_grips,
+                dim=len(self.grip_joints),
+                inputs=[substep, self._grip_joint_ids, self._grip_targets, self._grip_enabled],
+                outputs=[self.model.joint_enabled, self.model.joint_X_p],
+                device=self.device,
+            )
+            self.collision_pipeline.collide(self.state_0, self.contacts)
+            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            if copy_last and substep == self.sim_substeps - 1:
+                self.state_0.assign(self.state_1)
+            else:
+                self.state_0, self.state_1 = self.state_1, self.state_0
+
     def _step_tie(self):
         """One frame of the tie: the hands' targets as usual, the virtual grippers applied before every substep."""
+        if self.grip_joints and self.native:
+            # The closures are re-anchored by a kernel, so the whole frame replays as one graph.
+            self.update_ik_targets()
+            self._grip_frame()
+            if self.use_graph:
+                if getattr(self, "_tie_graph", None) is None:
+                    with wp.ScopedDevice(self.device), wp.ScopedCapture() as capture:
+                        self._simulate_tie()
+                    self._tie_graph = capture.graph
+                with wp.ScopedDevice(self.device):
+                    wp.capture_launch(self._tie_graph)
+            else:
+                self._simulate_tie()
+            self._grips_engaged = True
+            self.sim_time += self.frame_dt
+            return
         self.update_ik_targets()
         self.ik_solver.step(self.ik_q, self.ik_q, iterations=self.ik_iters)
         wp.launch(
@@ -1214,6 +1299,9 @@ class Example:
             # While the virtual grippers tie the cable, they act before every substep.
             self._step_tie()
             return
+        if self.grip_joints and getattr(self, "_grips_engaged", False):
+            # The tie is over: release every virtual gripper before the captured steps.
+            self._engage_grips(np.zeros(len(self.grip_joints), dtype=bool), None)
         self.update_ik_targets()
         if self.graph is not None:
             with wp.ScopedDevice(self.device):
