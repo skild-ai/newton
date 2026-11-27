@@ -92,6 +92,11 @@ from .kernels import (
     ROW_WATERMARK_FAMILY_STRIDE,
     WARP_DETERMINISM_OFF,
     SweepField,
+    _get_tree_ab_factor_kernel,
+    _get_tree_ab_solve_tau_kernel,
+    _get_tree_augmented_drives_kernel,
+    _get_tree_body_relative_poses_kernel,
+    _get_tree_composite_inertia_kernel,
     _get_tree_fk_kernel,
     _get_tree_tau_kernel,
     accumulate_connect_wrenches_from_impulses,
@@ -155,7 +160,7 @@ from .kernels import (
     compute_propagation_velocity_rhs,
     compute_spatial_inertia,
     compute_velocity_predictor,
-    compute_world_contact_bias,
+    compute_world_contact_bias_warp,
     compute_world_contact_velocity_bias,
     copy_free_rigid_propagation_body_response,
     copy_unarticulated_body_state,
@@ -163,7 +168,6 @@ from .kernels import (
     crba_fill_par_dof,
     diag_from_JY_par_art,
     diag_from_JY_world,
-    eval_augmented_drives,
     eval_body_relative_poses,
     eval_joint_friction_load,
     eval_post_solve_parent_wrenches,
@@ -177,7 +181,7 @@ from .kernels import (
     finalize_body_dynamics,
     finalize_mf_constraint_counts,
     finalize_world_constraint_counts,
-    finalize_world_diag_cfm,
+    finalize_world_diag_cfm_warp,
     find_contact_family_segments,
     flag_invalid_joint_friction,
     flatten_propagation_joint_S,
@@ -1002,32 +1006,98 @@ class _SteelTreePlan:
         """Return a plan, or ``None`` when no articulation branches or the topology is unsupported."""
         if not model.articulation_count or not model.joint_count:
             return None
-        starts = model.articulation_start.numpy()
-        ends = np.asarray(articulation_joint_end)
+        starts = model.articulation_start.numpy().astype(np.int64)
+        ends = np.asarray(articulation_joint_end, dtype=np.int64)
         parents = model.joint_parent.numpy()
         children = model.joint_child.numpy()
-        if not np.array_equal(ends, starts[1:]):
+        count = model.articulation_count
+        # Loop-closing joints sit between a tree's end and the next articulation's start; the
+        # serial passes skip them and so does the plan. They own no body.
+        if np.any(ends < starts[:count]) or np.any(ends > starts[1 : count + 1]):
             return None
-        if np.any(children < 0):
+        sizes = ends - starts[:count]
+        tree_art = np.repeat(np.arange(count), sizes)
+        tree_joints = (np.arange(int(sizes.sum())) - np.repeat(np.cumsum(sizes) - sizes, sizes)) + starts[tree_art]
+        if np.any(children[tree_joints] < 0):
             return None
-        owners = np.bincount(children, minlength=model.body_count)
+        owners = np.bincount(children[tree_joints], minlength=model.body_count)
         if np.any(owners > 1):
             return None
-        body_owner = np.full(model.body_count, -1, dtype=np.int32)
-        body_owner[children] = np.arange(model.joint_count, dtype=np.int32)
-        joint_children = [[] for _ in range(model.joint_count)]
-        joint_depth = np.zeros(model.joint_count, dtype=np.int32)
-        for art in range(model.articulation_count):
-            start, end = int(starts[art]), int(ends[art])
-            for joint in range(start, end):
-                parent = int(parents[joint])
-                if parent >= 0:
-                    parent_joint = int(body_owner[parent])
-                    # Parents must precede their children within the articulation.
-                    if not start <= parent_joint < joint:
-                        return None
-                    joint_children[parent_joint].append(joint)
-                    joint_depth[joint] = joint_depth[parent_joint] + 1
+        body_owner = np.full(model.body_count, -1, dtype=np.int64)
+        body_owner[children[tree_joints]] = tree_joints
+        # Parents must precede their children within the articulation.
+        tree_parents = parents[tree_joints]
+        rooted = tree_parents < 0
+        parent_joints = np.where(rooted, -1, body_owner[np.maximum(tree_parents, 0)])
+        art_starts = starts[tree_art]
+        if np.any(~rooted & ((parent_joints < art_starts) | (parent_joints >= tree_joints))):
+            return None
+        # Articulations of one topology share a schedule, shifted by their first joint.
+        relative_parents = np.where(rooted, -1, parent_joints - art_starts).astype(np.int32)
+        bounds = np.concatenate(([0], np.cumsum(sizes)))
+        templates = {}
+        grouped = {}
+        has_branches = False
+        for art in range(count):
+            key = relative_parents[bounds[art] : bounds[art + 1]].tobytes()
+            template = templates.get(key)
+            if template is None:
+                template = templates[key] = _SteelTreePlan._template(relative_parents[bounds[art] : bounds[art + 1]])
+            has_branches |= template["lanes"] > 1
+            grouped.setdefault(template["lanes"], []).append((art, template))
+        if not has_branches:
+            return None
+        groups = []
+        for lanes, trees in sorted(grouped.items()):
+            max_levels = max(len(template["level_counts"]) for _, template in trees)
+            offsets = np.empty((len(trees), max_levels + 1), dtype=np.int32)
+            segment_offsets, joints = [np.zeros(1, dtype=np.int64)], []
+            child_offsets, child_segments = [np.zeros(1, dtype=np.int64)], []
+            segment_base = joint_base = child_base = 0
+            for row, (art, template) in enumerate(trees):
+                level_counts = np.zeros(max_levels, dtype=np.int64)
+                level_counts[: len(template["level_counts"])] = template["level_counts"]
+                offsets[row, 0] = segment_base
+                offsets[row, 1:] = segment_base + np.cumsum(level_counts)
+                joints.append(template["segment_joints"] + starts[art])
+                segment_offsets.append(template["segment_offsets"][1:] + joint_base)
+                child_segments.append(template["child_segments"] + segment_base)
+                child_offsets.append(template["child_offsets"][1:] + child_base)
+                segment_base += len(template["segment_offsets"]) - 1
+                joint_base += len(template["segment_joints"])
+                child_base += len(template["child_segments"])
+
+            def device_array(parts):
+                return wp.array(np.concatenate(parts).astype(np.int32), dtype=wp.int32, device=model.device)
+
+            groups.append(
+                _SteelTreeGroup(
+                    lanes=lanes,
+                    articulation_count=len(trees),
+                    max_levels=max_levels,
+                    articulations=wp.array([art for art, _ in trees], dtype=wp.int32, device=model.device),
+                    level_offsets=wp.array(offsets, dtype=wp.int32, device=model.device),
+                    segment_offsets=device_array(segment_offsets),
+                    segment_joints=device_array(joints),
+                    child_offsets=device_array(child_offsets),
+                    child_segments=device_array(child_segments),
+                )
+            )
+        return cls(tuple(groups))
+
+    @staticmethod
+    def _template(relative_parents: np.ndarray) -> dict:
+        """Schedule one articulation topology given each joint's parent joint relative to the first (-1: root).
+
+        Joint and segment indices of the returned arrays are relative to the articulation.
+        """
+        joint_count = len(relative_parents)
+        joint_children = [[] for _ in range(joint_count)]
+        joint_depth = [0] * joint_count
+        for joint, parent_joint in enumerate(relative_parents.tolist()):
+            if parent_joint >= 0:
+                joint_children[parent_joint].append(joint)
+                joint_depth[joint] = joint_depth[parent_joint] + 1
 
         def schedule_cost(levels):
             width = max(map(len, levels), default=1)
@@ -1037,75 +1107,50 @@ class _SteelTreePlan:
             )
             return lanes, rounds
 
-        segment_depth = np.zeros(model.joint_count, dtype=np.int32)
-        grouped = {}
-        has_branches = False
-        for art in range(model.articulation_count):
-            start, end = int(starts[art]), int(ends[art])
-            levels = []
-            joint_levels = []
-            for joint in range(start, end):
-                joint_level = int(joint_depth[joint])
-                if joint_level == len(joint_levels):
-                    joint_levels.append([])
-                joint_levels[joint_level].append([joint])
-                parent = int(parents[joint])
-                level = 0
-                if parent >= 0:
-                    parent_joint = int(body_owner[parent])
-                    if len(joint_children[parent_joint]) == 1:
-                        continue
-                    level = int(segment_depth[parent_joint]) + 1
-                segment = [joint]
-                while len(joint_children[segment[-1]]) == 1:
-                    segment.append(joint_children[segment[-1]][0])
-                segment_depth[segment] = level
-                if level == len(levels):
-                    levels.append([])
-                levels[level].append(segment)
-            lanes, rounds = schedule_cost(levels)
-            joint_lanes, joint_rounds = schedule_cost(joint_levels)
-            # A long chain can hold up the other branches of its level. Keep the schedule with
-            # fewer sequential joint rounds; this is a topology proxy, not a runtime guarantee.
-            if rounds > joint_rounds:
-                levels, lanes = joint_levels, joint_lanes
-            has_branches |= lanes > 1
-            grouped.setdefault(lanes, []).append((art, levels))
-        if not has_branches:
-            return None
-        groups = []
-        for lanes, trees in sorted(grouped.items()):
-            max_levels = max(len(levels) for _, levels in trees)
-            offsets = np.empty((len(trees), max_levels + 1), dtype=np.int32)
-            segments = []
-            for row, (_, levels) in enumerate(trees):
-                offsets[row, 0] = len(segments)
-                for level in range(max_levels):
-                    if level < len(levels):
-                        segments.extend(levels[level])
-                    offsets[row, level + 1] = len(segments)
-            segment_ids = {segment[0]: index for index, segment in enumerate(segments)}
-            segment_offsets, joints = [0], []
-            child_offsets, child_segments = [0], []
-            for segment in segments:
-                joints.extend(segment)
-                segment_offsets.append(len(joints))
-                child_segments.extend(segment_ids[child] for child in reversed(joint_children[segment[-1]]))
-                child_offsets.append(len(child_segments))
-            groups.append(
-                _SteelTreeGroup(
-                    lanes=lanes,
-                    articulation_count=len(trees),
-                    max_levels=max_levels,
-                    articulations=wp.array([art for art, _ in trees], dtype=wp.int32, device=model.device),
-                    level_offsets=wp.array(offsets, dtype=wp.int32, device=model.device),
-                    segment_offsets=wp.array(segment_offsets, dtype=wp.int32, device=model.device),
-                    segment_joints=wp.array(joints, dtype=wp.int32, device=model.device),
-                    child_offsets=wp.array(child_offsets, dtype=wp.int32, device=model.device),
-                    child_segments=wp.array(child_segments, dtype=wp.int32, device=model.device),
-                )
-            )
-        return cls(tuple(groups))
+        segment_depth = [0] * joint_count
+        levels = []
+        joint_levels = []
+        for joint, parent_joint in enumerate(relative_parents.tolist()):
+            joint_level = joint_depth[joint]
+            if joint_level == len(joint_levels):
+                joint_levels.append([])
+            joint_levels[joint_level].append([joint])
+            level = 0
+            if parent_joint >= 0:
+                if len(joint_children[parent_joint]) == 1:
+                    continue
+                level = segment_depth[parent_joint] + 1
+            segment = [joint]
+            while len(joint_children[segment[-1]]) == 1:
+                segment.append(joint_children[segment[-1]][0])
+            for member in segment:
+                segment_depth[member] = level
+            if level == len(levels):
+                levels.append([])
+            levels[level].append(segment)
+        lanes, rounds = schedule_cost(levels)
+        joint_lanes, joint_rounds = schedule_cost(joint_levels)
+        # A long chain can hold up the other branches of its level. Keep the schedule with
+        # fewer sequential joint rounds; this is a topology proxy, not a runtime guarantee.
+        if rounds > joint_rounds:
+            levels, lanes = joint_levels, joint_lanes
+        segments = [segment for level in levels for segment in level]
+        segment_ids = {segment[0]: index for index, segment in enumerate(segments)}
+        segment_offsets, joints = [0], []
+        child_offsets, child_segments = [0], []
+        for segment in segments:
+            joints.extend(segment)
+            segment_offsets.append(len(joints))
+            child_segments.extend(segment_ids[child] for child in reversed(joint_children[segment[-1]]))
+            child_offsets.append(len(child_segments))
+        return {
+            "lanes": lanes,
+            "level_counts": np.array([len(level) for level in levels], dtype=np.int64),
+            "segment_offsets": np.array(segment_offsets, dtype=np.int64),
+            "segment_joints": np.array(joints, dtype=np.int64),
+            "child_offsets": np.array(child_offsets, dtype=np.int64),
+            "child_segments": np.array(child_segments, dtype=np.int64),
+        }
 
 
 _DENSE_META_ROW_TYPE_BITS = 3
@@ -2335,11 +2380,15 @@ class SolverSteel(SolverBase, CouplingInterface):
                 mimic rows iterative, which avoids a singular block when a mimic row is
                 nearly dependent on a closure.
             parallel_tree: Traverse the independent branches of each articulation tree in
-                parallel (forward kinematics and dynamics, the inverse-dynamics backward pass
-                and state publication), with up to 32 threads per articulation instead of
-                one. Results match the serial traversal up to floating-point summation order.
-                Unbranched articulations, models whose joints are not ordered parent before
-                child, and CPU devices keep the serial traversal. Broad trees can benefit; narrow trees can be
+                parallel (forward kinematics and dynamics, the inverse-dynamics backward pass,
+                the drive pass, the composite-inertia reduction, the articulated-body factor and
+                solve, the root-relative poses of loop closures and state publication), with up
+                to 32 threads per articulation instead of one. Forward kinematics and inverse
+                dynamics match the serial traversal up to floating-point summation order; the
+                other passes match it bit for bit. Articulations closed by loop joints traverse
+                their spanning tree; the loop joints stay constraint rows. Unbranched
+                articulations, models whose joints are not ordered parent before child, and CPU
+                devices keep the serial traversal. Broad trees can benefit; narrow trees can be
                 slower, so measure the full step before enabling it.
             reuse_kinematics: Opt in to carrying the kinematics and inverse-dynamics terms the solver
                 forms when it publishes a step's body state into the next step, instead of re-deriving
@@ -3174,6 +3223,15 @@ class SolverSteel(SolverBase, CouplingInterface):
             if self._tree_plan is not None
             else ()
         )
+        # The cooperative drive pass splits each articulation's joints into chunks of its lanes.
+        self._tree_max_joints = ()
+        if self._tree_plan is not None:
+            starts = model.articulation_start.numpy()
+            ends = self._articulation_joint_end.numpy()
+            self._tree_max_joints = tuple(
+                int(np.max(ends[arts] - starts[arts]))
+                for arts in (group.articulations.numpy() for group in self._tree_plan.groups)
+            )
         self._setup_propagation(model)
         self._articulation_constraint_max = self._requested_dense_max_constraints
         self._setup_diagonal_mass(model)
@@ -3270,6 +3328,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             if self._composite_articulation_count and model.device.is_cuda
             else None
         )
+        # With a tree plan the global reduction walks the tree levels instead.
+        self._tree_composite_launches = self._tree_plan_rows(composite_articulations)
         self._dummy_is_free_rigid = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._dummy_mf_slot_counter = wp.zeros((self._world_count,), dtype=wp.int32, device=model.device)
         self._dummy_contact_count = wp.zeros((1,), dtype=wp.int32, device=model.device)
@@ -5056,25 +5116,46 @@ class SolverSteel(SolverBase, CouplingInterface):
         anchors would inherit in full and a nearly degenerate (normalized) closure row would amplify.
         """
         model = self.model
+        inputs = [
+            model.articulation_start,
+            self._articulation_joint_end,
+            self._body_to_articulation,
+            model.joint_type,
+            model.joint_parent,
+            model.joint_child,
+            model.joint_q_start,
+            model.joint_qd_start,
+            state_in.joint_q,
+            model.joint_X_p,
+            model.joint_X_c,
+            model.joint_axis,
+            model.joint_dof_dim,
+            state_in.body_q,
+        ]
+        if self._tree_plan is not None:
+            for group in self._tree_plan.groups:
+                per_warp = 32 // group.lanes
+                wp.launch(
+                    _get_tree_body_relative_poses_kernel(group.lanes),
+                    dim=((group.articulation_count + per_warp - 1) // per_warp, 32),
+                    inputs=[
+                        group.articulation_count,
+                        group.max_levels,
+                        group.articulations,
+                        group.level_offsets,
+                        group.segment_offsets,
+                        group.segment_joints,
+                        *inputs,
+                    ],
+                    outputs=[self._body_rel_t, self._articulation_ref_t],
+                    block_dim=32,
+                    device=model.device,
+                )
+            return
         wp.launch(
             eval_body_relative_poses,
             dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                self._articulation_joint_end,
-                self._body_to_articulation,
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state_in.joint_q,
-                model.joint_X_p,
-                model.joint_X_c,
-                model.joint_axis,
-                model.joint_dof_dim,
-                state_in.body_q,
-            ],
+            inputs=inputs,
             outputs=[self._body_rel_t, self._articulation_ref_t],
             device=model.device,
             block_dim=self._serial_block_dim(model.articulation_count),
@@ -8600,9 +8681,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._stage4_bilateral_preelim()
             self._stage4_compute_matrix_free_diag()
         # Sparse row builders write the response diagonals directly.
+        # A world's rows are independent: a warp per world splits them.
         wp.launch(
-            finalize_world_diag_cfm,
-            dim=self._world_count,
+            finalize_world_diag_cfm_warp,
+            dim=(self._world_count, 32),
             inputs=[self._constraint_count, self._row_type, self._cfm],
             outputs=[self._diag],
             device=model.device,
@@ -8632,8 +8714,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
         # The right-hand side holds only the bias; J v is recomputed every iteration.
         wp.launch(
-            compute_world_contact_bias,
-            dim=self._world_count,
+            compute_world_contact_bias_warp,
+            dim=(self._world_count, 32),
             inputs=[
                 self._constraint_count,
                 self._phi,
@@ -9364,35 +9446,40 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._tree_plan is not None:
             self._launch_tree_tau(tau_inputs, state_aug)
             if self._articulation_max_dofs > 0:
-                wp.launch(
-                    eval_augmented_drives,
-                    dim=model.articulation_count,
-                    inputs=[
-                        model.articulation_start,
-                        self._articulation_joint_end,
-                        self._articulation_H_rows,
-                        model.joint_type,
-                        model.joint_qd_start,
-                        model.joint_q_start,
-                        model.joint_dof_dim,
-                        state_in.joint_q,
-                        state_in.joint_qd,
-                        self._passive_joint_damping,
-                        self._drive_mode == "augmented",
-                        model.joint_target_ke,
-                        model.joint_target_kd,
-                        control.joint_target_q,
-                        model.joint_target_q_start,
-                        control.joint_target_qd,
-                        model.joint_effort_limit,
-                        self._articulation_max_dofs,
-                        dt,
-                        self._dynamics_art_active,
-                    ],
-                    outputs=[self._aug_row_counts, self._aug_row_dof_index, self._aug_row_K, state_aug._joint_tau],
-                    block_dim=self._serial_block_dim(model.articulation_count),
-                    device=model.device,
-                )
+                for group, max_joints in zip(self._tree_plan.groups, self._tree_max_joints, strict=True):
+                    per_warp = 32 // group.lanes
+                    wp.launch(
+                        _get_tree_augmented_drives_kernel(group.lanes),
+                        dim=((group.articulation_count + per_warp - 1) // per_warp, 32),
+                        inputs=[
+                            group.articulation_count,
+                            max_joints,
+                            group.articulations,
+                            model.articulation_start,
+                            self._articulation_joint_end,
+                            self._articulation_H_rows,
+                            model.joint_type,
+                            model.joint_qd_start,
+                            model.joint_q_start,
+                            model.joint_dof_dim,
+                            state_in.joint_q,
+                            state_in.joint_qd,
+                            self._passive_joint_damping,
+                            self._drive_mode == "augmented",
+                            model.joint_target_ke,
+                            model.joint_target_kd,
+                            control.joint_target_q,
+                            model.joint_target_q_start,
+                            control.joint_target_qd,
+                            model.joint_effort_limit,
+                            self._articulation_max_dofs,
+                            dt,
+                            self._dynamics_art_active,
+                        ],
+                        outputs=[self._aug_row_counts, self._aug_row_dof_index, self._aug_row_K, state_aug._joint_tau],
+                        block_dim=32,
+                        device=model.device,
+                    )
         elif self._articulation_max_dofs > 0:
             wp.launch(
                 eval_rigid_tau_and_augmented_drives,
@@ -9554,6 +9641,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._ab_rows_launch_by_size = {}
         self._ab_body_I_A = None
         self._ab_branch_slot = None
+        self._ab_tree_launches_by_size = {}
+        self._ab_tree_body_scratch = None
         if not self._articulated_body_sizes:
             return
         self._ab_body_I_A = wp.zeros(max(model.body_count, 1), dtype=wp.spatial_matrix, device=device)
@@ -9601,10 +9690,94 @@ class SolverSteel(SolverBase, CouplingInterface):
             while rows_launch < max_constraints and n_arts * rows_launch < 512 * max(self._sm_count, 1):
                 rows_launch *= 2
             self._ab_rows_launch_by_size[size] = min(rows_launch, max_constraints)
+        self._setup_tree_articulated_body(model)
+
+    def _setup_tree_articulated_body(self, model: Model) -> None:
+        """Map each articulated-body group onto the tree plan for the cooperative factor and tau solve.
+
+        Every articulation of a group is in exactly one tree-plan group; a launch covers the
+        articulations a (group, tree-plan group) pair shares, by their rows in both.
+        """
+        if self._tree_plan is None:
+            return
+        for size in sorted(self._articulated_body_sizes):
+            self._ab_tree_launches_by_size[size] = self._tree_plan_rows(self._group_to_art[size].numpy())
+        if self._ab_tree_launches_by_size:
+            self._ab_tree_body_scratch = wp.zeros(
+                max(model.body_count, 1), dtype=wp.spatial_vector, device=model.device
+            )
+
+    def _tree_plan_rows(self, articulations: np.ndarray) -> tuple:
+        """Return the cooperative launches over ``articulations``, one per tree-plan group holding any.
+
+        Each launch is ``(group, count, plan_rows, positions)``: the plan rows of the selected
+        articulations in that group and their positions in ``articulations``. Empty without a plan.
+        """
+        if self._tree_plan is None:
+            return ()
+        device = self.model.device
+        position = {int(art): index for index, art in enumerate(articulations)}
+        launches = []
+        for group in self._tree_plan.groups:
+            group_arts = group.articulations.numpy()
+            plan_rows = [row for row, art in enumerate(group_arts) if int(art) in position]
+            if not plan_rows:
+                continue
+            launches.append(
+                (
+                    group,
+                    len(plan_rows),
+                    wp.array(plan_rows, dtype=wp.int32, device=device),
+                    wp.array([position[int(art)] for art in group_arts[plan_rows]], dtype=wp.int32, device=device),
+                )
+            )
+        return tuple(launches)
 
     def _stage2_factor_articulated_body(self, size: int, state_aug: State) -> None:
         """Factor the augmented mass matrices of an articulated-body group."""
         model = self.model
+        launches = self._ab_tree_launches_by_size.get(size)
+        if launches:
+            for group, count, plan_rows, group_index in launches:
+                per_warp = 32 // group.lanes
+                wp.launch(
+                    _get_tree_ab_factor_kernel(group.lanes),
+                    dim=((count + per_warp - 1) // per_warp, 32),
+                    inputs=[
+                        count,
+                        group.max_levels,
+                        plan_rows,
+                        group_index,
+                        group.articulations,
+                        group.level_offsets,
+                        group.segment_offsets,
+                        group.segment_joints,
+                        group.child_offsets,
+                        group.child_segments,
+                        self._articulation_dof_start,
+                        self._mass_update_mask,
+                        model.joint_child,
+                        model.joint_qd_start,
+                        state_aug._joint_S_s,
+                        state_aug._body_I_s,
+                        self._R_by_size[size],
+                        size,
+                        self._articulation_max_dofs,
+                        self._aug_row_counts,
+                        self._aug_row_dof_index,
+                        self._aug_row_K,
+                    ],
+                    outputs=[
+                        self._ab_body_I_A,
+                        self._ab_diag_by_size[size],
+                        self._ab_S_by_size[size],
+                        self._ab_U_by_size[size],
+                        self._ab_Dinv_by_size[size],
+                    ],
+                    block_dim=32,
+                    device=model.device,
+                )
+            return
         wp.launch(
             factor_articulated_body,
             dim=self._n_arts_by_size[size],
@@ -9641,6 +9814,40 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _stage3_solve_articulated_body(self, size: int, state_aug: State) -> None:
         """Solve the unconstrained accelerations of an articulated-body group."""
         model = self.model
+        launches = self._ab_tree_launches_by_size.get(size)
+        if launches:
+            for group, count, plan_rows, group_index in launches:
+                per_warp = 32 // group.lanes
+                wp.launch(
+                    _get_tree_ab_solve_tau_kernel(group.lanes),
+                    dim=((count + per_warp - 1) // per_warp, 32),
+                    inputs=[
+                        count,
+                        group.max_levels,
+                        plan_rows,
+                        group_index,
+                        group.articulations,
+                        group.level_offsets,
+                        group.segment_offsets,
+                        group.segment_joints,
+                        group.child_offsets,
+                        group.child_segments,
+                        self._articulation_dof_start,
+                        self._dynamics_art_active,
+                        model.joint_ancestor,
+                        model.joint_child,
+                        model.joint_qd_start,
+                        self._ab_S_by_size[size],
+                        self._ab_U_by_size[size],
+                        self._ab_Dinv_by_size[size],
+                        size,
+                        state_aug._joint_tau,
+                    ],
+                    outputs=[self._ab_rhs_by_size[size], self._ab_tree_body_scratch, state_aug._joint_qdd],
+                    block_dim=32,
+                    device=model.device,
+                )
+            return
         wp.launch(
             solve_articulated_body_tau,
             dim=self._n_arts_by_size[size],
@@ -9731,7 +9938,31 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[state_aug._body_I_s, self._body_inertia_terms],
                 device=model.device,
             )
-        if global_flag and self._composite_inertia_warp_kernel is not None:
+        if global_flag and self._tree_composite_launches:
+            for group, count, plan_rows, _ in self._tree_composite_launches:
+                per_warp = 32 // group.lanes
+                wp.launch(
+                    _get_tree_composite_inertia_kernel(group.lanes),
+                    dim=((count + per_warp - 1) // per_warp, 32),
+                    inputs=[
+                        count,
+                        group.max_levels,
+                        plan_rows,
+                        group.articulations,
+                        group.level_offsets,
+                        group.segment_offsets,
+                        group.segment_joints,
+                        group.child_offsets,
+                        group.child_segments,
+                        model.joint_child,
+                        state_aug._body_I_s,
+                        self._dynamics_art_active,
+                    ],
+                    outputs=[self._body_I_c],
+                    block_dim=32,
+                    device=model.device,
+                )
+        elif global_flag and self._composite_inertia_warp_kernel is not None:
             # A global refresh reduces every articulation that reads composite inertias,
             # one warp per articulation.
             wp.launch_tiled(
