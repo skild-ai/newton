@@ -1858,6 +1858,21 @@ for scene, frames in (
             use_viewer=True,
             test_suffix=f"native_steel_{mode}",
         )
+# The bimanual cable twist with MuJoCo arms and a VBD cable coupled through gripper proxies, and both bimanual tasks
+# natively under one Steel solver. (The coupled wrap can print MuJoCo line-search warnings.)
+for task, options, suffix in (
+    ("twist", {}, ""),
+    ("twist", {"solver": "steel", "solve-mode": "colored"}, "_native_steel"),
+    ("wrap", {"solver": "steel", "solve-mode": "colored"}, "_native_steel"),
+):
+    add_example_test(
+        TestMultiphysicsExamples,
+        name="multiphysics.example_franka_bimanual_cable",
+        devices=cuda_test_devices,
+        test_options={"task": task, **options},
+        use_viewer=True,
+        test_suffix=f"{task}{suffix}",
+    )
 add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_franka_cloth_block",
