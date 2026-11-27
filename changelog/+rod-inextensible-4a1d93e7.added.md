@@ -1,1 +1,0 @@
-Add `inextensible` to `ModelBuilder.add_joint_rod` and `ModelBuilder.add_rod`: an inextensible rod joint has only its three rotational DOFs, so its anchors stay coincident and it carries bend and twist but no stretch or shear.

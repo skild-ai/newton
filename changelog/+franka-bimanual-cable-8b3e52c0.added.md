@@ -1,1 +1,0 @@
-Add the `franka_bimanual_cable` example: two Franka arms manipulate one cable with GPU IK (`--task twist` rolls its ends in opposite directions, `--task wrap` winds it around a pole), coupled to MuJoCo or Steel arms through gripper proxies or solved natively by one `SolverSteel` (`--solver steel`).

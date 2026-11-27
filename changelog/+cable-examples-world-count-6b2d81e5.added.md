@@ -1,1 +1,0 @@
-Add `--world-count` to the `contacts_rj45_plug`, `cable_bundle_hysteresis`, `cable_twist`, `cable_plectoneme` and `cable_michell_threshold` examples: each replicates its scene into independent worlds and drives, seeds and checks every world's scripted bodies, not only the first world's.

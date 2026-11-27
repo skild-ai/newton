@@ -1,1 +1,0 @@
-The colored immediate-response sweep keeps each world's generalized velocities in shared memory when they fit and loads each contact's rows before solving it, which cuts the latency of every contact update. Results match the previous sweep up to floating-point rounding.

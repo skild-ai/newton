@@ -1,1 +1,0 @@
-Added `coupled_contact_passes` to `SolverSteel`, which revisits contacts between two responding articulations (such as a gripper jaw on a rod) in every serial Gauss-Seidel iteration. Serial rod worlds now solve each contact's normal and friction rows in one warp update and factor rod articulations of up to 128 DOFs in one compensated single-precision launch.

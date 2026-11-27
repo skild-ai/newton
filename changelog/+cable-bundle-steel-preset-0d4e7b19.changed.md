@@ -1,1 +1,0 @@
-The `cable_bundle_hysteresis` example steps native Steel at 3 substeps of 14 iterations instead of 2 of 20: at two substeps a cable squeezed between an obstacle and its neighbours could be flung sideways during loading and lose its Dahl bend, depending on the GPU's summation order.
