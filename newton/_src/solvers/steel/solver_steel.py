@@ -2962,7 +2962,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                     f"{', '.join(incompatible)} requires row_schedule='interleaved', got {self._row_schedule!r}"
                 )
         self._articulated_contact_response = articulated_contact_response
-        self._nesterov_momentum = model.device.is_cuda if nesterov_momentum is None else bool(nesterov_momentum)
+        if nesterov_momentum is None:
+            # The sparse direct solve's compact contact rows run their own plain sweep, so its default is off;
+            # requesting momentum explicitly is rejected when the rows are built.
+            elim = self._kernel_overrides.get("closure_direct_contacts", "off") == "elim"
+            nesterov_momentum = model.device.is_cuda and not elim
+        self._nesterov_momentum = bool(nesterov_momentum)
         for name, value in (("friction_combine", friction_combine), ("restitution_combine", restitution_combine)):
             if value not in _MATERIAL_COMBINE_MODES:
                 raise ValueError(f"{name} must be one of {tuple(_MATERIAL_COMBINE_MODES)}, got {value!r}")
