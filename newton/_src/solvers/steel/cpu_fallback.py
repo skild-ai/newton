@@ -10,7 +10,7 @@ with the same update math, so a CPU solve tracks the CUDA one to float
 round-off (the CUDA kernels reduce dot products in a different order).
 
 Only the configurations the CPU accepts are mirrored: ``friction_mode=
-"fixed_normal"`` without contact torsion, contact compliance, joint friction or
+"fixed_normal"`` without contact torsion, contact compliance, joint friction,
 free-rigid angular friction or Nesterov momentum.
 """
 

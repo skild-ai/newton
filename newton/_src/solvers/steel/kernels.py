@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import dataclass
 from functools import cache
 
 import warp as wp
 
 from ...core.types import MAXVAL
+from ...geometry.sdf_planar_recovery import MeshRecoveryData, active_recovery_contact, recovery_step_depth
 from ...sim import BodyFlags, JointType
 from ...sim.articulation import (
     compute_2d_rotational_dofs,
@@ -21,6 +23,168 @@ from .friction_patches import WARP_DETERMINISM_OFF, FrictionPatches, warmstart_d
 
 # SolverSteel rejects models with ``requires_grad``, so no kernel needs an adjoint.
 wp.set_module_options({"enable_backward": False, **WARP_DETERMINISM_OFF})
+
+
+# All sweep owners use the projected correction dotted with the previous lookahead.
+# Changing the active operator (e.g. enabling friction) starts a fresh sequence.
+_MOMENTUM_AGE = "interrupted || dot < 0.0f ? 0 : previous_age + 1"
+_MOMENTUM_BETA = """
+    if (age < 2) return 0.0f;
+    float beta = static_cast<float>(age - 1) / static_cast<float>(age + 2);
+    // Anchors retain tangential traction across solves. Its common component
+    // in both directions regularizes the cosine around a loaded equilibrium.
+    dot += anchor_sq;
+    correction_sq += anchor_sq;
+    lookahead_sq += anchor_sq;
+    if (correction_sq > 0.0f && lookahead_sq > 0.0f) {
+        // Project the lookahead onto the last correction and back onto its direction.
+        const float cosine_sq = (dot / correction_sq) * (dot / lookahead_sq);
+        beta *= fminf(1.0f, cosine_sq);
+    }
+    // A torque impulse is measured in N m s. Limit its extrapolation by the
+    // angular correction itself, independently of the linear contact impulses.
+    if (beta * beta * torque_move_sq > torque_correction_sq)
+        beta = sqrtf(torque_correction_sq / torque_move_sq);
+    return beta;
+"""
+
+
+@wp.func_native(f"return {_MOMENTUM_AGE};")
+def next_momentum_age(previous_age: int, dot: float, interrupted: bool) -> int: ...
+
+
+@wp.func_native(_MOMENTUM_BETA)
+def momentum_beta(
+    age: int,
+    dot: float,
+    correction_sq: float,
+    lookahead_sq: float,
+    torque_correction_sq: float,
+    torque_move_sq: float,
+    anchor_sq: float,
+) -> float: ...
+
+
+@dataclass(frozen=True)
+class SweepField:
+    """A lane-strided vector in the sweep's own coordinates."""
+
+    value: str  # CUDA lvalue, indexed by i
+    count: str
+    capacity: int
+    impulse: bool = False
+    history: tuple[str, str] | None = None  # optional global previous value and lookahead
+    movable: str = "true"  # stateless velocity-limit rows keep their last clamp
+    torque: str = ""  # rows carrying angular impulses
+    patch_rows: tuple[str, str] | None = None  # row kind at i and parent at {row}
+
+
+def warp_momentum(
+    enabled: bool,
+    fields: list[SweepField],
+    *,
+    lanes: int = 32,
+    iteration: str = "iteration",
+    restart: str = "false",
+    check_response_roundoff: bool = False,
+    patch_anchors: bool = False,
+) -> tuple[str, str]:
+    """Emit a projected sweep's gradient restart and update its impulses and affine images together."""
+    if not enabled:
+        return "", ""
+    declarations = ["int momentum_age = 0;"]
+    anchor_load = []
+    products = []
+    motion = []
+    updates = []
+    for k, field in enumerate(fields):
+        if field.history is None:
+            slots = (field.capacity + lanes - 1) // lanes
+            declarations.append(f"float previous_{k}[{slots}];")
+            if field.impulse:
+                declarations.append(f"float extrap_{k}[{slots}];")
+            previous, extrap = f"previous_{k}[j]", f"extrap_{k}[j]"
+        else:
+            previous, extrap = field.history
+        loop = f"for (int i = lane, j = 0; i < {field.count}; i += {lanes}, ++j)"
+        if patch_anchors and field.patch_rows:
+            kind, parent = field.patch_rows
+            anchor_load.append(f"""{loop} if (({kind}) == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
+                const int normal = {parent.format(row="i")};
+                if (normal >= 0 && ({parent.format(row="normal")}) >= 0)
+                    anchor_sq += {field.value} * {field.value};
+            }}""")
+        if field.impulse:
+            torque_progress = ""
+            if field.torque:
+                torque_progress = f"""if ({field.torque}) {{
+                    torque_correction_sq += correction * correction;
+                    torque_move_sq += move * move;
+                }}"""
+            products.append(f"""{loop} {{
+                {f"if (!({field.movable})) continue;" if field.movable != "true" else ""}
+                const float move = {field.value} - {previous};
+                const float correction = move - {extrap};
+                dot += correction * {extrap};
+                correction_sq += correction * correction;
+                lookahead_sq += {extrap} * {extrap};
+                {torque_progress}
+            }}""")
+        else:
+            motion.append(f"{loop} moved |= {field.value} != {previous};")
+        roundoff = ""
+        if check_response_roundoff and field.impulse:
+            roundoff = f"""if (beta != 0.0f && ({field.movable})) {{
+                const float move = x - {previous};
+                const float lost = (y - x) - beta * move;
+                reapply_impulses |= (y == x && move != 0.0f) || fabsf(lost) > fabsf(move - {extrap});
+            }}"""
+        updates.append(f"""{loop} {{
+            const float x = {field.value};
+            const float y = beta != 0.0f && ({field.movable}) ? x + beta * (x - {previous}) : x;
+            {roundoff}
+            {previous} = x;
+            {f"{extrap} = y - x;" if field.impulse else ""}
+            if (beta != 0.0f) {field.value} = y;
+        }}""")
+    # Only a patch normal links to itself or another normal; point contacts have parent -1.
+    declarations.append("float anchor_sq = 0.0f;" if anchor_load else "constexpr float anchor_sq = 0.0f;")
+    seed = ""
+    if anchor_load:
+        seed = f"""if ({iteration} == 0) {{
+            {chr(10).join(anchor_load)}
+            for (int d = {lanes // 2}; d; d >>= 1)
+                anchor_sq += __shfl_xor_sync(MASK, anchor_sq, d, {lanes});
+        }}"""
+    metrics = ["dot", "correction_sq", "lookahead_sq"]
+    if any(field.torque for field in fields):
+        metrics.extend(("torque_correction_sq", "torque_move_sq"))
+    reductions = "\n".join(f"{name} += __shfl_xor_sync(MASK, {name}, d, {lanes});" for name in metrics)
+    step = f"""
+        {"bool reapply_impulses = false;" if check_response_roundoff else ""}
+        float beta = 0.0f;
+        {seed}
+        if ({iteration} > 0) {{
+            float dot = 0.0f, correction_sq = 0.0f, lookahead_sq = 0.0f;
+            float torque_correction_sq = 0.0f, torque_move_sq = 0.0f;
+            if (momentum_age > 1) {{
+                {chr(10).join(products)}
+                for (int d = {lanes // 2}; d; d >>= 1) {{ {reductions} }}
+            }}
+            // In a redundant system the impulses can still move in a null direction
+            // after every represented velocity has reached a fixed point.
+            bool moved = false;
+            {chr(10).join(motion)}
+            const bool interrupted = {restart} || !__any_sync(MASK, moved);
+            const int previous_age = momentum_age;
+            const int age = {_MOMENTUM_AGE};
+            beta = [&]() {{ {_MOMENTUM_BETA} }}();
+            momentum_age = age;
+        }}
+        {chr(10).join(updates)}
+        __syncwarp(MASK);
+"""
+    return "\n".join(declarations), step
 
 
 def _steel_module(name: str) -> wp.Module:
@@ -60,6 +224,9 @@ PGS_CONSTRAINT_TYPE_JOINT_FRICTION = 8
 # the normal, each present only for a positive pair coefficient [m] and bounded by that coefficient times the normal load.
 PGS_CONSTRAINT_TYPE_CONTACT_ROLLING = 9
 PGS_CONSTRAINT_TYPE_CONTACT_SPIN = 10
+# The free-body sweep's packed row metadata keeps the row type in the low bits of ``.w`` and the signed parent row above.
+MF_META_ROW_TYPE_BITS = 8
+MF_META_ROW_TYPE_MASK = (1 << MF_META_ROW_TYPE_BITS) - 1
 
 # Positive gaps below this slop [m] count as touching: it absorbs float32 residuals of
 # rows that land exactly at contact.
@@ -789,7 +956,8 @@ def jcalc_tau(
     if type == JointType.BALL:
         for i in range(3):
             j = dof_start + i
-            # Passive damping per angular DOF, as in SolverFeatherstone; a ball joint has no passive spring.
+            # Passive damping enters the RHS and the positive damping adds to the
+            # implicit mass diagonal; a ball joint has no passive spring.
             value = -wp.dot(joint_S_s[j], body_f_s) + joint_f[j] - joint_damping[j] * joint_qd[j]
             if add_existing_tau != 0:
                 value += tau[j]
@@ -830,9 +998,8 @@ def jcalc_tau(
         for i in range(axis_count):
             j = dof_start + i
             S_s = joint_S_s[j]
-            # Passive spring/damping applied explicitly; the drive gains stay on the
-            # implicit augmented path. These joint types have one coordinate per DOF,
-            # so coord_start + i addresses the axis position and its rest coordinate.
+            # Passive forces enter the RHS; positive damping also adds its velocity
+            # derivative to the mass diagonal. Spring rest positions use coordinate indices.
             passive_f = joint_stiffness[j] * (joint_rest_q[coord_start + i] - joint_q[coord_start + i])
             passive_f -= joint_damping[j] * joint_qd[j]
             # total torque / force on the joint (drive forces handled via augmented mass)
@@ -3313,6 +3480,8 @@ def prepare_articulation_augmented_drives(
     joint_dof_dim: wp.array2d[int],
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
+    joint_damping: wp.array[float],
+    augment_drives: bool,
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
     joint_target_pos: wp.array[float],
@@ -3328,7 +3497,7 @@ def prepare_articulation_augmented_drives(
     row_K: wp.array[float],
     tau: wp.array[float],
 ):
-    """Prepare one articulation's implicit drive rows and explicit force."""
+    """Prepare implicit drive/damping rows and the explicit drive force."""
     joint_start = articulation_start[articulation]
     joint_end = articulation_joint_end[articulation]
     if reset_tau != 0:
@@ -3344,7 +3513,12 @@ def prepare_articulation_augmented_drives(
     slot = int(0)
     for joint_index in range(joint_start, joint_end):
         type = joint_type[joint_index]
-        if type != JointType.PRISMATIC and type != JointType.REVOLUTE and type != JointType.D6:
+        if (
+            type != JointType.PRISMATIC
+            and type != JointType.REVOLUTE
+            and type != JointType.D6
+            and type != JointType.BALL
+        ):
             continue
 
         axis_count = joint_dof_dim[joint_index, 0] + joint_dof_dim[joint_index, 1]
@@ -3354,22 +3528,32 @@ def prepare_articulation_augmented_drives(
             if slot >= max_dofs:
                 break
             dof_index = qd_start + axis
-            ke = joint_target_ke[dof_index]
-            kd = joint_target_kd[dof_index]
-            if ke <= 0.0 and kd <= 0.0:
-                continue
-
-            K = ke * dt * dt + kd * dt
+            ke = float(0.0)
+            kd = float(0.0)
+            if augment_drives and type != JointType.BALL:
+                ke = joint_target_ke[dof_index]
+                kd = joint_target_kd[dof_index]
+            # Preserve the existing rule that a nonpositive drive diagonal is skipped.
+            drive = augment_drives and type != JointType.BALL and (ke > 0.0 or kd > 0.0)
+            drive_K = ke * dt * dt + kd * dt
+            drive = drive and drive_K > 0.0
+            if not drive:
+                drive_K = 0.0
+            # The explicit -damping * qd remains in tau. This diagonal makes
+            # its velocity dependence implicit without applying drive limits.
+            K = drive_K + wp.max(joint_damping[dof_index], 0.0) * dt
             if K <= 0.0:
                 continue
 
-            q = joint_q[coord_start + axis]
-            qd = joint_qd[dof_index]
-            target_pos = joint_target_pos[joint_target_q_start[joint_index] + axis]
-            u0 = -(ke * (q - target_pos + dt * qd) + kd * (qd - joint_target_vel[dof_index]))
-            effort_limit = joint_effort_limit[dof_index]
-            if effort_limit > 0.0:
-                u0 = wp.clamp(u0, -effort_limit, effort_limit)
+            u0 = float(0.0)
+            if drive:
+                q = joint_q[coord_start + axis]
+                qd = joint_qd[dof_index]
+                target_pos = joint_target_pos[joint_target_q_start[joint_index] + axis]
+                u0 = -(ke * (q - target_pos + dt * qd) + kd * (qd - joint_target_vel[dof_index]))
+                effort_limit = joint_effort_limit[dof_index]
+                if effort_limit > 0.0:
+                    u0 = wp.clamp(u0, -effort_limit, effort_limit)
 
             row_index = articulation * max_dofs + slot
             row_dof_index[row_index] = dof_index
@@ -3396,6 +3580,8 @@ def eval_augmented_drives(
     joint_dof_dim: wp.array2d[int],
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
+    joint_damping: wp.array[float],
+    augment_drives: bool,
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
     joint_target_pos: wp.array[float],
@@ -3424,6 +3610,8 @@ def eval_augmented_drives(
         joint_dof_dim,
         joint_q,
         joint_qd,
+        joint_damping,
+        augment_drives,
         joint_target_ke,
         joint_target_kd,
         joint_target_pos,
@@ -3465,6 +3653,8 @@ def eval_rigid_tau_and_augmented_drives(
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     articulation_origin: wp.array[wp.vec3],
+    drive_joint_qd: wp.array[float],
+    augment_drives: bool,
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
     joint_target_pos: wp.array[float],
@@ -3523,7 +3713,9 @@ def eval_rigid_tau_and_augmented_drives(
         joint_q_start,
         joint_dof_dim,
         joint_q,
-        joint_qd,
+        drive_joint_qd,
+        joint_damping,
+        augment_drives,
         joint_target_ke,
         joint_target_kd,
         joint_target_pos,
@@ -3543,17 +3735,25 @@ def eval_rigid_tau_and_augmented_drives(
 @wp.kernel
 def build_mass_update_mask(
     global_flag: int,
+    dt: float,
     mass_update_requested: wp.array[int],
     articulation_active: wp.array[int],
     mass_update_mask: wp.array[int],
+    mass_factor_dt: wp.array[float],
 ):
+    """Refresh active factors whose timestep differs, including during graph replay."""
     tid = wp.tid()
     flag = 1 if global_flag != 0 else 0
-    if mass_update_requested[tid] != 0:
+    # Ignore float-rounding jitter, but retain relative sensitivity for tiny timesteps.
+    factor_dt = mass_factor_dt[tid]
+    dt_changed = wp.abs(factor_dt - dt) > 1.0e-6 * wp.max(wp.abs(factor_dt), wp.abs(dt))
+    if mass_update_requested[tid] != 0 or dt_changed:
         flag = 1
     if articulation_active[tid] == 0:
         flag = 0
     mass_update_mask[tid] = flag
+    if flag != 0:
+        mass_factor_dt[tid] = dt
 
 
 # =============================================================================
@@ -4824,6 +5024,50 @@ def _contact_points_world(
     return point_a_world, point_b_world
 
 
+@wp.kernel
+def prepare_contact_recovery(
+    count: wp.array[int],
+    threads: int,
+    point0: wp.array[wp.vec3],
+    point1: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+    shape0: wp.array[int],
+    shape1: wp.array[int],
+    margin0: wp.array[float],
+    margin1: wp.array[float],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    recovery: MeshRecoveryData,
+    generation: wp.array[int],
+    baumgarte: float,
+    recovery_phi: wp.array[float],
+):
+    # The row builders use nonpositive values as recovery depths, finite
+    # positive values as ordinary contacts, and infinity as expired contacts.
+    total = count[0]
+    if total > shape0.shape[0]:
+        return
+    for c in range(wp.tid(), total, threads):
+        recovery_phi[c] = 1.0
+        a = shape0[c]
+        b = shape1[c]
+        if a < 0 or b < 0:
+            continue
+        body_a = shape_body[a]
+        body_b = shape_body[b]
+        pose_a = body_q[body_a] if body_a >= 0 else wp.transform_identity()
+        pose_b = body_q[body_b] if body_b >= 0 else wp.transform_identity()
+        slot = active_recovery_contact(recovery, generation[0], a, b, pose_a, pose_b, normal[c])
+        if slot < -1:
+            recovery_phi[c] = wp.inf
+        elif slot >= 0:
+            n = -normal[c]
+            pa, pb = _contact_points_world(c, body_a, body_b, n, point0, point1, margin0, margin1, body_q)
+            depth = recovery_step_depth(recovery.contacts[slot].thickness, wp.max(wp.dot(n, pb - pa), 0.0))
+            # Keep large user-supplied Baumgarte gains within the certified step depth.
+            recovery_phi[c] = -depth / wp.max(baumgarte, 1.0)
+
+
 @wp.func
 def contact_row_points(
     c: int,
@@ -4959,6 +5203,7 @@ def _allocate_world_contact_slot(
     classify_only: int,
     shape_torsion_radius: wp.array[float],
     torsion_spares: int,
+    recovery_phi: wp.array[float],
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -5038,7 +5283,7 @@ def _allocate_world_contact_slot(
         b_has_dofs and body_has_response_dofs[body_b] != 0 and (body_flags[body_b] & BodyFlags.KINEMATIC) == 0
     )
     contact_slots_needed[c] = 0
-    if not a_can_respond and not b_can_respond:
+    if (not a_can_respond and not b_can_respond) or (recovery_phi and wp.isinf(recovery_phi[c])):
         contact_slot[c] = -1
         contact_path[c] = -1
         return
@@ -5222,6 +5467,7 @@ def allocate_world_contact_slots(
     classify_only: int,
     shape_torsion_radius: wp.array[float],
     torsion_spares: int,
+    recovery_phi: wp.array[float],
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -5296,6 +5542,7 @@ def allocate_world_contact_slots(
             classify_only,
             shape_torsion_radius,
             torsion_spares,
+            recovery_phi,
             contact_world,
             contact_slot,
             contact_art_a,
@@ -5624,6 +5871,23 @@ def mf_contact_row_dot(
     return out
 
 
+@wp.func
+def contact_max_depenetration_velocity(
+    body_a: int, body_b: int, rigid_body_max_depenetration_velocity: wp.array[float]
+) -> float:
+    """Return the smaller positive finite maximum depenetration velocity of a contact's bodies, else infinity."""
+    bound = float(wp.inf)
+    if body_a >= 0:
+        bound_a = rigid_body_max_depenetration_velocity[body_a]
+        if bound_a > 0.0 and bound_a < bound:
+            bound = bound_a
+    if body_b >= 0:
+        bound_b = rigid_body_max_depenetration_velocity[body_b]
+        if bound_b > 0.0 and bound_b < bound:
+            bound = bound_b
+    return bound
+
+
 @wp.kernel
 def prepare_world_contact_rows(
     contact_count: wp.array[int],
@@ -5655,6 +5919,8 @@ def prepare_world_contact_rows(
     restitution_velocity_threshold: float,
     friction_combine: int,
     restitution_combine: int,
+    recovery_phi: wp.array[float],
+    rigid_body_max_depenetration_velocity: wp.array[float],
     # outputs
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
@@ -5662,6 +5928,7 @@ def prepare_world_contact_rows(
     world_phi: wp.array2d[float],
     world_target_velocity: wp.array2d[float],
     world_row_rebound_velocity: wp.array2d[float],
+    world_row_max_depenetration_velocity: wp.array2d[float],
 ):
     """Write the metadata of every dense contact's normal row and, when allocated, its friction rows.
 
@@ -5694,6 +5961,10 @@ def prepare_world_contact_rows(
             c, body_a, body_b, normal, contact_point0, contact_point1, contact_thickness0, contact_thickness1, body_q
         )
         phi = wp.dot(normal, point_a_world - point_b_world)
+        restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution, restitution_combine)
+        if recovery_phi and recovery_phi[c] <= 0.0:
+            phi = recovery_phi[c]
+            restitution = 0.0
         mu = combine_shape_coefficients(shape_a, shape_b, shape_material_mu, friction_combine)
         tangent0, tangent1 = contact_tangent_basis(normal)
 
@@ -5701,11 +5972,14 @@ def prepare_world_contact_rows(
         world_row_parent[world, slot] = -1
         world_row_mu[world, slot] = mu
         world_phi[world, slot] = phi
+        world_row_max_depenetration_velocity[world, slot] = contact_max_depenetration_velocity(
+            body_a, body_b, rigid_body_max_depenetration_velocity
+        )
         point_a_normal, point_b_normal = contact_row_points(
             c, 0, point_a_world, point_b_world, contact_shared_anchor, contact_friction_shared_anchor, friction_patches
         )
         world_row_rebound_velocity[world, slot] = contact_rebound_velocity(
-            mixed_contact_restitution(shape_a, shape_b, shape_material_restitution, restitution_combine),
+            restitution,
             body_a,
             art_a,
             body_b,
@@ -6247,7 +6521,7 @@ def scatter_augmented_drive_dof_K(
     # outputs
     dof_K: wp.array[float],
 ):
-    """Write each DOF's implicit drive term ``dt * kd + dt^2 * ke`` for a mass refresh.
+    """Write each DOF's combined implicit drive and passive damping diagonal for a mass refresh.
 
     The DOF-indexed form of :func:`apply_augmented_mass_diagonal_grouped`, consumed by the
     sparse mass factors, which assemble the mass matrix without dense storage.
@@ -6399,6 +6673,34 @@ def compute_world_contact_bias(
         world_rhs[world, i] = rhs
         if contact_w < 1.0:
             world_row_w[world, i] = row_w
+
+
+@wp.kernel
+def bound_world_contact_depenetration_bias(
+    world_constraint_count: wp.array[int],
+    max_constraints: int,
+    world_phi: wp.array2d[float],
+    world_row_type: wp.array2d[int],
+    world_target_velocity: wp.array2d[float],
+    world_row_max_depenetration_velocity: wp.array2d[float],
+    pgs_beta: float,
+    dt: float,
+    # in/out
+    world_rhs: wp.array2d[float],
+):
+    """Bound the Baumgarte term of each penetrating dense contact by the row's maximum depenetration velocity.
+
+    Must run right after :func:`compute_world_contact_bias`.
+    """
+    tid = wp.tid()
+    world = tid // max_constraints
+    i = tid - world * max_constraints
+    if i >= world_constraint_count[world] or world_row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
+        return
+    phi = world_phi[world, i]
+    bound = world_row_max_depenetration_velocity[world, i]
+    if phi <= 0.0 and pgs_beta * phi * (1.0 / dt) < -bound:
+        world_rhs[world, i] = -world_target_velocity[world, i] - bound
 
 
 @wp.kernel
@@ -7093,6 +7395,8 @@ def _build_mf_contact_row(
     restitution_velocity_threshold: float,
     friction_combine: int,
     restitution_combine: int,
+    recovery_phi: wp.array[float],
+    rigid_body_max_depenetration_velocity: wp.array[float],
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -7104,6 +7408,7 @@ def _build_mf_contact_row(
     mf_phi: wp.array2d[float],
     mf_target_velocity: wp.array2d[float],
     mf_row_rebound_velocity: wp.array2d[float],
+    mf_row_max_depenetration_velocity: wp.array2d[float],
 ):
     """Build the normal row and, when allocated, the two sliding friction rows of a free-body contact.
 
@@ -7142,12 +7447,16 @@ def _build_mf_contact_row(
         c, body_a, body_b, normal, contact_point0, contact_point1, contact_thickness0, contact_thickness1, body_q
     )
     phi = wp.dot(normal, point_a_world - point_b_world)
+    restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution, restitution_combine)
+    if recovery_phi and recovery_phi[c] <= 0.0:
+        phi = recovery_phi[c]
+        restitution = 0.0
     mu = combine_shape_coefficients(shape_a, shape_b, shape_material_mu, friction_combine)
     point_a_normal, point_b_normal = contact_row_points(
         c, 0, point_a_world, point_b_world, contact_shared_anchor, contact_friction_shared_anchor, friction_patches
     )
     rebound_velocity = contact_rebound_velocity(
-        mixed_contact_restitution(shape_a, shape_b, shape_material_restitution, restitution_combine),
+        restitution,
         body_a,
         contact_art_a[c],
         body_b,
@@ -7207,6 +7516,9 @@ def _build_mf_contact_row(
             mf_row_parent[world, row_idx] = -1
             mf_phi[world, row_idx] = phi
             mf_row_rebound_velocity[world, row_idx] = rebound_velocity
+            mf_row_max_depenetration_velocity[world, row_idx] = contact_max_depenetration_velocity(
+                body_a, body_b, rigid_body_max_depenetration_velocity
+            )
         else:
             mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
             mf_row_parent[world, row_idx] = slot
@@ -7268,6 +7580,8 @@ def build_mf_contact_rows(
     restitution_velocity_threshold: float,
     friction_combine: int,
     restitution_combine: int,
+    recovery_phi: wp.array[float],
+    rigid_body_max_depenetration_velocity: wp.array[float],
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -7279,6 +7593,7 @@ def build_mf_contact_rows(
     mf_phi: wp.array2d[float],
     mf_target_velocity: wp.array2d[float],
     mf_row_rebound_velocity: wp.array2d[float],
+    mf_row_max_depenetration_velocity: wp.array2d[float],
 ):
     """Build the free-body contact rows with a grid-stride loop."""
     total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
@@ -7315,6 +7630,8 @@ def build_mf_contact_rows(
             restitution_velocity_threshold,
             friction_combine,
             restitution_combine,
+            recovery_phi,
+            rigid_body_max_depenetration_velocity,
             mf_body_a,
             mf_body_b,
             mf_J_a,
@@ -7325,6 +7642,7 @@ def build_mf_contact_rows(
             mf_phi,
             mf_target_velocity,
             mf_row_rebound_velocity,
+            mf_row_max_depenetration_velocity,
         )
 
 
@@ -8009,7 +8327,7 @@ def compute_mf_effective_mass_and_rhs(
     body_to_articulation: wp.array[int],
     articulation_dof_start: wp.array[int],
     incident_velocity: wp.array[float],
-    rigid_body_max_depenetration_velocity: wp.array[float],
+    mf_row_max_depenetration_velocity: wp.array2d[float],
     pgs_cfm: float,
     pgs_beta: float,
     contact_w: float,
@@ -8025,7 +8343,7 @@ def compute_mf_effective_mass_and_rhs(
 ):
     """Compute the response ``H^-1 J^T``, inverse effective mass and bias of each free-body row.
 
-    The effective mass is ``J_a H_a^-1 J_a^T + J_b H_b^-1 J_b^T + cfm`` with the full
+    The step denominator is ``J_a H_a^-1 J_a^T + J_b H_b^-1 J_b^T + cfm`` with the full
     6x6 inverse spatial inertia of each free body. The right-hand side holds only the
     bias; the solve recomputes ``J v`` every iteration. Penetrating contacts get the
     Baumgarte term, bounded by the bodies' maximum depenetration velocity; separated
@@ -8089,16 +8407,9 @@ def compute_mf_effective_mass_and_rhs(
             row_w = contact_w
         if phi_val < 0.0:
             bias = pgs_beta * phi_val / dt
-            max_depen = 1.0e20
-            if ba >= 0:
-                max_depen = rigid_body_max_depenetration_velocity[ba]
-            if bb >= 0:
-                max_depen_b = rigid_body_max_depenetration_velocity[bb]
-                if max_depen_b > 0.0 and wp.isfinite(max_depen_b):
-                    if max_depen_b < max_depen:
-                        max_depen = max_depen_b
-            if max_depen > 0.0 and wp.isfinite(max_depen):
-                bias = wp.max(bias, -max_depen)
+            bound = mf_row_max_depenetration_velocity[world, i]
+            if wp.isfinite(bound):
+                bias = wp.max(bias, -bound)
         else:
             bias = contact_speculative_scale * phi_val / dt
         rebound_velocity = mf_row_rebound_velocity[world, i]
@@ -8751,6 +9062,129 @@ def build_joint_limit_rows(
 
 
 @wp.kernel
+def build_distance_limit_rows(
+    articulation_dof_start: wp.array[int],
+    art_to_world: wp.array[int],
+    group_to_art: wp.array[int],
+    articulation_active: wp.array[int],
+    distance_start: wp.array[int],
+    distance_joint: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_c: wp.array[wp.transform],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    body_com: wp.array[wp.vec3],
+    joint_q: wp.array[float],
+    activation_gap: wp.array[float],
+    joint_qd: wp.array[float],
+    activation_speed_scale: float,
+    dt: float,
+    max_constraints: int,
+    # outputs
+    world_slot_counter: wp.array[int],
+    J_group: wp.array3d[float],
+    world_row_type: wp.array2d[int],
+    world_row_parent: wp.array2d[int],
+    world_row_mu: wp.array2d[float],
+    world_phi: wp.array2d[float],
+    world_target_velocity: wp.array2d[float],
+    row_slot_mode: int,
+    element_row_cursor: wp.array[int],
+):
+    """Allocate and fill the anchor-distance limit rows of the root DISTANCE joint of one articulation per thread.
+
+    A lower bound is active when positive and an upper bound when non-negative, both below ``MAXVAL``, as in
+    :class:`~newton.solvers.SolverXPBD`; a zero minimum distance is no bound. The distance is
+    ``|p|``, the child anchor's position in the parent anchor frame (the joint's linear coordinates). With the
+    joint velocity ``(v, w)`` of the child COM in that frame, its rate is ``n . v + (r x n) . w`` for ``n = p / |p|``
+    and ``r = p - p_com``, so each row spans only the joint's own six DOFs. At coincident anchors ``n`` follows the
+    anchor's predicted velocity. The row bounds a velocity projection, not the next distance, so with an offset COM
+    the transverse anchor velocity and rotation within the step can carry the anchor past a positive bound. A zero
+    maximum distance holds ``p`` at zero with two opposing rows per axis, which are always active.
+    """
+    group_idx = wp.tid()
+    art = group_to_art[group_idx]
+    if articulation_active[art] == 0:
+        return
+    world = art_to_world[art]
+    dof_start = articulation_dof_start[art]
+    for k in range(distance_start[art], distance_start[art + 1]):
+        joint = distance_joint[k]
+        dof = joint_qd_start[joint]
+        lower = joint_limit_lower[dof]
+        upper = joint_limit_upper[dof]
+        has_lower = lower > 0.0 and lower < MAXVAL
+        has_upper = upper >= 0.0 and upper < MAXVAL
+        if not has_lower and not has_upper:
+            continue
+        q = joint_q_start[joint]
+        p = wp.vec3(joint_q[q], joint_q[q + 1], joint_q[q + 2])
+        X_j = wp.transform(p, wp.quat(joint_q[q + 3], joint_q[q + 4], joint_q[q + 5], joint_q[q + 6]))
+        com = wp.transform_point(X_j * wp.transform_inverse(joint_X_c[joint]), body_com[joint_child[joint]])
+        local = dof - dof_start
+        if has_upper and upper == 0.0:
+            # The distance has no direction at coincident anchors, so bound each axis of p instead.
+            for row in range(6):
+                axis = row // 2
+                sign = 1.0 - 2.0 * float(row % 2)
+                e = wp.vec3(0.0, 0.0, 0.0)
+                e[axis] = sign
+                slot = reserve_world_rows(row_slot_mode, world_slot_counter, world, 1, element_row_cursor, art)
+                if row_slot_mode == ROW_SLOTS_COUNT or slot >= max_constraints:
+                    continue
+                e_w = wp.cross(p - com, e)
+                for i in range(3):
+                    J_group[group_idx, slot, local + i] = e[i]
+                    J_group[group_idx, slot, local + 3 + i] = e_w[i]
+                world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+                world_row_parent[world, slot] = -1
+                world_row_mu[world, slot] = 0.0
+                world_phi[world, slot] = sign * p[axis]
+                world_target_velocity[world, slot] = 0.0
+            continue
+        distance = wp.length(p)
+        r = p - com
+        n = wp.vec3(1.0, 0.0, 0.0)
+        if distance > 1.0e-9:
+            n = p / distance
+        else:
+            # Coincident anchors separate along the anchor's predicted velocity, so bound that direction.
+            v = wp.vec3(joint_qd[dof], joint_qd[dof + 1], joint_qd[dof + 2])
+            w = wp.vec3(joint_qd[dof + 3], joint_qd[dof + 4], joint_qd[dof + 5])
+            u = v + wp.cross(w, r)
+            if wp.length(u) > 1.0e-9:
+                n = wp.normalize(u)
+        n_w = wp.cross(r, n)
+        rate = float(0.0)
+        for i in range(3):
+            rate += n[i] * joint_qd[dof + i] + n_w[i] * joint_qd[dof + 3 + i]
+        gap = joint_limit_effective_gap(activation_gap[dof], activation_speed_scale, dt, rate)
+        for side in range(2):
+            phi = distance - lower
+            active = has_lower and distance <= lower + gap
+            sign = 1.0
+            if side == 1:
+                phi = upper - distance
+                active = has_upper and distance >= upper - gap
+                sign = -1.0
+            if not active:
+                continue
+            slot = reserve_world_rows(row_slot_mode, world_slot_counter, world, 1, element_row_cursor, art)
+            if row_slot_mode == ROW_SLOTS_COUNT or slot >= max_constraints:
+                continue
+            for i in range(3):
+                J_group[group_idx, slot, local + i] = sign * n[i]
+                J_group[group_idx, slot, local + 3 + i] = sign * n_w[i]
+            world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+            world_row_parent[world, slot] = -1
+            world_row_mu[world, slot] = 0.0
+            world_phi[world, slot] = phi
+            world_target_velocity[world, slot] = 0.0
+
+
+@wp.kernel
 def scale_array_inplace(values: wp.array[float], scale: float):
     """Multiply every entry of ``values`` by ``scale``."""
     i = wp.tid()
@@ -9026,6 +9460,7 @@ def build_propagation_contact_rows(
     use_contact_units: int,
     contact_unit: wp.array[int],
     contact_unit_response: wp.array[int],
+    recovery_phi: wp.array[float],
     # outputs
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
@@ -9091,6 +9526,10 @@ def build_propagation_contact_rows(
             c, body_a, body_b, normal, contact_point0, contact_point1, contact_thickness0, contact_thickness1, body_q
         )
         phi = wp.dot(normal, point_a_world - point_b_world)
+        restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution, restitution_combine)
+        if recovery_phi and recovery_phi[c] <= 0.0:
+            phi = recovery_phi[c]
+            restitution = 0.0
         mu = combine_shape_coefficients(shape_a, shape_b, shape_material_mu, friction_combine)
         tangent0, tangent1 = contact_tangent_basis(normal)
         com_a = wp.vec3(0.0)
@@ -9104,7 +9543,7 @@ def build_propagation_contact_rows(
             c, 0, point_a_world, point_b_world, contact_shared_anchor, contact_friction_shared_anchor, friction_patches
         )
         rebound_velocity = contact_rebound_velocity(
-            mixed_contact_restitution(shape_a, shape_b, shape_material_restitution, restitution_combine),
+            restitution,
             body_a,
             art_a,
             body_b,
@@ -10247,16 +10686,9 @@ def compute_propagation_effective_mass_and_rhs(
             row_w = contact_w
         if phi < 0.0:
             bias = pgs_beta * phi / dt
-            max_depen = 1.0e20
-            if ba >= 0:
-                max_depen = rigid_body_max_depenetration_velocity[ba]
-            if bb >= 0:
-                max_depen_b = rigid_body_max_depenetration_velocity[bb]
-                if max_depen_b > 0.0 and wp.isfinite(max_depen_b):
-                    if max_depen_b < max_depen:
-                        max_depen = max_depen_b
-            if max_depen > 0.0 and wp.isfinite(max_depen):
-                bias = wp.max(bias, -max_depen)
+            bound = contact_max_depenetration_velocity(ba, bb, rigid_body_max_depenetration_velocity)
+            if wp.isfinite(bound):
+                bias = wp.max(bias, -bound)
         else:
             bias = contact_speculative_scale * phi / dt
         if rebound_velocity > 0.0:

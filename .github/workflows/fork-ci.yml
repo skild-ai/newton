@@ -16,8 +16,9 @@ on:
       - "release-*"
   workflow_dispatch:
 
+# Push runs get one group per commit, so every merge to main is tested.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -119,7 +120,16 @@ jobs:
           --shard-index ${{ matrix.shard-index }}
           --start-directory asv/tests
           --junit-report-xml asv-rspec.xml
+      # Cache keys are immutable, so only save a key that is new.
+      - name: Look up Warp kernel cache
+        id: lookup-warp-cache
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7  # v5.0.4
+        with:
+          path: ~/.cache/warp
+          key: ${{ steps.warp-cache-key.outputs.prefix }}${{ hashFiles('uv.lock', 'newton/**/*.py') }}
+          lookup-only: true
       - name: Save Warp kernel cache
+        if: steps.lookup-warp-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7  # v5.0.4
         with:
           path: ~/.cache/warp

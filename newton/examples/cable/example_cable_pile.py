@@ -41,12 +41,16 @@ class Example:
     ):
         self.viewer = viewer
         self.args = args
+        self.solver_type = getattr(args, "solver", "vbd") if args is not None else "vbd"
 
         # Simulation cadence
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 5, propagation=(5, 12))
+        if self.solver_type == "kamino":
+            self.sim_substeps, self.sim_iterations = 2, 5
+        else:
+            self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 5, propagation=(5, 12))
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         # Cable pile parameters
@@ -64,6 +68,8 @@ class Example:
         layer_gap = cable_radius * 3.0
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "kamino":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         builder.rigid_gap = 0.0
 
         # Material properties
@@ -181,18 +187,23 @@ class Example:
         )
         self.contacts = self.collision_pipeline.contacts()
 
-        self.solver = cable_solver.make_solver(
-            self.model,
-            args,
-            # Three rows (normal and two tangents) per contact of the world's budget.
-            contacts=self.contacts_per_world,
-            contact_rows=3 * self.contacts_per_world,
-            # A cable touching itself: the task's peak, 5 contacts, with room to spare.
-            same_articulation_contacts=32,
-            iterations=self.sim_iterations,
-            rigid_body_contact_buffer_size=256,
-            rigid_contact_history=True,
-        )
+        if self.solver_type == "kamino":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+        else:
+            self.solver = cable_solver.make_solver(
+                self.model,
+                args,
+                # Three rows (normal and two tangents) per contact of the world's budget.
+                contacts=self.contacts_per_world,
+                contact_rows=3 * self.contacts_per_world,
+                # A cable touching itself: the task's peak, 5 contacts, with room to spare.
+                same_articulation_contacts=32,
+                iterations=self.sim_iterations,
+                rigid_body_contact_buffer_size=256,
+                rigid_contact_history=True,
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -277,5 +288,5 @@ class Example:
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init(cable_solver.create_parser())
+    viewer, args = newton.examples.init(cable_solver.create_parser(extra_solvers=("kamino",)))
     newton.examples.run(Example(viewer, args), args)

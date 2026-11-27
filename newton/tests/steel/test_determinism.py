@@ -27,7 +27,7 @@ from newton._src.solvers.steel.kernels import (
     crba_fill_par_dof,
 )
 from newton.solvers import SolverSteel
-from newton.tests.steel._fixtures import _build_four_bar
+from newton.tests.steel._fixtures import _build_four_bar, printf_capture_is_reliable
 from newton.tests.unittest_utils import (
     StdOutCapture,
     add_function_test,
@@ -445,13 +445,15 @@ def _check_propagation_coverage(test, model, options):
     test.assertGreater(np.bincount(row_bodies[row_bodies >= 0]).max(), 2)
     body_count = solver._propagation_body_count.numpy()
     body_list = solver._propagation_body_list.numpy()
-    # The colored sweep, the serial unit sweep (twists staged by local slot) and the cached response read the body map.
+    # The colored sweep, the serial unit sweep (twists staged by local slot) and the cached response read the
+    # ordered contact-body list. Momentum also needs the world-to-body map to update every responding twist.
     reads_body_map = (
         options.get("solve_mode") == "colored"
         or options["propagation_cached_response"]
         or solver._propagation_serial_units
     )
-    test.assertEqual(solver._propagation_world_bodies is not None, reads_body_map)
+    test.assertEqual(solver._propagation_world_bodies is not None, reads_body_map or solver.nesterov_momentum)
+    test.assertEqual(np.any(body_count), reads_body_map)
     if options["propagation_cached_response"]:
         test.assertTrue(np.all(solver._propagation_cache_world_flag.numpy() == 1))
         # Cache-eligible bodies come first; each partition is in body order.
@@ -653,8 +655,8 @@ def test_overflow_warning_names_deterministic_mode(test, device):
         "While its contacts and joint rows are unchanged it drops the same contacts every step; otherwise it drops "
         "the tail of the new contact order."
     )
-    # Warp CPU printf capture is unreliable on Windows; the overflow status and routing are still checked there.
-    check_output = not (wp.get_device(device).is_cpu and sys.platform == "win32")
+    # Captured kernel printf is unreliable on Windows; the overflow status and routing are still checked there.
+    check_output = printf_capture_is_reliable()
     for deterministic in (wp.DeterministicMode.NOT_GUARANTEED, RUN_TO_RUN):
         with test.subTest(deterministic=deterministic.name):
             solver = SolverSteel(
@@ -667,7 +669,7 @@ def test_overflow_warning_names_deterministic_mode(test, device):
                 paths = []
                 for _ in range(2):
                     solver.step(state, model.state(), model.control(), contacts, 0.005)
-                    paths.append(solver._contact_path.numpy())
+                    paths.append(solver._contact_path.numpy().copy())
                 wp.synchronize_device(device)
             finally:
                 output = capture.end() if check_output else ""
@@ -788,8 +790,8 @@ def test_deterministic_joint_friction_rows_follow_dof_order(test, device):
         np.testing.assert_allclose(row_mu[world, friction_rows], expected, rtol=1.0e-6)
 
 
-def test_deterministic_bilateral_rows_follow_element_order(test, device):
-    """Give a world's mimic rows, then its loop-closure rows, their slots in element order."""
+def test_bilateral_rows_follow_element_order(test, device):
+    """Give a world's mimic rows, then its loop-closure rows, their slots in element order in every mode."""
     mimic_count = 512
     builder = _build_four_bar()
     # Many rows on one follower need the deprecated API; joint-owned mimics allow one per joint.
@@ -798,14 +800,34 @@ def test_deterministic_bilateral_rows_follow_element_order(test, device):
         for _ in range(mimic_count):
             builder.add_constraint_mimic(joint0=1, joint1=0, coef0=0.0, coef1=1.0)
     model = builder.finalize(device=device)
-    solver = SolverSteel(model, deterministic=RUN_TO_RUN, articulation_constraint_max=mimic_count + 64)
-    state = model.state()
-    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-    solver.step(state, model.state(), model.control(), None, 0.005)
+    for mode in (RUN_TO_RUN, wp.DeterministicMode.NOT_GUARANTEED):
+        with test.subTest(deterministic=mode):
+            solver = SolverSteel(model, deterministic=mode, articulation_constraint_max=mimic_count + 64)
+            state = model.state()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+            solver.step(state, model.state(), model.control(), None, 0.005)
 
-    mimic_slot = solver._mimic_slot.numpy()
-    np.testing.assert_array_equal(mimic_slot, mimic_slot[0] + np.arange(mimic_count))
-    np.testing.assert_array_equal(solver._connect_slot.numpy(), [mimic_slot[0] + mimic_count])
+            mimic_slot = solver._mimic_slot.numpy()
+            np.testing.assert_array_equal(mimic_slot, mimic_slot[0] + np.arange(mimic_count))
+            np.testing.assert_array_equal(solver._connect_slot.numpy(), [mimic_slot[0] + mimic_count])
+
+
+def test_loop_closure_rows_follow_element_order(test, device):
+    """Give the loop-closure rows of one world their slots in element order in every mode."""
+    closure_count = 512
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.replicate(_build_four_bar(), closure_count, spacing=(1.0, 0.0, 0.0), separate_worlds=False)
+    model = builder.finalize(device=device)
+    for mode in (RUN_TO_RUN, wp.DeterministicMode.NOT_GUARANTEED):
+        with test.subTest(deterministic=mode):
+            solver = SolverSteel(model, deterministic=mode, articulation_constraint_max=4 * closure_count)
+            state = model.state()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+            solver.step(state, model.state(), model.control(), None, 0.005)
+
+            # Each BALL closure takes three rows.
+            connect_slot = solver._connect_slot.numpy()
+            np.testing.assert_array_equal(connect_slot, connect_slot[0] + 3 * np.arange(closure_count))
 
 
 @contextlib.contextmanager
@@ -929,7 +951,8 @@ for _fn in (
     test_deterministic_launches_replay_identically,
     test_deterministic_joint_rows_follow_articulation_order,
     test_deterministic_joint_friction_rows_follow_dof_order,
-    test_deterministic_bilateral_rows_follow_element_order,
+    test_bilateral_rows_follow_element_order,
+    test_loop_closure_rows_follow_element_order,
     test_inherited_global_mode_keeps_steel_ordering,
 ):
     add_function_test(TestSteelDeterminism, _fn.__name__, _fn, devices=cuda_devices)

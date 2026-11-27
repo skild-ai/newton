@@ -40,7 +40,7 @@ Most Newton sensors follow a common pattern:
    model = builder.finalize()
 
    # 1. Create sensor and specify what to measure
-   imu = SensorIMU(model, sites="imu_*", request_state_attributes=False)
+   imu = SensorIMU(model, sites="imu_*")
 
    # Create solver and state
    solver = newton.solvers.SolverMuJoCo(model)
@@ -92,10 +92,10 @@ link filters are matched against the final path component of each label.
    import re
 
    # single pattern: all shapes whose label starts with "foot_"
-   SensorIMU(model, sites="foot_*", request_state_attributes=False)
+   SensorIMU(model, sites="foot_*")
 
    # compiled regular expression: full-match an environment and object label
-   SensorIMU(model, sites=re.compile(r"/World/envs/env_[0-9]+/imu_(left|right)"), request_state_attributes=False)
+   SensorIMU(model, sites=re.compile(r"/World/envs/env_[0-9]+/imu_(left|right)"))
 
    # list of patterns: union of two groups
    SensorContact(model, sensing_shapes=["*Plate*", "*Flap*"])
@@ -106,7 +106,7 @@ link filters are matched against the final path component of each label.
 Available Sensors
 -----------------
 
-Newton provides five sensor types. See the
+Newton provides four sensor types. See the
 :doc:`API reference <../api/newton_sensors>` for constructor arguments,
 attributes, and usage examples.
 
@@ -116,8 +116,10 @@ attributes, and usage examples.
 * :class:`~newton.sensors.SensorIMU` -- linear acceleration and angular velocity at site frames.
 * :class:`~newton.sensors.SensorCamera` -- raytraced color, HDR color, depth, forward-depth, normal, albedo, and
   shape-index rendering; one view per camera transform, mapped to worlds via a per-view selector. Deformable
-  visual meshes render too; see :ref:`deformable-visual-camera-output`.
-* :class:`~newton.sensors.SensorTiledCamera` -- deprecated; superseded by :class:`~newton.sensors.SensorCamera`.
+  visual meshes render too; see :ref:`deformable-visual-camera-output`. Installing ``newton[optix]`` enables
+  experimental OptiX ray tracing with ``backend="optix"``; build its shapes with
+  ``model.bvh_build_shapes(state, backend="optix")`` and refit them with
+  ``model.bvh_refit_shapes(state, backend="optix")``.
 
 Camera Rays from USD and Calibration Data
 -----------------------------------------
@@ -188,6 +190,12 @@ Solver Observables
 ``SensorIMU`` requires ``SolverBase.ObservableKind.BODY_QDD`` and ``SensorContact``
 requires ``SolverBase.ObservableKind.CONTACT_F``. ``SensorContact`` uses only the
 linear part of each ``CONTACT_F`` wrench (force [N]); the torque part is ignored.
+With :class:`~newton.solvers.SolverSteel` sleeping and ``sleep_skip_constraints=True``,
+``SensorContact`` keeps reading the last support force of a sleeping body when every
+solver step requests ``CONTACT_F`` and, across collision passes, the pipeline matches
+contacts (``contact_matching="latest"``); otherwise the force drops to zero until the
+body wakes. With ``sleep_skip_constraints=False`` the forces of sleeping bodies are
+solved and reported directly (see :ref:`steel_sleep_observable`).
 Each sensor's ``solver_observable_kinds`` property provides its requirements
 without mutating the model. Union the sets when both sensors are present.
 Pass a contacts buffer to the factory when requesting contact-indexed

@@ -9,10 +9,10 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.robot._tabletop_demo import TabletopDemo
+from newton.examples.robot._tabletop_demo import TabletopDemo, download_robot_assets
 from newton.examples.robot.example_steel_wrecking_ball import Example
 from newton.solvers import SolverSteel
-from newton.tests.unittest_utils import USD_AVAILABLE, add_function_test, get_selected_cuda_test_devices
+from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, requires
 from newton.viewer import ViewerNull
 
 
@@ -84,9 +84,13 @@ def test_wrecking_ball_idle(test, device):
         example.check_capacity()
 
 
-@unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+@requires("pxr.Usd")
 class TestWreckingBallStability(unittest.TestCase):
-    pass
+    @classmethod
+    def setUpClass(cls):
+        # Download outside the per-test output check, which rejects the download log.
+        if get_selected_cuda_test_devices():
+            download_robot_assets("ur10")
 
 
 add_function_test(

@@ -12,11 +12,11 @@ import newton
 import newton.examples
 
 
-def create_parser(baseline="vbd"):
+def create_parser(baseline="vbd", extra_solvers=()):
     parser = newton.examples.create_parser()
     parser.add_argument(
         "--solver",
-        choices=(baseline, "steel"),
+        choices=(baseline, *extra_solvers, "steel"),
         default=baseline,
         help=f"Run the {baseline} scene or solve its rods natively with Steel on CUDA.",
     )

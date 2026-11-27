@@ -11,7 +11,7 @@ import warp as wp
 
 import newton
 from newton.solvers import SolverSteel
-from newton.tests.unittest_utils import USD_AVAILABLE, add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices, requires
 
 DT = 1.0 / 240.0
 HALF = 0.1
@@ -318,10 +318,9 @@ def test_mjcf_import(test, device):
     test.assertAlmostEqual(float(model.shape_gap.numpy()[by_label["frame"]]), 0.003, places=6)
 
 
+@requires("pxr.Usd")
 def test_usd_import(test, device):
     """Read ``newton:steel:adhesion`` from a USD shape and hold a box that falls without it."""
-    if not USD_AVAILABLE:
-        test.skipTest("Requires usd-core")
     from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
     adhesion = 1.1 * WEIGHT / CONTACT_POINTS
@@ -373,8 +372,10 @@ def test_validation(test, device):
             SolverSteel(model, **options)
     solver = SolverSteel(model)
     _set_adhesion(model, ceiling, -1.0)
+    flags = model.get_attribute_update_flags("steel:adhesion")
+    test.assertEqual(flags, newton.ModelFlags.SHAPE_PROPERTIES)
     with test.assertRaisesRegex(ValueError, "steel:adhesion"):
-        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+        solver.notify_model_changed(flags)
     model.steel.adhesion = wp.ones(model.shape_count - 1, dtype=wp.float32, device=device)
     with test.assertRaisesRegex(ValueError, "steel:adhesion has shape"):
         solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)

@@ -9,11 +9,15 @@ import warp as wp
 
 from .friction import FRICTION_PAIR_CUDA
 from .kernels import (
+    MF_META_ROW_TYPE_BITS,
+    MF_META_ROW_TYPE_MASK,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     WARP_DETERMINISM_OFF,
+    SweepField,
+    warp_momentum,
 )
 
 wp.set_module_options(WARP_DETERMINISM_OFF)
@@ -27,6 +31,7 @@ def _get_pgs_solve_sparse_kernel(
     *,
     free_body_constraint_max: int = 0,
     free_row_dofs: int = 0,
+    nesterov_momentum: bool = False,
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -57,6 +62,25 @@ def _get_pgs_solve_sparse_kernel(
     limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
     velocity_limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
     mf_storage = mf_initialize = mf_sweep = mf_writeback = ""
+    before_clamp = after_clamp = ""
+    velocity_history = None
+    if nesterov_momentum and F:
+        # A stateless clamp has no accumulated impulse. Move the snapshot by
+        # its accepted velocity change, leaving other rows free to accelerate.
+        slots = (D + 31) // 32
+        velocity_history = ("previous_delta[j]", "")
+        before_clamp = f"""
+            float before[{slots}];
+            const bool clamping = kind == {velocity_limit_type} && change != 0.0f;
+            if (clamping) {{
+                for (int d = lane; d < {D}; d += 32) before[d / 32] = delta[d];
+                __syncwarp(MASK);
+            }}
+"""
+        after_clamp = f"""
+            if (clamping)
+                for (int d = lane; d < {D}; d += 32) previous_delta[d / 32] += delta[d] - before[d / 32];
+"""
     if F:
         mf_storage = f"""
     __shared__ float mf_impulse_storage[{W * F}];
@@ -89,9 +113,9 @@ def _get_pgs_solve_sparse_kernel(
         for (int row = 0; row < mf_count; ++row) {{
             const int global_row = mf_offset + row;
             const int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[global_row * 4]);
-            const int kind = meta.w & 0xffff;
+            const int kind = meta.w & {MF_META_ROW_TYPE_MASK};
             const bool friction = kind == {friction_type};
-            const int parent = meta.w >> 16;
+            const int parent = meta.w >> {MF_META_ROW_TYPE_BITS};
             if (friction && row != parent + 1) continue;
             const int sibling = friction ? parent + 2 : -1;
             const float inverse_diagonal = __int_as_float(meta.y);
@@ -148,8 +172,8 @@ def _get_pgs_solve_sparse_kernel(
             if (friction) {{
                 // Patch normal rows link the region's next normal (circular list, -1 ends a point contact).
                 float normal_load = mf_impulse[parent];
-                for (int next = mf_meta.data[(mf_offset + parent) * 4 + 3] >> 16;
-                     next >= 0 && next != parent; next = mf_meta.data[(mf_offset + next) * 4 + 3] >> 16)
+                for (int next = mf_meta.data[(mf_offset + parent) * 4 + 3] >> {MF_META_ROW_TYPE_BITS};
+                     next >= 0 && next != parent; next = mf_meta.data[(mf_offset + next) * 4 + 3] >> {MF_META_ROW_TYPE_BITS})
                     normal_load += mf_impulse[next];
                 const float radius = fmaxf(mf_row_mu.data[global_row] * normal_load, 0.0f);
                 const float old_sibling = mf_impulse[sibling];
@@ -178,6 +202,7 @@ def _get_pgs_solve_sparse_kernel(
             }}
             const float change = kind == {velocity_limit_type} ? new_impulse : new_impulse - old_impulse;
             if (lane == 0) mf_impulse[row] = new_impulse;
+{before_clamp}
             if (change != 0.0f || sibling_change != 0.0f) {{
                 changed = 1;
                 if (index >= 0) {{
@@ -188,11 +213,19 @@ def _get_pgs_solve_sparse_kernel(
                 }}
             }}
             __syncwarp(MASK);
+{after_clamp}
         }}
 """
         mf_writeback = """
     for (int i = lane; i < mf_count; i += 32) mf_impulses.data[mf_offset + i] = mf_impulse[i];
 """
+    fields = [SweepField("impulse[i]", "count", M, True), SweepField("delta[i]", str(D), D, history=velocity_history)]
+    if F:
+        movable = f"(mf_meta.data[(mf_offset + i) * 4 + 3] & {MF_META_ROW_TYPE_MASK}) != {velocity_limit_type}"
+        fields.append(SweepField("mf_impulse[i]", "mf_count", F, True, movable=movable))
+    mom_history, mom_step = warp_momentum(nesterov_momentum, fields)
+    if velocity_history:
+        mom_history += f"\nfloat previous_delta[{slots}];"
     snippet = (
         "#if defined(__CUDA_ARCH__)\n"
         + FRICTION_PAIR_CUDA
@@ -225,7 +258,9 @@ def _get_pgs_solve_sparse_kernel(
 {mf_initialize}
     __syncwarp(MASK);
 
+{mom_history}
     for (int iteration = 0; iteration < iterations; ++iteration) {{
+{mom_step}
         int changed = 0;
         for (int row = 0; row < count; ++row) {{
             const int row_type = static_cast<int>(type[row]);

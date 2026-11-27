@@ -19,6 +19,7 @@ from newton._src.solvers.steel.friction_patches import FrictionPatches
 from newton._src.solvers.steel.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     allocate_world_contact_slots,
     apply_world_contact_restitution,
     compute_mf_effective_mass_and_rhs,
@@ -37,6 +38,7 @@ from newton.tests.steel._fixtures import (
     _reset_state,
     _shape_cfg,
     _sphere_inertia,
+    printf_capture_is_reliable,
     set_torsion_radius,
     steel_mode_options,
 )
@@ -138,6 +140,7 @@ def _launch_contact_allocator(
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
+            None,
         ],
         outputs=[
             outputs["world"],
@@ -216,6 +219,7 @@ def _launch_articulation_pair_contact_allocator(
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
+            None,
         ],
         outputs=[
             wp.full((1,), -9, dtype=wp.int32, device=device),
@@ -286,7 +290,7 @@ def _mf_speculative_rhs(device, scale: float) -> float:
             wp.array([-1], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
-            wp.array([float("inf")], dtype=wp.float32, device=device),
+            wp.full((1, 1), wp.inf, dtype=wp.float32, device=device),
             1.0,
             0.2,
             1.0,
@@ -476,6 +480,7 @@ def _launch_dense_contact_builders(
         "phi": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
         "target_velocity": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
         "row_rebound_velocity": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
+        "row_max_depenetration_velocity": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
     }
     wp.launch(
         prepare_world_contact_rows,
@@ -508,6 +513,8 @@ def _launch_dense_contact_builders(
             0.5,  # restitution_velocity_threshold
             0,  # friction_combine
             0,  # restitution_combine
+            None,
+            wp.full((3,), wp.inf, dtype=wp.float32, device=device),
         ],
         outputs=list(metadata.values()),
         device=device,
@@ -581,7 +588,7 @@ def test_shared_anchors_warn_with_patch_friction(test, device):
     """Explain that patch anchors keep their friction points when shared anchors are requested."""
     model = _free_body_model(device)
     for flag in ("contact_shared_anchor", "contact_friction_shared_anchor"):
-        with test.subTest(flag=flag), test.assertWarnsRegex(newton.exceptions.NewtonWarning, "friction_anchor_beta=0"):
+        with test.subTest(flag=flag), test.assertWarnsRegex(newton.NewtonWarning, "friction_anchor_beta=0"):
             SolverSteel(model, **{flag: True})
         solver = SolverSteel(model, friction_anchor_beta=0.0, **{flag: True})
         test.assertTrue(getattr(solver, flag))
@@ -849,16 +856,19 @@ def test_overflow_warning_enabled_after_construction_latches(test, device):
     test.assertTrue(solver.constraint_overflow.numpy().any())
     test.assertEqual(solver._row_overflow_warning_emitted.numpy().tolist(), [0, 0, 0, 0, 0])
     solver.warn_constraint_overflow = True
+    check_output = printf_capture_is_reliable()
     capture = StdOutCapture()
-    capture.begin()
+    if check_output:
+        capture.begin()
     try:
         solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
     finally:
         try:
             wp.synchronize()
         finally:
-            printed = capture.end()
-    test.assertRegex(printed, "constraint-row overflow")
+            printed = capture.end() if check_output else ""
+    if check_output:
+        test.assertRegex(printed, "constraint-row overflow")
     test.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
     test.assertTrue(np.isfinite(output.joint_q.numpy()).all())
 
@@ -871,11 +881,98 @@ def test_disabled_restitution_ignores_threshold_edits(test, device):
     test.assertEqual(solver._rebound_velocity_threshold, float(np.finfo(np.float32).max))
 
 
+def _peak_depenetration_speed(device, scene, bounds, response="immediate"):
+    """Return the peak separation speed of boxes started 50 mm deep with Baumgarte 0.8 and no gravity."""
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    SolverSteel.register_custom_attributes(builder)
+    if scene == "free":
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_ground_plane()
+    elif scene in ("slider", "kinematic"):
+        body = builder.add_link()
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_articulation([builder.add_joint_prismatic(-1, body, axis=newton.Axis.Z)])
+        if scene == "kinematic":
+            # A jointless kinematic box with its top face at z = 0.
+            floor = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, -0.1), wp.quat_identity()), is_kinematic=True)
+            builder.add_shape_box(floor, hx=0.1, hy=0.1, hz=0.1)
+        else:
+            builder.add_ground_plane()
+    elif scene == "fixed":
+        # A free box resting 50 mm deep on a zero-DOF link.
+        link = builder.add_link()
+        builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_articulation([builder.add_joint_fixed(-1, link)])
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.15), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+    else:
+        for z in (0.0, 0.15):
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, z), wp.quat_identity()))
+            builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+    model = builder.finalize(device=device)
+    model.steel.rigid_body_max_depenetration_velocity.assign(np.asarray(bounds, dtype=np.float32))
+    solver = SolverSteel(model, baumgarte=0.8, iterations=50, articulated_contact_response=response)
+    state_0, state_1 = model.state(), model.state()
+    if scene in ("slider", "kinematic"):
+        state_0.joint_q.assign(np.array([0.05], dtype=np.float32))
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    peak = 0.0
+    for _ in range(5):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+        if scene in ("slider", "kinematic"):
+            speed = abs(float(state_1.joint_qd.numpy()[0]))
+        else:
+            body_qd = state_1.body_qd.numpy()
+            speed = abs(float(body_qd[-1][2] - (body_qd[0][2] if scene in ("pair", "fixed") else 0.0)))
+        peak = max(peak, speed)
+        state_0, state_1 = state_1, state_0
+    return peak
+
+
+def test_max_depenetration_velocity_bounds_every_contact_route(test, device):
+    """Bound the Baumgarte speed of free-body and articulated contacts by the smaller positive body bound."""
+    bound = 0.5
+    unbounded = 0.8 * 0.05 * 240.0
+    cases = (
+        ("free", [bound], "immediate"),
+        ("slider", [bound], "immediate"),
+        ("slider", [bound], "propagation"),
+        ("pair", [0.0, bound], "immediate"),
+        ("pair", [bound, 0.0], "immediate"),
+        # Bodies without response DOFs still contribute their bound.
+        ("kinematic", [0.0, bound], "immediate"),
+        ("kinematic", [0.0, bound], "propagation"),
+        ("fixed", [bound, 0.0], "immediate"),
+        ("fixed", [0.0, bound], "immediate"),
+        ("fixed", [bound, 0.0], "propagation"),
+    )
+    for scene, bounds, response in cases:
+        with test.subTest(scene=scene, bounds=bounds, response=response):
+            speed = _peak_depenetration_speed(device, scene, bounds, response)
+            test.assertGreater(speed, bound * 0.95)
+            test.assertLessEqual(speed, bound * 1.05)
+    for scene, bounds in (("free", [np.inf]), ("slider", [np.inf]), ("slider", [0.0])):
+        with test.subTest(scene=scene, bounds=bounds):
+            test.assertAlmostEqual(
+                _peak_depenetration_speed(device, scene, bounds), unbounded, delta=1.0e-3 * unbounded
+            )
+
+
 class TestSteelContactControls(unittest.TestCase):
     pass
 
 
 devices = get_cuda_test_devices()
+add_function_test(
+    TestSteelContactControls,
+    "test_max_depenetration_velocity_bounds_every_contact_route",
+    test_max_depenetration_velocity_bounds_every_contact_route,
+    devices=get_test_devices(),
+)
 
 
 for _fn in (
@@ -1331,18 +1428,23 @@ UPPER_MASS = 0.5
 FILL = -7.0
 
 
-def _stacked_boxes(device):
-    """Two free boxes stacked on the ground: ground-box and box-box contacts."""
-    builder = newton.ModelBuilder()
-    builder.add_ground_plane()
+def _stacked_boxes(device, worlds=1, contact_matching="disabled"):
+    """Two free boxes stacked on the ground per world: ground-box and box-box contacts."""
+    template = newton.ModelBuilder()
     for z, half, mass in ((0.1, 0.1, LOWER_MASS), (0.25, 0.05, UPPER_MASS)):
         inertia = wp.mat33(np.eye(3) * mass * (2.0 * half) ** 2 / 6.0)
-        body = builder.add_body(
+        body = template.add_body(
             xform=wp.transform(wp.vec3(0.0, 0.0, z), wp.quat_identity()), mass=mass, inertia=inertia
         )
-        builder.add_shape_box(body, hx=half, hy=half, hz=half, cfg=newton.ModelBuilder.ShapeConfig(density=0.0))
+        template.add_shape_box(body, hx=half, hy=half, hz=half, cfg=newton.ModelBuilder.ShapeConfig(density=0.0))
+    if worlds == 1:
+        builder = template
+    else:
+        builder = newton.ModelBuilder()
+        builder.replicate(template, worlds, spacing=(1.0, 0.0, 0.0))
+    builder.add_ground_plane()
     model = builder.finalize(device=device)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64 * worlds, contact_matching=contact_matching)
     return model, pipeline
 
 
@@ -1380,19 +1482,25 @@ def test_contact_f_reports_each_box_weight(test, device, steps=150, torsion_radi
     observables.contact_f.fill_(wp.spatial_vector(FILL, FILL, FILL, FILL, FILL, FILL))
     states = [model.state(), model.state()]
     control = model.control()
-    for _ in range(steps):
+    row_overflow = options.get("free_body_constraint_max") is not None
+    for step in range(steps):
         pipeline.collide(states[0], contacts)
         solver.step(states[0], states[1], control, contacts, DT, observables=observables)
         states.reverse()
+        if row_overflow and step == min(10, steps) - 1:
+            # Check dropped rows before the unsupported boxes leave the ground.
+            contact_f = observables.contact_f.numpy()
+            _check_rows(test, contacts, contact_f)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            dropped = solver._contact_slot.numpy()[:count] < 0
+            test.assertTrue(dropped.any())
+            np.testing.assert_array_equal(contact_f[:count][dropped], 0.0)
     contact_f = observables.contact_f.numpy()
-    _check_rows(test, contacts, contact_f)
-    if options.get("free_body_constraint_max") is not None:
-        # Rows beyond the capacity were dropped; those contacts report zero.
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        dropped = solver._contact_slot.numpy()[:count] < 0
-        test.assertTrue(dropped.any())
-        np.testing.assert_array_equal(contact_f[:count][dropped], 0.0)
+    if row_overflow and int(contacts.rigid_contact_count.numpy()[0]) == 0:
+        np.testing.assert_array_equal(contact_f, 0.0)
     else:
+        _check_rows(test, contacts, contact_f)
+    if not row_overflow:
         weight = np.linalg.norm(model.gravity.numpy()[0])
         net = _net_body_forces(model, contacts, contact_f)
         np.testing.assert_allclose(net[0], [0.0, 0.0, LOWER_MASS * weight], atol=0.03 * LOWER_MASS * weight)
@@ -1442,7 +1550,7 @@ def test_contact_f_in_a_captured_graph(test, device):
 
 
 def test_contact_f_of_sleeping_islands(test, device, skip_constraints=True):
-    """Report a sleeping island's contact forces: zero with skipped rows, else the resting force."""
+    """Report a sleeping island's contact forces: zero with skipped rows and no matching, else the resting force."""
     model, pipeline = _stacked_boxes(device)
     solver = SolverSteel(
         model,
@@ -1473,6 +1581,156 @@ def test_contact_f_of_sleeping_islands(test, device, skip_constraints=True):
         weight = np.linalg.norm(model.gravity.numpy()[0])
         np.testing.assert_allclose(net[0, 2], LOWER_MASS * weight, rtol=0.03)
         np.testing.assert_allclose(net[1, 2], UPPER_MASS * weight, rtol=0.03)
+
+
+# The boxes start at rest, so their islands fall asleep after sleep_quiet_time / DT = 6 steps.
+SLEEP_SETTLE_STEPS = 12
+
+
+class _SleepingContactForces:
+    """Stacked boxes in ``worlds`` worlds under a sleeping solver that skips rows, with contact matching."""
+
+    def __init__(self, device, worlds=1, contact_matching="latest", skip_constraints=True):
+        self.model, self.pipeline = _stacked_boxes(device, worlds, contact_matching)
+        self.solver = SolverSteel(
+            self.model,
+            iterations=32,
+            enable_sleeping=True,
+            sleep_quiet_time=0.05,
+            sleep_skip_constraints=skip_constraints,
+            friction_anchor_beta=0.0,
+        )
+        self.contacts = self.pipeline.contacts()
+        kinds = {SolverBase.ObservableKind.CONTACT_F}
+        self.observables = self.solver.observables(kinds, contacts=self.contacts)
+        self.states = [self.model.state(), self.model.state()]
+        self.control = self.model.control()
+        self.weight = np.linalg.norm(self.model.gravity.numpy()[0])
+
+    def step(self, body_f=None, observables=True, collide=True):
+        self.states[0].clear_forces()
+        if body_f is not None:
+            self.states[0].body_f.assign(body_f)
+        if collide:
+            self.pipeline.collide(self.states[0], self.contacts)
+        if observables:
+            self.observables.contact_f.fill_(wp.spatial_vector(FILL, FILL, FILL, FILL, FILL, FILL))
+        self.solver.step(
+            self.states[0],
+            self.states[1],
+            self.control,
+            self.contacts,
+            DT,
+            observables=self.observables if observables else None,
+        )
+        self.states.reverse()
+
+    def settle(self):
+        for _ in range(SLEEP_SETTLE_STEPS):
+            self.step()
+
+    def net(self):
+        contact_f = self.observables.contact_f.numpy()
+        return _net_body_forces(self.model, self.contacts, contact_f)
+
+    def awake(self):
+        return self.solver._sleeping.body_awake.numpy()
+
+    def assert_resting(self, net):
+        weights = np.tile([LOWER_MASS, UPPER_MASS], self.model.body_count // 2) * self.weight
+        np.testing.assert_allclose(net[:, 2], weights, rtol=0.03)
+        np.testing.assert_allclose(net[:, :2], 0.0, atol=0.03 * self.weight)
+
+
+def test_sleeping_contact_f_keeps_the_last_force(test, device):
+    """Report the last solved force of a sleeping island's skipped contacts, as the row-solving solver does."""
+    scene = _SleepingContactForces(device)
+    reference = _SleepingContactForces(device, skip_constraints=False)
+    asleep_steps = 0
+    last = None
+    for _ in range(SLEEP_SETTLE_STEPS + 10):
+        scene.step()
+        reference.step()
+        if scene.awake().any():
+            continue
+        asleep_steps += 1
+        net = scene.net()
+        _check_rows(test, scene.contacts, scene.observables.contact_f.numpy())
+        scene.assert_resting(net)
+        np.testing.assert_allclose(net, reference.net(), rtol=0.0, atol=0.01 * scene.weight)
+        # The step an island falls asleep still solves its rows; later steps carry that force bit for bit.
+        if asleep_steps > 1:
+            np.testing.assert_array_equal(net, last)
+        last = net
+        if asleep_steps == 10:
+            break
+    test.assertEqual(asleep_steps, 10)
+
+
+def test_sleeping_contact_f_wakes_to_the_solved_force(test, device):
+    """Report the solved force again once a wake event restores the island's rows."""
+    scene = _SleepingContactForces(device)
+    scene.settle()
+    np.testing.assert_array_equal(scene.awake(), [0, 0])
+    scene.assert_resting(scene.net())
+    # Half the upper box's weight pulls it up: a carried force would still report the full weight.
+    body_f = np.zeros((2, 6), dtype=np.float32)
+    body_f[1, 2] = 0.5 * UPPER_MASS * scene.weight
+    scene.step(body_f)
+    np.testing.assert_array_equal(scene.awake(), [1, 1])
+    net = scene.net()
+    np.testing.assert_allclose(net[1, 2], 0.5 * UPPER_MASS * scene.weight, rtol=0.05)
+    np.testing.assert_allclose(net[0, 2], LOWER_MASS * scene.weight, rtol=0.05)
+
+
+def test_sleeping_contact_f_across_reset(test, device):
+    """Keep carried forces in worlds a masked reset leaves asleep and restart them in the woken worlds."""
+    scene = _SleepingContactForces(device, worlds=2)
+    scene.settle()
+    np.testing.assert_array_equal(scene.awake(), [0, 0, 0, 0])
+    asleep = scene.net()
+    scene.assert_resting(asleep)
+    world_mask = wp.array([True, False, False], dtype=wp.bool, device=device)
+    scene.solver.reset(scene.states[0], world_mask)
+    scene.step()
+    np.testing.assert_array_equal(scene.awake(), [1, 1, 0, 0])
+    net = scene.net()
+    scene.assert_resting(net)
+    np.testing.assert_array_equal(net[2:], asleep[2:])
+    scene.solver.reset(scene.states[0])
+    scene.settle()
+    np.testing.assert_array_equal(scene.awake(), [0, 0, 0, 0])
+    scene.assert_resting(scene.net())
+
+
+def test_sleeping_contact_f_needs_every_step(test, device, collide=True):
+    """Report zero for skipped contacts after a step that did not request the force, until the island wakes."""
+    scene = _SleepingContactForces(device)
+    scene.settle()
+    np.testing.assert_array_equal(scene.awake(), [0, 0])
+    carried = scene.net()
+    scene.assert_resting(carried)
+    # A step on the unchanged contact set carries the force without a match.
+    scene.step(collide=False)
+    np.testing.assert_array_equal(scene.net(), carried)
+    scene.step(observables=False, collide=collide)
+    scene.step(collide=collide)
+    np.testing.assert_array_equal(scene.net(), 0.0)
+    scene.step()
+    np.testing.assert_array_equal(scene.net(), 0.0)
+
+
+def test_sleeping_contact_f_in_a_captured_graph(test, device):
+    """Carry the force through graph replays, which see the generations on the device."""
+    scene = _SleepingContactForces(device)
+    scene.step()
+    with wp.ScopedCapture(device) as recorded:
+        scene.step()
+        scene.step()
+    for _ in range(SLEEP_SETTLE_STEPS // 2):
+        wp.capture_launch(recorded.graph)
+    np.testing.assert_array_equal(scene.awake(), [0, 0])
+    scene.assert_resting(scene.net())
 
 
 def test_contact_f_of_compliant_hydroelastic_rows(test, device):
@@ -1693,6 +1951,33 @@ add_function_test(
     test_contact_f_of_sleeping_islands,
     devices=cuda_devices,
     skip_constraints=False,
+)
+
+
+for _name in (
+    "test_sleeping_contact_f_keeps_the_last_force",
+    "test_sleeping_contact_f_wakes_to_the_solved_force",
+    "test_sleeping_contact_f_across_reset",
+    "test_sleeping_contact_f_needs_every_step",
+):
+    add_function_test(TestSteelContactObservable, _name, globals()[_name], devices=all_devices)
+
+
+# Without a collision pass the contact generation stays the same, so only the step count can break the chain.
+add_function_test(
+    TestSteelContactObservable,
+    "test_sleeping_contact_f_needs_every_step_on_a_reused_contact_set",
+    test_sleeping_contact_f_needs_every_step,
+    devices=all_devices,
+    collide=False,
+)
+
+
+add_function_test(
+    TestSteelContactObservable,
+    "test_sleeping_contact_f_in_a_captured_graph",
+    test_sleeping_contact_f_in_a_captured_graph,
+    devices=cuda_devices,
 )
 
 
@@ -3850,7 +4135,7 @@ class TestSteelJointlessKinematicBody(unittest.TestCase):
                 two_steps()
         # Each round prescribes new inputs, so a copy that ran once or out of order would publish stale values.
         for round_index in range(2):
-            body_q, body_qd = states[0].body_q.numpy(), states[0].body_qd.numpy()
+            body_q, body_qd = states[0].body_q.numpy().copy(), states[0].body_qd.numpy().copy()
             body_q[[floor, side], 0] += 0.1
             body_qd[floor] = np.array(self.PRESCRIBED_QD) * (round_index + 1)
             body_qd[side] = -np.array(self.PRESCRIBED_QD) * (round_index + 1)
@@ -4009,12 +4294,12 @@ class TestSteelJointlessKinematicBody(unittest.TestCase):
         np.testing.assert_array_equal(state_out.joint_qd.numpy(), state_in.joint_qd.numpy())
 
 
-def _momentum_solves(model, **options):
-    """Settle a scene; return the velocity error and the free-body momentum imbalance of one solve.
+def _momentum_solves(model, kick=None, reference_iterations=8000, **options):
+    """Settle a scene, add ``kick`` to its joint velocities; return the error and the imbalance of one solve.
 
-    The error is the mass-weighted body velocity distance from an 8000-sweep plain Gauss-Seidel
-    solve; the imbalance is the largest gap between a free body's linear momentum change and gravity
-    plus its reported contact impulses. Both are in units of one step of gravity.
+    The error is the mass-weighted body velocity distance from a ``reference_iterations``-sweep plain
+    Gauss-Seidel solve; the imbalance is the largest gap between a free body's linear momentum change and
+    gravity plus its reported contact impulses. Both are in units of one step of gravity.
     """
     dt = 1.0 / 60.0
     control = model.control()
@@ -4027,6 +4312,9 @@ def _momentum_solves(model, **options):
         pipeline.collide(state, contacts)
         settle.step(state, output, control, contacts, dt)
         state, output = output, state
+    if kick is not None:
+        state.joint_qd.assign(state.joint_qd.numpy() + kick)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     pipeline.collide(state, contacts)
     start = model.state()
     observables = None
@@ -4041,7 +4329,7 @@ def _momentum_solves(model, **options):
 
     mass = model.body_mass.numpy()
     inertia = np.trace(model.body_inertia.numpy(), axis1=1, axis2=2) / 3.0
-    reference = solve(8000, False)
+    reference = solve(reference_iterations, False)
 
     def error(iterations, momentum):
         delta = solve(iterations, momentum) - reference
@@ -4066,7 +4354,7 @@ def _momentum_solves(model, **options):
 
 
 def test_nesterov_momentum_converges_a_tower_in_fewer_sweeps(test, device):
-    """Reach the plain Gauss-Seidel solution of a ten-box tower in fewer sweeps; reject unsupported routes."""
+    """Reach the plain Gauss-Seidel solution of a ten-box tower in fewer sweeps."""
     builder = newton.ModelBuilder()
     cfg = newton.ModelBuilder.ShapeConfig(mu=0.75, gap=0.002)
     jitter = np.random.default_rng(0).uniform(-0.002, 0.002, (10, 2))
@@ -4085,17 +4373,9 @@ def test_nesterov_momentum_converges_a_tower_in_fewer_sweeps(test, device):
     plain, accelerated = error(24, False), error(24, True)
     test.assertLess(accelerated, 0.5 * plain, f"24 sweeps: plain {plain:.3f}, momentum {accelerated:.3f}")
 
-    for options in (
-        {"articulated_contact_response": "propagation"},
-        {"solve_mode": "colored", "articulated_contact_response": "propagation"},
-        {"row_schedule": "phased"},
-    ):
-        with test.subTest(**options), test.assertRaisesRegex(ValueError, "nesterov_momentum requires"):
-            SolverSteel(model, nesterov_momentum=True, **options)
-
 
 def test_nesterov_momentum_on_articulated_rows(test, device):
-    """Accelerate dense articulated contact, joint-limit and velocity-limit rows on the general sweep only."""
+    """Preserve local ownership and accelerate the general sweep with articulated contacts and velocity limits."""
     builder = newton.ModelBuilder()
     builder.add_ground_plane()
     parent, joints = -1, []
@@ -4120,13 +4400,16 @@ def test_nesterov_momentum_on_articulated_rows(test, device):
     builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=4000.0))
     model = builder.finalize(device=device)
 
-    # The specialized owners have no momentum sweep, so the option must route around them.
-    test.assertTrue(SolverSteel(model)._local_internal_fast_path)
-    general = SolverSteel(model, nesterov_momentum=True)
-    for name in ("_local_internal_fast_path", "_paired_factor_coordinates", "_sparse_diagonal_contact_solve"):
-        test.assertFalse(getattr(general, name), name)
-    test.assertIsNone(general._sparse_mass_matrix_size)
-    test.assertIn("_momentum", general._pgs_solve_mf_gs_kernel.key)
+    plain_solver = SolverSteel(model, nesterov_momentum=False)
+    accelerated_solver = SolverSteel(model, nesterov_momentum=True)
+    test.assertTrue(plain_solver._local_internal_fast_path)
+    for name in (
+        "_local_internal_fast_path",
+        "_paired_factor_coordinates",
+        "_sparse_diagonal_contact_solve",
+        "_sparse_mass_matrix_size",
+    ):
+        test.assertEqual(getattr(plain_solver, name), getattr(accelerated_solver, name), name)
 
     error, _ = _momentum_solves(
         model, articulation_constraint_max=128, enable_joint_limits=True, enable_joint_velocity_limits=True
@@ -4134,6 +4417,114 @@ def test_nesterov_momentum_on_articulated_rows(test, device):
     test.assertLess(error(2000, True), 1.0e-4)
     plain, accelerated = error(24, False), error(24, True)
     test.assertLess(accelerated, 0.5 * plain, f"24 sweeps: plain {plain:.4f}, momentum {accelerated:.4f}")
+
+
+def test_nesterov_momentum_restarts_on_an_opposing_correction(test, device):
+    """Restart momentum when a sweep's correction opposes the extrapolation of a sliding stack."""
+    builder = newton.ModelBuilder()
+    cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.002)
+    for i in range(3):
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05 + 0.1001 * i), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    # Each box slides at its own speed, so the friction rows between boxes pull against each other.
+    kick = np.zeros((3, 6), dtype=np.float32)
+    kick[:, 0] = (0.5, 1.0, 1.5)
+    error, _ = _momentum_solves(model, kick=kick.reshape(-1))
+
+    plain, accelerated = error(64, False), error(64, True)
+    test.assertLess(accelerated, 2.0e-4, f"64 sweeps: plain {plain:.2e}, momentum {accelerated:.2e}")
+
+
+def test_nesterov_momentum_restarts_when_friction_starts(test, device):
+    """Restart momentum when friction switches on, so the first two friction sweeps are plain sweeps."""
+    builder = newton.ModelBuilder()
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.5 * np.pi))
+    )
+    builder.add_shape_capsule(
+        body, radius=0.05, half_height=0.15, cfg=newton.ModelBuilder.ShapeConfig(mu=0.5, gap=0.002)
+    )
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    kick = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 3.0], dtype=np.float32)
+    # The 62 normal-only sweeps converge the normal rows, so both solves reach friction from the same impulses.
+    error, _ = _momentum_solves(model, kick=kick, reference_iterations=64, contact_friction_position_iterations=2)
+
+    test.assertLess(error(64, True), 1.0e-4)
+
+
+def test_nesterov_momentum_skips_velocity_limit_rows(test, device):
+    """Extrapolate no dense or free-body velocity-limit row, while the clamps change and beta is nonzero."""
+    builder = newton.ModelBuilder()
+    SolverSteel.register_custom_attributes(builder)
+    builder.add_ground_plane()
+    parent, joints = -1, []
+    for i in range(3):
+        link = builder.add_link(xform=wp.transform((0.2 * i + 0.1, 0.0, 0.031), wp.quat_identity()))
+        builder.add_shape_box(link, hx=0.1, hy=0.04, hz=0.03)
+        joints.append(
+            builder.add_joint_revolute(
+                parent,
+                link,
+                axis=(0.0, 1.0, 0.0),
+                parent_xform=wp.transform((0.0, 0.0, 0.031) if parent < 0 else (0.1, 0.0, 0.0), wp.quat_identity()),
+                child_xform=wp.transform((-0.1, 0.0, 0.0), wp.quat_identity()),
+                velocity_limit=0.2,
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    # A capped box spinning down onto the last link, so the contact pushes both sets of clamps every sweep.
+    box = builder.add_body(
+        xform=wp.transform((0.5, 0.0, 0.112), wp.quat_identity()),
+        custom_attributes={"steel:rigid_body_max_linear_velocity": 1.0, "steel:rigid_body_max_angular_velocity": 0.3},
+    )
+    builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=4000.0))
+    builder.joint_qd[:9] = [0.2, -0.2, 0.2, 0.0, 0.0, -0.8, 2.0, 0.0, 0.0]
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    state, start, output = model.state(), model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+    pipeline.collide(state, contacts)
+
+    previous = None
+    for iterations in range(2, 8):
+        start.assign(state)
+        solver = SolverSteel(
+            model,
+            iterations=iterations,
+            nesterov_momentum=True,
+            enable_joint_velocity_limits=True,
+            articulation_constraint_max=128,
+        )
+        solver.step(start, output, model.control(), contacts, 1.0 / 60.0)
+        dense_count = int(solver._constraint_count.numpy()[0])
+        mf_count = int(solver._mf_constraint_count.numpy()[0])
+        dense_limits = solver._row_type.numpy()[0, :dense_count] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+        mf_limits = solver._mf_row_type.numpy()[0, :mf_count] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+        clamps = (
+            solver._impulses.numpy()[0, :dense_count][dense_limits],
+            solver._mf_impulses.numpy()[0, :mf_count][mf_limits],
+        )
+        test.assertTrue(np.any(clamps[0] > 0.0) and np.any(clamps[1] > 0.0), iterations)
+        if previous is not None:
+            test.assertFalse(np.array_equal(clamps[0], previous[0]), iterations)
+            test.assertFalse(np.array_equal(clamps[1], previous[1]), iterations)
+        previous = clamps
+        if iterations < 3:
+            continue
+        # The last sweep's extrapolation per row, from the [prev dense][prev mf][e dense][e mf] scratch.
+        dense_max = solver._articulation_constraint_max
+        scratch = solver._momentum_scratch.numpy()[0]
+        mf_max = scratch.size // 2 - dense_max
+        dense_e = scratch[dense_max + mf_max : dense_max + mf_max + dense_count]
+        mf_e = scratch[2 * dense_max + mf_max : 2 * dense_max + mf_max + mf_count]
+        test.assertTrue(np.any(dense_e[~dense_limits] != 0.0), f"beta is zero at {iterations} sweeps")
+        np.testing.assert_array_equal(dense_e[dense_limits], 0.0)
+        np.testing.assert_array_equal(mf_e[mf_limits], 0.0)
 
 
 def test_nesterov_momentum_keeps_a_mass_ratio_stack_standing(test, device):
@@ -4177,6 +4568,9 @@ class TestSteelNesterovMomentum(unittest.TestCase):
 for _name in (
     "test_nesterov_momentum_converges_a_tower_in_fewer_sweeps",
     "test_nesterov_momentum_on_articulated_rows",
+    "test_nesterov_momentum_restarts_on_an_opposing_correction",
+    "test_nesterov_momentum_restarts_when_friction_starts",
+    "test_nesterov_momentum_skips_velocity_limit_rows",
     "test_nesterov_momentum_keeps_a_mass_ratio_stack_standing",
 ):
     add_function_test(TestSteelNesterovMomentum, _name, globals()[_name], devices=cuda_devices)

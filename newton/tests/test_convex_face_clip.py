@@ -392,42 +392,74 @@ class TestConvexFaceClip(unittest.TestCase):
 devices = get_test_devices()
 cuda_devices = get_selected_cuda_test_devices()
 add_function_test(
-    TestConvexFaceClip, "test_rounded_hull_rests_on_face", test_rounded_hull_rests_on_face, devices=devices
+    TestConvexFaceClip,
+    "test_rounded_hull_rests_on_face",
+    test_rounded_hull_rests_on_face,
+    devices=devices,
+    requires=("scipy",),
 )
-add_function_test(TestConvexFaceClip, "test_hull_clipped_to_box_face", test_hull_clipped_to_box_face, devices=devices)
 add_function_test(
-    TestConvexFaceClip, "test_cube_hull_matches_legacy_corners", test_cube_hull_matches_legacy_corners, devices=devices
+    TestConvexFaceClip,
+    "test_hull_clipped_to_box_face",
+    test_hull_clipped_to_box_face,
+    devices=devices,
+    requires=("scipy",),
+)
+add_function_test(
+    TestConvexFaceClip,
+    "test_cube_hull_matches_legacy_corners",
+    test_cube_hull_matches_legacy_corners,
+    devices=devices,
+    requires=("scipy",),
 )
 add_function_test(
     TestConvexFaceClip, "test_many_sided_face_spans_footprint", test_many_sided_face_spans_footprint, devices=devices
 )
-add_function_test(TestConvexFaceClip, "test_cube_hull_on_edge", test_cube_hull_on_edge, devices=devices)
+add_function_test(
+    TestConvexFaceClip, "test_cube_hull_on_edge", test_cube_hull_on_edge, devices=devices, requires=("scipy",)
+)
 add_function_test(
     TestConvexFaceClip,
     "test_face_clip_leaves_other_pairs_unchanged",
     test_face_clip_leaves_other_pairs_unchanged,
     devices=devices,
+    requires=("scipy",),
 )
 add_function_test(
     TestConvexFaceClip,
     "test_runtime_scale_matches_baked_vertices",
     test_runtime_scale_matches_baked_vertices,
     devices=devices,
+    requires=("scipy",),
 )
-add_function_test(TestConvexFaceClip, "test_face_clip_deterministic", test_face_clip_deterministic, devices=devices)
+add_function_test(
+    TestConvexFaceClip,
+    "test_face_clip_deterministic",
+    test_face_clip_deterministic,
+    devices=devices,
+    requires=("scipy",),
+)
 add_function_test(
     TestConvexFaceClip,
     "test_non_planar_face_stays_within_capacity",
     test_non_planar_face_stays_within_capacity,
     devices=devices,
+    requires=("scipy",),
 )
 add_function_test(
     TestConvexFaceClip,
     "test_non_planar_face_clip_is_bounds_checked",
     test_non_planar_face_clip_is_bounds_checked,
     devices=["cpu"],
+    requires=("scipy",),
 )
-add_function_test(TestConvexFaceClip, "test_rounded_hull_settles", test_rounded_hull_settles, devices=cuda_devices)
+add_function_test(
+    TestConvexFaceClip,
+    "test_rounded_hull_settles",
+    test_rounded_hull_settles,
+    devices=cuda_devices,
+    requires=("scipy",),
+)
 
 
 if __name__ == "__main__":

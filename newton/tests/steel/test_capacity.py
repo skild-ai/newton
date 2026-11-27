@@ -4,7 +4,6 @@
 """Row capacities, overflow reporting, watermarks and heterogeneous-world guards of SolverSteel."""
 
 import gc
-import sys
 import unittest
 import weakref
 
@@ -13,9 +12,14 @@ import warp as wp
 
 import newton
 from newton._src.solvers.steel.friction_patches import FrictionPatches
-from newton._src.solvers.steel.kernels import allocate_world_contact_slots, finalize_mf_constraint_counts
+from newton._src.solvers.steel.kernels import (
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    allocate_world_contact_slots,
+    finalize_mf_constraint_counts,
+)
+from newton._src.solvers.steel.solver_steel import _STATIC_SHARED_MEMORY_BYTES, _mfgs_block_shared_bytes
 from newton.solvers import SolverSteel
-from newton.tests.steel._fixtures import steel_mode_options
+from newton.tests.steel._fixtures import printf_capture_is_reliable, steel_mode_options
 from newton.tests.unittest_utils import StdOutCapture, add_function_test, get_cuda_test_devices, get_test_devices
 
 
@@ -77,8 +81,7 @@ def test_dense_capacity_failure_is_world_local(test, device, solve_mode="serial"
 
 def test_overflow_warning_is_printed_once(test, device, solve_mode="serial", response="immediate"):
     """Print one device-side warning per overflowing row family, inside this test."""
-    if wp.get_device(device).is_cpu and sys.platform == "win32":
-        test.skipTest("Warp CPU printf capture is unreliable on Windows")
+    check_output = printf_capture_is_reliable()
     model = _box_on_ground(device, worlds=2)
     if response == "propagation":
         # The propagation rows hold every contact, in free_body_constraint_max + articulation_constraint_max rows.
@@ -93,7 +96,8 @@ def test_overflow_warning_is_printed_once(test, device, solve_mode="serial", res
     step_output = []
     for _ in range(2):
         capture = StdOutCapture()
-        capture.begin()
+        if check_output:
+            capture.begin()
         try:
             pipeline.collide(state_in, contacts)
             solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
@@ -102,7 +106,7 @@ def test_overflow_warning_is_printed_once(test, device, solve_mode="serial", res
             try:
                 wp.synchronize()
             finally:
-                output = capture.end()
+                output = capture.end() if check_output else ""
         step_output.append(
             [
                 line
@@ -110,10 +114,11 @@ def test_overflow_warning_is_printed_once(test, device, solve_mode="serial", res
                 if line.strip() and not (line.startswith("Module") and "load on device" in line)
             ]
         )
-    family = "propagation" if response == "propagation" else "matrix-free"
-    test.assertEqual(len(step_output[0]), 1, step_output[0])
-    test.assertRegex(step_output[0][0], rf"^Warning: Steel {family} constraint-row overflow in world [01]:")
-    test.assertEqual(step_output[1], [])
+    if check_output:
+        family = "propagation" if response == "propagation" else "matrix-free"
+        test.assertEqual(len(step_output[0]), 1, step_output[0])
+        test.assertRegex(step_output[0][0], rf"^Warning: Steel {family} constraint-row overflow in world [01]:")
+        test.assertEqual(step_output[1], [])
     expected = [0, 0, 0, 1, 0] if response == "propagation" else [0, 1, 0, 0, 0]
     np.testing.assert_array_equal(solver._row_overflow_warning_emitted.numpy(), expected)
 
@@ -456,6 +461,7 @@ def test_allocator_rejects_incomplete_contact_frame(test, device):
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
+            None,
         ],
         outputs=[
             wp.zeros((capacity,), dtype=wp.int32, device=device),
@@ -594,6 +600,7 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity, propagat
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
+            None,
         ],
         outputs=[
             wp.zeros((contact_count,), dtype=wp.int32, device=device),
@@ -1070,6 +1077,61 @@ def test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_bu
             np.testing.assert_allclose(sized_qd, ample_qd, atol=1e-6)
 
 
+def _folding_chain(device, links=12):
+    """A chain hung from one end whose links fold onto each other, one articulation."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    capsule_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.5 * np.pi)
+    parent, joints = -1, []
+    for i in range(links):
+        link = builder.add_link(xform=wp.transform(wp.vec3(0.08 * i + 0.04, 0.0, 0.5), wp.quat_identity()))
+        builder.add_shape_capsule(
+            link, xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), capsule_rot), radius=0.025, half_height=0.02
+        )
+        anchor = wp.vec3(0.0, 0.0, 0.5) if parent < 0 else wp.vec3(0.04, 0.0, 0.0)
+        joints.append(
+            builder.add_joint_revolute(
+                parent,
+                link,
+                axis=(0.0, 1.0, 0.0) if i % 3 else (0.0, 0.3, 1.0),
+                parent_xform=wp.transform(anchor, wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(-0.04, 0.0, 0.0), wp.quat_identity()),
+                armature=0.002,
+                damping=0.002,
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    return builder.finalize(device=device)
+
+
+def test_deterministic_overflow_repeats(test, device):
+    """Repeat an overflowing colored propagation solve bitwise with the deterministic row order."""
+    finals = []
+    for _ in range(2):
+        model = _folding_chain(device)
+        solver = SolverSteel(
+            model,
+            solve_mode="colored",
+            articulated_contact_response="propagation",
+            articulation_constraint_max=32,
+            deterministic=wp.DeterministicMode.RUN_TO_RUN,
+            warn_constraint_overflow=False,
+        )
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        for _ in range(320):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+        test.assertTrue(bool(solver.constraint_overflow.numpy()[0]))
+        body_q = state_0.body_q.numpy()
+        test.assertTrue(np.isfinite(body_q).all())
+        finals.append(body_q)
+    np.testing.assert_array_equal(finals[1], finals[0])
+
+
 add_function_test(
     TestSteelRowAllocation,
     "test_propagation_constraint_max_sizes_the_propagation_family",
@@ -1081,6 +1143,165 @@ add_function_test(
     "test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget",
     test_propagation_constraint_max_keeps_contact_rows_with_a_small_free_body_budget,
     devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelRowAllocation,
+    "test_deterministic_overflow_repeats",
+    test_deterministic_overflow_repeats,
+    devices=get_cuda_test_devices(),
+)
+
+
+def _stacked_boxes(device):
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    for i in range(4):
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1 + 0.2 * i), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+    return builder.finalize(device=device)
+
+
+def _rollout(model, steps=30, **options):
+    solver = SolverSteel(model, deterministic=wp.DeterministicMode.RUN_TO_RUN, **options)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    return solver, state_0.body_q.numpy(), state_0.body_qd.numpy()
+
+
+def _sweep_block_bytes(solver):
+    mf_rows = solver._mf_meta_packed.shape[1] // 4
+    return _mfgs_block_shared_bytes(
+        solver._articulation_constraint_max,
+        mf_rows,
+        solver._max_world_dofs,
+        shared_metadata=solver._mfgs_shared_metadata,
+        has_drive_rows=solver._has_drive_rows,
+        fuse_vel_limits=solver._velocity_limits_fused,
+        pair_cache=solver._mfgs_pair_cache,
+        torsion_links=solver._mfgs_torsion_links,
+        velocity_limit_units=solver._enable_joint_velocity_limits,
+        stream_mf_lambda=solver._mfgs_stream_mf_lambda,
+    )
+
+
+def test_free_body_capacity_past_sweep_shared_memory(test, device):
+    """Step with a free-body capacity whose impulses do not fit the sweep's shared memory, as a small capacity does."""
+    model = _stacked_boxes(device)
+    small, small_q, small_qd = _rollout(model, free_body_constraint_max=1024)
+    large, large_q, large_qd = _rollout(model, free_body_constraint_max=16384)
+    test.assertFalse(small._mfgs_stream_mf_lambda)
+    test.assertTrue(large._mfgs_stream_mf_lambda)
+    test.assertTrue(np.isfinite(large_q).all())
+    np.testing.assert_array_equal(large_q, small_q)
+    np.testing.assert_array_equal(large_qd, small_qd)
+
+
+def test_sweep_shared_memory_fits_static_limit(test, device):
+    """Keep the selected sweep layout within static shared memory on both sides of the free-body boundary."""
+    model = _stacked_boxes(device)
+    probe = SolverSteel(model)
+    dims = (probe._articulation_constraint_max, probe._max_world_dofs)
+    rows = {"has_drive_rows": probe._has_drive_rows, "fuse_vel_limits": probe._velocity_limits_fused}
+
+    def fits(mf_rows):
+        return _mfgs_block_shared_bytes(dims[0], mf_rows, dims[1], shared_metadata=False, **rows) <= (
+            _STATIC_SHARED_MEMORY_BYTES
+        )
+
+    boundary = next(n for n in range(_STATIC_SHARED_MEMORY_BYTES // 4, 0, -1) if fits(n))
+    for capacity, streamed in ((boundary, False), (boundary + 1, True)):
+        with test.subTest(free_body_constraint_max=capacity):
+            solver, body_q, _ = _rollout(model, steps=2, free_body_constraint_max=capacity)
+            test.assertEqual(solver._mfgs_stream_mf_lambda, streamed)
+            test.assertLessEqual(_sweep_block_bytes(solver), _STATIC_SHARED_MEMORY_BYTES)
+            test.assertTrue(np.isfinite(body_q).all())
+    with test.assertRaisesRegex(ValueError, "articulation_constraint_max=16384"):
+        SolverSteel(model, articulation_constraint_max=16384)
+
+
+def test_free_body_rows_past_16_bit_parent_index(test, device):
+    """Apply the sliding rows of free-body contacts whose normal row index is 32768 or more."""
+    # 900 bodies of nine boxes each: about 36,000 live rows from 5,400 DOFs.
+    builder = newton.ModelBuilder()
+    builder.rigid_gap = 0.002
+    builder.add_ground_plane()
+    for ix in range(30):
+        for iy in range(30):
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.1 * ix, 0.1 * iy, 0.01), wp.quat_identity()))
+            for k in range(9):
+                offset = wp.vec3(0.025 * (k % 3), 0.025 * (k // 3), 0.0)
+                builder.add_shape_box(body, xform=wp.transform(offset, wp.quat_identity()), hx=0.01, hy=0.01, hz=0.01)
+    model = builder.finalize(device=device)
+    solver = SolverSteel(model, free_body_constraint_max=65536)
+    pipeline = newton.CollisionPipeline(model, broad_phase="sap")
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    joint_qd = state_0.joint_qd.numpy()
+    joint_qd[0::6] = 0.5
+    state_0.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    for _ in range(12):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, model.control(), contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    test.assertFalse(solver.constraint_overflow.numpy().any())
+    live_rows = int(solver._mf_constraint_count.numpy()[0])
+    row_type = solver._mf_row_type.numpy()[0, :live_rows]
+    row_parent = solver._mf_row_parent.numpy()[0, :live_rows]
+    test.assertTrue((row_parent[row_type == PGS_CONSTRAINT_TYPE_FRICTION] >= 32768).any())
+    # Friction of mu 1 over 0.05 s stops every box; a box whose sliding rows were skipped keeps 0.5 m/s.
+    np.testing.assert_array_less(np.abs(state_0.body_qd.numpy()[:, 0]), 0.1)
+    with test.assertRaisesRegex(ValueError, "free_body_constraint_max must be at most 8388608 on CUDA"):
+        SolverSteel(model, free_body_constraint_max=(1 << 23) + 1)
+
+
+def test_cpu_free_body_capacity_past_the_cuda_index_limit(test, device):
+    """Construct and step on CPU with a free-body capacity above the CUDA sweep's 8,388,608-row limit."""
+    builder = newton.ModelBuilder()
+    link = builder.add_link()
+    builder.add_shape_sphere(link, radius=0.1)
+    builder.add_articulation([builder.add_joint_revolute(-1, link, axis=(1.0, 0.0, 0.0))])
+    model = builder.finalize(device=device)
+    solver = SolverSteel(model, free_body_constraint_max=(1 << 23) + 1)
+    state_0, state_1 = model.state(), model.state()
+    for _ in range(3):
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    test.assertTrue(np.isfinite(state_0.joint_q.numpy()).all())
+
+
+class TestSteelSweepSharedMemory(unittest.TestCase):
+    pass
+
+
+add_function_test(
+    TestSteelSweepSharedMemory,
+    "test_free_body_capacity_past_sweep_shared_memory",
+    test_free_body_capacity_past_sweep_shared_memory,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelSweepSharedMemory,
+    "test_sweep_shared_memory_fits_static_limit",
+    test_sweep_shared_memory_fits_static_limit,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelSweepSharedMemory,
+    "test_free_body_rows_past_16_bit_parent_index",
+    test_free_body_rows_past_16_bit_parent_index,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelSweepSharedMemory,
+    "test_cpu_free_body_capacity_past_the_cuda_index_limit",
+    test_cpu_free_body_capacity_past_the_cuda_index_limit,
+    devices=["cpu"],
 )
 
 

@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton.exceptions import NewtonWarning
+from newton import NewtonWarning
 from newton.solvers import SolverSteel
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
 
@@ -123,6 +123,7 @@ def _rollout(device, scene, mode):
         solver = SolverSteel(
             model,
             solve_mode=mode[0],
+            nesterov_momentum=False,  # Compare the plain sweep implemented by both devices.
             articulated_contact_response=mode[1],
             iterations=12,
             enable_joint_limits=True,
