@@ -269,7 +269,11 @@ def _crossing_rods(device):
 
 
 def _settle(model, steps, **options):
-    pipeline = newton.CollisionPipeline(model)
+    # Contact warm starting reads the pipeline's matching.
+    matching = (
+        {"contact_matching": "latest", "contact_matching_sort": "keys"} if options.get("contact_warmstart") else {}
+    )
+    pipeline = newton.CollisionPipeline(model, **matching)
     solver = newton.solvers.SolverSteel(model, articulation_constraint_max=640, **options)
     a, b, control, contacts = model.state(), model.state(), model.control(), pipeline.contacts()
     for _ in range(steps):
@@ -356,7 +360,7 @@ def test_propagation_contact_units(test, device):
     with kernel_overrides({"colored_packed": False}):
         _, rest, contacts = _settle(model, 60, **options)
     test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="latest")
     results = {}
     for enabled in (True, False):
         with kernel_overrides({"colored_packed": False, "contact_units": enabled}):
@@ -423,7 +427,7 @@ def test_propagation_contact_units_self_contact(test, device):
     with kernel_overrides({"colored_packed": False}):
         _, rest, contacts = _settle(model, 30, **options)
     test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="latest")
     results = {}
     for enabled in (True, False):
         with kernel_overrides({"colored_packed": False, "contact_units": enabled}):
