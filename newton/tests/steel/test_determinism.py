@@ -445,9 +445,13 @@ def _check_propagation_coverage(test, model, options):
     test.assertGreater(np.bincount(row_bodies[row_bodies >= 0]).max(), 2)
     body_count = solver._propagation_body_count.numpy()
     body_list = solver._propagation_body_list.numpy()
-    # Colored and cached response need the ordered contact-body list. Momentum
-    # also needs the world-to-body map to update every responding twist.
-    reads_body_map = options.get("solve_mode") == "colored" or options["propagation_cached_response"]
+    # The colored sweep, the serial unit sweep (twists staged by local slot) and the cached response read the
+    # ordered contact-body list. Momentum also needs the world-to-body map to update every responding twist.
+    reads_body_map = (
+        options.get("solve_mode") == "colored"
+        or options["propagation_cached_response"]
+        or solver._propagation_serial_units
+    )
     test.assertEqual(solver._propagation_world_bodies is not None, reads_body_map or solver.nesterov_momentum)
     test.assertEqual(np.any(body_count), reads_body_map)
     if options["propagation_cached_response"]:

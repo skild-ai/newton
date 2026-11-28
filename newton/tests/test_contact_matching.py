@@ -1714,6 +1714,124 @@ def test_sticky_disabled_no_sticky_buffers(test, device):
 devices = get_test_devices()
 cuda_devices = get_cuda_test_devices()
 
+
+# ---------------------------------------------------------------------------
+# Key-sorted matching (contact_matching_sort="keys")
+# ---------------------------------------------------------------------------
+
+
+def _build_box_and_spheres(device):
+    """A box (several contacts on one shape pair) and two spheres resting on the ground."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0999)))
+    builder.add_shape_box(body=b, hx=0.1, hy=0.1, hz=0.1)
+    for x in (-0.5, 0.5):
+        s = builder.add_body(xform=wp.transform(wp.vec3(x, 0.0, 0.0999)))
+        builder.add_shape_sphere(body=s, radius=0.1)
+    model = builder.finalize(device=device)
+    return model, model.state()
+
+
+def _contact_rows(contacts, count):
+    shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+    shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+    point0 = contacts.rigid_contact_point0.numpy()[:count]
+    return [(int(a), int(b), tuple(np.round(p, 5))) for a, b, p in zip(shape0, shape1, point0, strict=True)]
+
+
+def test_key_sorted_matching_without_deterministic_mode(test, device):
+    """Key-sorted matching allocates the match index but neither deterministic mode nor a contact sorter."""
+    with wp.ScopedDevice(device):
+        model, _state = _build_simple_scene(device)
+        pipeline = newton.CollisionPipeline(
+            model, broad_phase="nxn", contact_matching="latest", contact_matching_sort="keys"
+        )
+        test.assertFalse(pipeline.deterministic)
+        test.assertIsNone(pipeline._contact_sorter)
+        test.assertTrue(pipeline._contact_matcher.orders_by_keys)
+        # The pair keys distinguish every shape, so each contact searches only its own pair's predecessors.
+        test.assertGreaterEqual(1 << pipeline._contact_matcher._shape_index_bits, model.shape_count)
+        test.assertIsNotNone(pipeline.contacts().rigid_contact_match_index)
+        # An explicit deterministic pipeline sorts the contacts and matches them as usual.
+        sorted_pipeline = newton.CollisionPipeline(
+            model, broad_phase="nxn", contact_matching="latest", contact_matching_sort="keys", deterministic=True
+        )
+        test.assertTrue(sorted_pipeline.deterministic)
+        test.assertFalse(sorted_pipeline._contact_matcher.orders_by_keys)
+
+
+def test_key_sorted_matching_rejects_sticky_and_report(test, device):
+    with wp.ScopedDevice(device):
+        model, _state = _build_simple_scene(device)
+        for options in ({"contact_matching": "sticky"}, {"contact_matching": "latest", "contact_report": True}):
+            with test.assertRaisesRegex(ValueError, "contact_matching_sort"):
+                newton.CollisionPipeline(model, broad_phase="nxn", contact_matching_sort="keys", **options)
+
+
+def test_key_sorted_matching_names_previous_rows(test, device):
+    """Each contact of a resting scene matches, one to one, the previous buffer row of the same contact."""
+    with wp.ScopedDevice(device):
+        model, state = _build_box_and_spheres(device)
+        for body_frame in (False, True):
+            pipeline = newton.CollisionPipeline(
+                model,
+                broad_phase="nxn",
+                contact_matching="latest",
+                contact_matching_body_frame=body_frame,
+                contact_matching_sort="keys",
+            )
+            contacts = pipeline.contacts()
+            count1 = _collide_once(pipeline, state, contacts)
+            test.assertGreater(count1, 4)
+            test.assertTrue(np.all(contacts.rigid_contact_match_index.numpy()[:count1] == MATCH_NOT_FOUND))
+            previous = _contact_rows(contacts, count1)
+            for _ in range(3):
+                count = _collide_once(pipeline, state, contacts)
+                test.assertEqual(count, count1)
+                current = _contact_rows(contacts, count)
+                match = contacts.rigid_contact_match_index.numpy()[:count]
+                test.assertTrue(np.all(match >= 0), f"unmatched resting contacts: {match}")
+                test.assertEqual(len(set(match.tolist())), count, "matches must be one to one")
+                for row, prev_row in enumerate(match):
+                    test.assertEqual(current[row], previous[prev_row])
+                previous = current
+
+
+def test_key_sorted_matching_agrees_with_sorted_matching(test, device):
+    """Key-sorted and contact-sorted matching pair the same contacts while a body slides and lifts off."""
+    with wp.ScopedDevice(device):
+        model, state = _build_box_and_spheres(device)
+        results = {}
+        for sort in ("contacts", "keys"):
+            pipeline = newton.CollisionPipeline(
+                model, broad_phase="nxn", contact_matching="latest", contact_matching_sort=sort
+            )
+            contacts = pipeline.contacts()
+            q0 = state.body_q.numpy().copy()
+            pairs = []
+            previous = None
+            for frame in range(6):
+                q = q0.copy()
+                q[0, 0] += 0.0002 * frame  # the box slides less than the match threshold per frame
+                q[2, 2] += 0.004 * frame  # one sphere lifts off and its contact breaks
+                state.body_q.assign(q)
+                count = _collide_once(pipeline, state, contacts)
+                current = _contact_rows(contacts, count)
+                match = contacts.rigid_contact_match_index.numpy()[:count]
+                if previous is not None:
+                    pairs.append(
+                        sorted(
+                            (current[row], previous[m] if m >= 0 else int(m != MATCH_NOT_FOUND))
+                            for row, m in enumerate(match)
+                        )
+                    )
+                previous = current
+            state.body_q.assign(q0)
+            results[sort] = pairs
+        test.assertEqual(results["keys"], results["contacts"])
+
+
 add_function_test(
     TestContactMatching, "test_first_frame_all_not_found", test_first_frame_all_not_found, devices=devices
 )
@@ -1931,6 +2049,13 @@ add_function_test(
     devices=cuda_devices,
 )
 
+for _name, _fn in (
+    ("test_key_sorted_matching_without_deterministic_mode", test_key_sorted_matching_without_deterministic_mode),
+    ("test_key_sorted_matching_rejects_sticky_and_report", test_key_sorted_matching_rejects_sticky_and_report),
+    ("test_key_sorted_matching_names_previous_rows", test_key_sorted_matching_names_previous_rows),
+    ("test_key_sorted_matching_agrees_with_sorted_matching", test_key_sorted_matching_agrees_with_sorted_matching),
+):
+    add_function_test(TestContactMatching, _name, _fn, devices=devices)
 add_function_test(
     TestContactMatchingSticky,
     "test_sticky_common_translation",

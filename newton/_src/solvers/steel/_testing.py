@@ -19,8 +19,17 @@ def kernel_overrides(overrides: Mapping[str, object]) -> Iterator[None]:
     A solver reads the overrides once at construction and keeps them. Tasks and threads that
     inherit this context see the overrides; others do not. Keys: ``cholesky_kernel``, ``trisolve_kernel``,
     ``hinv_jt_kernel``, ``tile_threads``, ``serial_kernel_block_dim``,
-    ``sparse_mass_matrix``, ``diagonal_mass``, ``propagation_tree_kernel`` and the
-    ``colored_*`` sweep variants.
+    ``sparse_mass_matrix``, ``diagonal_mass``, ``propagation_tree_kernel``, ``contact_unit_sweep`` (``False``
+    keeps rod worlds on the fused row sweep), ``rod_cholesky`` (``"panels"`` factors rod articulations with the
+    double-precision panels), ``split_contact_jacobian`` (``False`` builds rod contact Jacobians one thread per
+    contact), ``propagation_refine_paths`` (``False`` refines same-articulation propagation rows one
+    articulation per thread), ``propagation_split_same_articulation_rows`` (``False`` steps those rows with
+    their exact, unsplit response), ``tree_dynamics`` (``False`` keeps rod trees on the dense unconstrained
+    velocity), ``rod_tree_kernel`` and ``rod_tree_factor``/``rod_tree_response``/``rod_tree_propagate``
+    (``False`` keeps rod trees on the generic multi-DOF tree kernels), ``rod_serial_immediate`` (``False``
+    colors the immediate response of rod worlds in ``solve_mode="colored"``), ``propagation_serial_units``
+    (``False`` keeps the serial propagation sweep on its row-at-a-time kernel) and the ``colored_*`` sweep
+    variants.
     """
     token = _KERNEL_OVERRIDES.set(dict(overrides))
     try:

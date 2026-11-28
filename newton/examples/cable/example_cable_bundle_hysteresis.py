@@ -31,6 +31,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 
 
 @wp.kernel
@@ -159,6 +160,7 @@ class Example:
 
     def __init__(self, viewer, args):
         # Store viewer and arguments
+        self.clamps = cable_solver.CableClamps(args)
         self.viewer = viewer
         self.args = args
 
@@ -173,8 +175,9 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 10
-        self.sim_iterations = 5
+        # Native Steel: three substeps of 14 sweeps. At two, a cable squeezed between an obstacle and its neighbours
+        # can be flung sideways during loading and lose its bend, depending on the GPU's summation order.
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 5, propagation=(3, 14))
         self.update_step_interval = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
 
@@ -190,9 +193,10 @@ class Example:
         builder = newton.ModelBuilder()
         builder.rigid_gap = 0.05
 
-        # Dahl plasticity parameters live on the Model as VBD custom attributes.
+        # The selected solver owns the Dahl material attributes.
         if with_dahl:
-            newton.solvers.SolverVBD.register_custom_attributes(builder)
+            solver_type = newton.solvers.SolverSteel if self.clamps.steel else newton.solvers.SolverVBD
+            solver_type.register_custom_attributes(builder)
         builder.gravity = (0.0, 0.0, -9.81)
 
         # Set default material properties for cables (cable-to-cable contact)
@@ -267,15 +271,12 @@ class Example:
             )
 
             # Make obstacle kinematic
-            builder.body_mass[body] = 0.0
-            builder.body_inv_mass[body] = 0.0
-            builder.body_inertia[body] = wp.mat33(0.0)
-            builder.body_inv_inertia[body] = wp.mat33(0.0)
+            self.clamps.pin(builder, body, moving=True)
 
             self.obstacle_bodies.append(body)
             obstacle_init_z_list.append(float(z))
 
-        # Add ground plane
+        # Ground plane, shared by the ``--world-count`` copies of this world.
         ground_cfg = newton.ModelBuilder.ShapeConfig(
             density=builder.default_shape_cfg.density,
             kf=builder.default_shape_cfg.kf,
@@ -283,23 +284,47 @@ class Example:
             mu=1.0,
             restitution=builder.default_shape_cfg.restitution,
         )
-        builder.add_ground_plane(cfg=ground_cfg)
+        self.clamps.finish(builder)
+        builder, self.world_count, expand = cable_solver.replicate_worlds(
+            builder, args, self.clamps, ground_cfg=ground_cfg
+        )
+        stride = builder.body_count // self.world_count
+        self.cable_body_ids = [
+            [w * stride + b for b in ids] for w in range(self.world_count) for ids in self.cable_body_ids
+        ]
+        self.obstacle_bodies = expand(self.obstacle_bodies)
 
         # Color bodies for VBD solver
-        builder.color()
+        if not self.clamps.steel:
+            builder.color()
 
         # Finalize model
         self.model = builder.finalize()
 
         # Author positive per-joint Dahl parameters to enable Dahl friction.
-        if with_dahl and hasattr(self.model, "vbd"):
-            self.model.vbd.dahl_eps_max.fill_(float(eps_max))
-            self.model.vbd.dahl_tau.fill_(float(tau))
+        if with_dahl:
+            material = self.model.steel if self.clamps.steel else self.model.vbd
+            material.dahl_eps_max.fill_(float(eps_max))
+            material.dahl_tau.fill_(float(tau))
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
-        self.solver = newton.solvers.SolverVBD(
+        # Contacts per world: the task's peak, 4,958 contacts, under Steel and VBD, with a quarter on top.
+        self.contacts_per_world = cable_solver.contact_budget(self.model, 22)
+        self.collision_pipeline = newton.CollisionPipeline(
             self.model,
+            rigid_contact_max=self.contacts_per_world * self.model.world_count,
+            **cable_solver.pipeline_options(args),
+        )
+        self.clamps.bind(self.model)
+        self.solver = cable_solver.make_solver(
+            self.model,
+            args,
+            contacts=self.contacts_per_world,
+            contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies) // self.world_count,
+            # A cable touching itself: the task's peak, 266 contacts, with a quarter on top.
+            same_articulation_contacts=352,
             iterations=self.sim_iterations,
+            # The obstacles push the bundle sideways: every sweep's impulses must reach the whole cable.
+            propagation_interval=1,
         )
 
         # Initialize states and contacts
@@ -318,8 +343,8 @@ class Example:
         for i in range(num_obstacles):
             y = (+amplitude) if (i % 2 == 0) else (-amplitude)
             init_y_list.append(float(y))
-        self.obstacle_init_y = wp.array(init_y_list, dtype=float, device=self.solver.device)
-        self.obstacle_init_z = wp.array(obstacle_init_z_list, dtype=float, device=self.solver.device)
+        self.obstacle_init_y = wp.array(init_y_list * self.world_count, dtype=float, device=self.solver.device)
+        self.obstacle_init_z = wp.array(obstacle_init_z_list * self.world_count, dtype=float, device=self.solver.device)
 
         # Triangle wave parameters
         self.obstacle_amp_scale = 1.0
@@ -362,11 +387,11 @@ class Example:
                     self.sim_time_array,
                     float(self.obstacle_stop_time),
                     float(self.obstacle_release_time),
-                    self.state_0.body_q,
-                    self.state_1.body_q,
+                    *self.clamps.pose_buffers(self.state_0, self.state_1),
                 ],
                 device=self.solver.device,
             )
+            self.clamps.update(self.state_0, self.sim_dt)
             # Advance time in a separate 1-thread kernel to avoid races in move_obstacles_triwave().
             wp.launch(
                 advance_time,
@@ -383,7 +408,8 @@ class Example:
             if refresh_contacts:
                 self.collision_pipeline.collide(self.state_0, self.contacts)
 
-            self.solver.set_rigid_history_update(refresh_contacts)
+            if not self.clamps.steel:
+                self.solver.set_rigid_history_update(refresh_contacts)
             self.solver.step(
                 self.state_0,
                 self.state_1,
@@ -415,6 +441,7 @@ class Example:
 
     def test_final(self):
         """Test cable bundle hysteresis simulation for stability and correctness (called after simulation)."""
+        cable_solver.check_capacity(self.solver)
         if self.sim_time < self.obstacle_release_time + 0.4:
             return
 
@@ -446,7 +473,8 @@ class Example:
 
     @staticmethod
     def create_parser():
-        parser = newton.examples.create_parser()
+        parser = cable_solver.create_parser()
+        cable_solver.add_world_count_arg(parser)
         parser.add_argument("--segments", type=int, default=40, help="Number of cable segments")
         parser.add_argument("--no-dahl", action="store_true", help="Disable Dahl friction (purely elastic)")
         parser.add_argument("--eps-max", type=float, default=2.0, help="Maximum plastic strain [rad]")

@@ -777,13 +777,19 @@ def test_closure_owner_stays_awake_and_releases(test, device):
     test.assertGreater(_four_bar_gaps(model, states[0], 1)[0], 1.0e-2)
 
 
-def test_propagation_rejects_closures(test, device):
-    """Reject loop closures with propagation contact responses, enabled or released."""
+def test_propagation_closures(test, device):
+    """Solve loop closures as rows of the propagation sweep, and drop them once released."""
     for enabled in (True, False):
-        model = _build_four_bar().finalize(device=device)
-        _set_joint_enabled(model, [_LOOP_JOINT], enabled)
-        with test.assertRaisesRegex(NotImplementedError, "Loop-closing joints are not supported"):
-            SolverSteel(model, articulated_contact_response="propagation")
+        gaps = {}
+        for response in ("immediate", "propagation"):
+            model, solver, state_0, state_1, control = _four_bar_setup(device, articulated_contact_response=response)
+            _set_joint_enabled(model, [_LOOP_JOINT], enabled)
+            state_0, _ = _step_four_bar(solver, state_0, state_1, control, 120)
+            test.assertTrue(np.all(np.isfinite(state_0.body_q.numpy())))
+            gaps[response] = float(_four_bar_gaps(model, state_0, 1)[0])
+        if enabled:
+            # The closure holds about as tightly as the dense rows hold it.
+            test.assertLess(gaps["propagation"], max(2.0 * gaps["immediate"], 1.0e-3))
 
 
 def test_disabled_tree_joint_is_reported(test, device):
@@ -1195,7 +1201,7 @@ for _name in (
     "test_replaced_joint_enabled_array",
     "test_release_matches_xpbd",
     "test_closure_owner_stays_awake_and_releases",
-    "test_propagation_rejects_closures",
+    "test_propagation_closures",
     "test_disabled_tree_joint_is_reported",
 ):
     add_function_test(TestSteelConnectModelEdits, _name, globals()[_name], devices=cuda_devices)
@@ -1718,13 +1724,16 @@ def test_propagation_keeps_iterative_mimic_rows(test, device):
             test.assertGreater(solver._mimic_count, 0)
 
 
-def test_propagation_rejects_loop_joints(test, device):
-    """Reject loop-closing joints with the propagation responses."""
-    model = _build_four_bar().finalize(device=device)
-    for solve_mode in ("serial", "colored"):
+def test_propagation_loop_joints(test, device):
+    """Run a loop-closing joint with the propagation response in both solve modes (serial on CPU)."""
+    for solve_mode in ("serial", "colored") if wp.get_device(device).is_cuda else ("serial",):
         with test.subTest(solve_mode=solve_mode):
-            with test.assertRaisesRegex(NotImplementedError, "Loop-closing joints.*articulated_contact_response"):
-                SolverSteel(model, solve_mode=solve_mode, articulated_contact_response="propagation")
+            model, solver, state_0, state_1, control = _four_bar_setup(
+                device, solve_mode=solve_mode, articulated_contact_response="propagation"
+            )
+            state_0, _ = _step_four_bar(solver, state_0, state_1, control, 60)
+            test.assertTrue(np.all(np.isfinite(state_0.body_q.numpy())))
+            test.assertLess(float(_four_bar_gaps(model, state_0, 1)[0]), 1.0e-2)
 
 
 class TestSteelPreelimination(unittest.TestCase):
@@ -1760,9 +1769,9 @@ add_function_test(
 
 add_function_test(
     TestSteelPreeliminationPropagation,
-    "test_propagation_rejects_loop_joints",
-    test_propagation_rejects_loop_joints,
-    devices=cuda_devices,
+    "test_propagation_loop_joints",
+    test_propagation_loop_joints,
+    devices=get_test_devices(),
 )
 
 

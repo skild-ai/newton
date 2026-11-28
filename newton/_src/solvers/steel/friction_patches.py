@@ -666,7 +666,7 @@ def _build(
 
     # Binary search the previous pair, avoiding a scan over other worlds/pairs.
     lo = int(0)
-    hi = prev.center.shape[0]
+    hi = prev.valid.shape[0]
     while lo < hi:
         mid = (lo + hi) // 2
         if prev.keys[mid] < key:
@@ -678,7 +678,7 @@ def _build(
     # Index valid history once per pair rather than rescanning all old contacts
     # for every new friction location. Keep sorted order for matching ties.
     prev_anchor_stop = prev_start
-    while prev_stop < prev.center.shape[0] and prev.keys[prev_stop] == key:
+    while prev_stop < prev.valid.shape[0] and prev.keys[prev_stop] == key:
         p = prev.indices[prev_stop]
         prev.used[p] = 0
         if prev.valid[p] != 0:
@@ -1157,6 +1157,7 @@ def _carry_frozen_pairs(
 @wp.kernel(enable_backward=False)
 def _store_history(
     q: wp.array[wp.transform],
+    count: wp.array[int],
     frame: _PatchFrame,
     prev: _PatchFrame,
     previous_q: wp.array[wp.transform],
@@ -1166,6 +1167,13 @@ def _store_history(
     if c < previous_q.shape[0]:
         previous_q[c] = q[c]
     if c >= frame.valid.shape[0]:
+        return
+    if c >= count[0]:
+        # Slots past the frame's contacts hold _prepare's defaults: the sorted keys, their slots and the
+        # validity are all a later frame reads there.
+        prev.keys[c] = frame.keys[c]
+        prev.indices[c] = frame.indices[c]
+        prev.valid[c] = frame.valid[c]
         return
     normal = frame.normal[c]
     if frame.valid[c] != 0 and frame.body_a[c] >= 0:
@@ -1334,6 +1342,10 @@ _CARRIED_HISTORY_FIELDS = frozenset(
 )
 
 
+# Fields of the previous frame that _build and _check_frozen_carry write as scratch.
+_PREVIOUS_SCRATCH_FIELDS = frozenset(("used", "members"))
+
+
 @wp.kernel(enable_backward=False)
 def _copy_carried_history(
     src: _PatchFrame,
@@ -1389,10 +1401,14 @@ class _FrictionPatchState:
         self._changed_shapes = wp.zeros(model.shape_body.shape[0], dtype=int, device=device)
         self._changed_bodies = wp.zeros(model.body_count, dtype=int, device=device)
         self.current = self._frame(capacity, device)
-        self.previous = self._frame(capacity, device)
-        # Only the current frame flags failed carries.
-        self.previous.carry_failed = wp.zeros(0, dtype=int, device=device)
+        # The previous frame holds the carried history and the two fields _build and _check_frozen_carry use as
+        # scratch on it; the rest only the current frame builds and reads.
+        self.previous = self._frame(capacity, device, _CARRIED_HISTORY_FIELDS | _PREVIOUS_SCRATCH_FIELDS)
         self.previous_q = wp.zeros(model.body_count, dtype=wp.transform, device=device)
+        # Contact count of the frame build() prepared (the history store reads it); every slot until then.
+        # (kept referenced: rebinding _frame_count must not free it under a capture).
+        self._frame_count_all = wp.full(1, 2**31 - 1, dtype=wp.int32, device=device)
+        self._frame_count = self._frame_count_all
         # Body pairs large enough for the warp flood: at most one per _FLOOD_MIN_CONTACTS + 1
         # contacts, grown by a fixed grid of warps so the launch does not scale with capacity.
         pair_capacity = capacity // (_FLOOD_MIN_CONTACTS + 1) + 1
@@ -1436,10 +1452,15 @@ class _FrictionPatchState:
             )
 
     @staticmethod
-    def _frame(n, device):
+    def _frame(n, device, fields=None):
+        """A patch frame of ``n`` slots; with ``fields``, every other field is empty."""
         frame = _PatchFrame()
-        frame.keys = wp.full(2 * n, 0x7FFFFFFFFFFFFFFF, dtype=wp.int64, device=device)
-        frame.indices = wp.zeros(2 * n, dtype=int, device=device)
+
+        def size(name, count):
+            return count if fields is None or name in fields else 0
+
+        frame.keys = wp.full(size("keys", 2 * n), 0x7FFFFFFFFFFFFFFF, dtype=wp.int64, device=device)
+        frame.indices = wp.zeros(size("indices", 2 * n), dtype=int, device=device)
         for field in (
             "center",
             "normal",
@@ -1450,13 +1471,13 @@ class _FrictionPatchState:
             "surface_b",
             "tangent_impulse",
         ):
-            setattr(frame, field, wp.zeros(n, dtype=wp.vec3, device=device))
-        frame.mu = wp.zeros(n, dtype=wp.vec2, device=device)
-        frame.angular = wp.zeros(n, dtype=wp.vec2, device=device)
-        frame.radius = wp.zeros(n, dtype=float, device=device)
-        frame.support_gap_limit = wp.zeros(n, dtype=float, device=device)
-        frame.gap = wp.zeros(n, dtype=float, device=device)
-        frame.separation = wp.zeros(n, dtype=float, device=device)
+            setattr(frame, field, wp.zeros(size(field, n), dtype=wp.vec3, device=device))
+        frame.mu = wp.zeros(size("mu", n), dtype=wp.vec2, device=device)
+        frame.angular = wp.zeros(size("angular", n), dtype=wp.vec2, device=device)
+        frame.radius = wp.zeros(size("radius", n), dtype=float, device=device)
+        frame.support_gap_limit = wp.zeros(size("support_gap_limit", n), dtype=float, device=device)
+        frame.gap = wp.zeros(size("gap", n), dtype=float, device=device)
+        frame.separation = wp.zeros(size("separation", n), dtype=float, device=device)
         for field in (
             "body_a",
             "body_b",
@@ -1474,7 +1495,7 @@ class _FrictionPatchState:
             "second",
             "carry_failed",
         ):
-            setattr(frame, field, wp.zeros(n, dtype=int, device=device))
+            setattr(frame, field, wp.zeros(size(field, n), dtype=int, device=device))
         return frame
 
     def build(
@@ -1497,6 +1518,8 @@ class _FrictionPatchState:
         coefficients [m] and a per-body flag of the bodies whose contacts take the free-rigid route. Such
         contacts then share a patch only if their pair coefficients match.
         """
+        # The history store copies full records only for this frame's contacts.
+        self._frame_count = contacts.rigid_contact_count
         wp.launch(
             _prepare,
             dim=self.capacity,
@@ -1641,7 +1664,7 @@ class _FrictionPatchState:
         wp.launch(
             _store_history,
             dim=max(self.capacity, self.previous_q.shape[0]),
-            inputs=[state.body_q, self.current, self.previous, self.previous_q],
+            inputs=[state.body_q, self._frame_count, self.current, self.previous, self.previous_q],
             device=state.body_q.device,
         )
 

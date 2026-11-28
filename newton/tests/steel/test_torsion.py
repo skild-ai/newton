@@ -425,8 +425,18 @@ def test_invalid_input_and_unsupported_modes(test, device):
     for radius in (-1.0, float("nan"), float("inf")):
         with test.assertRaises(ValueError):
             fixture(radius, device=device)
-    with test.assertRaises(ValueError):
-        fixture(0.01, device=device, contact_warmstart=True)
+
+
+def test_spin_stops_below_bound_with_warm_start(test, device):
+    """Stop the spin of a warm-started solve as a cold one does: torsion rows carry no history and start cold."""
+    for options in ({}, _PROPAGATION_TORSION, _COLORED_TORSION):
+        with test.subTest(**options):
+            result, solver, *_ = fixture(
+                0.01, device=device, spin=1.0, center_only=True, contact_warmstart=True, **options
+            )
+            test.assertLess(np.max(np.abs(result["body_qd"][:, 5])), 1e-4)
+            if not options:  # the host preparation of the immediate response counts its rows
+                test.assertGreater(solver._torsion_stats["rows"], 0)
 
 
 def test_capture_is_explicitly_rejected(test, device):
@@ -542,6 +552,7 @@ for _fn in (
 for _fn in (
     test_default_off_equivalent,
     test_spin_stops_below_bound,
+    test_spin_stops_below_bound_with_warm_start,
     test_zero_friction_and_zero_load,
     test_joint_response_and_coupled_budget,
     test_witness_count_does_not_multiply_torque,
@@ -2945,7 +2956,6 @@ def test_propagation_captured_steps_match_eager_steps_and_report_errors(test, de
 def test_propagation_unsupported_combinations_raise(test, device):
     """Keep torsion rejected where its rows are not solved."""
     for options, error, message in (
-        ({**_PROPAGATION_TORSION, "contact_warmstart": True}, ValueError, "contact_warmstart=False"),
         ({**_PROPAGATION_TORSION, "velocity_iterations": 1}, NotImplementedError, "velocity_iterations=0"),
         ({"articulated_contact_response": "propagation"}, NotImplementedError, "contact_torsion_device=True"),
     ):
@@ -3572,12 +3582,11 @@ def test_colored_sleeping_islands_drop_their_torsion_rows(test, device):
 
 
 def test_colored_unsupported_combinations_raise(test, device):
-    """Keep colored torsion rejected without device preparation, with velocity iterations and with warm start."""
+    """Keep colored torsion rejected without device preparation and with velocity iterations."""
     colored = {"solve_mode": "colored", "articulated_contact_response": "propagation"}
     for options, error, message in (
         (colored, NotImplementedError, "contact_torsion_device=True"),
         ({**_COLORED_TORSION, "velocity_iterations": 1}, NotImplementedError, "velocity_iterations=0"),
-        ({**_COLORED_TORSION, "contact_warmstart": True}, ValueError, "contact_warmstart=False"),
     ):
         with test.subTest(**options), test.assertRaisesRegex(error, message):
             fixture(0.01, device=device, step=False, **options)

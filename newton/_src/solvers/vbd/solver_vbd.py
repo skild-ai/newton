@@ -888,6 +888,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             collision_frequency=collision_frequency,
             collision_frequency_type=collision_frequency_type,
         )
+        if model.joint_count and getattr(model, "_has_rod_joints", False):
+            rod = model.joint_type.numpy() == int(JointType.ROD)
+            if np.any(rod & (model.joint_dof_dim.numpy()[:, 0] == 0)):
+                raise ValueError("SolverVBD does not support inextensible JointType.ROD joints (no linear axes).")
         self._empty_mesh_recovery = empty_mesh_recovery(model.device.alias)
         # The solver's warm-start setting is authoritative for an owned pipeline:
         # multiplier restores ride the pipeline's matched contact indices, so

@@ -26,6 +26,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 
 
 def _y_dirs_xy() -> list[wp.vec3]:
@@ -39,6 +40,7 @@ def _y_dirs_xy() -> list[wp.vec3]:
 
 class Example:
     def __init__(self, viewer, args):
+        self.clamps = cable_solver.CableClamps(args)
         self.viewer = viewer
         self.args = args
         self.solver_type = getattr(args, "solver", "vbd") if args is not None else "vbd"
@@ -47,8 +49,12 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 2 if self.solver_type == "kamino" else 20
-        self.sim_iterations = 5
+        if self.solver_type == "kamino":
+            self.sim_substeps, self.sim_iterations = 2, 5
+        else:
+            # Native Steel: two substeps of 12 sweeps follow the 8-of-32 trajectory within 0.04 mm and settle to the
+            # same hanging shape.
+            self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 20, 5, propagation=(2, 12))
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         # Cable parameters.
@@ -114,27 +120,36 @@ class Example:
                 label="pinned_tip",
             )
         else:
-            builder.body_mass[pinned_body] = 0.0
-            builder.body_inv_mass[pinned_body] = 0.0
-            builder.body_inertia[pinned_body] = wp.mat33(0.0)
-            builder.body_inv_inertia[pinned_body] = wp.mat33(0.0)
+            self.clamps.pin(builder, pinned_body)
 
         if getattr(args, "ground", True):
             builder.add_ground_plane()
 
-        builder.color(balance_colors=False)
+        self.clamps.finish(builder)
+        if not self.clamps.steel:
+            builder.color(balance_colors=False)
         sim_device = wp.get_device(args.device) if args.device else None
         self.model = builder.finalize(device=sim_device)
         self.model.set_gravity((0.0, 0.0, float(getattr(args, "gravity_z", -9.81))))
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        # Contacts per world: the task makes none under Steel or VBD, so the budget's minimum.
+        self.contacts_per_world = cable_solver.contact_budget(self.model, 0)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            rigid_contact_max=self.contacts_per_world * self.model.world_count,
+            **cable_solver.pipeline_options(args),
+        )
+        self.clamps.bind(self.model)
         if self.solver_type == "kamino":
             config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver=self.kamino_backend)
             config.use_collision_detector = False
             self.solver = newton.solvers.SolverKamino(self.model, config=config)
         else:
-            self.solver = newton.solvers.SolverVBD(
+            self.solver = cable_solver.make_solver(
                 self.model,
+                args,
+                contacts=self.contacts_per_world,
+                contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies),
                 iterations=self.sim_iterations,
             )
 
@@ -184,6 +199,7 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
+        cable_solver.check_capacity(self.solver)
         if self.state_0.body_q is None or self.model.joint_parent is None or self.model.joint_child is None:
             raise RuntimeError("Body/joint state is not available.")
 
@@ -238,8 +254,7 @@ class Example:
 
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
-    parser.add_argument("--solver", choices=["vbd", "kamino"], default="vbd", help="Cable dynamics solver.")
+    parser = cable_solver.create_parser(extra_solvers=("kamino",))
     parser.add_argument(
         "--kamino-backend", choices=["lox", "scc"], default="lox", help="Kamino dynamics solver backend."
     )

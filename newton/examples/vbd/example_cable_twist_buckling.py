@@ -35,6 +35,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 from newton.examples.vbd._viewer import node_xyz, set_viewer_camera
 
 
@@ -119,6 +120,7 @@ class Example:
     SEED_BODY_OFFSET_Y = 5.0e-4  # 0.5 mm
 
     def __init__(self, viewer, args=None):
+        self.clamps = cable_solver.CableClamps(args)
         self.viewer = viewer
         self.args = args
 
@@ -140,8 +142,9 @@ class Example:
         self.fps = self.FPS
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = int(params["substeps"])
-        self.sim_iterations = int(params["iterations"])
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(
+            args, params["substeps"], params["iterations"], propagation=(2, 4)
+        )
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.frame_index = 0
 
@@ -174,7 +177,7 @@ class Example:
             twist_stiffness=self.twist_stiffness,
             twist_damping=self.twist_damping,
             label="twist_buckling",
-            wrap_in_articulation=False,
+            wrap_in_articulation=self.clamps.steel,
         )
 
         self.bodies = list(map(int, bodies))
@@ -185,20 +188,32 @@ class Example:
         self.root_body = self.bodies[0]
         self.tip_body = self.bodies[-1]
         for body in (self.root_body, self.tip_body):
-            builder.body_mass[body] = 0.0
-            builder.body_inv_mass[body] = 0.0
-            builder.body_inertia[body] = wp.mat33(0.0)
-            builder.body_inv_inertia[body] = wp.mat33(0.0)
-        builder.add_articulation(self.joints, label="twist_buckling_articulation")
+            self.clamps.pin(builder, body)
+        if not self.clamps.steel:
+            builder.add_articulation(self.joints, label="twist_buckling_articulation")
 
-        builder.color()
+        self.clamps.finish(builder)
+        if not self.clamps.steel:
+            builder.color()
         self.model = builder.finalize()
         contact_history = self.contact_mode == "alm-history"
+        # VBD's contact history and native Steel's contact warm start read the matching.
+        steel_matching = cable_solver.pipeline_options(self.args) if self.clamps.steel else {}
         contact_matching = "latest" if contact_history else "disabled"
-        self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching=contact_matching)
-        self.contacts = self.collision_pipeline.contacts()
-        self.solver = newton.solvers.SolverVBD(
+        # Contacts per world: the task makes none under Steel or VBD, so the budget's minimum.
+        self.contacts_per_world = cable_solver.contact_budget(self.model, 0)
+        self.collision_pipeline = newton.CollisionPipeline(
             self.model,
+            rigid_contact_max=self.contacts_per_world * self.model.world_count,
+            **({"contact_matching": contact_matching} | steel_matching),
+        )
+        self.contacts = self.collision_pipeline.contacts()
+        self.clamps.bind(self.model)
+        self.solver = cable_solver.make_solver(
+            self.model,
+            args,
+            contacts=self.contacts_per_world,
+            contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies),
             iterations=self.sim_iterations,
             rigid_contact_history=contact_history,
             rigid_body_contact_buffer_size=256,
@@ -227,6 +242,9 @@ class Example:
         body_q_np[self.bodies[mid], 1] += self.seed_offset
         self.state_0.body_q.assign(body_q_np)
         self.state_1.body_q.assign(body_q_np)
+        if self.clamps.steel:
+            for state in (self.state_0, self.state_1):
+                newton.eval_ik(self.model, state, state.joint_q, state.joint_qd)
         self.twist_angles_np = np.zeros(self.sim_substeps, dtype=np.float32)
         self.twist_angles = wp.array(self.twist_angles_np, dtype=wp.float32, device=self.model.device)
 
@@ -320,7 +338,7 @@ class Example:
                 self.twist_angles,
                 int(substep_index),
             ],
-            outputs=[self.state_0.body_q, self.state_1.body_q],
+            outputs=self.clamps.pose_buffers(self.state_0, self.state_1),
             device=self.model.device,
         )
 
@@ -328,10 +346,12 @@ class Example:
         for i in range(self.sim_substeps):
             self._apply_command(substep_index=i)
             self.state_0.clear_forces()
+            self.clamps.update(self.state_0, self.sim_dt)
             self.viewer.apply_forces(self.state_0)
             if self.contact_enabled:
                 self.collision_pipeline.collide(self.state_0, self.contacts)
-            self.solver.set_rigid_history_update(True)
+            if not self.clamps.steel:
+                self.solver.set_rigid_history_update(True)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
@@ -564,6 +584,7 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
+        cable_solver.check_capacity(self.solver)
         row = self.metrics()
         link = self.link_metrics()
         assert row["finite"], f"non-finite cable centerline: {row}"
@@ -579,7 +600,7 @@ class Example:
 
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
+    parser = cable_solver.create_parser()
     parser.set_defaults(num_frames=int(Example.FPS * Example.TOTAL_TIME))
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

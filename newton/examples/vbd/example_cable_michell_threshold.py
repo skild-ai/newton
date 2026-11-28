@@ -37,6 +37,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 from newton.examples.vbd._viewer import node_xyz, set_viewer_camera
 
 
@@ -84,8 +85,11 @@ class Example:
         self.fps = self.FPS
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 8
-        self.sim_iterations = 28
+        # Implicit Euler damps the near-threshold vibration. Resolve that mode
+        # in the reduced solver through the full six-second observation window.
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(
+            args, 32 if getattr(args, "solver", "vbd") == "steel" else 8, 28, propagation=(12, 8)
+        )
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.critical_twist = self.TOTAL_TWIST
@@ -133,9 +137,22 @@ class Example:
                 }
             )
 
-        builder.color()
+        # ``--world-count`` copies of the sweep; each world's rings are checked as cases of their own.
+        builder, self.world_count, _expand = cable_solver.replicate_worlds(builder, args, None, ground=False)
+        stride = builder.body_count // self.world_count
+        self.cases = [
+            {
+                **case,
+                "label": case["label"] + (f" world {w}" if w else ""),
+                "bodies": [w * stride + b for b in case["bodies"]],
+            }
+            for w in range(self.world_count)
+            for case in self.cases
+        ]
+        if getattr(args, "solver", "vbd") == "vbd":
+            builder.color()
         self.model = builder.finalize()
-        self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations)
+        self.solver = cable_solver.make_solver(self.model, args, self.sim_iterations)
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
@@ -197,6 +214,7 @@ class Example:
     def _make_bodies_kinematic(builder: newton.ModelBuilder, bodies) -> None:
         for body_id in bodies:
             body = int(body_id)
+            builder.body_flags[body] = int(newton.BodyFlags.KINEMATIC)
             builder.body_mass[body] = 0.0
             builder.body_inv_mass[body] = 0.0
             builder.body_inertia[body] = wp.mat33(0.0)
@@ -300,6 +318,9 @@ class Example:
 
         self.state_0.body_q.assign(body_q)
         self.state_1.body_q.assign(body_q)
+        if isinstance(self.solver, newton.solvers.SolverSteel):
+            for state in (self.state_0, self.state_1):
+                newton.eval_ik(self.model, state, state.joint_q, state.joint_qd)
 
     def simulate(self) -> None:
         for _ in range(self.sim_substeps):
@@ -390,6 +411,7 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
+        cable_solver.check_capacity(self.solver)
         metrics = {case["label"]: self._metrics(case) for case in self.cases}
 
         assert all(bool(row["finite"]) for row in metrics.values()), f"non-finite ring positions: {metrics}"
@@ -411,7 +433,8 @@ class Example:
 
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
+    parser = cable_solver.create_parser()
+    cable_solver.add_world_count_arg(parser)
     parser.set_defaults(num_frames=int(Example.FPS * Example.RUN_TIME))
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

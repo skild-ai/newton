@@ -24,6 +24,7 @@ Runs:
 - `python -m newton.examples mujoco_franka_vbd_cable_admm_solver --payload-kind vbd-cable`
   - The payload is a VBD cable.
 - `python -m newton.examples mujoco_franka_vbd_cable_admm_solver --rigid-solver steel`
+- `python -m newton.examples mujoco_franka_vbd_cable_admm_solver --solver steel --solve-mode colored --device cuda:0`
 """
 
 from __future__ import annotations
@@ -38,6 +39,8 @@ import newton
 import newton.examples
 import newton.ik as ik
 import newton.utils
+from newton.examples.cable import solver as cable_solver
+from newton.examples.multiphysics import franka_cable
 from newton.solvers import SolverMuJoCo, SolverSteel, SolverVBD, SolverXPBD
 
 PAYLOAD_CENTER = wp.vec3(0.5, 0.0, 0.256)
@@ -119,6 +122,9 @@ def _find_label_index(labels: list[str], suffix: str) -> int:
 
 class Example:
     def __init__(self, viewer, args):
+        self.native_cable = getattr(args, "solver", "coupled") == "steel"
+        # Levenberg-Marquardt iterations per frame, warm-started from the previous frame's solution.
+        self.ik_iterations = max(1, int(args.ik_iterations))
         self.viewer = viewer
         self.sim_time = 0.0
         self.fps = 60
@@ -127,7 +133,10 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.use_graph = bool(args.graph_capture)
         self.world_count = max(1, int(args.world_count))
-        self.payload_kind = str(args.payload_kind)
+        if self.native_cable:
+            # The propagation response holds this grasp at the same budget and runs faster from 1,024 worlds.
+            cable_solver.arm_contact_response(args, self.world_count, threshold=1024)
+        self.payload_kind = args.payload_kind or ("vbd-cable" if self.native_cable else "xpbd-chain")
         self.rigid_solver = str(args.rigid_solver)
         self.payload_segments = max(2, int(args.payload_segments))
         self.payload_radius = float(args.payload_radius)
@@ -136,9 +145,10 @@ class Example:
 
         template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         template.rigid_gap = 0.005
-        SolverMuJoCo.register_custom_attributes(template)
-        if self.payload_kind == "vbd-cable":
-            SolverVBD.register_custom_attributes(template)
+        if not self.native_cable:
+            SolverMuJoCo.register_custom_attributes(template)
+            if self.payload_kind == "vbd-cable":
+                SolverVBD.register_custom_attributes(template)
         self._emit_template(template)
 
         bodies_per_world = template.body_count
@@ -150,56 +160,79 @@ class Example:
         self._expand_world_indices(bodies_per_world, joints_per_world, shapes_per_world)
         self.ground_shapes = [self._emit_ground_plane(builder)]
 
-        builder.color()
+        if not self.native_cable:
+            builder.color()
         self.model = builder.finalize()
         self.device = self.model.device
         self.use_graph = self.use_graph and self.device.is_cuda
         self._count_admm_shape_pairs_per_world()
 
+        # Native Steel: contacts per world, the task's peak (51) with room for the jaws.
+        capacity = {}
+        if self.native_cable:
+            capacity["rigid_contact_max"] = cable_solver.contact_budget(self.model, 6) * self.model.world_count
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
+            **capacity,
+            # Native Steel: every world grasps alike (a sorted contact stream for Steel's deterministic mode).
+            deterministic=self.native_cable,
+            **cable_solver.pipeline_options(args),
         )
         self.contacts = self.collision_pipeline.contacts()
-        payload_name = "vbd" if self.payload_kind == "vbd-cable" else "xpbd"
-        payload_solver = self._make_payload_solver(args)
-        rigid_name, rigid_solver = self._make_rigid_solver(args)
-        self.solver = SolverCoupledADMM(
-            model=self.model,
-            entries=[
-                SolverCoupled.Entry(
-                    name=rigid_name,
-                    solver=rigid_solver,
-                    bodies=self.franka_bodies,
-                    joints=self.franka_joints,
-                ),
-                SolverCoupled.Entry(
-                    name=payload_name,
-                    solver=payload_solver,
-                    bodies=self.payload_bodies,
-                    joints=self.payload_joints,
-                ),
-            ],
-            coupling=SolverCoupledADMM.Config(
-                iterations=int(args.admm_iterations),
-                rho=float(args.rho),
-                gamma=float(args.gamma),
-                baumgarte=float(args.baumgarte),
-                rigid_contact_matching=str(args.rigid_contact_matching),
-                contact_matching_pos_threshold=args.contact_matching_pos_threshold,
-                contact_matching_normal_dot_threshold=args.contact_matching_normal_dot_threshold,
-                contact_matching_force_scale=args.contact_matching_force_scale,
-                contact_pairs=[
-                    SolverCoupledADMM.ContactPair(
-                        source=rigid_name,
-                        destination=payload_name,
+        if self.native_cable:
+            if self.payload_kind != "vbd-cable":
+                raise ValueError("Native Steel cable mode requires --payload-kind vbd-cable.")
+            self.solver = cable_solver.make_solver(
+                self.model,
+                args,
+                args.steel_iterations,
+                # Contact rows are reserved per world, including jaw patches and limits.
+                contact_rows=24 * self.payload_segments + 64,
+                enable_joint_limits=True,
+                deterministic=True,
+            )
+        else:
+            payload_name = "vbd" if self.payload_kind == "vbd-cable" else "xpbd"
+            payload_solver = self._make_payload_solver(args)
+            rigid_name, rigid_solver = self._make_rigid_solver(args)
+            self.solver = SolverCoupledADMM(
+                model=self.model,
+                entries=[
+                    SolverCoupled.Entry(
+                        name=rigid_name,
+                        solver=rigid_solver,
+                        bodies=self.franka_bodies,
+                        joints=self.franka_joints,
+                    ),
+                    SolverCoupled.Entry(
+                        name=payload_name,
+                        solver=payload_solver,
+                        bodies=self.payload_bodies,
+                        joints=self.payload_joints,
                     ),
                 ],
-            ),
-        )
+                coupling=SolverCoupledADMM.Config(
+                    iterations=int(args.admm_iterations),
+                    rho=float(args.rho),
+                    gamma=float(args.gamma),
+                    baumgarte=float(args.baumgarte),
+                    rigid_contact_matching=str(args.rigid_contact_matching),
+                    contact_matching_pos_threshold=args.contact_matching_pos_threshold,
+                    contact_matching_normal_dot_threshold=args.contact_matching_normal_dot_threshold,
+                    contact_matching_force_scale=args.contact_matching_force_scale,
+                    contact_pairs=[
+                        SolverCoupledADMM.ContactPair(
+                            source=rigid_name,
+                            destination=payload_name,
+                        ),
+                    ],
+                ),
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
-        self.solver.prepare_contacts(self.contacts)
+        if not self.native_cable:
+            self.solver.prepare_contacts(self.contacts)
         self.control = self.model.control()
         self._build_keyframes()
         self._build_ik()
@@ -217,7 +250,7 @@ class Example:
         self.capture()
 
     def _make_rigid_solver(self, args):
-        if self.rigid_solver == "steel":
+        if self.native_cable or self.rigid_solver == "steel":
             # Steel sizes its contact scratch from the model before it sees a contact buffer.
             self.model.rigid_contact_max = self.contacts.rigid_contact_max
             return "steel", lambda v: SolverSteel(
@@ -279,12 +312,14 @@ class Example:
         franka_shape_end = builder.shape_count
         franka_bodies = list(range(franka_body_start, franka_body_end))
 
-        gravcomp = builder.custom_attributes["mujoco:gravcomp"]
-        if gravcomp.values is None:
-            gravcomp.values = {}
-        for body in franka_bodies:
-            gravcomp.values[body] = 1.0
-            if self.rigid_solver == "steel":
+        if not self.native_cable:
+            gravcomp = builder.custom_attributes["mujoco:gravcomp"]
+            if gravcomp.values is None:
+                gravcomp.values = {}
+            for body in franka_bodies:
+                gravcomp.values[body] = 1.0
+        if self.native_cable or self.rigid_solver == "steel":
+            for body in franka_bodies:
                 builder.body_disable_gravity[body] = True
 
         payload_shape_start = builder.shape_count
@@ -492,11 +527,11 @@ class Example:
             link_offset_rotation=wp.quat_identity(),
             target_rotations=self.ik_target_rotations,
         )
-        joint_limit_lower = wp.clone(self.model.joint_limit_lower.reshape((self.world_count, -1))[:, : self.n_coords])
-        joint_limit_upper = wp.clone(self.model.joint_limit_upper.reshape((self.world_count, -1))[:, : self.n_coords])
+        # One limit per DoF of the IK arm, shared by every world's problem (limits tiled per world would add a
+        # residual row per world and outgrow the tiled solve's shared memory with many worlds).
         self.joint_limits_obj = ik.IKObjectiveJointLimit(
-            joint_limit_lower=joint_limit_lower.flatten(),
-            joint_limit_upper=joint_limit_upper.flatten(),
+            joint_limit_lower=self.ik_model.joint_limit_lower,
+            joint_limit_upper=self.ik_model.joint_limit_upper,
             weight=10.0,
         )
         self.ik_solver = ik.IKSolver(
@@ -506,7 +541,7 @@ class Example:
             lambda_initial=0.05,
             jacobian_mode=ik.IKJacobianType.ANALYTIC,
         )
-        self.ik_iters = 24
+        self.ik_iters = self.ik_iterations
 
     def _build_keyframes(self) -> None:
         cx, cy, cz = PAYLOAD_CENTER[0], PAYLOAD_CENTER[1], PAYLOAD_CENTER[2]
@@ -596,7 +631,8 @@ class Example:
             newton.examples.apply_coupled_viewer_forces(self, self.state_0)
             self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-            newton.eval_ik(self.model, self.state_1, self.state_1.joint_q, self.state_1.joint_qd)
+            if not self.native_cable:
+                newton.eval_ik(self.model, self.state_1, self.state_1.joint_q, self.state_1.joint_qd)
             if need_state_copy and substep == self.sim_substeps - 1:
                 self.state_0.assign(self.state_1)
             else:
@@ -608,7 +644,12 @@ class Example:
             self.simulate()
         self.sim_time += self.frame_dt
 
+    def test_post_step(self):
+        if self.native_cable:
+            franka_cable.check_carry(self, PAYLOAD_LENGTH, lift_key=4, placement_key=7)
+
     def test_final(self):
+        cable_solver.check_capacity(self.solver)
         body_q = self.state_0.body_q.numpy()
         body_qd = self.state_0.body_qd.numpy()
         assert np.all(np.isfinite(body_q)), "Body positions contain NaN or inf values"
@@ -617,6 +658,8 @@ class Example:
         assert np.all(self.admm_shape_pairs_per_world == self.admm_shape_pairs_per_world[0]), (
             "Franka-payload ADMM contact pair counts should be identical across replicated worlds"
         )
+        if self.native_cable:
+            franka_cable.check_release(self, PAYLOAD_LENGTH, GRIP_OPEN)
         if self.use_graph:
             assert self.graph is not None, "Graph capture was requested but no graph was captured"
 
@@ -627,7 +670,10 @@ class Example:
 
     @staticmethod
     def create_parser():
-        parser = newton.examples.create_parser()
+        parser = cable_solver.create_parser(baseline="coupled")
+        # The jaws pinch the cable between two articulations, which the immediate response's exact Gauss-Seidel
+        # holds at a small budget (as in franka_cable_ik_pick_place).
+        parser.set_defaults(contact_response=None)
         newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=8)
@@ -669,8 +715,8 @@ class Example:
         parser.add_argument(
             "--payload-kind",
             choices=["xpbd-chain", "vbd-cable"],
-            default="xpbd-chain",
-            help="Payload simulated by the non-MuJoCo solver.",
+            default=None,
+            help="Payload type (rod cable for native Steel, XPBD chain for the coupled solver).",
         )
         parser.add_argument("--payload-segments", type=int, default=11, help="Number of payload rigid/cable segments.")
         parser.add_argument("--payload-radius", type=float, default=0.012, help="Payload capsule/cable radius [m].")
@@ -698,11 +744,14 @@ class Example:
             default=True,
             help="Disable graph capture.",
         )
+        parser.add_argument("--ik-iterations", type=int, default=8, help="IK iterations per frame (warm-started).")
         return parser
 
 
 if __name__ == "__main__":
     parser = Example.create_parser()
+    if parser.parse_known_args()[0].solver == "steel":
+        parser.set_defaults(num_frames=435)
     viewer, args = newton.examples.init(parser)
     example = Example(viewer, args)
     newton.examples.run(example, args)

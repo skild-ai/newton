@@ -47,15 +47,17 @@ def _build_press(device):
     return builder.finalize(device=device)
 
 
-def _run_press(device, steps: int, warm_kwargs: dict, contact_matching: str | None = "sticky"):
+def _run_press(
+    device, steps: int, warm_kwargs: dict, contact_matching: str | None = "sticky", pipeline_kwargs: dict | None = None
+):
     """Drive the press to a stall and record per-step contact-impulse sums and speeds.
 
     Returns ``(impulse_sum_per_step, |joint_qd|_per_step, final_state)``.
     """
     model = _build_press(device)
     solver = newton.solvers.SolverSteel(model, iterations=8, baumgarte=0.1, **warm_kwargs)
-    pipeline_kwargs = {} if contact_matching is None else {"contact_matching": contact_matching}
-    pipeline = newton.CollisionPipeline(model, **pipeline_kwargs)
+    options = {} if contact_matching is None else {"contact_matching": contact_matching}
+    pipeline = newton.CollisionPipeline(model, **options, **(pipeline_kwargs or {}))
     contacts = pipeline.contacts()
     state_0, state_1 = model.state(), model.state()
     control = model.control()
@@ -120,6 +122,9 @@ def _gather_rows(
             wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device=device),
             wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device=device),
             wp.full((1, max_c), 100.0, dtype=wp.float32, device=device),
+            # No contact units: per-row layouts and friction coefficients.
+            wp.full((1, 1), -1, dtype=wp.int32, device=device),
+            wp.zeros(20, dtype=wp.float32, device=device),
             decay,
             dt_scale,
             # The previous step is 1, so the step ratio is dt_scale; generation 1 of
@@ -652,6 +657,31 @@ def test_identity_warmstart_requires_contact_matching(test, device):
         _run_press(device, 3, {"contact_warmstart": True}, contact_matching=None)
 
 
+def test_warmstart_with_key_sorted_matching(test, device):
+    """Matching that sorts only the contact keys holds the press as matching that sorts the contacts.
+
+    The stall pose and impulse ledger agree with and without friction anchors.
+    """
+    steps = 240
+    stall = slice(120, None)
+    keys = {"contact_matching_body_frame": True, "contact_matching_sort": "keys"}
+    for anchors in ({}, {"friction_anchor_beta": 0.0}):
+        with test.subTest(anchors=anchors):
+            warm = {"contact_warmstart": True, **anchors}
+            lam_keys, speed_keys, state_keys = _run_press(device, steps, warm, "latest", keys)
+            lam_sorted, _speed, state_sorted = _run_press(
+                device, steps, warm, "latest", {"contact_matching_body_frame": True}
+            )
+            test.assertTrue(np.isfinite(state_keys.body_q.numpy()).all())
+            growth = lam_keys[-10:].mean() / max(lam_keys[stall][:10].mean(), 1e-12)
+            test.assertLess(growth, 1.25, f"warm-start impulse grew x{growth:.2f} at a stall")
+            test.assertLess(speed_keys[stall].max(), 0.02)
+            np.testing.assert_allclose(lam_keys[-10:].mean(), lam_sorted[-10:].mean(), rtol=0.05)
+            test.assertAlmostEqual(
+                float(state_keys.joint_q.numpy()[0]), float(state_sorted.joint_q.numpy()[0]), delta=1.0e-3
+            )
+
+
 def test_single_flag_enables_dense_and_mf_carry(test, device):
     """Enable the single all-contact warm-start mode with ``contact_warmstart=True``."""
     model = _build_press(device)
@@ -746,6 +776,7 @@ for _fn in (
     test_identity_warmstart_holds_static_press,
     test_identity_warmstart_matches_cold_equilibrium,
     test_identity_warmstart_requires_contact_matching,
+    test_warmstart_with_key_sorted_matching,
     test_single_flag_enables_dense_and_mf_carry,
     test_both_row_families_seed_impulses_scaled_by_the_step_ratio,
     test_substeps_reuse_contacts_with_their_own_history,
@@ -830,6 +861,8 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
                 wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3),
                 wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3),
                 wp.full((1, max_c), 100.0, dtype=wp.float32),
+                wp.full((1, 1), -1, dtype=wp.int32),  # no contact units
+                wp.zeros(20, dtype=wp.float32),
                 0.75,
                 4.0,  # dt; the previous step below is 1, so the step ratio is 4
                 wp.ones(1, dtype=float),

@@ -775,6 +775,11 @@ add_example_batch(
             "test_options": {"num-frames": 150, "no-dahl": True},
             "test_suffix": "no_dahl_recovery",
         },
+        {
+            "devices": cuda_test_devices,
+            "test_options": {"num-frames": 150, "solver": "steel", "solve-mode": "colored"},
+            "test_suffix": "native_steel_dahl_retention",
+        },
     ],
 )
 add_example_test(
@@ -783,6 +788,14 @@ add_example_test(
     devices=test_devices,
     use_viewer=True,
     test_options={"num-frames": 540},
+)
+add_example_test(
+    TestCableExamples,
+    name="cable.example_cable_cross_slide_table",
+    devices=cuda_test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 540, "solver": "steel", "solve-mode": "colored"},
+    test_suffix="native_steel",
 )
 add_example_test(
     TestCableExamples,
@@ -2015,6 +2028,48 @@ add_example_test(
     use_viewer=True,
     test_suffix="steel",
 )
+for scene, frames in (
+    ("multiphysics.example_franka_cable_ik_pick_place", 450),
+    ("multiphysics.example_mujoco_franka_vbd_cable_admm_solver", 435),
+):
+    for mode in ("serial", "colored"):
+        add_example_test(
+            TestMultiphysicsExamples,
+            name=scene,
+            devices=cuda_test_devices,
+            test_options={"solver": "steel", "solve-mode": mode, "num-frames": frames},
+            use_viewer=True,
+            test_suffix=f"native_steel_{mode}",
+        )
+# The propagation response, the example's default from 1,024 worlds, at one world.
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_franka_cable_ik_pick_place",
+    devices=cuda_test_devices,
+    test_options={"solver": "steel", "solve-mode": "colored", "contact-response": "propagation", "num-frames": 450},
+    use_viewer=True,
+    test_suffix="native_steel_propagation",
+)
+# The bimanual cable twist with MuJoCo arms and a VBD cable coupled through gripper proxies (with line-search room,
+# since MuJoCo prints a warning when it runs out), and every bimanual task natively under one Steel solver, with
+# both contact responses.
+_NATIVE = {"solver": "steel", "solve-mode": "colored"}
+for task, options, suffix in (
+    ("twist", {"mujoco-ls-iterations": 50}, ""),
+    *(
+        (task, {**_NATIVE, "contact-response": response}, f"_native_steel_{response}")
+        for task in ("twist", "wrap", "knot")
+        for response in ("immediate", "propagation")
+    ),
+):
+    add_example_test(
+        TestMultiphysicsExamples,
+        name="multiphysics.example_franka_bimanual_cable",
+        devices=cuda_test_devices,
+        test_options={"task": task, **options},
+        use_viewer=True,
+        test_suffix=f"{task}{suffix}",
+    )
 add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_franka_cloth_block",
@@ -2322,6 +2377,23 @@ for example_name in (
         devices=cuda_test_devices,
         test_options={"requires": ("pxr.Usd",)},
         use_viewer=True,
+    )
+
+# Native Steel inserts the RJ45 plug, the latch snaps, and it holds the plug against the pull-back.
+for mode in ("colored", "serial"):
+    add_example_test(
+        TestUSDDependentExamples,
+        name="contacts.example_contacts_rj45_plug",
+        devices=cuda_test_devices,
+        test_options={
+            "requires": ("pxr.Usd",),
+            "solver": "steel",
+            "solve-mode": mode,
+            "insert": True,
+            "num-frames": 240,
+        },
+        use_viewer=True,
+        test_suffix=f"native_steel_insert_{mode}",
     )
 
 

@@ -23,6 +23,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 
 
 @wp.kernel
@@ -120,6 +121,7 @@ class Example:
 
     def __init__(self, viewer, args):
         # Store viewer and arguments
+        self.clamps = cable_solver.CableClamps(args)
         self.viewer = viewer
         self.args = args
         self.solver_type = getattr(args, "solver", "vbd") if args is not None else "vbd"
@@ -128,8 +130,10 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 2 if self.solver_type == "kamino" else 10
-        self.sim_iterations = 5
+        if self.solver_type == "kamino":
+            self.sim_substeps, self.sim_iterations = 2, 5
+        else:
+            self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 5, propagation=(2, 4))
         self.update_step_interval = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
 
@@ -195,36 +199,51 @@ class Example:
             if self.solver_type == "kamino":
                 # Kamino advances kinematic bodies with their prescribed velocity
                 builder.body_flags[first_body] = int(newton.BodyFlags.KINEMATIC)
-            builder.body_mass[first_body] = 0.0
-            builder.body_inv_mass[first_body] = 0.0
-            builder.body_inertia[first_body] = wp.mat33(0.0)
-            builder.body_inv_inertia[first_body] = wp.mat33(0.0)
+            self.clamps.pin(builder, first_body, moving=True)
             kinematic_body_indices.append(first_body)
 
             # Store for twist application and testing
             self.cable_bodies_list.append(rod_bodies)
             self.first_bodies.append(first_body)
 
-        # Create array of kinematic body indices
+        # Ground plane and ``--world-count`` copies of this world.
+        self.clamps.finish(builder)
+        builder, self.world_count, expand = cable_solver.replicate_worlds(builder, args, self.clamps)
+        kinematic_body_indices = expand(kinematic_body_indices)
+        self.cable_bodies_list = [
+            [w * builder.body_count // self.world_count + b for b in bodies]
+            for w in range(self.world_count)
+            for bodies in self.cable_bodies_list
+        ]
         self.kinematic_bodies = wp.array(kinematic_body_indices, dtype=wp.int32)
 
-        # Add ground plane
-        builder.add_ground_plane()
-
         # Color particles and rigid bodies for VBD solver
-        builder.color()
+        if not self.clamps.steel:
+            builder.color()
 
         # Finalize model
         self.model = builder.finalize()
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        # Contacts per world: the task's peak, 771 contacts, under Steel and VBD, with a quarter on top.
+        self.contacts_per_world = cable_solver.contact_budget(self.model, 5)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            rigid_contact_max=self.contacts_per_world * self.model.world_count,
+            **cable_solver.pipeline_options(args),
+        )
+        self.clamps.bind(self.model)
         if self.solver_type == "kamino":
             config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
             config.use_collision_detector = False
             self.solver = newton.solvers.SolverKamino(self.model, config=config)
         else:
-            self.solver = newton.solvers.SolverVBD(
+            self.solver = cable_solver.make_solver(
                 self.model,
+                args,
+                contacts=self.contacts_per_world,
+                contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies) // self.world_count,
+                # A cable touching itself: the task's peak, 387 contacts, with a quarter on top.
+                same_articulation_contacts=512,
                 iterations=self.sim_iterations,
             )
 
@@ -264,15 +283,16 @@ class Example:
             self.state_0.clear_forces()
 
             # Apply continuous spin to first capsules
-            if self.solver_type == "vbd":
+            if self.solver_type != "kamino":
                 wp.launch(
                     kernel=spin_first_capsules_kernel,
                     dim=self.kinematic_bodies.shape[0],
                     inputs=[self.kinematic_bodies, self.first_twist_rates, self.sim_dt],
-                    outputs=[self.state_0.body_q, self.state_1.body_q],
+                    outputs=self.clamps.pose_buffers(self.state_0, self.state_1),
                 )
 
             # Apply forces to the model
+            self.clamps.update(self.state_0, self.sim_dt)
             self.viewer.apply_forces(self.state_0)
 
             # Collision detection and contact refresh cadence.
@@ -310,6 +330,7 @@ class Example:
 
     def test_final(self):
         """Test cable twist simulation for stability and correctness (called after simulation)."""
+        cable_solver.check_capacity(self.solver)
 
         # Use instance variables for consistency with initialization
         segment_length = self.cable_length / self.num_elements
@@ -352,8 +373,7 @@ class Example:
 
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
-    parser = newton.examples.create_parser()
-    parser.add_argument("--solver", choices=["vbd", "kamino"], default="vbd", help="Cable dynamics solver.")
+    parser = cable_solver.add_world_count_arg(cable_solver.create_parser(extra_solvers=("kamino",)))
     viewer, args = newton.examples.init(parser)
 
     # Create example and run

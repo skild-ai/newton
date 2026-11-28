@@ -33,24 +33,26 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 
 
 @wp.kernel
 def _drive_endpoints_kernel(
-    root_body: int,
-    tip_body: int,
+    root_bodies: wp.array[int],
+    tip_bodies: wp.array[int],
     root_pos: wp.vec3,
     tip_pos: wp.vec3,
     root_rest_rot: wp.quat,
     tip_rest_rot: wp.quat,
     twist_angle: wp.array[wp.float32],
+    substep: int,
     body_q0: wp.array[wp.transform],
     body_q1: wp.array[wp.transform],
 ):
     # Counter-twist: split the total end-to-end twist symmetrically. The angle
     # lives in a device array so the simulate() loop can be captured into a
     # CUDA graph and replayed with the angle updated from the host each frame.
-    angle = twist_angle[0]
+    angle = twist_angle[substep]
     root_axis = wp.quat_rotate(root_rest_rot, wp.vec3(0.0, 0.0, 1.0))
     tip_axis = wp.quat_rotate(tip_rest_rot, wp.vec3(0.0, 0.0, 1.0))
     root_rot = wp.mul(wp.quat_from_axis_angle(root_axis, -0.5 * angle), root_rest_rot)
@@ -58,6 +60,8 @@ def _drive_endpoints_kernel(
     root_pose = wp.transform(root_pos, root_rot)
     tip_pose = wp.transform(tip_pos, tip_rot)
 
+    root_body = root_bodies[wp.tid()]
+    tip_body = tip_bodies[wp.tid()]
     body_q0[root_body] = root_pose
     body_q1[root_body] = root_pose
     body_q0[tip_body] = tip_pose
@@ -122,6 +126,7 @@ class Example:
     SEED_BODY_OFFSET_Y = 1.0e-3
 
     def __init__(self, viewer, args=None):
+        self.clamps = cable_solver.CableClamps(args)
         self.viewer = viewer
         self.args = args
         self.solver_type = getattr(args, "solver", "vbd") if args is not None else "vbd"
@@ -129,12 +134,15 @@ class Example:
         self.fps = self.FPS
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = int(getattr(args, "substeps", None) or self.SIM_SUBSTEPS)
+        preset_substeps, preset_iterations = cable_solver.budget(
+            args, self.SIM_SUBSTEPS, self.SIM_ITERATIONS, propagation=(4, 16)
+        )
+        self.sim_substeps = int(getattr(args, "substeps", None) or preset_substeps)
         # The captured substep loop ping-pongs state_0/state_1, so an even count
         # keeps the buffers in their original roles after each frame replay.
         if self.sim_substeps % 2 == 1:
             self.sim_substeps += 1
-        self.sim_iterations = int(getattr(args, "iterations", None) or self.SIM_ITERATIONS)
+        self.sim_iterations = int(getattr(args, "iterations", None) or preset_iterations)
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         nodes = self._hanging_arc_nodes()
@@ -168,7 +176,7 @@ class Example:
             twist_stiffness=self.TWIST_STIFFNESS,
             twist_damping=self.TWIST_DAMPING,
             label="plectoneme",
-            wrap_in_articulation=False,
+            wrap_in_articulation=self.clamps.steel,
         )
         self.bodies = list(map(int, bodies))
         self.joints = list(map(int, joints))
@@ -176,25 +184,37 @@ class Example:
 
         self.root_body = self.bodies[0]
         self.tip_body = self.bodies[-1]
-        if self.solver_type == "vbd":
-            for body in (self.root_body, self.tip_body):
-                builder.body_mass[body] = 0.0
-                builder.body_inv_mass[body] = 0.0
-                builder.body_inertia[body] = wp.mat33(0.0)
-                builder.body_inv_inertia[body] = wp.mat33(0.0)
-        builder.add_articulation(self.joints, label="plectoneme_articulation")
         if self.solver_type == "kamino":
+            builder.add_articulation(self.joints, label="plectoneme_articulation")
             # Kamino simulates massless bodies, so it drives kinematic anchors
             # with loop-closing welds to the endpoints
             self.root_anchor, self.tip_anchor = (
                 self._add_kinematic_anchor(builder, body) for body in (self.root_body, self.tip_body)
             )
+        else:
+            for body in (self.root_body, self.tip_body):
+                self.clamps.pin(builder, body, moving=(body == self.root_body))
+            if not self.clamps.steel:
+                builder.add_articulation(self.joints, label="plectoneme_articulation")
 
-        builder.color()
+        self.clamps.finish(builder)
+        builder, self.world_count, expand = cable_solver.replicate_worlds(builder, args, self.clamps, ground=False)
+        if not self.clamps.steel:
+            builder.color()
         self.model = builder.finalize()
+        self.root_bodies = wp.array(expand([self.root_body]), dtype=int, device=self.model.device)
+        self.tip_bodies = wp.array(expand([self.tip_body]), dtype=int, device=self.model.device)
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="latest")
+        # Contacts per world: the task's peak, 225 contacts, under Steel and VBD, with a quarter on top.
+        self.contacts_per_world = cable_solver.contact_budget(self.model, 3.5)
+        # VBD's contact history reads latest matching (sorted contacts); native Steel's warm start needs only the
+        # key-sorted match (cable_solver.pipeline_options).
+        matching = cable_solver.pipeline_options(args) if self.clamps.steel else {"contact_matching": "latest"}
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model, rigid_contact_max=self.contacts_per_world * self.model.world_count, **matching
+        )
         self.contacts = self.collision_pipeline.contacts()
+        self.clamps.bind(self.model)
         if self.solver_type == "kamino":
             config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
             config.use_collision_detector = False
@@ -202,8 +222,11 @@ class Example:
             config.lox.projected_twist_fraction = 1.0
             self.solver = newton.solvers.SolverKamino(self.model, config=config)
         else:
-            self.solver = newton.solvers.SolverVBD(
+            self.solver = cable_solver.make_solver(
                 self.model,
+                args,
+                contacts=self.contacts_per_world,
+                contact_rows=3 * self.contacts_per_world + 6 * len(self.clamps.bodies) // self.world_count,
                 iterations=self.sim_iterations,
                 rigid_contact_history=True,
                 rigid_body_contact_buffer_size=1024,
@@ -223,13 +246,16 @@ class Example:
         # Symmetry-breaking seed at the mid body.
         mid = self.NUM_ELEMENTS // 2
         body_q_np = self.state_0.body_q.numpy()
-        body_q_np[self.bodies[mid], 1] += self.SEED_BODY_OFFSET_Y
+        body_q_np[expand([self.bodies[mid]]), 1] += self.SEED_BODY_OFFSET_Y
         self.state_0.body_q.assign(body_q_np)
         self.state_1.body_q.assign(body_q_np)
+        if self.clamps.steel:
+            for state in (self.state_0, self.state_1):
+                newton.eval_ik(self.model, state, state.joint_q, state.joint_qd)
 
         # End-to-end twist angle, kept in a device array so the simulate() loop
         # can be captured into a CUDA graph and replayed with a host update.
-        self.twist_angle = wp.array([0.0], dtype=wp.float32, device=self.model.device)
+        self.twist_angle = wp.zeros(self.sim_substeps, dtype=wp.float32, device=self.model.device)
         # End-to-end twist rate over the current frame, which drives the Kamino endpoints.
         self.twist_rate = wp.array([0.0], dtype=wp.float32, device=self.model.device)
 
@@ -284,7 +310,7 @@ class Example:
             return self.target_twist * a
         return self.target_twist
 
-    def _apply_command(self) -> None:
+    def _apply_command(self, substep: int) -> None:
         if self.solver_type == "kamino":
             wp.launch(
                 _drive_endpoint_velocities_kernel,
@@ -296,17 +322,18 @@ class Example:
             return
         wp.launch(
             _drive_endpoints_kernel,
-            dim=1,
+            dim=self.world_count,
             inputs=[
-                self.root_body,
-                self.tip_body,
+                self.root_bodies,
+                self.tip_bodies,
                 wp.vec3(*self.root_rest_pos),
                 wp.vec3(*self.tip_rest_pos),
                 self.root_rest_rot,
                 self.tip_rest_rot,
                 self.twist_angle,
+                substep,
             ],
-            outputs=[self.state_0.body_q, self.state_1.body_q],
+            outputs=self.clamps.pose_buffers(self.state_0, self.state_1),
             device=self.model.device,
         )
 
@@ -323,9 +350,10 @@ class Example:
             self.graph = None
 
     def simulate(self) -> None:
-        for _ in range(self.sim_substeps):
-            self._apply_command()
+        for substep in range(self.sim_substeps):
+            self._apply_command(substep)
             self.state_0.clear_forces()
+            self.clamps.update(self.state_0, self.sim_dt)
             self.viewer.apply_forces(self.state_0)
             self.collision_pipeline.collide(self.state_0, self.contacts)
             if self.solver_type == "vbd":
@@ -334,11 +362,13 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        # The twist ramp is smooth, so a single per-frame angle (held across the
-        # frame's substeps) is sufficient and lets the substep loop be a graph.
-        angle = self._command(self.sim_time)
-        self.twist_angle.assign(np.array([angle], dtype=np.float32))
-        rate = (self._command(self.sim_time + self.frame_dt) - angle) / self.frame_dt
+        # Resolve the angular velocity of the prescribed roots at the solver cadence.
+        if self.clamps.steel:
+            angles = [self._command(self.sim_time + j * self.sim_dt) for j in range(self.sim_substeps)]
+        else:
+            angles = [self._command(self.sim_time)] * self.sim_substeps
+        self.twist_angle.assign(np.asarray(angles, dtype=np.float32))
+        rate = (self._command(self.sim_time + self.frame_dt) - angles[0]) / self.frame_dt
         self.twist_rate.assign(np.array([rate], dtype=np.float32))
         if self.graph is not None:
             wp.capture_launch(self.graph)
@@ -356,6 +386,7 @@ class Example:
     # Test
     # ------------------------------------------------------------------
     def test_final(self):
+        cable_solver.check_capacity(self.solver)
         body_q = self.state_0.body_q.numpy()
         body_qd = self.state_0.body_qd.numpy()
 
@@ -367,8 +398,8 @@ class Example:
 
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
-    parser.add_argument("--solver", choices=["vbd", "kamino"], default="vbd", help="Cable dynamics solver.")
+    parser = cable_solver.create_parser(extra_solvers=("kamino",))
+    cable_solver.add_world_count_arg(parser)
     parser.add_argument("--iterations", dest="iterations", type=int, default=None)
     parser.add_argument("--substeps", dest="substeps", type=int, default=None)
     parser.set_defaults(num_frames=int(Example.FPS * Example.TOTAL_TIME))

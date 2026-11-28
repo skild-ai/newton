@@ -205,7 +205,9 @@ class JointType(IntEnum):
 
     ROD = 7
     """Rod joint: 7-coordinate relative pose and 6-DoF relative
-    twist with stretch, shear, bend, and twist response."""
+    twist with stretch, shear, bend, and twist response. An inextensible rod joint has only its three angular
+    axes: a 4-coordinate quaternion and 3-DoF relative angular velocity at the junction, with bend and twist
+    response; stretch and shear are not degrees of freedom at all."""
 
     def dof_count(self, num_axes: int) -> tuple[int, int]:
         """
@@ -224,11 +226,17 @@ class JointType(IntEnum):
             - For PRISMATIC and REVOLUTE joints, both values are 1 (single axis).
             - For BALL joints, dof_count is 3 (angular velocity), coord_count is 4 (quaternion).
             - For FREE, DISTANCE, and ROD joints, dof_count is 6 (3 translation + 3 rotation), coord_count is 7 (3 position + 4 quaternion).
+            - For an inextensible ROD joint (three angular axes, no linear ones), dof_count is 3 and coord_count is 4,
+              as for a BALL joint.
             - For FIXED joints, both values are 0.
         """
         dof_count = num_axes
         coord_count = num_axes
         if self == JointType.BALL:
+            dof_count = 3
+            coord_count = 4
+        elif self == JointType.ROD and num_axes == 3:
+            # An inextensible rod joint: bend and twist only, a quaternion at the junction.
             dof_count = 3
             coord_count = 4
         elif self == JointType.FREE or self == JointType.DISTANCE or self == JointType.ROD:
@@ -256,6 +264,8 @@ class JointType(IntEnum):
         """
         cts_count = 6 - num_axes
         if self == JointType.BALL:
+            cts_count = 3
+        elif self == JointType.ROD and num_axes == 3:
             cts_count = 3
         elif self == JointType.FREE or self == JointType.DISTANCE or self == JointType.ROD:
             cts_count = 0

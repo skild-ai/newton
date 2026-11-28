@@ -37,6 +37,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 from newton.examples.vbd._viewer import node_xyz, set_viewer_camera
 
 
@@ -61,8 +62,7 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 10
-        self.sim_iterations = 20
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 20, propagation=(2, 4))
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.cable_length = self.NUM_ELEMENTS * self.SEGMENT_LENGTH
@@ -101,6 +101,7 @@ class Example:
             )
             # Zero mass + zero inertia in Newton's VBD makes the root kinematic.
             root_body = rod_bodies[0]
+            builder.body_flags[root_body] = int(newton.BodyFlags.KINEMATIC)
             builder.body_mass[root_body] = 0.0
             builder.body_inv_mass[root_body] = 0.0
             builder.body_inertia[root_body] = wp.mat33(0.0)
@@ -108,10 +109,11 @@ class Example:
 
             self.tip_bodies.append(int(rod_bodies[-1]))
 
-        builder.color()
+        if getattr(args, "solver", "vbd") == "vbd":
+            builder.color()
         self.model = builder.finalize()
 
-        self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations)
+        self.solver = cable_solver.make_solver(self.model, args, self.sim_iterations)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -201,6 +203,7 @@ class Example:
         return out
 
     def test_final(self):
+        cable_solver.check_capacity(self.solver)
         states = self._measured_tip_state()
         deflections = [s[0] for s in states]
         dispx = [s[1] for s in states]
@@ -238,7 +241,7 @@ class Example:
 
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
+    parser = cable_solver.create_parser()
     parser.set_defaults(num_frames=int(60 * (Example.RAMP_TIME + Example.HOLD_TIME)) + 30)
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

@@ -22,10 +22,9 @@ class _SleepState:
             if not math.isfinite(value) or value <= 0:
                 raise ValueError("Sleeping thresholds and quiet time must be finite and positive")
         model = solver.model
-        if model.requires_grad or model.particle_count or solver._contact_warmstart or solver._velocity_iterations:
+        if model.requires_grad or model.particle_count or solver._velocity_iterations:
             raise ValueError(
-                "Experimental sleeping requires a rigid, non-differentiable model without warm start or "
-                "velocity-only iterations"
+                "Experimental sleeping requires a rigid, non-differentiable model without velocity-only iterations"
             )
         if model.articulation_count == 0:
             raise ValueError("Experimental sleeping requires at least one articulation")
@@ -116,6 +115,12 @@ class _SleepState:
             device=device,
         )
         self.dof_art = wp.array(dof_art, dtype=int, device=device)
+        # A rod joint stores its bend, twist and stretch material as target gains; those are passive elasticity
+        # with a fixed rest shape, not a drive, so they do not keep the articulation awake.
+        drive_dof = np.ones(model.joint_dof_count, dtype=np.int32)
+        for joint in np.flatnonzero(model.joint_type.numpy() == int(JointType.ROD)):
+            drive_dof[qd_start[joint] : qd_start[joint + 1]] = 0
+        self.drive_dof = wp.array(drive_dof, dtype=int, device=device)
         starts = model.articulation_start.numpy()[:-1]
         root_types = model.joint_type.numpy()[starts]
         root_parents = model.joint_parent.numpy()[starts]
@@ -336,6 +341,7 @@ class _SleepState:
                 control.joint_f,
                 model.joint_target_ke,
                 model.joint_target_kd,
+                self.drive_dof,
                 self.solver._passive_spring_stiffness,
                 self.valid,
                 self.root_veto,
@@ -950,13 +956,15 @@ def _input_dofs(
     force: wp.array[float],
     ke: wp.array[float],
     kd: wp.array[float],
+    drive_dof: wp.array[int],
     spring: wp.array[float],
     valid: wp.array[int],
     veto: wp.array[int],
 ):
     i = wp.tid()
     if nodes[i] >= 0:
-        if force[i] != 0.0 or ke[i] != 0.0 or kd[i] != 0.0 or spring[i] != 0.0 or (valid[0] != 0 and qd[i] != last[i]):
+        driven = drive_dof[i] != 0 and (ke[i] != 0.0 or kd[i] != 0.0)
+        if force[i] != 0.0 or driven or spring[i] != 0.0 or (valid[0] != 0 and qd[i] != last[i]):
             wp.atomic_max(veto, parent[nodes[i]], 1)
 
 

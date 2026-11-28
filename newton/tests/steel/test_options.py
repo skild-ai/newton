@@ -1181,7 +1181,7 @@ class TestSteelSolveModeOptions(unittest.TestCase):
             self.assertEqual((solver.solve_mode, solver.articulated_contact_response), ("serial", "immediate"))
             solver = SolverSteel(model, solve_mode="colored", articulated_contact_response="propagation")
             self.assertEqual((solver.solve_mode, solver.articulated_contact_response), ("colored", "propagation"))
-        with self.assertRaisesRegex(ValueError, re.escape("requires articulated_contact_response='propagation'")):
+        with self.assertRaisesRegex(ValueError, "requires a CUDA device"):
             SolverSteel(model, solve_mode="colored", articulated_contact_response="immediate")
         with self.assertRaisesRegex(ValueError, "solve_mode must be 'serial' or 'colored'"):
             SolverSteel(model, solve_mode="dense")

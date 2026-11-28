@@ -5,7 +5,7 @@ import functools
 
 import warp as wp
 
-from .articulation import eval_joint_child_state, eval_joint_motion
+from .articulation import eval_joint_child_state, eval_joint_motion, rod_as_ball
 
 TILE_BLOCK_DIM = 32
 # The kernel stages one wp.transform (28 B) per joint of a level in two
@@ -104,6 +104,7 @@ def create_eval_articulation_fk_tile(level_capacity: int, write_all: bool, has_j
                         qd_start = joint_qd_start[joint]
                         lin_axis_count = joint_dof_dim[joint, 0]
                         ang_axis_count = joint_dof_dim[joint, 1]
+                        type = rod_as_ball(type, lin_axis_count)
                         X_j, v_j = eval_joint_motion(
                             type,
                             q_start,

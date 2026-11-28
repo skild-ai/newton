@@ -29,8 +29,8 @@ from pxr import Usd, UsdGeom
 import newton
 import newton.examples
 import newton.usd
+from newton.examples.cable import solver as cable_solver
 from newton.math import quat_between_vectors_robust
-from newton.solvers import SolverVBD
 
 CONTACT_KE = 1.0e5
 CONTACT_KD = 0.0
@@ -49,6 +49,12 @@ MESH_SDF_MAX_RESOLUTION = 128
 MESH_SDF_NARROW_BAND_RANGE = (-2.0 * SHAPE_CFG.gap, 2.0 * SHAPE_CFG.gap)
 
 PLUG_Y_OFFSET = -0.025
+
+# --insert: (time [s], gizmo y offset from the start [m]) keyframes. -PLUG_Y_OFFSET is fully inserted, and the push
+# aims past it so the gizmo spring seats the plug and snaps the latch; the last key pulls back against the latch.
+INSERT_PUSH = -PLUG_Y_OFFSET + 0.015
+INSERT_KEYS = ((0.3, 0.0), (1.8, INSERT_PUSH), (2.6, INSERT_PUSH), (3.4, 0.0))
+INSERT_LATCHED_TOL = 0.002  # [m] the plug may back out this far against the latch
 
 CABLE_RADIUS = 0.00325
 CABLE_KINEMATIC_COUNT = 4  # first N rod bodies are inside the plug and follow it
@@ -75,8 +81,8 @@ def _apply_gizmo_force(
     stiffness: float,
     damping: float,
     pick_body: wp.array[int],
-    plug_idx: int,
-    latch_idx: int,
+    plug_ids: wp.array[int],
+    latch_ids: wp.array[int],
     gravity: wp.vec3,
 ):
     """Apply forces based on interaction mode.
@@ -85,8 +91,10 @@ def _apply_gizmo_force(
       * ``>= 0`` -- viewer is picking that body index (damping only on others)
       * ``< 0``  -- spring toward ``pick_target[0]``
 
-    Also cancels gravity for the plug and latch so only the cable sags.
+    Also cancels gravity for the plug and latch so only the cable sags. One thread per world.
     """
+    plug_idx = plug_ids[wp.tid()]
+    latch_idx = latch_ids[wp.tid()]
     # Cancel gravity for plug and latch unconditionally.
     anti_g0 = -gravity * body_mass[plug_idx]
     anti_g1 = -gravity * body_mass[latch_idx]
@@ -126,23 +134,26 @@ def _apply_gizmo_force(
 
 @wp.kernel
 def _sync_cable_anchors(
+    source: wp.array[wp.transform],
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
-    plug_idx: int,
+    plug_ids: wp.array[int],
+    anchors_per_world: int,
     anchor_indices: wp.array[int],
     anchor_offsets: wp.array[wp.vec3],
     anchor_rotations: wp.array[wp.quat],
 ):
-    """Copy the plug transform into kinematic cable bodies."""
+    """Copy each world's plug transform into its kinematic cable bodies."""
     tid = wp.tid()
-    plug_tf = body_q[plug_idx]
+    plug_tf = source[plug_ids[tid // anchors_per_world]]
     plug_pos = wp.transform_get_translation(plug_tf)
     plug_rot = wp.transform_get_rotation(plug_tf)
     idx = anchor_indices[tid]
     anchor_world = plug_pos + wp.quat_rotate(plug_rot, anchor_offsets[tid])
     cable_rot = wp.normalize(wp.mul(plug_rot, anchor_rotations[tid]))
     body_q[idx] = wp.transform(anchor_world, cable_rot)
-    body_qd[idx] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    if body_qd:
+        body_qd[idx] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 @wp.kernel
@@ -233,10 +244,16 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 6
+        # Native Steel's propagation response holds the latch at 3 substeps of 8 sweeps as at 6 of 12 (the plug backs
+        # out 0.34 mm against a 2 mm tolerance either way).
+        self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 6, 12, propagation=(3, 8))
         self.sim_dt = self.frame_dt / self.sim_substeps
 
+        self.clamps = cable_solver.CableClamps(args)
         self.viewer = viewer
+        # Script the gizmo: insert the plug, then pull it back against the latch.
+        self.insert = bool(getattr(args, "insert", False))
+        self._latch_deflection_min = 0.0
         self.pick_stiffness = 50.0
         self.pick_damping = 10.0
 
@@ -247,10 +264,9 @@ class Example:
         plug_mesh, pc = _load_mesh(stage, "/World/Plug")
         latch_mesh, lc = _load_mesh(stage, "/World/Latch")
 
+        # One world's scene; it is replicated into ``--world-count`` worlds below.
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         builder.rigid_gap = 0.005
-
-        builder.add_ground_plane()
 
         # Socket (static body)
         socket_shape = builder.add_shape_mesh(
@@ -345,10 +361,7 @@ class Example:
 
         # Lock the kinematic prefix and the far cable end.
         for idx in (*rod_bodies[:CABLE_KINEMATIC_COUNT], rod_bodies[-1]):
-            builder.body_mass[idx] = 0.0
-            builder.body_inv_mass[idx] = 0.0
-            builder.body_inertia[idx] = wp.mat33(0.0)
-            builder.body_inv_inertia[idx] = wp.mat33(0.0)
+            self.clamps.pin(builder, idx, moving=(idx != rod_bodies[-1]))
 
         anchor_body_ids = tuple(rod_bodies[:CABLE_KINEMATIC_COUNT])
         anchor_offsets = tuple(
@@ -356,12 +369,31 @@ class Example:
         )
         anchor_rots = tuple(cable_quats[i] for i in range(CABLE_KINEMATIC_COUNT))
 
-        builder.color()
-        self.model = builder.finalize()
+        self.clamps.finish(builder)
+        template = builder
+        self.world_count = max(1, int(getattr(args, "world_count", 1)))
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        builder.rigid_gap = template.rigid_gap
+        builder.add_ground_plane()
+        builder.replicate(template, copy_count=self.world_count)
+        stride = template.body_count
+        self.clamps.replicate(self.world_count, stride, template.joint_count, template.articulation_count)
 
-        self._cable_anchor_indices = wp.array(anchor_body_ids, dtype=int, device=self.model.device)
-        self._cable_anchor_offsets = wp.array(anchor_offsets, dtype=wp.vec3, device=self.model.device)
-        self._cable_anchor_rotations = wp.array(anchor_rots, dtype=wp.quat, device=self.model.device)
+        def expand(ids):
+            return [w * stride + i for w in range(self.world_count) for i in ids]
+
+        if not self.clamps.steel:
+            builder.color()
+        self.model = builder.finalize()
+        device = self.model.device
+
+        # World 0's plug and latch, which the gizmo and the viewer follow, and every world's.
+        self._plug_ids = wp.array(expand([self._plug_body]), dtype=int, device=device)
+        self._latch_ids = wp.array(expand([self._latch_body]), dtype=int, device=device)
+        self._cable_anchor_count = len(anchor_body_ids)
+        self._cable_anchor_indices = wp.array(expand(anchor_body_ids), dtype=int, device=device)
+        self._cable_anchor_offsets = wp.array(anchor_offsets * self.world_count, dtype=wp.vec3, device=device)
+        self._cable_anchor_rotations = wp.array(anchor_rots * self.world_count, dtype=wp.quat, device=device)
 
         # Endpoint alignment: include the last kinematic body so it aims toward
         # the first dynamic body's start endpoint after deformation. The
@@ -374,12 +406,12 @@ class Example:
             wp.vec3(0.0, 0.0, -0.5 * float(wp.length(cable_points[i + 2] - cable_points[i + 1])))
             for i in range(align_start, len(rod_bodies) - 1)
         )
-        self._cable_align_indices = wp.array(align_bodies, dtype=int, device=self.model.device)
-        self._cable_align_next = wp.array(align_next, dtype=int, device=self.model.device)
+        self._cable_align_indices = wp.array(expand(align_bodies), dtype=int, device=device)
+        self._cable_align_next = wp.array(expand(align_next), dtype=int, device=device)
         self._cable_align_next_start_offsets = wp.array(
-            align_next_start_offsets, dtype=wp.vec3, device=self.model.device
+            align_next_start_offsets * self.world_count, dtype=wp.vec3, device=device
         )
-        self._cable_align_count = len(align_bodies)
+        self._cable_align_count = len(align_bodies) * self.world_count
 
         self.viewer.set_model(self.model)
         self.viewer.picking_enabled = True
@@ -394,14 +426,28 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        # Contacts per world: the task's peak, 297 contacts while the plug is inserted, under Steel and VBD, with a quarter on top.
+        self.contacts_per_world = cable_solver.contact_budget(self.model, 10)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            rigid_contact_max=self.contacts_per_world * self.model.world_count,
+            **cable_solver.pipeline_options(args),
+        )
         self.contacts = self.collision_pipeline.contacts()
 
         self._initial_body_q = self.state_0.body_q.numpy().copy()
 
-        self.solver = SolverVBD(
+        self.clamps.bind(self.model)
+        self.solver = cable_solver.make_solver(
             self.model,
-            iterations=12,
+            args,
+            enable_joint_limits=True,
+            # Per world: three rows per budgeted contact, six per clamped body and one limit row per DOF.
+            contacts=self.contacts_per_world,
+            contact_rows=3 * self.contacts_per_world
+            + 6 * len(self.clamps.bodies) // self.world_count
+            + self.model.joint_dof_count // max(self.model.world_count, 1),
+            iterations=self.sim_iterations,
             rigid_body_contact_buffer_size=256,
         )
 
@@ -424,7 +470,7 @@ class Example:
             self.state_0.clear_forces()
             wp.launch(
                 kernel=_apply_gizmo_force,
-                dim=1,
+                dim=self.world_count,
                 inputs=(
                     self.state_0.body_q,
                     self.state_0.body_qd,
@@ -434,8 +480,8 @@ class Example:
                     self.pick_stiffness,
                     self.pick_damping,
                     self._pick_body,
-                    self._plug_body,
-                    self._latch_body,
+                    self._plug_ids,
+                    self._latch_ids,
                     self._gravity,
                 ),
                 device=self.model.device,
@@ -447,36 +493,45 @@ class Example:
             # correct anchor positions and rest-relative rotations.
             wp.launch(
                 kernel=_sync_cable_anchors,
-                dim=CABLE_KINEMATIC_COUNT,
+                dim=CABLE_KINEMATIC_COUNT * self.world_count,
                 inputs=(
                     self.state_0.body_q,
-                    self.state_0.body_qd,
-                    self._plug_body,
+                    self.clamps.targets if self.clamps.steel else self.state_0.body_q,
+                    None if self.clamps.steel else self.state_0.body_qd,
+                    self._plug_ids,
+                    self._cable_anchor_count,
                     self._cable_anchor_indices,
                     self._cable_anchor_offsets,
                     self._cable_anchor_rotations,
                 ),
                 device=self.model.device,
             )
+            self.clamps.update(self.state_0, self.sim_dt)
             self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
             # Snap each capsule's +Z to the next capsule's start endpoint so
             # collision/render geometry follows the deformed centerline.
-            wp.launch(
-                kernel=_align_cable_orientations,
-                dim=self._cable_align_count,
-                inputs=(
-                    self.state_0.body_q,
-                    self._cable_align_indices,
-                    self._cable_align_next,
-                    self._cable_align_next_start_offsets,
-                ),
-                device=self.model.device,
-            )
+            if not self.clamps.steel:
+                wp.launch(
+                    kernel=_align_cable_orientations,
+                    dim=self._cable_align_count,
+                    inputs=(
+                        self.state_0.body_q,
+                        self._cable_align_indices,
+                        self._cable_align_next,
+                        self._cable_align_next_start_offsets,
+                    ),
+                    device=self.model.device,
+                )
 
     def step(self):
+        if self.insert:
+            dy = float(np.interp(self.sim_time, *zip(*INSERT_KEYS, strict=True)))
+            self.gizmo_tf = wp.transform(
+                wp.vec3(self._rest_pos[0], self._rest_pos[1] + dy, self._rest_pos[2]), wp.quat_identity()
+            )
         gp = wp.transform_get_translation(self.gizmo_tf)
 
         picking = getattr(self.viewer, "picking", None)
@@ -492,13 +547,27 @@ class Example:
 
         self.sim_time += self.frame_dt
 
-        counts = self.solver.body_body_contact_counts.numpy()
-        buf = self.solver.body_body_contact_buffer_pre_alloc
-        overflow = np.where(counts > buf)[0]
-        if len(overflow):
-            for i in overflow:
-                label = self.model.body_label[i] if hasattr(self.model, "body_label") else i
-                print(f"[contact overflow] body {label} (idx={i}): {counts[i]} contacts (buffer={buf})")
+        if not self.clamps.steel:
+            counts = self.solver.body_body_contact_counts.numpy()
+            buf = self.solver.body_body_contact_buffer_pre_alloc
+            overflow = np.where(counts > buf)[0]
+            if len(overflow):
+                for i in overflow:
+                    label = self.model.body_label[i] if hasattr(self.model, "body_label") else i
+                    print(f"[contact overflow] body {label} (idx={i}): {counts[i]} contacts (buffer={buf})")
+
+        if self.insert:
+            # Hinge angle about -X from the body poses; the plug cannot rotate.
+            body_q = self.state_0.body_q.numpy()
+            plug = body_q[self._plug_ids.numpy()]
+            latch = body_q[self._latch_ids.numpy()]
+            plug_qx, plug_qw = plug[:, 3], plug[:, 6]
+            latch_qx, latch_qw = latch[:, 3], latch[:, 6]
+            latch_angle = -2.0 * np.arctan2(
+                latch_qx * plug_qw - latch_qw * plug_qx, latch_qw * plug_qw + latch_qx * plug_qx
+            )
+            self._latch_deflection_min = np.minimum(self._latch_deflection_min, latch_angle)
+            return
 
         # Snap gizmo to the plug when the user isn't dragging it.
         gizmo_active = bool(getattr(self.viewer, "gizmo_is_using", False))
@@ -518,14 +587,35 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
+        cable_solver.check_capacity(self.solver)
         body_q = self.state_0.body_q.numpy()
         initial_q = self._initial_body_q
         for i in range(len(body_q)):
             assert np.all(np.isfinite(body_q[i])), f"Body {i} has non-finite transform"
             drift = np.linalg.norm(body_q[i] - initial_q[i])
             assert drift < 1.0, f"Body {i} drifted {drift:.4f} from initial transform"
+        if self.insert and self.sim_time >= INSERT_KEYS[-1][0]:
+            backed_out = -PLUG_Y_OFFSET - (body_q[self._plug_ids.numpy(), 1] - self._rest_pos[1])
+            world = int(np.argmax(backed_out))
+            assert backed_out[world] < INSERT_LATCHED_TOL, (
+                f"world {world}: plug backed out {backed_out[world] * 1e3:.1f} mm: the latch did not hold"
+            )
+            deflection = np.broadcast_to(self._latch_deflection_min, (self.world_count,))
+            world = int(np.argmax(deflection))
+            assert deflection[world] < -0.05, f"world {world}: latch never deflected (min {deflection[world]:.3f} rad)"
+
+    @staticmethod
+    def create_parser():
+        parser = cable_solver.create_parser()
+        newton.examples.add_world_count_arg(parser)
+        parser.add_argument(
+            "--insert",
+            action="store_true",
+            help="Script the gizmo: insert the plug, then pull it back against the latch.",
+        )
+        return parser
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    viewer, args = newton.examples.init(Example.create_parser())
     newton.examples.run(Example(viewer, args), args)

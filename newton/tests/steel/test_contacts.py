@@ -137,6 +137,7 @@ def _launch_contact_allocator(
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
+            wp.zeros((1,), dtype=wp.float32, device=device),
             0,
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
@@ -214,6 +215,7 @@ def _launch_articulation_pair_contact_allocator(
             _friction_threshold(enable_friction, friction_gap),
             _disabled_patches(device),
             0,
+            wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
             0,
@@ -440,6 +442,7 @@ def _launch_dense_contact_builders(
             body_q,
             patches,
             *anchors,
+            0,
         ],
         outputs=[serial],
         device=device,
@@ -514,6 +517,7 @@ def _launch_dense_contact_builders(
             0,  # restitution_combine
             None,
             wp.full((3,), wp.inf, dtype=wp.float32, device=device),
+            wp.zeros((2,), dtype=wp.float32, device=device),  # articulated_mu_rolling
         ],
         outputs=list(metadata.values()),
         device=device,

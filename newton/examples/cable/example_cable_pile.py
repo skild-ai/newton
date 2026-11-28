@@ -15,6 +15,7 @@ Success criteria:
 
 Runs:
 - `python -m newton.examples cable_pile`
+- `python -m newton.examples cable_pile --solver steel --solve-mode colored --device cuda:0`
 """
 
 import math
@@ -24,6 +25,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 
 
 class Example:
@@ -45,8 +47,10 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 2 if self.solver_type == "kamino" else 10
-        self.sim_iterations = 5
+        if self.solver_type == "kamino":
+            self.sim_substeps, self.sim_iterations = 2, 5
+        else:
+            self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 10, 5, propagation=(5, 12))
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         # Cable pile parameters
@@ -164,11 +168,23 @@ class Example:
                     label=f"cable_l{layer}_{lane}",
                 )
 
-        builder.color()
+        if getattr(args, "solver", "vbd") == "vbd":
+            builder.color()
 
         self.model = builder.finalize()
         # Size persistent contact history before graph capture.
-        self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="sticky")
+        # Contacts per world: the task's peak, 2,873 contacts, under Steel and VBD, with a quarter on top.
+        self.contacts_per_world = cable_solver.contact_budget(self.model, 0.9)
+        # VBD's contact history reads sticky matching (sorted contacts); native Steel's warm start needs only the
+        # key-sorted match (cable_solver.pipeline_options).
+        matching = (
+            cable_solver.pipeline_options(args)
+            if getattr(args, "solver", "vbd") == "steel"
+            else {"contact_matching": "sticky"}
+        )
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model, rigid_contact_max=self.contacts_per_world * self.model.world_count, **matching
+        )
         self.contacts = self.collision_pipeline.contacts()
 
         if self.solver_type == "kamino":
@@ -176,8 +192,14 @@ class Example:
             config.use_collision_detector = False
             self.solver = newton.solvers.SolverKamino(self.model, config=config)
         else:
-            self.solver = newton.solvers.SolverVBD(
+            self.solver = cable_solver.make_solver(
                 self.model,
+                args,
+                # Three rows (normal and two tangents) per contact of the world's budget.
+                contacts=self.contacts_per_world,
+                contact_rows=3 * self.contacts_per_world,
+                # A cable touching itself: the task's peak, 5 contacts, with room to spare.
+                same_articulation_contacts=32,
                 iterations=self.sim_iterations,
                 rigid_body_contact_buffer_size=256,
                 rigid_contact_history=True,
@@ -234,6 +256,7 @@ class Example:
 
     def test_final(self):
         """Test cable pile simulation for stability and correctness (called after simulation)."""
+        cable_solver.check_capacity(self.solver)
         cable_radius = 0.012
         cable_diameter = 2.0 * cable_radius
 
@@ -265,7 +288,5 @@ class Example:
 
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
-    parser.add_argument("--solver", choices=["vbd", "kamino"], default="vbd", help="Cable dynamics solver.")
-    viewer, args = newton.examples.init(parser)
+    viewer, args = newton.examples.init(cable_solver.create_parser(extra_solvers=("kamino",)))
     newton.examples.run(Example(viewer, args), args)

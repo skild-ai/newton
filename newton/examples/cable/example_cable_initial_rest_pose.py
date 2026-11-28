@@ -29,6 +29,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.cable import solver as cable_solver
 
 
 def _create_helix_points(
@@ -59,8 +60,11 @@ class Example:
 
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 2 if self.solver_type == "kamino" else 5
-        self.sim_iterations = 5
+        if self.solver_type == "kamino":
+            self.sim_substeps, self.sim_iterations = 2, 5
+        else:
+            # Native Steel: two substeps of eight sweeps relax both cables to the same shapes as four of eight.
+            self.sim_substeps, self.sim_iterations = cable_solver.budget(args, 5, 5, propagation=(2, 8))
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
 
@@ -136,10 +140,22 @@ class Example:
         self.cable_bodies = [left_bodies, right_bodies]
 
         builder.add_ground_plane()
-        builder.color(balance_colors=False)
+        if getattr(args, "solver", "vbd") == "vbd":
+            builder.color(balance_colors=False)
         self.model = builder.finalize(device=args.device)
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="latest")
+        # Contacts per world: the task's peak, 704 contacts, under Steel and VBD, with a quarter on top.
+        self.contacts_per_world = cable_solver.contact_budget(self.model, 7.5)
+        # VBD's contact history reads latest matching (sorted contacts); native Steel's warm start needs only the
+        # key-sorted match (cable_solver.pipeline_options).
+        matching = (
+            cable_solver.pipeline_options(args)
+            if getattr(args, "solver", "vbd") == "steel"
+            else {"contact_matching": "latest"}
+        )
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model, rigid_contact_max=self.contacts_per_world * self.model.world_count, **matching
+        )
         self.contacts = self.collision_pipeline.contacts()
         if self.solver_type == "kamino":
             use_scc = self.kamino_backend == "scc"
@@ -160,9 +176,14 @@ class Example:
                 config.scc.bilateral_solve_interval = 1
             self.solver = newton.solvers.SolverKamino(self.model, config=config)
         else:
-            self.solver = newton.solvers.SolverVBD(
+            self.solver = cable_solver.make_solver(
                 self.model,
-                iterations=self.sim_iterations,
+                args,
+                self.sim_iterations,
+                contacts=self.contacts_per_world,
+                contact_rows=3 * self.contacts_per_world,
+                # A cable touching itself: the task's peak, 606 contacts, with a quarter on top.
+                same_articulation_contacts=768,
             )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -223,6 +244,7 @@ class Example:
 
     def test_final(self):
         """Verify both cable simulations remain finite and bounded."""
+        cable_solver.check_capacity(self.solver)
         body_q = self.state_0.body_q.numpy()
         body_qd = self.state_0.body_qd.numpy()
         body_indices = [body for cable_bodies in self.cable_bodies for body in cable_bodies]
@@ -233,8 +255,7 @@ class Example:
 
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
-    parser.add_argument("--solver", choices=["vbd", "kamino"], default="vbd", help="Cable dynamics solver.")
+    parser = cable_solver.create_parser(extra_solvers=("kamino",))
     parser.add_argument(
         "--kamino-backend", choices=["lox", "scc", "padmm"], default="lox", help="Kamino dynamics solver backend."
     )

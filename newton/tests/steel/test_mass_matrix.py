@@ -42,6 +42,7 @@ def test_warp_reduction_matches_scalar_branched_trees(test, device):
             wp.ones(2, dtype=wp.int32, device=device),
             joint_ancestor,
             joint_child,
+            None,
             body_inertia,
             wp.ones(1, dtype=wp.int32, device=device),
             0,
