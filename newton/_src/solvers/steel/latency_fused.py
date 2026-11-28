@@ -40,10 +40,14 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_TORSION,
     WARP_DETERMINISM_OFF,
+    _response_apply,
+    contact_response,
+    contact_unit_row,
     momentum_beta,
     momentum_step_native,
     next_momentum_age,
     propagation_momentum_apply_row,
+    propagation_row_unit,
 )
 
 # Tree groups one fused kernel can carry, one warp each.
@@ -270,6 +274,22 @@ class SplitSweep:
     history: wp.array2d[wp.vec2]
     age: wp.array[int]
     anchor_sq: wp.array[float]
+    # Rod trees (``rods``): their links' twists follow the tree propagation, which installs the impulses pending on
+    # each body, so the step adds each propagation row's move to its rod bodies' pending impulses (and its twist
+    # estimate) instead of extrapolating their twists. ``rod_body`` flags the rod trees' bodies.
+    rod_body: wp.array[int]
+    prop_body_a: wp.array2d[int]
+    prop_body_b: wp.array2d[int]
+    prop_J_a: wp.array3d[float]
+    prop_J_b: wp.array3d[float]
+    prop_MiJt_a: wp.array3d[float]
+    prop_MiJt_b: wp.array3d[float]
+    row_contact: wp.array2d[int]
+    contact_units: wp.array[float]
+    contact_unit_response: wp.array[int]
+    contact_responses: wp.array[float]
+    response_split: wp.array3d[float]
+    body_impulses: wp.array2d[float]
 
 
 @wp.struct
@@ -390,8 +410,70 @@ def _update_rows(
         h.history[world, offset + i] = wp.vec2(x, e)
 
 
+@wp.func
+def _rod_inject_add(h: SplitSweep, body: int, impulse: wp.spatial_vector, twist: wp.spatial_vector):
+    if body >= 0:
+        if h.rod_body[body] != 0:
+            for k in range(6):
+                wp.atomic_add(h.twist, body, k, twist[k])
+                wp.atomic_add(h.body_impulses, body, k, impulse[k])
+
+
+@wp.func
+def _rod_inject_row(world: int, i: int, offset: int, h: SplitSweep):
+    """Add row ``i``'s move (its history's second entry) to the pending impulses and twists of its rod bodies.
+
+    The step moved the row's impulse by ``e``; a rod body's twist is ``v0 + R lambda`` installed by the tree
+    propagation from its pending impulses, so adding ``J^T e`` there makes the propagation install exactly the
+    extrapolated twist ``v + beta (v - v_prev)``. A contact unit's three rows move together on its first row.
+    """
+    rc = propagation_row_unit(h.row_contact, world, i)
+    ba = h.prop_body_a[world, i]
+    bb = h.prop_body_b[world, i]
+    if rc >= 0:
+        if (rc & 3) != 0:
+            return
+        p = rc >> 2
+        slot = h.contact_unit_response[p]
+        pa = wp.spatial_vector()
+        pb = wp.spatial_vector()
+        va = wp.spatial_vector()
+        vb = wp.spatial_vector()
+        for r in range(3):
+            e = h.history[world, offset + i + r][1]
+            pa += contact_unit_row(h.contact_units, p, r, 0) * e
+            pb += contact_unit_row(h.contact_units, p, r, 1) * e
+            if slot >= 0:
+                va += contact_response(h.contact_responses, slot, r, 0) * e
+                vb += contact_response(h.contact_responses, slot, r, 1) * e
+        if slot < 0:
+            if ba >= 0:
+                va = _response_apply(h.response_split, ba, pa)
+            if bb >= 0:
+                vb = _response_apply(h.response_split, bb, pb)
+        _rod_inject_add(h, ba, pa, va)
+        _rod_inject_add(h, bb, pb, vb)
+        return
+    e = h.history[world, offset + i][1]
+    if e == 0.0:
+        return
+    pa = wp.spatial_vector()
+    pb = wp.spatial_vector()
+    va = wp.spatial_vector()
+    vb = wp.spatial_vector()
+    for k in range(6):
+        pa[k] = h.prop_J_a[world, i, k] * e
+        va[k] = h.prop_MiJt_a[world, i, k] * e
+        pb[k] = h.prop_J_b[world, i, k] * e
+        vb[k] = h.prop_MiJt_b[world, i, k] * e
+    _rod_inject_add(h, ba, pa, va)
+    _rod_inject_add(h, bb, pb, vb)
+
+
 @cache
-def get_split_momentum(warps: int, propagation: bool, torsion: bool, ordered: bool, patch_anchors: bool):
+def get_split_momentum(
+    warps: int, propagation: bool, torsion: bool, ordered: bool, patch_anchors: bool, rods: bool = False
+):
     """Use the owner block to advance the iterate before its first row phase."""
     stride = 32 * warps
 
@@ -489,6 +571,16 @@ def get_split_momentum(warps: int, propagation: bool, torsion: bool, ordered: bo
         _update_rows(world, lane, stride, h.free, free_offset, beta, True, h)
         if wp.static(propagation):
             _update_rows(world, lane, stride, h.prop, prop_offset, beta, False, h)
+            if wp.static(rods):
+                if beta != 0.0:
+                    if wp.static(ordered):
+                        # One thread in row order keeps run-to-run runs bitwise identical.
+                        if lane == 0:
+                            for i in range(wp.min(h.prop.count[world], h.prop.impulses.shape[1])):
+                                _rod_inject_row(world, i, prop_offset, h)
+                    else:
+                        for i in range(lane, wp.min(h.prop.count[world], h.prop.impulses.shape[1]), stride):
+                            _rod_inject_row(world, i, prop_offset, h)
         for i in range(lane, h.dofs.shape[1], stride):
             dof = h.dofs[world, i]
             if dof >= 0:
@@ -500,11 +592,16 @@ def get_split_momentum(warps: int, propagation: bool, torsion: bool, ordered: bo
             start = h.body_start[world]
             for i in range(lane, 6 * (h.body_start[world + 1] - start), stride):
                 body = h.bodies[start + i // 6]
-                axis = i % 6
-                v = h.twist[body, axis]
-                if beta != 0.0:
-                    h.twist[body, axis] = v + beta * (v - h.prev_twist[body, axis])
-                h.prev_twist[body, axis] = v
+                skip = False
+                if wp.static(rods):
+                    # A rod body's move arrives through its pending impulses (above).
+                    skip = h.rod_body[body] != 0
+                if not skip:
+                    axis = i % 6
+                    v = h.twist[body, axis]
+                    if beta != 0.0:
+                        h.twist[body, axis] = v + beta * (v - h.prev_twist[body, axis])
+                    h.prev_twist[body, axis] = v
         if wp.static(warps > 1):
             _block_sync()
         return age
@@ -513,8 +610,10 @@ def get_split_momentum(warps: int, propagation: bool, torsion: bool, ordered: bo
 
 
 @cache
-def get_advance_split_sweep(propagation: bool, torsion: bool, ordered: bool, patch_anchors: bool) -> wp.Kernel:
-    advance = get_split_momentum(1, propagation, torsion, ordered, patch_anchors)
+def get_advance_split_sweep(
+    propagation: bool, torsion: bool, ordered: bool, patch_anchors: bool, rods: bool = False
+) -> wp.Kernel:
+    advance = get_split_momentum(1, propagation, torsion, ordered, patch_anchors, rods)
 
     @wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)
     def advance_split_sweep(histories: wp.array[SplitSweep], iteration: int, friction_transition: bool):
@@ -541,6 +640,7 @@ def get_fused_iteration_kernel(
     momentum: bool = False,
     warps: int = 0,
     split_momentum: bool = False,
+    split_rods: bool = False,
     torsion: bool = False,
     ordered: bool = False,
     patch_anchors: bool = False,
@@ -564,7 +664,9 @@ def get_fused_iteration_kernel(
     block_threads = 32 * (2 + n_slots + int(has_rods))
     momentum_step = momentum_step_native(block_threads) if momentum else None
     # SolverSteel(nesterov_momentum=True): the split sweep's own Nesterov, for solves without rod-tree momentum.
-    advance_momentum = get_split_momentum(warps, True, torsion, ordered, patch_anchors) if split_momentum else None
+    advance_momentum = (
+        get_split_momentum(warps, True, torsion, ordered, patch_anchors, split_rods) if split_momentum else None
+    )
 
     @wp.func(module="unique")
     def row_phase_impl(

@@ -3068,10 +3068,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     f"{', '.join(incompatible)} requires row_schedule='interleaved', got {self._row_schedule!r}"
                 )
         self._articulated_contact_response = articulated_contact_response
-        # Rod trees take their own momentum, stepped with the tree propagation (propagation_momentum), so the
-        # split-sweep Nesterov defaults off for them.
         if nesterov_momentum is None:
-            nesterov_momentum = model.device.is_cuda and not getattr(model, "_has_rod_joints", False)
+            nesterov_momentum = model.device.is_cuda
         self._nesterov_momentum = bool(nesterov_momentum)
         if self._nesterov_momentum and propagation_momentum:
             raise ValueError("nesterov_momentum and propagation_momentum both extrapolate the sweep; enable one")
@@ -7396,6 +7394,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._cpu_mf_gs_v = None
         self._mf_gs_row_phases = False
         self._split_momentum = None
+        self._split_momentum_rods = False
         self._pgs_solve_mf_gs_kernel = None
         self._pgs_solve_mf_gs_kernels = {}
         self._mfgs_pair_cache = False
@@ -7621,12 +7620,29 @@ class SolverSteel(SolverBase, CouplingInterface):
         ordered = propagation and self._propagation_colored and self._ordered_rows
         if ordered:
             h.prop_order = self._color_unit_order.reshape((worlds, self._color_order_stride))
+        # Rod trees take the step through their pending impulses (latency_fused._rod_inject_row).
+        tree_only = self._propagation_rod_trees() if propagation else np.zeros(0, dtype=bool)
+        rods = bool(tree_only.any())
+        if rods:
+            body_art = self._body_to_articulation.numpy()
+            rod_body = np.zeros(len(body_art), dtype=np.int32)
+            rod_body[body_art >= 0] = tree_only[body_art[body_art >= 0]]
+            h.rod_body = wp.array(rod_body, dtype=wp.int32, device=device)
+            h.prop_body_a, h.prop_body_b = self._propagation_body_a, self._propagation_body_b
+            h.prop_J_a, h.prop_J_b = self._propagation_J_a, self._propagation_J_b
+            h.prop_MiJt_a, h.prop_MiJt_b = self._propagation_MiJt_a, self._propagation_MiJt_b
+            h.row_contact = self._propagation_row_contact
+            h.contact_units, h.contact_unit_response = self._contact_units, self._contact_unit_response
+            h.contact_responses = self._contact_responses
+            h.response_split = self._propagation_body_response_split
+            h.body_impulses = self._propagation_body_impulses
+        self._split_momentum_rods = rods
         h.history = wp.empty((worlds, width), dtype=wp.vec2, device=device)
         h.age = wp.empty(worlds, dtype=int, device=device)
         if patch_anchors:
             h.anchor_sq = wp.empty(worlds, device=device)
         self._advance_split_sweep = latency_fused.get_advance_split_sweep(
-            propagation, self._contact_torsion_enabled, ordered, patch_anchors
+            propagation, self._contact_torsion_enabled, ordered, patch_anchors, rods
         )
         self._split_momentum_state = h
         self._split_momentum = wp.array([h], dtype=latency_fused.SplitSweep, device=device)
@@ -12964,9 +12980,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._split_weighted_articulation = wp.array(rod_art, dtype=wp.int32, device=device)
         # Momentum of the sweeps: the previous sweep's impulses, a sweep's starting impulses, the move to install,
         # and each world's Nesterov sequence.
-        momentum = self._propagation_momentum_option
-        if momentum is None:
-            momentum = self._rod_material is not None and not self._nesterov_momentum
+        momentum = bool(self._propagation_momentum_option)
         self._propagation_momentum = bool(momentum)
         momentum_shape = (worlds, rows) if self._propagation_momentum else (1, 1)
         self._momentum_prev = wp.zeros(momentum_shape, dtype=wp.float32, device=device)
@@ -15610,6 +15624,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             warps=block_threads // 32,
             patch_anchors=self._momentum_patch_anchors,
             split_momentum=self._nesterov_momentum,
+            split_rods=self._split_momentum_rods,
             torsion=self._contact_torsion_enabled,
             ordered=self._ordered_rows,
             has_phase3=interleaved and has_internal_rows,
