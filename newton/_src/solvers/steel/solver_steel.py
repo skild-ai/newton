@@ -2842,9 +2842,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 Can converge in fewer iterations on stacks, mass ratios and long chains; gains appear above a
                 few iterations. The position and velocity passes each start fresh history. On CUDA this
                 preserves the selected mass factorization, row ownership, scheduling and propagation fusion.
-                Defaults to enabled on CUDA, except for rod models under the immediate response (whose dense rows
-                converge without it and whose contact-unit sweep has no momentum path). With
-                ``propagation_momentum`` the propagation rows take that step instead (see there). CPU uses plain sweeps, so at a fixed iteration count the
+                Defaults to enabled on CUDA, except for models with rod joints, which default to
+                ``propagation_momentum`` alone. Enabled with ``propagation_momentum``, it keeps to the generalized
+                and free-body rows and that step takes the propagation rows (see there). CPU uses plain sweeps, so at a fixed iteration count the
                 device defaults can produce different trajectories. Pass ``False`` for plain Gauss-Seidel
                 sweeps on CUDA. Construction-only.
         """
@@ -3072,10 +3072,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 )
         self._articulated_contact_response = articulated_contact_response
         if nesterov_momentum is None:
-            # Rods under the immediate response converge on their dense rows without it, and their contact-unit
-            # sweep (one warp reduction per contact) has no momentum path.
-            rods_immediate = getattr(model, "_has_rod_joints", False) and articulated_contact_response == "immediate"
-            nesterov_momentum = model.device.is_cuda and not rods_immediate
+            # Rod models default to propagation_momentum alone. Under the immediate response their dense rows
+            # converge without Nesterov and their contact-unit sweep has no momentum path; under propagation,
+            # Nesterov on the generalized rows beside the rod trees lowered no preset (1,024 jittered worlds of each
+            # arm task), cost 1-2.5%, and let the cross-slide table's cable bounce out of its height bounds.
+            nesterov_momentum = model.device.is_cuda and not getattr(model, "_has_rod_joints", False)
         self._nesterov_momentum = bool(nesterov_momentum)
         for name, value in (("friction_combine", friction_combine), ("restitution_combine", restitution_combine)):
             if value not in _MATERIAL_COMBINE_MODES:
