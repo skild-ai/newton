@@ -2041,7 +2041,6 @@ def parse_usd(
                     else:
                         has_effective_inertia = True
                         inertia_tensor = wp.mat33(ixx, ixy, ixz, ixy, iyy, iyz, ixz, iyz, izz)
-            mass_compute_failed = False
 
             # Mass that the body's current inertia corresponds to.
             inertia_mass_basis = builder.body_mass[body_id]
@@ -2055,14 +2054,6 @@ def parse_usd(
                     cmp_mass, cmp_i_diag, cmp_com, cmp_principal_axes = rigid_body_api.ComputeMassProperties(
                         mass_properties.get_collision_mass_information
                     )
-                    if cmp_mass < 0.0:
-                        # Genuine mass-computer failure (colliders not discoverable,
-                        # e.g. shapes created by schema resolvers are not real USD
-                        # prims). Distinct from the blocked-attrs workaround above,
-                        # where real colliders exist and the accumulated-property
-                        # fallback must preserve upstream's mass-precedence scaling
-                        # rather than trigger the PhysX small-sphere inertia.
-                        mass_compute_failed = True
                 if cmp_mass < 0.0 or not math.isfinite(cmp_mass):
                     # ComputeMassProperties failed to discover colliders (e.g. shapes
                     # created by schema resolvers are not real USD prims) or aggregated
@@ -2155,19 +2146,7 @@ def parse_usd(
                     )
                 # When mass is authored but inertia is not, scale the accumulated
                 # inertia to be consistent with the authored mass.
-                if not has_effective_inertia and mass > 0.0 and mass_compute_failed:
-                    radius = 0.1 / linear_unit if linear_unit > 0.0 else 0.1
-                    inertia_val = 0.4 * mass * radius * radius
-                    inertia = wp.mat33(np.eye(3, dtype=np.float32) * inertia_val)
-                    builder.body_inertia[body_id] = inertia
-                    builder.body_inv_inertia[body_id] = wp.inverse(inertia)
-                    if verbose:
-                        logger.info(
-                            "Applied PhysX small-sphere fallback inertia for body %s: diagonal elements = %s.",
-                            body_path,
-                            inertia_val,
-                        )
-                elif not has_effective_inertia and inertia_mass_basis > 0.0 and mass > 0.0:
+                if not has_effective_inertia and inertia_mass_basis > 0.0 and mass > 0.0:
                     scale = mass / inertia_mass_basis
                     builder.body_inertia[body_id] = wp.mat33(np.array(builder.body_inertia[body_id]) * scale)
                     builder.body_inv_inertia[body_id] = wp.inverse(builder.body_inertia[body_id])

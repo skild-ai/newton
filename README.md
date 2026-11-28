@@ -1138,9 +1138,6 @@ python -m newton.examples --describe robot_omniwheel
       </a>
     </td>
     <td align="center" width="33%">
-      <a href="https://github.com/skild-ai/newton/blob/main/newton/examples/steel/example_steel_magnetic_door.py">
-        <img width="320" src="https://raw.githubusercontent.com/skild-ai/newton/main/docs/images/examples/example_steel_magnetic_door.jpg" alt="Steel Magnetic Door">
-      </a>
     </td>
   </tr>
   <tr>
@@ -1151,7 +1148,6 @@ python -m newton.examples --describe robot_omniwheel
       <code>python -m newton.examples steel_determinism_arms</code>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples steel_magnetic_door</code>
     </td>
   </tr>
   <tr>
@@ -1180,34 +1176,6 @@ python -m newton.examples --describe robot_omniwheel
     </td>
     <td align="center" width="33%">
       <code>python -m newton.examples steel_plate_rack</code>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="https://github.com/skild-ai/newton/blob/main/newton/examples/robot/example_steel_pelican_bicycle.py">
-        <img width="320" src="https://raw.githubusercontent.com/skild-ai/newton/main/docs/images/examples/example_steel_pelican_bicycle.jpg" alt="Steel Pelican Bicycle">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/skild-ai/newton/blob/main/newton/examples/robot/example_steel_cup_unpacking.py">
-        <img width="320" src="https://raw.githubusercontent.com/skild-ai/newton/main/docs/images/examples/example_steel_cup_unpacking.jpg" alt="Steel Cup Unpacking">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="https://github.com/skild-ai/newton/blob/main/newton/examples/robot/example_steel_toy_well.py">
-        <img width="320" src="https://raw.githubusercontent.com/skild-ai/newton/main/docs/images/examples/example_steel_toy_well.jpg" alt="Steel Toy Well">
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples steel_pelican_bicycle</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples steel_cup_unpacking</code>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples steel_toy_well</code>
     </td>
   </tr>
   <tr>

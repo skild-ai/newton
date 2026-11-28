@@ -1840,7 +1840,6 @@ class CollisionPipeline:
         sdf_hydroelastic_config: HydroelasticSDF.Config | None = None,
         shape_pairs_max: int | None = None,
         deterministic: bool = False,
-        box_box_sat: bool = False,
         convex_face_clip: bool = False,
         contact_matching: Literal["disabled", "latest", "sticky"] = "disabled",
         contact_matching_pos_threshold: float = 0.0005,
@@ -1936,11 +1935,6 @@ class CollisionPipeline:
             broad_phase:
                 Either a broad phase mode string ("explicit", "nxn", "sap") or
                 a prebuilt broad phase instance for expert usage.
-            box_box_sat: Route box-box pairs through the SAT reference-face
-                clipping primitive instead of GJK/MPR, with a feature-identity-reduced
-                4-slot manifold. Stable multi-point box manifolds (no witness-
-                point teleports). Cannot be combined with a prebuilt
-                ``narrow_phase``. Defaults to False.
             convex_face_clip: Build box/plane versus convex-mesh manifolds by
                 clipping the hull's incident face against the box or plane
                 reference face, keeping up to 4 points; pairs the face does not
@@ -2172,11 +2166,6 @@ class CollisionPipeline:
                 raise ValueError("body_pair_reduction requires the pipeline to build its own narrow phase")
             if sdf_hydroelastic_config is not None:
                 raise ValueError("sdf_hydroelastic_config cannot be used when narrow_phase is provided")
-            if box_box_sat:
-                raise ValueError(
-                    "box_box_sat cannot be used when narrow_phase is provided; "
-                    "construct the NarrowPhase with box_box_sat=True instead"
-                )
             if convex_face_clip:
                 raise ValueError(
                     "convex_face_clip cannot be used when narrow_phase is provided; "
@@ -2587,7 +2576,6 @@ class CollisionPipeline:
                 has_meshes=has_meshes,
                 has_heightfields=has_heightfields,
                 use_lean_gjk_mpr=use_lean_gjk_mpr,
-                box_box_sat=box_box_sat,
                 convex_face_clip=convex_face_clip,
                 tetrahedron_separation=tetrahedron_separation,
                 convex_support_acceleration=model._convex_support_lut.shape[0] > 1,

@@ -9,7 +9,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.coupled.model_view import ModelView
 from newton.solvers import SolverMuJoCo, SolverSteel, SolverVBD
 from newton.solvers.experimental.coupled import (
     CouplingInterface,
@@ -1104,28 +1103,6 @@ for _name, _func in (
     add_function_test(TestCoupledSolverSteel, _name, _func, devices=get_cuda_test_devices())
 
 
-def test_coupling_owned_disabled_joints_are_accepted(test, device):
-    """Accept a tree joint disabled in this view because another entry simulates it, and keep rejecting others."""
-    builder = newton.ModelBuilder()
-    root = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
-    child = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
-    joints = [builder.add_joint_free(root), builder.add_joint_revolute(root, child, axis=newton.Axis.Z)]
-    builder.add_articulation(joints)
-    model = builder.finalize(device=device)
-    hinge = wp.array([1], dtype=int, device=device)
-
-    view = ModelView(model, "owned_elsewhere")
-    view.disable_joints(hinge)
-    with test.assertRaisesRegex(NotImplementedError, "disabled joints in an articulation tree"):
-        SolverSteel(view)
-
-    view.mark_coupling_disabled_joints(hinge)
-    solver = SolverSteel(view)
-    state_0, state_1 = view.state(), view.state()
-    solver.step(state_0, state_1, view.control(), None, 1.0e-3)
-    solver.check_constraint_capacity()
-
-
 add_function_test(
     TestCoupledSolverSteel,
     "test_split_articulation_gets_free_root",
@@ -1136,12 +1113,6 @@ add_function_test(
     TestCoupledSolverSteel,
     "test_gravity_acceleration_omits_disabled_bodies",
     test_gravity_acceleration_omits_disabled_bodies,
-    devices=get_test_devices(),
-)
-add_function_test(
-    TestCoupledSolverSteel,
-    "test_coupling_owned_disabled_joints_are_accepted",
-    test_coupling_owned_disabled_joints_are_accepted,
     devices=get_test_devices(),
 )
 

@@ -1,1 +1,0 @@
-Fix `SolverSteel` solving a contact torsion row before some of its group's contact rows with `solve_mode="colored"` and `propagation_color_order="longest_first"`, by hosting the group in its member in the highest row.

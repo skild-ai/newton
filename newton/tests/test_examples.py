@@ -1175,7 +1175,7 @@ add_example_test(
 )
 
 
-for tabletop_task in ("bolt_sweep", "wrecking_ball", "plate_rack", "pelican_bicycle", "cup_unpacking", "toy_well"):
+for tabletop_task in ("bolt_sweep", "wrecking_ball", "plate_rack"):
     add_example_test(
         TestRobotExamples,
         name=f"robot.example_steel_{tabletop_task}",
@@ -1335,14 +1335,6 @@ add_example_test(
     name="steel.example_steel_determinism_arms",
     devices=cuda_test_devices,
     test_options={"requires": ("git", "trimesh", "collada"), "num-frames": 20},
-    use_viewer=True,
-)
-
-add_example_test(
-    TestSteelExamples,
-    name="steel.example_steel_magnetic_door",
-    devices=test_devices,
-    test_options={"num-frames": 420},
     use_viewer=True,
 )
 
