@@ -3074,8 +3074,6 @@ class SolverSteel(SolverBase, CouplingInterface):
             rods_immediate = getattr(model, "_has_rod_joints", False) and articulated_contact_response == "immediate"
             nesterov_momentum = model.device.is_cuda and not rods_immediate
         self._nesterov_momentum = bool(nesterov_momentum)
-        if self._nesterov_momentum and propagation_momentum:
-            raise ValueError("nesterov_momentum and propagation_momentum both extrapolate the sweep; enable one")
         for name, value in (("friction_combine", friction_combine), ("restitution_combine", restitution_combine)):
             if value not in _MATERIAL_COMBINE_MODES:
                 raise ValueError(f"{name} must be one of {tuple(_MATERIAL_COMBINE_MODES)}, got {value!r}")
@@ -7593,7 +7591,10 @@ class SolverSteel(SolverBase, CouplingInterface):
 
     def _setup_split_momentum(self, model: Model) -> None:
         """Keep the iterate across kernel boundaries for phased and propagation solves."""
-        propagation = self._propagation_active
+        # With propagation_momentum the propagation rows and their bodies' twists take that step (installed through
+        # the trees' pending impulses), so Nesterov's split sweep keeps to the generalized and free-body rows.
+        propagation = self._propagation_active and not self._propagation_momentum
+        self._split_momentum_propagation = propagation
 
         patch_anchors = self._momentum_patch_anchors
 
@@ -12985,7 +12986,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._split_weighted_articulation = wp.array(rod_art, dtype=wp.int32, device=device)
         # Momentum of the sweeps: the previous sweep's impulses, a sweep's starting impulses, the move to install,
         # and each world's Nesterov sequence.
-        momentum = bool(self._propagation_momentum_option)
+        momentum = self._propagation_momentum_option
+        if momentum is None:
+            momentum = self._rod_material is not None
         self._propagation_momentum = bool(momentum)
         momentum_shape = (worlds, rows) if self._propagation_momentum else (1, 1)
         self._momentum_prev = wp.zeros(momentum_shape, dtype=wp.float32, device=device)
@@ -15628,7 +15631,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             ),
             warps=block_threads // 32,
             patch_anchors=self._momentum_patch_anchors,
-            split_momentum=self._nesterov_momentum,
+            split_momentum=self._nesterov_momentum and self._split_momentum is not None,
+            split_propagation=getattr(self, "_split_momentum_propagation", True),
             split_rods=self._split_momentum_rods,
             torsion=self._contact_torsion_enabled,
             ordered=self._ordered_rows,

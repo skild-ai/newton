@@ -647,6 +647,7 @@ def get_fused_iteration_kernel(
     momentum: bool = False,
     warps: int = 0,
     split_momentum: bool = False,
+    split_propagation: bool = True,
     split_rods: bool = False,
     torsion: bool = False,
     ordered: bool = False,
@@ -672,7 +673,9 @@ def get_fused_iteration_kernel(
     momentum_step = momentum_step_native(block_threads) if momentum else None
     # SolverSteel(nesterov_momentum=True): the split sweep's own Nesterov, for solves without rod-tree momentum.
     advance_momentum = (
-        get_split_momentum(warps, True, torsion, ordered, patch_anchors, split_rods) if split_momentum else None
+        get_split_momentum(warps, split_propagation, torsion, ordered, patch_anchors, split_rods)
+        if split_momentum
+        else None
     )
 
     @wp.func(module="unique")
