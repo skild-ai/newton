@@ -1463,7 +1463,7 @@ def eval_rigid_fk_id(
     body_mass: wp.array[float],
     body_inertia: wp.array[wp.mat33],
     is_free_rigid: wp.array[int],
-    materialize_all_body_inertia: int,
+    materialize_all_body_inertia: wp.array[int],
     materialize_body_inertia_terms: int,
     body_world: wp.array[int],
     gravity: wp.array[wp.vec3],
@@ -1517,7 +1517,7 @@ def eval_rigid_fk_id(
             origin = wp.transform_point(body_q[root_body], body_com[root_body])
     articulation_origin[index] = origin
 
-    write_body_inertia = materialize_all_body_inertia
+    write_body_inertia = materialize_all_body_inertia[0]
     if is_free_rigid[index] != 0:
         write_body_inertia = 1
     cached_child = int(-1)
@@ -1781,7 +1781,7 @@ def finalize_body_dynamics(
     body_inertia: wp.array[wp.mat33],
     is_free_rigid: wp.array[int],
     articulation_origin: wp.array[wp.vec3],
-    materialize_all_body_inertia: int,
+    materialize_all_body_inertia: wp.array[int],
     materialize_body_inertia_terms: int,
     body_world: wp.array[int],
     gravity: wp.array[wp.vec3],
@@ -1810,7 +1810,7 @@ def finalize_body_dynamics(
     if articulation_reuse[articulation] != 0:
         return
     origin = articulation_origin[articulation]
-    write_body_inertia = materialize_all_body_inertia
+    write_body_inertia = materialize_all_body_inertia[0]
     if is_free_rigid[articulation] != 0:
         write_body_inertia = 1
     v_s = body_v_s[body]
@@ -1989,7 +1989,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
         body_mass: wp.array[float],
         body_inertia: wp.array[wp.mat33],
         is_free_rigid: wp.array[int],
-        materialize_all_body_inertia: int,
+        materialize_all_body_inertia: wp.array[int],
         materialize_body_inertia_terms: int,
         body_world: wp.array[int],
         gravity: wp.array[wp.vec3],
@@ -2048,7 +2048,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
             _tree_warp_sync()
 
         origin = wp.vec3()
-        write_body_inertia = materialize_all_body_inertia
+        write_body_inertia = materialize_all_body_inertia[0]
         if active:
             origin = articulation_origin[articulation]
             if is_free_rigid[articulation] != 0:
@@ -2142,6 +2142,7 @@ def refresh_masked_body_inertia(
     body_mass: wp.array[float],
     body_inertia: wp.array[wp.mat33],
     write_body_inertia_terms: int,
+    global_refresh: wp.array[int],
     # outputs
     body_I_s: wp.array[wp.spatial_matrix],
     body_inertia_terms: wp.array2d[float],
@@ -2149,8 +2150,11 @@ def refresh_masked_body_inertia(
     """Materialize current link inertias selected by a reuse-step mass update mask.
 
     The compact COM terms feed the direct diagonal inertia owner, which bypasses ``body_I_s``; refresh them
-    under the same mask so a masked inertial update reaches every mass consumer.
+    under the same mask so a masked inertial update reaches every mass consumer. A global refresh step
+    (``global_refresh[0]`` set) already materialized every inertia during forward kinematics and skips this.
     """
+    if global_refresh[0] != 0:
+        return
     joint = wp.tid()
     articulation = joint_articulation[joint]
     if articulation < 0 or joint >= articulation_joint_end[articulation] or mass_update_mask[articulation] == 0:
@@ -2543,11 +2547,20 @@ def compute_composite_inertia(
     joint_ancestor: wp.array[int],
     joint_child: wp.array[int],
     body_I_s: wp.array[wp.spatial_matrix],
+    global_refresh: wp.array[int],
+    skip_global_refresh: int,
     # outputs
     body_I_c: wp.array[wp.spatial_matrix],
 ):
+    """Sum the link inertias of each masked articulation into composite inertias, child to parent.
+
+    With ``skip_global_refresh`` set, a global refresh step (``global_refresh[0]`` set) leaves the
+    reduction to the warp kernel, or to nothing when no articulation reads composite inertias.
+    """
     art_idx = wp.tid()
 
+    if skip_global_refresh != 0 and global_refresh[0] != 0:
+        return
     if mass_update_mask[art_idx] == 0:
         return
 
@@ -3756,7 +3769,7 @@ def eval_rigid_tau_and_augmented_drives(
 
 @wp.kernel
 def build_mass_update_mask(
-    global_flag: int,
+    global_flag: wp.array[int],
     dt: float,
     mass_update_requested: wp.array[int],
     articulation_active: wp.array[int],
@@ -3765,7 +3778,7 @@ def build_mass_update_mask(
 ):
     """Refresh active factors whose timestep differs, including during graph replay."""
     tid = wp.tid()
-    flag = 1 if global_flag != 0 else 0
+    flag = 1 if global_flag[0] != 0 else 0
     # Ignore float-rounding jitter, but retain relative sensitivity for tiny timesteps.
     factor_dt = mass_factor_dt[tid]
     dt_changed = wp.abs(factor_dt - dt) > 1.0e-6 * wp.max(wp.abs(factor_dt), wp.abs(dt))
@@ -3776,6 +3789,39 @@ def build_mass_update_mask(
     mass_update_mask[tid] = flag
     if flag != 0:
         mass_factor_dt[tid] = dt
+
+
+@wp.kernel(enable_backward=False)
+def advance_mass_refresh_step(
+    interval: int,
+    # outputs
+    refresh_step: wp.array[int],
+    global_refresh: wp.array[int],
+):
+    """Flag this step's global mass refresh from the device step counter, then advance the counter.
+
+    The counter runs modulo ``interval`` on the device, so a step captured in a CUDA graph keeps the
+    cadence on every replay, whatever the step it was captured at.
+    """
+    step = refresh_step[0]
+    global_refresh[0] = wp.where(step == 0, 1, 0)
+    refresh_step[0] = (step + 1) % interval
+
+
+@wp.kernel(enable_backward=False)
+def zero_on_global_mass_refresh(
+    global_refresh: wp.array[int],
+    stride: int,
+    # outputs
+    values: wp.array[float],
+):
+    """Zero ``values`` on a global mass refresh step; ``stride`` is the launch dimension."""
+    if global_refresh[0] == 0:
+        return
+    i = wp.tid()
+    while i < values.shape[0]:
+        values[i] = 0.0
+        i += stride
 
 
 # =============================================================================
