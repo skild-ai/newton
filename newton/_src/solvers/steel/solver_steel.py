@@ -7537,6 +7537,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             if model.device.is_cuda:
                 self._pgs_solve_mf_gs_kernel = next(iter(self._pgs_solve_mf_gs_kernels.values()))
             self._init_local_solve_kernels(device_arch, mf_rows)
+        if self._nesterov_momentum and self._propagation_active and self._split_momentum is None:
+            # Without generalized rows (every articulation a rod tree) the row setup above does not run; the
+            # propagation sweep still carries Nesterov's history across its launches.
+            self._setup_split_momentum(model)
         self._setup_contact_unit_sweep(model)
         self._setup_latency_fused(model)
 
