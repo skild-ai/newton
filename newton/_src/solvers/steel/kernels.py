@@ -9984,15 +9984,22 @@ def accumulate_propagation_body_activity(
     # outputs
     body_activity: wp.array[float],
 ):
-    """Each body's summed normal impulse over its contact rows, from the step's warm-started impulses."""
+    """Each body's summed load over its contact and loop-closure rows, from the step's warm-started impulses.
+
+    A contact row counts its normal impulse; a closure row (bilateral, either sign per axis) its magnitude, so a body
+    held by a closure (a clamped end) weighs its load like one resting on a contact.
+    """
     tid = wp.tid()
     world = tid // propagation_max_constraints
     i = tid - world * propagation_max_constraints
     if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
         return
-    if propagation_row_type_of(propagation_row_type, world, i) != PGS_CONSTRAINT_TYPE_CONTACT:
-        return
+    row_type = propagation_row_type_of(propagation_row_type, world, i)
     lam = propagation_impulses[world, i]
+    if row_type == PGS_CONSTRAINT_TYPE_CONNECT:
+        lam = wp.abs(lam)
+    elif row_type != PGS_CONSTRAINT_TYPE_CONTACT:
+        return
     if lam <= 0.0:
         return
     ba = propagation_body_a[world, i]
