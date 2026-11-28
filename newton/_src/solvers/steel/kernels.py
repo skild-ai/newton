@@ -10289,16 +10289,14 @@ def propagation_momentum_step(
 
 
 @wp.func
-def _project_contact_impulse(n: float, t1: float, t2: float, mu: float) -> wp.vec3:
-    """A contact's normal and two friction impulses projected onto its cone: n >= 0, |t| <= mu n."""
-    n = wp.max(n, 0.0)
-    r = wp.sqrt(t1 * t1 + t2 * t2)
-    limit = mu * n
-    if r > limit and r > 0.0:
-        scale = limit / r
-        t1 = t1 * scale
-        t2 = t2 * scale
-    return wp.vec3(n, t1, t2)
+def _project_contact_impulse(n: float, t1: float, t2: float) -> wp.vec3:
+    """A contact's extrapolated impulses projected onto the set every sweep pass leaves them in: n >= 0.
+
+    The sweep bounds friction by the normal impulse its pair saw, which later rows in the pass change, so a
+    stored pair can sit outside |t| <= mu n; clamping friction to that cone here would undo legitimate sweep
+    output every step. The next pass re-clamps the extrapolated friction against its own normal.
+    """
+    return wp.vec3(wp.max(n, 0.0), t1, t2)
 
 
 @wp.func
@@ -10359,7 +10357,6 @@ def propagation_momentum_apply_row(
     propagation_MiJt_b: wp.array3d[float],
     propagation_row_type: wp.array2d[int],
     propagation_row_parent: wp.array2d[int],
-    propagation_row_mu: wp.array2d[float],
     propagation_row_contact: wp.array2d[int],
     contact_units: wp.array[float],
     contact_unit_response: wp.array[int],
@@ -10373,9 +10370,9 @@ def propagation_momentum_apply_row(
 ):
     """Move each row's impulse on by its world's momentum and add the move to its bodies' twists and impulses.
 
-    A contact's extrapolated normal and friction impulses are projected onto its friction cone (n >= 0,
-    |t| <= mu n) before the move is installed, so the step never carries an adhesive or out-of-cone impulse into
-    the trees. A contact's rows move together on its normal row's thread: a contact unit's three rows sum into
+    A contact's extrapolated normal impulse is clamped to n >= 0 before the move is installed, so the step never
+    carries an adhesive impulse into the trees (see _project_contact_impulse for why friction is left to the
+    next pass). A contact's rows move together on its normal row's thread: a contact unit's three rows sum into
     one impulse and response per body; separate rows add their own.
     """
     rc = propagation_row_unit(propagation_row_contact, world, i)
@@ -10385,24 +10382,23 @@ def propagation_momentum_apply_row(
         p = rc >> 2
         slot = contact_unit_response[p]
         stored = slot >= 0
-        lam = wp.vec3(
+        lam3 = wp.vec3(
             propagation_impulses[world, i], propagation_impulses[world, i + 1], propagation_impulses[world, i + 2]
         )
-        prev = wp.vec3(momentum_prev[world, i], momentum_prev[world, i + 1], momentum_prev[world, i + 2])
-        mu = contact_unit_block(contact_units, 1, p)[3]
-        y = lam + beta * (lam - prev)
-        y = _project_contact_impulse(y[0], y[1], y[2], mu)
+        prev3 = wp.vec3(momentum_prev[world, i], momentum_prev[world, i + 1], momentum_prev[world, i + 2])
+        y3 = lam3 + beta * (lam3 - prev3)
+        y3 = _project_contact_impulse(y3[0], y3[1], y3[2])
         pa = wp.spatial_vector()
         pb = wp.spatial_vector()
         va = wp.spatial_vector()
         vb = wp.spatial_vector()
         moved = bool(False)
         for r in range(3):
-            momentum_prev[world, i + r] = lam[r]
-            delta_r = y[r] - lam[r]
+            momentum_prev[world, i + r] = lam3[r]
+            delta_r = y3[r] - lam3[r]
             if delta_r != 0.0:
                 moved = True
-                propagation_impulses[world, i + r] = y[r]
+                propagation_impulses[world, i + r] = y3[r]
                 pa += contact_unit_row(contact_units, p, r, 0) * delta_r
                 pb += contact_unit_row(contact_units, p, r, 1) * delta_r
                 if stored:
@@ -10438,23 +10434,20 @@ def propagation_momentum_apply_row(
     if kind == PGS_CONSTRAINT_TYPE_CONTACT:
         friction = _contact_friction_rows(world, i, count, propagation_row_type, propagation_row_parent)
         n0 = propagation_impulses[world, i]
-        y = wp.vec3(n0 + beta * (n0 - momentum_prev[world, i]), 0.0, 0.0)
-        lam = wp.vec3(n0, 0.0, 0.0)
+        y3 = wp.vec3(n0 + beta * (n0 - momentum_prev[world, i]), 0.0, 0.0)
+        lam3 = wp.vec3(n0, 0.0, 0.0)
         if friction == 2:
             for r in range(1, 3):
-                lam[r] = propagation_impulses[world, i + r]
-                y[r] = lam[r] + beta * (lam[r] - momentum_prev[world, i + r])
-            mu = float(0.0)
-            if propagation_row_mu.shape[1] > 1:
-                mu = propagation_row_mu[world, i]
-            y = _project_contact_impulse(y[0], y[1], y[2], mu)
+                lam3[r] = propagation_impulses[world, i + r]
+                y3[r] = lam3[r] + beta * (lam3[r] - momentum_prev[world, i + r])
+            y3 = _project_contact_impulse(y3[0], y3[1], y3[2])
         else:
-            y[0] = wp.max(y[0], 0.0)
+            y3[0] = wp.max(y3[0], 0.0)
         for r in range(1 + friction):
-            momentum_prev[world, i + r] = lam[r]
-            propagation_impulses[world, i + r] = y[r]
+            momentum_prev[world, i + r] = lam3[r]
+            propagation_impulses[world, i + r] = y3[r]
             _momentum_row_add(
-                world, i + r, y[r] - lam[r], propagation_body_a, propagation_body_b, propagation_J_a, propagation_J_b,
+                world, i + r, y3[r] - lam3[r], propagation_body_a, propagation_body_b, propagation_J_a, propagation_J_b,
                 propagation_MiJt_a, propagation_MiJt_b, propagation_body_qd, propagation_body_impulses,
             )  # fmt: skip
         return
@@ -10483,7 +10476,6 @@ def propagation_momentum_apply(
     propagation_MiJt_b: wp.array3d[float],
     propagation_row_type: wp.array2d[int],
     propagation_row_parent: wp.array2d[int],
-    propagation_row_mu: wp.array2d[float],
     propagation_row_contact: wp.array2d[int],
     contact_units: wp.array[float],
     contact_unit_response: wp.array[int],
@@ -10515,7 +10507,6 @@ def propagation_momentum_apply(
         propagation_MiJt_b,
         propagation_row_type,
         propagation_row_parent,
-        propagation_row_mu,
         propagation_row_contact,
         contact_units,
         contact_unit_response,
@@ -10535,7 +10526,6 @@ def propagation_momentum_rows(
     momentum_beta: wp.array[float],
     propagation_row_type: wp.array2d[int],
     propagation_row_parent: wp.array2d[int],
-    propagation_row_mu: wp.array2d[float],
     # in/out
     propagation_impulses: wp.array2d[float],
     momentum_prev: wp.array2d[float],
@@ -10566,22 +10556,19 @@ def propagation_momentum_rows(
             return  # moved with its contact row
     if kind == PGS_CONSTRAINT_TYPE_CONTACT:
         friction = _contact_friction_rows(world, i, count, propagation_row_type, propagation_row_parent)
-        lam = wp.vec3(propagation_impulses[world, i], 0.0, 0.0)
-        y = wp.vec3(lam[0] + beta * (lam[0] - momentum_prev[world, i]), 0.0, 0.0)
+        lam3 = wp.vec3(propagation_impulses[world, i], 0.0, 0.0)
+        y3 = wp.vec3(lam3[0] + beta * (lam3[0] - momentum_prev[world, i]), 0.0, 0.0)
         if friction == 2:
             for r in range(1, 3):
-                lam[r] = propagation_impulses[world, i + r]
-                y[r] = lam[r] + beta * (lam[r] - momentum_prev[world, i + r])
-            mu = float(0.0)
-            if propagation_row_mu.shape[1] > 1:
-                mu = propagation_row_mu[world, i]
-            y = _project_contact_impulse(y[0], y[1], y[2], mu)
+                lam3[r] = propagation_impulses[world, i + r]
+                y3[r] = lam3[r] + beta * (lam3[r] - momentum_prev[world, i + r])
+            y3 = _project_contact_impulse(y3[0], y3[1], y3[2])
         else:
-            y[0] = wp.max(y[0], 0.0)
+            y3[0] = wp.max(y3[0], 0.0)
         for r in range(1 + friction):
-            momentum_prev[world, i + r] = lam[r]
-            propagation_impulses[world, i + r] = y[r]
-            momentum_delta[world, i + r] = y[r] - lam[r]
+            momentum_prev[world, i + r] = lam3[r]
+            propagation_impulses[world, i + r] = y3[r]
+            momentum_delta[world, i + r] = y3[r] - lam3[r]
         return
     lam = propagation_impulses[world, i]
     delta = beta * (lam - momentum_prev[world, i])

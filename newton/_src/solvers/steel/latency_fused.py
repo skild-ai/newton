@@ -829,7 +829,7 @@ def get_fused_iteration_kernel(
                     for r in range(t, rows_n, wp.static(block_threads)):
                         propagation_momentum_apply_row(
                             world, r, beta, rows_n, colored.body_a, colored.body_b, colored.J_a, colored.J_b,
-                            colored.MiJt_a, colored.MiJt_b, colored.row_type, colored.row_parent, colored.row_mu,
+                            colored.MiJt_a, colored.MiJt_b, colored.row_type, colored.row_parent,
                             extra[0].row_contact, colored.contact_units,
                             extra[0].unit_response, colored.contact_responses, colored.body_response_split,
                             propagation_impulses, extra[0].momentum_prev, body_qd, body_impulses,
