@@ -3105,7 +3105,8 @@ _FACTOR_PRELUDE = r"""
             for (int b = 0; b < 3; ++b) L.data[3 + a][3 + b] = Ib.data[a][b];
         }
     }
-    // Only the two diagonal 3x3 blocks: the off-diagonal blocks of a block-diagonal inertia stay exactly zero.
+    // Only the two diagonal 3x3 blocks: the off-diagonal blocks of a block-diagonal inertia stay exactly zero, and
+    // the translational block m I is the same in every frame.
     float* iw = IW.data + k * 18;
     #pragma unroll
     for (int r = 0; r < 6; ++r) {
@@ -3116,6 +3117,10 @@ _FACTOR_PRELUDE = r"""
             const int cb = col >= 3 ? 3 : 0;
             const int cc = col - cb;
             if (cb != rb) continue;
+            if (rb == 0) {
+                iw[rr * 3 + cc] = rr == cc ? L.data[0][0] : 0.0f;
+                continue;
+            }
             float v = 0.0f;
             #pragma unroll
             for (int a = 0; a < 3; ++a)
@@ -3168,7 +3173,9 @@ _FACTOR_PRELUDE = r"""
         }
     }
     if (dc == 6 && !done) {
-        // Any other full-rank S: Gauss-Jordan with static indices (registers, no pivot swaps).
+        // Any other full-rank S (not symmetric, so no Cholesky): Gauss-Jordan with partial pivoting. Each column
+        // swaps the largest remaining entry into the pivot row through compare-and-swap with static indices, so the
+        // matrices stay in registers; a vanishing pivot is floored, keeping the inverse finite.
         float m[36], inv[36];
         #pragma unroll
         for (int r = 0; r < 6; ++r)
@@ -3179,7 +3186,18 @@ _FACTOR_PRELUDE = r"""
             }
         #pragma unroll
         for (int c = 0; c < 6; ++c) {
-            const float sc = 1.0f / m[c * 6 + c];
+            #pragma unroll
+            for (int r = c + 1; r < 6; ++r) {
+                if (fabsf(m[r * 6 + c]) > fabsf(m[c * 6 + c])) {
+                    #pragma unroll
+                    for (int e = 0; e < 6; ++e) {
+                        const float a = m[c * 6 + e]; m[c * 6 + e] = m[r * 6 + e]; m[r * 6 + e] = a;
+                        const float b = inv[c * 6 + e]; inv[c * 6 + e] = inv[r * 6 + e]; inv[r * 6 + e] = b;
+                    }
+                }
+            }
+            const float pivot = m[c * 6 + c];
+            const float sc = 1.0f / (fabsf(pivot) > 1e-20f ? pivot : (pivot < 0.0f ? -1e-20f : 1e-20f));
             #pragma unroll
             for (int e = 0; e < 6; ++e) { m[c * 6 + e] *= sc; inv[c * 6 + e] *= sc; }
             #pragma unroll
