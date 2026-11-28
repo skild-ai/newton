@@ -74,9 +74,14 @@ _SOURCE = (
     __shared__ int si_all[SU_WPB * SU_CH * 4];
     float* sf = sf_all + wib * SU_CH * 29;
     int* si = si_all + wib * SU_CH * 4;
+    // cp.async needs sm_80; older devices stage the same words with plain loads (the waits below compile out).
     auto cpa = [](void* dst, const void* src) {
+#if __CUDA_ARCH__ >= 800
         const unsigned dst_s = (unsigned)__cvta_generic_to_shared(dst);
         asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(dst_s), "l"(src));
+#else
+        *reinterpret_cast<unsigned*>(dst) = *reinterpret_cast<const unsigned*>(src);
+#endif
     };
     int c0 = 0, c1 = 0;
     auto stage = [&](int start) {
@@ -102,8 +107,10 @@ _SOURCE = (
             cpa(&si[e * 4 + 2], propagation_row_la.data + off);
             cpa(&si[e * 4 + 3], propagation_row_lb.data + off);
         }
+#if __CUDA_ARCH__ >= 800
         asm volatile("cp.async.commit_group;\n" ::);
         asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
         __syncwarp();
         c0 = start;
         c1 = start + cnt;
