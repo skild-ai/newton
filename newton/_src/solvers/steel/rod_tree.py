@@ -80,7 +80,7 @@ _PRELUDE = (
 # The factor runs every lane of its warp: lanes past the sixth repeat lanes 0-5 (same tree, same values), so every
 # shuffle and warp sync takes the full mask. A partial mask compiles to a convergence check (MATCH.ANY and a
 # divergent branch) on every shuffle, which dominated the factor's serial walk. Only lanes 0-5 (``lead``) update
-# shared accumulators; identical stores from the repeating lanes are harmless.
+# shared accumulators and store the factor's results; the repeating lanes would write the same values again.
 _PRELUDE_FULL = (
     _PRELUDE.replace("const int grp = lane / 6;", "const int grp = 0;")
     .replace("const int r = lane - grp * 6;", "const int r = lane % 6;\n    const bool lead = lane < 6;")
@@ -229,12 +229,15 @@ _FACTOR = (
             for (int b = 0; b < 6; ++b) if (b == r) d_row[b] += diag;
         }
         gj(d_row, dinv, dc);
-        if (r < dc) {
+        // Lanes past the sixth repeat lanes 0-5 (and, packed, lanes of no tree): only the lead lanes store.
+        if (lead && r < dc) {
             #pragma unroll
             for (int b = 0; b < 6; ++b) propagation_tree_D_inv.data[cur.jid * 36 + r * 6 + b] = (b < dc) ? dinv[b] : 0.0f;
         }
-        #pragma unroll
-        for (int a = 0; a < 6; ++a) if (a < dc) propagation_tree_U.data[(cur.gd + a) * 6 + r] = u_row[a];
+        if (lead) {
+            #pragma unroll
+            for (int a = 0; a < 6; ++a) if (a < dc) propagation_tree_U.data[(cur.gd + a) * 6 + r] = u_row[a];
+        }
         __syncwarp(GMASK);
         #pragma unroll
         for (int b = 0; b < 6; ++b) Z[r * 6 + b] = (r < dc) ? dinv[b] : 0.0f;  // Z[a][b] = D^-1[a][b]
@@ -251,7 +254,7 @@ _FACTOR = (
                 ut = joint_tau.data[cur.gd + r];
                 #pragma unroll
                 for (int j = 0; j < 6; ++j) ut -= X[j * 6 + r] * pa_all[j];
-                propagation_tree_u.data[cur.gd + r] = ut;
+                if (lead) propagation_tree_u.data[cur.gd + r] = ut;
             }
             float c = 0.0f;
             #pragma unroll
@@ -322,6 +325,7 @@ _FACTOR = (
                 rec[12 + j] = cur.s[j];
             }
             rec[18] = ex; rec[19] = ey; rec[20] = ez; rec[21] = 0.0f; rec[22] = 0.0f; rec[23] = 0.0f;
+            if (lead) {
             float4* fr = reinterpret_cast<float4*>(propagation_tree_FR.data + k * 144 + r * 24);
             #pragma unroll
             for (int q = 0; q < 6; ++q) fr[q] = make_float4(rec[4 * q], rec[4 * q + 1], rec[4 * q + 2], rec[4 * q + 3]);
@@ -340,6 +344,7 @@ _FACTOR = (
             c2 = reinterpret_cast<float2*>(cr + 108 + r * 6);
             c2[0] = make_float2(qrow[0], qrow[1]); c2[1] = make_float2(qrow[2], qrow[3]); c2[2] = make_float2(qrow[4], qrow[5]);
             if (r == 0) *reinterpret_cast<float4*>(cr + 144) = make_float4(ex, ey, ez, 0.0f);
+            }
             __syncwarp(GMASK);
         }
 
@@ -605,11 +610,11 @@ _FACTOR = (
         float qdd = 0.0f;
         #pragma unroll
         for (int b = 0; b < 6; ++b) qdd += fc.d[b] * bcast(term, b);
-        if (r < fc.dc) joint_qdd.data[fc.gd + r] = qdd;
+        if (lead && r < fc.dc) joint_qdd.data[fc.gd + r] = qdd;
         float a_child = at;
         #pragma unroll
         for (int a = 0; a < 6; ++a) a_child += fc.sc[a] * bcast(qdd, a);
-        if (fc.flags & 64) body_accel.data[fc.child * 6 + r] = a_child;
+        if (lead && (fc.flags & 64)) body_accel.data[fc.child * 6 + r] = a_child;
         carry = a_child;
         fc = fn;
     }
