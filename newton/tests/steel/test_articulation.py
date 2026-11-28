@@ -4809,6 +4809,40 @@ def test_sparse_direct_closure_solve_is_independent_of_block_size(test, device):
         np.testing.assert_allclose(results[threads], results[512], rtol=0.0, atol=1.0e-5)
 
 
+def test_sparse_direct_closure_solve_sizes_shared_memory_from_the_device(test, device):
+    """The solve block's shared memory follows the device's per-block limit, not a fixed 97 KiB.
+
+    With the reported limit just above the factor's footprint plus Warp's 2 KiB static reservation, ``L`` stays in
+    shared memory; 4 bytes less moves it to global memory with the same steps; a limit too small for even the solve's
+    vectors raises at construction instead of failing to launch. The articulated-body mass solve keeps the Cholesky
+    triangular solve's own shared-memory check out of the way.
+    """
+    from newton._src.solvers.steel import closure_direct_sparse  # noqa: PLC0415
+
+    dev = wp.get_device(device)
+    run = functools.partial(
+        _sparse_ladder_run,
+        device,
+        units=12,
+        articulation_constraint_max=96,
+        overrides={**_SPARSE_DIRECT, "mass_solve": "articulated_body"},
+    )
+    solver, _, reference = run(steps=5)
+    buf = solver._closure_direct_sparse
+    test.assertEqual(buf.smem_limit, dev.max_shared_memory_per_block - closure_direct_sparse.WARP_STATIC_SMEM)
+    test.assertTrue(buf.smem_L)
+    fits = buf.smem_bytes + closure_direct_sparse.WARP_STATIC_SMEM
+    for limit, in_smem in ((fits, True), (fits - 4, False)):
+        with mock.patch.object(dev, "max_shared_memory_per_block", limit):
+            solver, _, state = run(steps=5)
+        test.assertEqual(solver._closure_direct_sparse.smem_L, in_smem)
+        test.assertLessEqual(solver._closure_direct_sparse.smem_bytes, limit - closure_direct_sparse.WARP_STATIC_SMEM)
+        np.testing.assert_allclose(state.joint_qd.numpy(), reference.joint_qd.numpy(), rtol=0.0, atol=1.0e-6)
+    with mock.patch.object(dev, "max_shared_memory_per_block", 4096):
+        with test.assertRaisesRegex(ValueError, "shared memory"):
+            run(steps=1)
+
+
 def _build_scissor_linkage(device, units, angle=0.0):
     """A planar scissor linkage (lazy tongs) of ``units`` crossed bar pairs on a free root, without gravity.
 
@@ -5033,6 +5067,7 @@ for _name in (
     "test_sparse_direct_closure_solve_refactors_a_flat_scissor",
     "test_sparse_direct_closure_solve_keeps_moving_scissors_finite",
     "test_sparse_direct_closure_solve_keeps_folded_scissors_unshifted",
+    "test_sparse_direct_closure_solve_sizes_shared_memory_from_the_device",
 ):
     add_function_test(TestSteelSparseDirectClosureSolve, _name, globals()[_name], devices=get_cuda_test_devices())
 for _name, _func in (

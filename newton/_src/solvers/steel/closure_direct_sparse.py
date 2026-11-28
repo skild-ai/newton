@@ -53,9 +53,22 @@ WHOLE_W = 16  # a level that is a single supernode at least this wide runs with 
 ROWS_WPB = 4  # closures (warps) per block of the row builder
 GEOM_FLOATS = 8  # per closure row: e (3), phi, target, angular, unused (2)
 CLOSURE_FLOATS = 8  # per closure: rel_a (3), rel_b (3), prescribed, valid
-# Dynamic shared memory per block: the opt-in limit of sm_86/sm_89/sm_120 (99 KiB; sm_80/sm_90 allow more) less the
-# 2 KiB Warp reserves statically in every kernel.
+# Static shared memory Warp reserves in every kernel; the solve's dynamic shared memory gets the rest of the device's
+# opt-in per-block limit.
+WARP_STATIC_SMEM = 2 * 1024
+# Dynamic shared memory per block on a device that does not report its limit: the opt-in limit of sm_86/sm_89/sm_120
+# (99 KiB) less ``WARP_STATIC_SMEM``.
 SMEM_LIMIT = 97 * 1024
+
+
+def smem_limit(device) -> int:
+    """Dynamic shared memory [bytes] one solve block may use on ``device``.
+
+    The device's opt-in per-block limit (99 KiB on sm_86/sm_89/sm_120, 163 KiB on sm_80, 227 KiB on sm_90) less the
+    static shared memory Warp reserves; ``SMEM_LIMIT`` when the device reports no limit.
+    """
+    available = int(getattr(device, "max_shared_memory_per_block", 0))
+    return available - WARP_STATIC_SMEM if available > 0 else SMEM_LIMIT
 
 
 def default_solve_threads(n_dofs: int) -> int:
@@ -281,16 +294,23 @@ class DirectSparseBuffers:
         # offsets and L's storage; the dense update buffers reuse x .. sD (3 x BC columns of QW rows) when they fit.
         vec_floats = 4 * D + 32 * 33 + 32 + D + 1
         work = 3 * D + 32 * 33
-        self.smem_L = (p.nnz + vec_floats) * 4 <= SMEM_LIMIT
+        self.smem_limit = smem_limit(device)
+        self.smem_L = (p.nnz + vec_floats) * 4 <= self.smem_limit
         bc = int(solver._kernel_overrides.get("closure_ds_bc", 4))
         if self.smem_L:
             self.BC = max(1, min(bc, work // (3 * self.QW)))
             self.wb_in_vec = True
             self.smem_bytes = (p.nnz + vec_floats) * 4
         else:
-            self.BC = bc
+            # L in global memory; fewer update columns per pass on a device with less shared memory.
+            self.BC = max(1, min(bc, (self.smem_limit // 4 - vec_floats) // (3 * self.QW)))
             self.wb_in_vec = False
             self.smem_bytes = (vec_floats + 3 * self.BC * self.QW) * 4
+        if self.smem_bytes > self.smem_limit:
+            raise ValueError(
+                f"closure_direct_factor='sparse': the {D}-DOF articulation's solve block needs {self.smem_bytes} bytes "
+                f"of shared memory, but {device} allows {self.smem_limit} per block"
+            )
         # Per-world buffers.
         self.Ha = wp.zeros((W, D, plan.NA), dtype=wp.float32, device=device)
         self.Jw = wp.zeros((W, KL * self.MAXR * KJ), dtype=wp.float32, device=device)
