@@ -19,8 +19,10 @@ and each world runs one thread block that keeps its whole factor in shared memor
 - ``solve``: one block per world. (1) Row weights, bias and ``r0`` per closure row; the rows are scaled by
   ``sqrt(w)`` in place. (2) ``P K P^T`` gathered straight into the packed storage of ``L`` and ``g0``. (3) A
   left-looking supernodal Cholesky level by level of the supernodal elimination tree (a warp per supernode; the
-  whole block on single-supernode levels, such as the dense root separator). (4) Forward/backward solves and
-  refinements. (5) ``v`` and the impulses.
+  whole block on single-supernode levels, such as the dense root separator). A world whose factor meets a pivot at
+  or below ``closure_direct_pivot_floor * K_jj`` (a nearly singular ``K`` that float32 cannot factor, such as a
+  scissor linkage at its flat pose) is factored once more with ``closure_direct_pivot_shift * diag(K)`` added.
+  (4) Forward/backward solves and refinements. (5) ``v`` and the impulses.
 
 Valid with one articulation per world (identical articulations) and loop-closure (connect) rows as the only
 articulation rows. Deterministic (no atomics on the data path).
@@ -295,9 +297,11 @@ class DirectSparseBuffers:
         self.qrow = wp.zeros((W, KL * self.MAXR), dtype=wp.float32, device=device)
         self.swrow = wp.zeros((W, KL * self.MAXR), dtype=wp.float32, device=device)
         self.Lg = wp.zeros((1, 1) if self.smem_L else (W, p.nnz), dtype=wp.float32, device=device)
+        self.kdiag = wp.zeros((W, D), dtype=wp.float32, device=device)  # diagonal of P K P^T (pivot floor and shift)
         self.geom_row = wp.zeros((nk * CONNECT_MAX_ROWS, GEOM_FLOATS), dtype=wp.float32, device=device)
         self.geom_closure = wp.zeros((nk, CLOSURE_FLOATS), dtype=wp.float32, device=device)
-        self.status = wp.zeros(4, dtype=wp.int32, device=device)  # [non-positive pivots, ...]
+        # [factors repeated with the pivot shift, anchor-mode mismatches, pivots still at the floor after the shift, -]
+        self.status = wp.zeros(4, dtype=wp.int32, device=device)
         # Per-world phase times [ns] (rows, factor, solves) and world 0's level stamps, with ``closure_ds_timing``.
         self.timing_enabled = bool(solver._kernel_overrides.get("closure_ds_timing", False))
         self.timing = wp.zeros(max(W * 4, 160) if self.timing_enabled else 1, dtype=wp.int64, device=device)
@@ -873,6 +877,7 @@ def get_ds_solve_kernel(
     float* L = {"(float*)(co + " + str(D + 1) + ")" if USE_SMEM else "&Lg.data[(size_t)world * " + str(NNZ) + "]"};
     // Dense column buffers of the whole-block updates: x .. sD while factoring (or their own region).
     float* wbuf = {"x" if WB_IN_VEC else "(float*)(co + " + str(D + 1) + ") + " + (str(NNZ) if USE_SMEM else "0")};
+    float* dK = &kdiag.data[(size_t)world * {D}];  // [D] diagonal of P K P^T before the factor
 #if DS_TIMING
     unsigned long long t0, t1, t2, t3;
 #endif
@@ -964,7 +969,25 @@ def get_ds_solve_kernel(
     if (tid == 0 && world == 0) {{ unsigned long long tq; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tq)); timing.data[100] = (long long)(tq - t0); }}
 #endif
 
-    // 2. Assembly of P K P^T into L's storage, and g0.
+    // 2. g0, then the assembly of P K P^T into L's storage and its factor (3.). Float32 cannot factor a nearly
+    //    singular K (such as a scissor linkage at its flat, fully extended pose, whose opening mode leaves pivots of
+    //    a few ulp of K_jj): a world whose factor meets a pivot at or below pivot_floor * K_jj is assembled again with
+    //    pivot_shift * K_jj added to the diagonal and factored once more. The refinements then carry the same shift
+    //    in their proximal term, so it leaves their fixed point unchanged.
+    for (int i = tid; i < {D}; i += {NT}) {{
+        float s = 0.0f;
+        const int c1 = g_ptr.data[i + 1];
+        for (int c = g_ptr.data[i]; c < c1; c++) {{
+            const int code = g_list.data[c];
+            const int k = code >> 6, a = code & 63;
+            #pragma unroll
+            for (int r = 0; r < {MAXR}; r++) s += Jb[((size_t)k * {MAXR} + r) * {KJ} + a] * Q[k * {MAXR} + r];
+        }}
+        g[i] = -s;
+        sm[i] = 0.0f;
+    }}
+    bool fail = false, shifted = false;  // this thread met a pivot at the floor; the shifted pass ran
+    for (int pass = 0; pass < 2; pass++) {{
     {{
         // Record per entry: (H index or -1, first two contributions, (start << 8) | count); two entries in flight.
         const int4* arec = (const int4*)asm_rec.data;
@@ -993,17 +1016,11 @@ def get_ds_solve_kernel(
             if (e1 < {NNZ}) L[e1] = vb;
         }}
     }}
-    for (int i = tid; i < {D}; i += {NT}) {{
-        float s = 0.0f;
-        const int c1 = g_ptr.data[i + 1];
-        for (int c = g_ptr.data[i]; c < c1; c++) {{
-            const int code = g_list.data[c];
-            const int k = code >> 6, a = code & 63;
-            #pragma unroll
-            for (int r = 0; r < {MAXR}; r++) s += Jb[((size_t)k * {MAXR} + r) * {KJ} + a] * Q[k * {MAXR} + r];
-        }}
-        g[i] = -s;
-        sm[i] = 0.0f;
+    __syncthreads();
+    if (pass == 0) {{
+        for (int i = tid; i < {D}; i += {NT}) dK[i] = L[co[i]];
+    }} else {{
+        for (int i = tid; i < {D}; i += {NT}) L[co[i]] += pivot_shift * dK[i];
     }}
     __syncthreads();
 #if DS_TIMING
@@ -1073,10 +1090,18 @@ def get_ds_solve_kernel(
             for (int li = l0 + warp; li < l1; li += {NW}) {{
                 const int s = lvl_sn.data[li];
                 const int c0 = sn[5 * s], w = sn[5 * s + 1], q = sn[5 * s + 2];
+                float dkl = 0.0f;  // K_jj of 32 columns at a time, one per lane
                 for (int tt = 0; tt < w; tt++) {{
                     const int o = co[c0 + tt];
+                    if ((tt & 31) == 0) dkl = tt + lane < w ? dK[c0 + tt + lane] : 0.0f;
+                    // A pivot at or below pivot_floor * K_jj has lost its digits to float32 rounding: flag the world
+                    // for the shifted pass (count it after the shift) and keep the factor finite with K_jj.
+                    const float kj = __shfl_sync(0xFFFFFFFF, dkl, tt & 31);
                     float piv = L[o];
-                    if (!(piv > 0.0f)) {{ if (lane == 0) atomicAdd(&status.data[0], 1); piv = 1.0e-30f; }}
+                    if (!(piv > pivot_floor * kj)) {{
+                        if (pass) {{ if (lane == 0) atomicAdd(&status.data[2], 1); }} else fail = true;
+                        piv = kj > 0.0f ? kj : 1.0f;
+                    }}
                     const float dg = sqrtf(piv);
                     const float id = 1.0f / dg;
                     __syncwarp();
@@ -1201,10 +1226,13 @@ def get_ds_solve_kernel(
                     const int r = dr[e / {NT}], c = dc[e / {NT}];
                     if (r < nb) sD[r * 33 + c] = L[co[c0 + k0 + c] + r - c];
                 }}
+                if (tid < nb) sInv[tid] = dK[c0 + k0 + tid];  // the panel's K_jj until sInv takes 1 / L_jj below
                 __syncthreads();
                 for (int j = 0; j < nb; j++) {{
+                    // The same pivot test as below, so the diagonal block's updates and L agree.
+                    const float kj = sInv[j];
                     float pv = sD[j * 33 + j];
-                    if (!(pv > 0.0f)) pv = 1.0e-30f;
+                    if (!(pv > pivot_floor * kj)) pv = kj > 0.0f ? kj : 1.0f;
                     const float ip = 1.0f / pv;
                     #pragma unroll
                     for (int z = 0; z < {DZ}; z++) {{
@@ -1216,8 +1244,12 @@ def get_ds_solve_kernel(
                 for (int e = tid; e < 528; e += {NT}) {{
                     const int r = dr[e / {NT}], c = dc[e / {NT}];
                     if (r < nb) {{
+                        const float kj = sInv[c];
                         float pv = sD[c * 33 + c];
-                        if (!(pv > 0.0f)) {{ if (r == c) atomicAdd(&status.data[0], 1); pv = 1.0e-30f; }}
+                        if (!(pv > pivot_floor * kj)) {{
+                            if (r == c) {{ if (pass) atomicAdd(&status.data[2], 1); else fail = true; }}
+                            pv = kj > 0.0f ? kj : 1.0f;
+                        }}
                         const float dg = sqrtf(pv);
                         const float v = r == c ? dg : sD[r * 33 + c] / dg;
                         L[co[c0 + k0 + c] + r - c] = v;
@@ -1307,6 +1339,11 @@ def get_ds_solve_kernel(
         if (tid == 0 && world == 0) {{ unsigned long long tq; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tq)); timing.data[5 + 2 * lev] = (long long)tq; }}
 #endif
     }}
+    const bool any_fail = __syncthreads_or(fail) != 0;
+    if (pass == 1) {{ shifted = true; break; }}
+    if (!any_fail) break;
+    if (tid == 0) atomicAdd(&status.data[0], 1);
+    }}
 #if DS_TIMING
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t2));
 #endif
@@ -1318,7 +1355,7 @@ def get_ds_solve_kernel(
     for (int it = 0; it < nsolve; it++) {{
         if (it > 0) {{
             for (int i = tid; i < {D}; i += {NT}) {{
-                float s = g[i];
+                float s = shifted ? g[i] + pivot_shift * dK[i] * x[i] : g[i];
                 const int c1 = h_ptr.data[i + 1];
                 for (int c = h_ptr.data[i]; c < c1; c++) s += Hw[h_list.data[2 * c]] * x[h_list.data[2 * c + 1]];
                 tv[i] = s;
@@ -1480,6 +1517,8 @@ def get_ds_solve_kernel(
         target_velocity: wp.array2d[float],
         qd0: wp.array[float],
         eps: float,
+        pivot_floor: float,
+        pivot_shift: float,
         bias_mode: int,
         h_dt: float,
         spring_k: float,
@@ -1515,6 +1554,7 @@ def get_ds_solve_kernel(
         qrow: wp.array2d[float],
         swrow: wp.array2d[float],
         Lg: wp.array2d[float],
+        kdiag: wp.array2d[float],
         status: wp.array[int],
         timing: wp.array[wp.int64],
         v_out: wp.array[float],
@@ -1535,6 +1575,8 @@ def get_ds_solve_kernel(
         target_velocity: wp.array2d[float],
         qd0: wp.array[float],
         eps: float,
+        pivot_floor: float,
+        pivot_shift: float,
         bias_mode: int,
         h_dt: float,
         spring_k: float,
@@ -1570,6 +1612,7 @@ def get_ds_solve_kernel(
         qrow: wp.array2d[float],
         swrow: wp.array2d[float],
         Lg: wp.array2d[float],
+        kdiag: wp.array2d[float],
         status: wp.array[int],
         timing: wp.array[wp.int64],
         v_out: wp.array[float],
@@ -1591,6 +1634,8 @@ def get_ds_solve_kernel(
             target_velocity,
             qd0,
             eps,
+            pivot_floor,
+            pivot_shift,
             bias_mode,
             h_dt,
             spring_k,
@@ -1626,6 +1671,7 @@ def get_ds_solve_kernel(
             qrow,
             swrow,
             Lg,
+            kdiag,
             status,
             timing,
             v_out,
@@ -1695,6 +1741,8 @@ def launch_solve(solver, rhs: wp.array, iterations: int, dt: float) -> None:
             solver._target_velocity,
             qd0,
             float(solver._closure_direct_eps),
+            float(solver._closure_direct_pivot_floor),
+            float(solver._closure_direct_pivot_shift),
             int(solver._closure_direct_bias == "implicit"),
             float(dt),
             float(spring_k),
@@ -1730,6 +1778,7 @@ def launch_solve(solver, rhs: wp.array, iterations: int, dt: float) -> None:
             buf.qrow,
             buf.swrow,
             buf.Lg,
+            buf.kdiag,
             buf.status,
             buf.timing,
         ],

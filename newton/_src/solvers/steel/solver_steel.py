@@ -3106,6 +3106,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             raise ValueError("closure_direct_factor must be None or 'sparse'")
         self._closure_ds_active = self._closure_direct_factor == "sparse"
         self._closure_direct_eps = float(self._kernel_overrides.get("closure_direct_eps", 1.0e-3))
+        self._closure_direct_pivot_floor = float(self._kernel_overrides.get("closure_direct_pivot_floor", 1.0e-4))
+        self._closure_direct_pivot_shift = float(self._kernel_overrides.get("closure_direct_pivot_shift", 1.0e-3))
+        if not 0.0 <= self._closure_direct_pivot_floor < self._closure_direct_pivot_shift:
+            raise ValueError("closure_direct_pivot_floor and closure_direct_pivot_shift need 0 <= floor < shift")
         self._closure_direct_bias = self._kernel_overrides.get("closure_direct_bias", "baumgarte")
         if self._closure_direct_bias not in ("baumgarte", "implicit"):
             raise ValueError("closure_direct_bias must be one of ['baumgarte', 'implicit']")

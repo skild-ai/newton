@@ -27,7 +27,11 @@ def kernel_overrides(overrides: Mapping[str, object]) -> Iterator[None]:
     experimental sparse direct solve (see ``closure_direct_sparse.py``), tuned by
     ``closure_direct_eps`` (row regularization, default ``1e-3``), ``closure_direct_bias``
     (``"baumgarte"`` or ``"implicit"`` with ``closure_direct_timeconst`` [s] and
-    ``closure_direct_dampratio``), ``closure_ds_threads`` (threads per world block),
+    ``closure_direct_dampratio``), ``closure_direct_pivot_floor`` and ``closure_direct_pivot_shift``
+    (defaults ``1e-4`` and ``1e-3``: a world whose factor meets a pivot at or below the floor times its
+    diagonal entry of ``K``, which float32 cannot resolve, is factored again with the shift times
+    ``diag(K)`` added, also in the refinements' proximal term; ``_closure_direct_sparse.status[0]``
+    counts those refactors), ``closure_ds_threads`` (threads per world block),
     ``closure_ds_bc`` (update columns per pass) and ``closure_ds_timing`` (per-world phase times).
     The sparse direct solve is correct on either mass solve, but on large looped mechanisms the dense Cholesky
     mass solve dominates the step (the Hoberman flower at resolution 2, one world: 199 ms per frame against
