@@ -685,6 +685,8 @@ def test_propagation_contracted_chain(test, device):
                     articulation_constraint_max=64,
                     solve_mode=mode,
                     propagation_momentum=False,
+                    # Nesterov's moves on rod rows arrive through the chains' pending impulses (no contraction).
+                    nesterov_momentum=False,
                     **_PROPAGATION,
                 )
             test.assertEqual(solver._rod_contracted, contracted)
@@ -1115,6 +1117,10 @@ def test_inextensible_tree_dynamics(test, device):
                 articulation_constraint_max=256,
                 iterations=16,
                 deterministic=wp.DeterministicMode.RUN_TO_RUN,
+                # The dense path's generalized rows would take Nesterov and the tree's rows propagation_momentum;
+                # the two dynamics paths are compared without either.
+                nesterov_momentum=False,
+                propagation_momentum=False,
             )
         test.assertEqual(bool(solver._tree_dynamics_sizes), tree)
         a, b, control, contacts = model.state(), model.state(), model.control(), pipeline.contacts()
