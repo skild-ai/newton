@@ -33,7 +33,8 @@ _PANEL = 32
     }
     __syncthreads();
     for (int j=0; j<m; ++j) {
-        if (!lane) tile[j][j] = sqrt(tile[j][j]);
+        // A pivot that lost definiteness (or is NaN) is floored: the factor stays finite instead of turning NaN.
+        if (!lane) tile[j][j] = sqrt(tile[j][j] > 1.0e-30 ? tile[j][j] : 1.0e-30);
         __syncthreads();
         if (lane>j && lane<m) tile[lane][j] /= tile[j][j];
         __syncthreads();
@@ -153,7 +154,8 @@ def _shared_kernel(n: int):
     for (int k = 0; k < N; ++k) {{
 {unrolled('''        if (ij[{e}] == ((k << 16) | k)) pivot = hi[{e}] + lo[{e}];''')}
         __syncthreads();
-        const float diagonal = sqrtf(pivot);
+        // A pivot that lost definiteness (or is NaN) is floored, so the column's reciprocal stays finite.
+        const float diagonal = sqrtf(pivot > 1.0e-20f ? pivot : 1.0e-20f);
 {
         unrolled('''        if (ij[{e}] >= 0 && (ij[{e}] & 0xFFFF) == k) {
             const int i = ij[{e}] >> 16;
