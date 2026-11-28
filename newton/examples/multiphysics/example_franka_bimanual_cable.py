@@ -73,7 +73,8 @@ _KNOT_TIE_TIME = 8.5
 # From the start of the pull to the hands closing on the ends (1.2 + 0.5 + 0.3 + 0.5) [s].
 _KNOT_GRAB_CLOSE = 2.5
 _KNOT_PULL_TIME = 10.1  # 1.2 + 0.5 + 0.3 + 0.5 + 0.3 + 0.6 + 6.0 + 0.3 + 0.4
-_KNOT_CINCH_TIME = 6.0  # [s] the slow pull that cinches the knot: at 4 s its peak tension slipped a jaw in about 1 run of 200
+# [s] the slow pull that cinches the knot: at 4 s its peak tension slipped a jaw in about one run of 200.
+_KNOT_CINCH_TIME = 6.0
 _KNOT_GRIP_IN = 8  # links from each end where the hands take the cable
 _KNOT_GRIP_CLEAR = 0.07  # [m] from the gripped link to any other strand of cable
 # [m] of cable the cinched overhand knot keeps (its loop alone takes ~11 cm of this 12 mm cable). Pulling farther
