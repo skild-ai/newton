@@ -8365,7 +8365,8 @@ class ModelBuilder:
         joint_dof_dim = self.joint_dof_dim[joint]
         if joint_type != JointType.ROD or tuple(joint_dof_dim) not in ((3, 3), (0, 3)):
             raise ValueError(
-                "_set_joint_rod_material_gains() expected a ROD layout (3 or 0 linear, 3 angular); got joint type "
+                "_set_joint_rod_material_gains() expected the six-DOF ROD layout (or the inextensible one: 0 linear, "
+                "3 angular); got joint type "
                 f"{JointType(joint_type).name} with dimensions {joint_dof_dim}. "
                 "Update the ROD material-axis mapping when changing its DOF layout."
             )
