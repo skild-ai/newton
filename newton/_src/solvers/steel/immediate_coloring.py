@@ -783,6 +783,11 @@ def packed_restitution(
     rhs: wp.array2d[float],
     weight: wp.array2d[float],
 ):
+    """Contact restitution of the packed rod path, whose rows all belong to world 0.
+
+    The packed path is single-world (``SolverSteel._packed_rod_size`` requires one world), so the row arrays are read
+    at world 0; the launch asserts it.
+    """
     c = wp.tid()
     if c >= count[0] or path[c] != 0:
         return

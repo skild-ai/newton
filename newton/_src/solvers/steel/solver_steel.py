@@ -9739,6 +9739,8 @@ class SolverSteel(SolverBase, CouplingInterface):
             )
         elif self._packed_rod_size is not None:
             if has_contacts:
+                # packed_restitution reads its rows at world 0: the packed path is single-world.
+                assert self._world_count == 1
                 wp.launch(
                     packed_restitution,
                     dim=contacts.rigid_contact_max,
