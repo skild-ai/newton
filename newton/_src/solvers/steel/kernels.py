@@ -12330,7 +12330,7 @@ def refine_same_articulation_propagation_rows_paths(
     same_row_count: wp.array[int],
     chain_flag: wp.array[int],
     body_chain_pos: wp.array[int],
-    propagation_tree_BR: wp.array2d[float],
+    propagation_tree_CR: wp.array2d[float],
     # scratch
     path_joint: wp.array2d[int],
     path_u: wp.array3d[float],
@@ -12393,7 +12393,7 @@ def refine_same_articulation_propagation_rows_paths(
             split_rows,
             chain_flag,
             body_chain_pos,
-            propagation_tree_BR,
+            propagation_tree_CR,
             path_joint,
             path_u,
             propagation_eff_mass_inv,
@@ -12404,16 +12404,17 @@ def refine_same_articulation_propagation_rows_paths(
 
 
 @wp.func
-def _chain_B_apply(BR: wp.array2d[float], pos: int, x: wp.spatial_vector, transpose: int) -> wp.spatial_vector:
-    """``B x`` (or ``B^T x``) for the chain link at walk position ``pos`` (row-major B leads its compact record)."""
+def _chain_B_apply(CR: wp.array2d[float], pos: int, x: wp.spatial_vector, transpose: int) -> wp.spatial_vector:
+    """``B x`` (or ``B^T x``) for the chain link at walk position ``pos``: row-major B leads its chain record (``CR``
+    per joint, ``rod_tree.CHAIN_REC`` wide; not the walk records ``BR``, whose layout interleaves lanes)."""
     y = wp.spatial_vector()
     for r in range(6):
         v = float(0.0)
         for c in range(6):
             if transpose != 0:
-                v += BR[pos, c * 6 + r] * x[c]
+                v += CR[pos, c * 6 + r] * x[c]
             else:
-                v += BR[pos, r * 6 + c] * x[c]
+                v += CR[pos, r * 6 + c] * x[c]
         y[r] = v
     return y
 
@@ -12436,7 +12437,7 @@ def _refine_chain_row(
     ba: int,
     bb: int,
     body_chain_pos: wp.array[int],
-    propagation_tree_BR: wp.array2d[float],
+    propagation_tree_CR: wp.array2d[float],
     propagation_body_response: wp.array3d[float],
     propagation_body_response_split: wp.array3d[float],
     body_split_weight: wp.array[int],
@@ -12483,7 +12484,7 @@ def _refine_chain_row(
     g = fd
     k = d_pos
     while k > s_pos:
-        g = _chain_B_apply(propagation_tree_BR, k, g, 0)
+        g = _chain_B_apply(propagation_tree_CR, k, g, 0)
         k -= 1
     ds = _response_apply(propagation_body_response, s_body, fs + g)
     # Each link's split response holds its own share (weight / joint weight); the row takes the smaller of its two
@@ -12496,8 +12497,8 @@ def _refine_chain_row(
     hs = _response_apply(propagation_body_response_split, s_body, fs) * f_s
     k = s_pos + 1
     while k <= d_pos:
-        h = _chain_B_apply(propagation_tree_BR, k, h, 1)
-        hs = _chain_B_apply(propagation_tree_BR, k, hs, 1)
+        h = _chain_B_apply(propagation_tree_CR, k, h, 1)
+        hs = _chain_B_apply(propagation_tree_CR, k, hs, 1)
         k += 1
     dd = h + _response_apply(propagation_body_response, d_body, fd)
     dds = hs + _response_apply(propagation_body_response_split, d_body, fd) * f_d
@@ -12578,7 +12579,7 @@ def _refine_path_row(
     split_rows: int,
     chain_flag: wp.array[int],
     body_chain_pos: wp.array[int],
-    propagation_tree_BR: wp.array2d[float],
+    propagation_tree_CR: wp.array2d[float],
     path_joint: wp.array2d[int],
     path_u: wp.array3d[float],
     propagation_eff_mass_inv: wp.array2d[float],
@@ -12608,7 +12609,7 @@ def _refine_path_row(
             ba,
             bb,
             body_chain_pos,
-            propagation_tree_BR,
+            propagation_tree_CR,
             propagation_body_response,
             propagation_body_response_split,
             body_split_weight,
