@@ -1121,7 +1121,7 @@ class RodMaterial:
                     state.body_q,
                 ],
                 outputs=[self.accumulated, result.body_qd],
-                block_dim=solver._articulation_block_dim,
+                block_dim=solver._serial_block_dim(len(self.integrated_articulations)),
                 device=m.device,
             )
         if self.all_spatial:

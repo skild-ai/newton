@@ -4,6 +4,9 @@
 """Row capacities, overflow reporting, watermarks and heterogeneous-world guards of SolverSteel."""
 
 import gc
+import hashlib
+import inspect
+import re
 import unittest
 import weakref
 
@@ -1279,6 +1282,156 @@ class TestSteelSweepSharedMemory(unittest.TestCase):
     pass
 
 
+def _row_offset_kernel(rows, dofs):
+    """A kernel that forms ``(world * rows + row) * dofs + dof`` the way Steel's native kernels index dense rows."""
+    from newton._src.solvers.steel.kernels import offset64  # noqa: PLC0415
+
+    snippet = f"""
+    const long long row_base = {offset64("world", rows * dofs)} + row * {dofs};
+    out.data[0] = row_base + dof;
+    """
+
+    @wp.func_native(snippet)
+    def row_offset_native(world: int, row: int, dof: int, out: wp.array[wp.int64]): ...
+
+    def row_offset_kernel(world: int, row: int, dof: int, out: wp.array[wp.int64]):
+        row_offset_native(world, row, dof, out)
+
+    row_offset_kernel.__name__ = f"row_offset_{rows}_{dofs}"
+    row_offset_kernel.__qualname__ = row_offset_kernel.__name__
+    return wp.kernel(enable_backward=False, module="unique")(row_offset_kernel)
+
+
+def test_dense_row_offsets_do_not_wrap_at_large_world_counts(test, device):
+    """Native row offsets stay exact past 2**31 elements, where the old 32-bit products wrapped.
+
+    The world counts are the first that overflowed int32: the Hoberman flower at resolution 2 (921 rows x 360 DOFs,
+    6,477 worlds) and the SMPL-X humanoid (320 rows x 159 DOFs, 42,207 worlds). The buffers themselves would need
+    more than 16 GB, so the test checks the offset arithmetic the kernels share rather than a full solve.
+    """
+    for rows, dofs, world in ((921, 360, 6477), (320, 159, 42207), (320, 159, 65535)):
+        kernel = _row_offset_kernel(rows, dofs)
+        out = wp.zeros(1, dtype=wp.int64, device=device)
+        row, dof = rows - 1, dofs - 1
+        wp.launch(kernel, dim=1, inputs=[world, row, dof, out], device=device)
+        expected = (world * rows + row) * dofs + dof
+        test.assertGreater(expected, 2**31 - 1)
+        test.assertEqual(int(out.numpy()[0]), expected)
+
+
+def _evaluate_native_index(expression, variable, value, device, constants=None):
+    """Evaluate a generated kernel's index expression with ``variable`` set to ``value`` in native code.
+
+    ``constants`` maps further names in ``expression`` to 32-bit ``int`` values fixed in the source.
+    """
+    declarations = "".join(f"const int {name} = {number};\n" for name, number in (constants or {}).items())
+    snippet = f"""
+    {declarations}const int {variable} = value;
+    const long long index = {expression};
+    out.data[0] = index;
+    """
+
+    @wp.func_native(snippet)
+    def index_native(value: int, out: wp.array[wp.int64]): ...
+
+    def index_kernel(value: int, out: wp.array[wp.int64]):
+        index_native(value, out)
+
+    index_kernel.__name__ = f"native_index_{hashlib.sha1(snippet.encode()).hexdigest()[:12]}"
+    index_kernel.__qualname__ = index_kernel.__name__
+    kernel = wp.kernel(enable_backward=False, module="unique")(index_kernel)
+    out = wp.zeros(1, dtype=wp.int64, device=device)
+    wp.launch(kernel, dim=1, inputs=[value, out], device=device)
+    return int(out.numpy()[0])
+
+
+def test_generated_block_offsets_do_not_wrap(test, device):
+    """Per-block bases that the generated kernels form outside ``offset64`` stay exact past 2**31 elements.
+
+    Each base is taken from the generated kernel source and evaluated at the first block index whose 32-bit
+    product wraps: the free-body L^-1 base of the sparse contact projection (6 x 6 per articulation group)
+    and the Nesterov momentum history of the matrix-free sweep (2 x (dense + free-body rows) per world, read
+    from the scratch array's ``int`` width).
+    CUDA only: both bases index CUDA kernels, and the CPU compiler may widen the overflowing product.
+    """
+    from newton._src.solvers.steel.solver_steel import _get_pgs_solve_mf_gs_kernel  # noqa: PLC0415
+    from newton._src.solvers.steel.sparse_contact import _get_sparse_contact_response_kernel  # noqa: PLC0415
+
+    contact = _get_sparse_contact_response_kernel(8)
+    source = inspect.getclosurevars(contact.func).nonlocals["project_native"].native_snippet
+    match = re.search(r"factor_base = ([^;]*\b36\b[^;]*);", source)
+    test.assertIsNotNone(match)
+    group = 2**31 // 36 + 1
+    test.assertEqual(_evaluate_native_index(match.group(1), "group", group, device), group * 36)
+
+    dense_rows, free_body_rows = 128, 512
+    sweep = _get_pgs_solve_mf_gs_kernel(
+        dense_rows,
+        free_body_rows,
+        12,
+        wp.get_device(device).arch,
+        has_dense_velocity_limit_rows=False,
+        shared_metadata=True,
+        nesterov_momentum=True,
+    )
+    match = re.search(r"&momentum_scratch\.data\[(.*)\];", sweep.native.native_snippet)
+    test.assertIsNotNone(match)
+    stride = 2 * (dense_rows + free_body_rows)
+    world = 2**31 // stride + 1
+    # The kernel reads the history width from the scratch array's shape, an int.
+    base = match.group(1).replace("momentum_scratch.shape[1]", "scratch_width")
+    test.assertEqual(_evaluate_native_index(base, "world", world, device, {"scratch_width": stride}), world * stride)
+
+
+def test_capacity_past_the_32_bit_index_range_fails_at_construction(test, device):
+    """A capacity whose 32-bit indexed rows pass 2**31 elements raises before any row buffer is allocated."""
+    model = _box_on_ground(device)
+    rows = 2**31 // 6 + 1  # 6-wide rows of one world past 2**31 - 1 elements
+    with test.assertRaisesRegex(
+        ValueError, r"propagation row Jacobians.*not even one world.*propagation_constraint_max"
+    ):
+        SolverSteel(model, articulated_contact_response="propagation", propagation_constraint_max=rows)
+    SolverSteel(model)
+    # The CUDA sweep takes at most 2**23 free-body rows per world, so the free-body rows pass 2**31 across worlds.
+    free_rows = 1 << 23
+    worlds = 2**31 // (6 * free_rows) + 1
+    model = _box_on_ground(device, worlds=worlds)
+    with test.assertRaisesRegex(
+        ValueError, rf"free-body row Jacobians.*at most {worlds - 1} worlds fit.*free_body_constraint_max"
+    ):
+        SolverSteel(model, free_body_constraint_max=free_rows)
+
+
+class TestSteelIndexRange(unittest.TestCase):
+    def test_int32_index_guard_bounds_worlds_by_capacity(self):
+        """The guard admits the last world count whose 32-bit indexed buffers fit and rejects the next one.
+
+        The bounds follow from the per-world widths of the buffers: 6-wide free-body and propagation rows and
+        12-int colored unit records. The 64-bit dense J/Y blocks of large scenes are not bounded by it.
+        """
+        from newton._src.solvers.steel.solver_steel import _check_int32_index_range  # noqa: PLC0415
+
+        limit = 2**31 - 1
+        cases = (
+            ("free-body row Jacobians", "free_body_constraint_max", 512 * 6, {"free_body_rows": 512}),
+            ("propagation row Jacobians", "propagation_constraint_max", 544 * 6, {"propagation_rows": 544}),
+            (
+                "colored-sweep unit records",
+                "propagation_constraint_max",
+                544 * 12,
+                {"propagation_rows": 544, "colored": True},
+            ),
+        )
+        for buffer, option, per_world, sizes in cases:
+            fit = limit // per_world
+            _check_int32_index_range(worlds=fit, dense_rows=32, world_dofs=6, **sizes)
+            with self.assertRaisesRegex(ValueError, rf"{buffer}.*at most {fit:,} worlds fit.*{option}"):
+                _check_int32_index_range(worlds=fit + 1, dense_rows=32, world_dofs=6, **sizes)
+        # SMPL-X (320 rows x 159 DOFs) at 65,536 worlds and the resolution-2 flower (921 x 360) at 8,192 worlds.
+        for worlds, rows, dofs in ((65536, 320, 159), (8192, 921, 360)):
+            _check_int32_index_range(worlds=worlds, dense_rows=rows, world_dofs=dofs, dense_group_articulations=worlds)
+
+
 add_function_test(
     TestSteelSweepSharedMemory,
     "test_free_body_capacity_past_sweep_shared_memory",
@@ -1302,6 +1455,24 @@ add_function_test(
     "test_cpu_free_body_capacity_past_the_cuda_index_limit",
     test_cpu_free_body_capacity_past_the_cuda_index_limit,
     devices=["cpu"],
+)
+add_function_test(
+    TestSteelIndexRange,
+    "test_dense_row_offsets_do_not_wrap_at_large_world_counts",
+    test_dense_row_offsets_do_not_wrap_at_large_world_counts,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelIndexRange,
+    "test_generated_block_offsets_do_not_wrap",
+    test_generated_block_offsets_do_not_wrap,
+    devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestSteelIndexRange,
+    "test_capacity_past_the_32_bit_index_range_fails_at_construction",
+    test_capacity_past_the_32_bit_index_range_fails_at_construction,
+    devices=get_cuda_test_devices(),
 )
 
 

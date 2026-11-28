@@ -44,6 +44,8 @@ def test_warp_reduction_matches_scalar_branched_trees(test, device):
             joint_child,
             None,
             body_inertia,
+            wp.ones(1, dtype=wp.int32, device=device),
+            0,
         ],
         outputs=[scalar],
         device=device,
@@ -64,6 +66,7 @@ def test_warp_reduction_matches_scalar_branched_trees(test, device):
             joint_child,
             body_inertia,
             wp.ones(2, dtype=wp.int32, device=device),
+            wp.ones(1, dtype=wp.int32, device=device),
         ],
         outputs=[parallel],
         block_dim=32 * warps_per_block,
@@ -519,6 +522,45 @@ def test_captured_two_substep_replay_matches_eager(test, device, solve_mode="ser
         np.testing.assert_allclose(captured, getattr(eager_a, name).numpy(), rtol=0.0, atol=2.0e-6, err_msg=name)
 
 
+def test_captured_replay_keeps_the_refresh_cadence(test, device, solve_mode="serial"):
+    """Replay graphs captured at an odd or even step, of one or three steps, with eager stepping's cadence."""
+    for options in ({}, {"double_buffer": True, "parallel_tree": True, "reuse_kinematics": True}):
+        for warm, steps_per_graph in ((1, 1), (2, 1), (1, 3), (2, 3)):
+            with test.subTest(options=options, warm=warm, steps_per_graph=steps_per_graph):
+                runs = []
+                for _ in range(2):
+                    model = _build_model(device, ground=False)
+                    solver = SolverSteel(model, update_mass_matrix_interval=2, **options)
+                    runs.append((solver, _make_initial_state(model), model.state(), model.control()))
+
+                def advance(run, count):
+                    solver, state_in, state_out, control = run
+                    for _ in range(count):
+                        solver.step(state_in, state_out, control, None, DT)
+                        for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                            wp.copy(getattr(state_in, name), getattr(state_out, name))
+
+                graph_run, eager_run = runs
+                for _ in range(warm):
+                    advance(graph_run, 1)
+                    advance(eager_run, 1)
+                with wp.ScopedCapture(device) as capture:
+                    advance(graph_run, steps_per_graph)
+                for replay in range(8):
+                    wp.capture_launch(capture.graph)
+                    advance(eager_run, steps_per_graph)
+                    # The last captured step refreshes exactly when the matching eager step does.
+                    test.assertEqual(
+                        graph_run[0]._mass_update_mask.numpy().tolist(),
+                        eager_run[0]._mass_update_mask.numpy().tolist(),
+                        f"replay {replay}",
+                    )
+                for name in ("joint_q", "joint_qd"):
+                    np.testing.assert_array_equal(
+                        getattr(graph_run[1], name).numpy(), getattr(eager_run[1], name).numpy(), err_msg=name
+                    )
+
+
 class TestSteelMassUpdateInterval(unittest.TestCase):
     pass
 
@@ -529,8 +571,10 @@ for _name in (
     "test_model_change_request_refreshes_a_reuse_step",
     "test_timestep_change_forces_a_refresh",
     "test_captured_two_substep_replay_matches_eager",
+    "test_captured_replay_keeps_the_refresh_cadence",
 ):
-    serial_devices = devices if _name == "test_captured_two_substep_replay_matches_eager" else get_test_devices()
+    captured = _name.startswith("test_captured_")
+    serial_devices = devices if captured else get_test_devices()
     add_function_test(TestSteelMassUpdateInterval, _name, globals()[_name], devices=serial_devices)
 
 

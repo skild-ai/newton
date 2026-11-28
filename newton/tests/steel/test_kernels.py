@@ -51,9 +51,9 @@ _ROWS = 64
 def test_default_launch_settings(test, device):
     """Select the kernels and launch widths automatically, matching explicitly pinned defaults bitwise."""
     solver = SolverSteel(_build_contact_scene(device))
-    test.assertEqual((solver._tile_threads, solver._serial_kernel_block_dim), (64, 256))
+    test.assertEqual((solver._tile_threads, solver._serial_kernel_block_dim), (64, "auto"))
     run = {"init": _set_box_velocities, "steps": 8}
-    explicit = {"tile_threads": 64, "serial_kernel_block_dim": 256}
+    explicit = {"tile_threads": 64, "serial_kernel_block_dim": "auto"}
     _assert_bitwise(
         test,
         _run(_build_contact_scene(device), **run),
@@ -71,8 +71,8 @@ def test_kernel_overrides_are_scoped_to_construction(test, device):
             nested = SolverSteel(model)
     default = SolverSteel(model)
     test.assertEqual((pinned._tile_threads, pinned._serial_kernel_block_dim), (32, 64))
-    test.assertEqual((nested._tile_threads, nested._serial_kernel_block_dim), (128, 256))
-    test.assertEqual((default._tile_threads, default._serial_kernel_block_dim), (64, 256))
+    test.assertEqual((nested._tile_threads, nested._serial_kernel_block_dim), (128, "auto"))
+    test.assertEqual((default._tile_threads, default._serial_kernel_block_dim), (64, "auto"))
     test.assertEqual(pinned._kernel_overrides, {"tile_threads": 32, "serial_kernel_block_dim": 64})
     test.assertEqual(default._kernel_overrides, {})
 
@@ -81,10 +81,26 @@ def test_serial_block_dim_is_bitwise(test, device):
     """Leave matrix-free results unchanged by the serial block size."""
     run = {"init": _set_box_velocities, "steps": 8}
     default = _run(_build_contact_scene(device), **run)
-    for overrides in ({"serial_kernel_block_dim": 64}, {"serial_kernel_block_dim": 512}):
+    for overrides in (
+        {"serial_kernel_block_dim": 8},
+        {"serial_kernel_block_dim": 256},
+        {"serial_kernel_block_dim": 512},
+    ):
         with test.subTest(overrides=overrides):
             result = _run(_build_contact_scene(device), overrides=overrides, **run)
             _assert_bitwise(test, default, result, str(overrides))
+
+
+def test_serial_launch_block_dim_spreads_threads_over_the_sms(test, device):
+    """Grow the serial block size only once every SM holds two blocks of the larger size."""
+    from newton._src.solvers.steel.solver_steel import _serial_launch_block_dim  # noqa: PLC0415
+
+    sms = 188
+    for threads, expected in ((1, 8), (1024, 8), (6015, 8), (6016, 16), (12032, 32), (24064, 64), (10**7, 64)):
+        with test.subTest(threads=threads):
+            test.assertEqual(_serial_launch_block_dim(threads, sms), expected)
+    # 1024 threads make 128 blocks for the 188 SMs instead of the 4 blocks of 256.
+    test.assertEqual(-(-1024 // _serial_launch_block_dim(1024, sms)), 128)
 
 
 def test_kernel_overrides_validate_their_values(test, device):
@@ -94,6 +110,7 @@ def test_kernel_overrides_validate_their_values(test, device):
         ({"tile_threads": 48}, "tile_threads"),
         ({"serial_kernel_block_dim": 0}, "serial_kernel_block_dim"),
         ({"serial_kernel_block_dim": 48}, "serial_kernel_block_dim"),
+        ({"serial_kernel_block_dim": 2048}, "serial_kernel_block_dim"),
     ):
         with test.subTest(overrides=overrides), test.assertRaisesRegex(ValueError, pattern):
             with kernel_overrides(overrides):
@@ -163,6 +180,7 @@ for _fn in (
     test_default_launch_settings,
     test_kernel_overrides_are_scoped_to_construction,
     test_kernel_overrides_validate_their_values,
+    test_serial_launch_block_dim_spreads_threads_over_the_sms,
     test_profile_annotates_every_stage_without_changing_results,
     test_profile_closes_the_open_range_when_a_stage_raises,
 ):
@@ -1022,7 +1040,7 @@ def test_launch_widths_step_identically(test, device, solve_mode="serial"):
         serial_kernel_block_dim=64,
     ):
         solver, joint_q = _legged_trajectory(model, **options)
-    test.assertEqual((default._tile_threads, default._serial_kernel_block_dim), (64, 256))
+    test.assertEqual((default._tile_threads, default._serial_kernel_block_dim), (64, "auto"))
     test.assertEqual((solver._tile_threads, solver._serial_kernel_block_dim), (128, 64))
     size = solver._size_groups[0]
     test.assertIsNot(solver._cholesky_kernels_by_size[size], default._cholesky_kernels_by_size[size])
@@ -1590,6 +1608,7 @@ def test_split_kinematics_match_the_fused_fk_id_kernel(test, device):
     for materialize_inertia, materialize_terms in ((1, 1), (0, 0), (1, 0)):
         with test.subTest(inertia=materialize_inertia, terms=materialize_terms):
             fused, split = fresh(), fresh()
+            materialize_all = wp.array([materialize_inertia], dtype=wp.int32, device=device)
             common = [
                 model.articulation_start,
                 solver._articulation_joint_end,
@@ -1615,7 +1634,7 @@ def test_split_kinematics_match_the_fused_fk_id_kernel(test, device):
                     model.body_mass,
                     model.body_inertia,
                     solver._is_free_rigid,
-                    materialize_inertia,
+                    materialize_all,
                     materialize_terms,
                     model.body_world,
                     model.gravity,
@@ -1681,7 +1700,7 @@ def test_split_kinematics_match_the_fused_fk_id_kernel(test, device):
                     model.body_inertia,
                     solver._is_free_rigid,
                     split["origin"],
-                    materialize_inertia,
+                    materialize_all,
                     materialize_terms,
                     model.body_world,
                     model.gravity,

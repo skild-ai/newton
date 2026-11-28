@@ -194,6 +194,22 @@ def _steel_module(name: str) -> wp.Module:
     return module
 
 
+def offset64(index: str, stride: int | str) -> str:
+    """Return the CUDA expression ``index * stride`` evaluated in 64-bit integers.
+
+    Native kernels index per-world blocks of the dense row system (rows x DOFs) and of the
+    mass matrices (DOFs x DOFs) by hand. Their totals pass 2**31 elements at large world
+    counts, for example 6,477 worlds of 921 rows x 360 DOFs or 42,207 worlds of 320 rows x
+    159 DOFs, where a 32-bit product wraps and reads or writes outside the buffer. Indices
+    derived from this offset must stay ``long long``.
+
+    Args:
+        index: CUDA expression of the block index, such as a world or articulation group.
+        stride: Elements per block, as a number or a CUDA expression.
+    """
+    return f"((long long)({index}) * ({stride}))"
+
+
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 # PGS joint drive row (``drive_mode="rows"``): a bilateral row per driven DOF whose
 # impulse follows the PhysX force-drive update each iteration; the velocity-only
@@ -1531,7 +1547,7 @@ def eval_rigid_fk_id(
     body_mass: wp.array[float],
     body_inertia: wp.array[wp.mat33],
     is_free_rigid: wp.array[int],
-    materialize_all_body_inertia: int,
+    materialize_all_body_inertia: wp.array[int],
     materialize_body_inertia_terms: int,
     body_world: wp.array[int],
     gravity: wp.array[wp.vec3],
@@ -1585,7 +1601,7 @@ def eval_rigid_fk_id(
             origin = wp.transform_point(body_q[root_body], body_com[root_body])
     articulation_origin[index] = origin
 
-    write_body_inertia = materialize_all_body_inertia
+    write_body_inertia = materialize_all_body_inertia[0]
     if is_free_rigid[index] != 0:
         write_body_inertia = 1
     cached_child = int(-1)
@@ -1747,6 +1763,100 @@ def eval_rigid_fk_kinematics(
 
 
 @wp.kernel(module=_KINEMATICS_KERNEL_MODULE, enable_backward=False)
+def eval_body_relative_poses(
+    articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
+    body_to_articulation: wp.array[int],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    body_q: wp.array[wp.transform],
+    # outputs
+    body_rel_t: wp.array[wp.vec3],
+    articulation_ref_t: wp.array[wp.vec3],
+):
+    """Compose each articulation's body positions relative to a reference point of its root joint.
+
+    ``body_rel_t[b]`` is body ``b``'s origin measured from ``articulation_ref_t[art]`` [m], in world
+    orientation. The forward kinematics composes world poses, so a body far from the world origin
+    carries the float32 rounding of its world position (about ``|x| * 6e-8`` per composition), and
+    the difference of two nearby points, such as a loop closure's gap, inherits it in full.
+    Composing from the reference keeps those differences at the precision of the articulation's
+    own size. The reference is a point the model or state holds exactly: for a root joint to the
+    world, its parent frame origin moved by the joint's own translation (``joint_X_p`` for a fixed
+    or hinged base, the free joint's position for a floating base); for a root joint to a body
+    outside the tree, that body's position. World anchors and other articulations' bodies then
+    subtract it without rounding a far-away position. Rotations do not depend on the world
+    position, so the chain takes them from ``body_q`` and only the translations are stored. Joints
+    run in articulation order, parents before children, as in :func:`eval_rigid_fk_kinematics`.
+    One thread per articulation.
+    """
+    art = wp.tid()
+    start = articulation_start[art]
+    end = articulation_joint_end[art]
+    if start >= end:
+        return
+    root_parent = joint_parent[start]
+    X_j = jcalc_transform(
+        joint_type[start],
+        joint_axis,
+        joint_qd_start[start],
+        joint_dof_dim[start, 0],
+        joint_dof_dim[start, 1],
+        joint_q,
+        joint_q_start[start],
+    )
+    X_pj = joint_X_p[start]
+    X_cinv = wp.transform_inverse(joint_X_c[start])
+    if root_parent < 0:
+        ref_t = wp.transform_get_translation(X_pj) + wp.quat_rotate(
+            wp.transform_get_rotation(X_pj), wp.transform_get_translation(X_j)
+        )
+        # The root body's offset from the reference: only the child-frame lever, rotated by the parent frame and joint.
+        root_rel = wp.quat_rotate(
+            wp.transform_get_rotation(X_pj) * wp.transform_get_rotation(X_j), wp.transform_get_translation(X_cinv)
+        )
+    else:
+        X_parent = body_q[root_parent]
+        ref_t = wp.transform_get_translation(X_parent)
+        root_rel = wp.quat_rotate(
+            wp.transform_get_rotation(X_parent), wp.transform_get_translation(X_pj * X_j * X_cinv)
+        )
+    articulation_ref_t[art] = ref_t
+    body_rel_t[joint_child[start]] = root_rel
+    for i in range(start + 1, end):
+        parent = joint_parent[i]
+        X_wpj = joint_X_p[i]
+        in_tree = False
+        if parent >= 0:
+            in_tree = body_to_articulation[parent] == art
+        if in_tree:
+            X_wpj = wp.transform(body_rel_t[parent], wp.transform_get_rotation(body_q[parent])) * X_wpj
+        else:
+            # Another root joint: its parent (the world or a body outside the tree) is in world coordinates.
+            if parent >= 0:
+                X_wpj = body_q[parent] * X_wpj
+            X_wpj = wp.transform(wp.transform_get_translation(X_wpj) - ref_t, wp.transform_get_rotation(X_wpj))
+        X_j = jcalc_transform(
+            joint_type[i],
+            joint_axis,
+            joint_qd_start[i],
+            joint_dof_dim[i, 0],
+            joint_dof_dim[i, 1],
+            joint_q,
+            joint_q_start[i],
+        )
+        body_rel_t[joint_child[i]] = wp.transform_get_translation(X_wpj * X_j * wp.transform_inverse(joint_X_c[i]))
+
+
+@wp.kernel(module=_KINEMATICS_KERNEL_MODULE, enable_backward=False)
 def finalize_body_dynamics(
     body_to_articulation: wp.array[int],
     body_q: wp.array[wp.transform],
@@ -1756,7 +1866,7 @@ def finalize_body_dynamics(
     body_inertia: wp.array[wp.mat33],
     is_free_rigid: wp.array[int],
     articulation_origin: wp.array[wp.vec3],
-    materialize_all_body_inertia: int,
+    materialize_all_body_inertia: wp.array[int],
     materialize_body_inertia_terms: int,
     body_world: wp.array[int],
     gravity: wp.array[wp.vec3],
@@ -1785,7 +1895,7 @@ def finalize_body_dynamics(
     if articulation_reuse[articulation] != 0:
         return
     origin = articulation_origin[articulation]
-    write_body_inertia = materialize_all_body_inertia
+    write_body_inertia = materialize_all_body_inertia[0]
     if is_free_rigid[articulation] != 0:
         write_body_inertia = 1
     v_s = body_v_s[body]
@@ -1964,7 +2074,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
         body_mass: wp.array[float],
         body_inertia: wp.array[wp.mat33],
         is_free_rigid: wp.array[int],
-        materialize_all_body_inertia: int,
+        materialize_all_body_inertia: wp.array[int],
         materialize_body_inertia_terms: int,
         body_world: wp.array[int],
         gravity: wp.array[wp.vec3],
@@ -2023,7 +2133,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
             _tree_warp_sync()
 
         origin = wp.vec3()
-        write_body_inertia = materialize_all_body_inertia
+        write_body_inertia = materialize_all_body_inertia[0]
         if active:
             origin = articulation_origin[articulation]
             if is_free_rigid[articulation] != 0:
@@ -2117,6 +2227,7 @@ def refresh_masked_body_inertia(
     body_mass: wp.array[float],
     body_inertia: wp.array[wp.mat33],
     write_body_inertia_terms: int,
+    global_refresh: wp.array[int],
     # outputs
     body_I_s: wp.array[wp.spatial_matrix],
     body_inertia_terms: wp.array2d[float],
@@ -2124,8 +2235,11 @@ def refresh_masked_body_inertia(
     """Materialize current link inertias selected by a reuse-step mass update mask.
 
     The compact COM terms feed the direct diagonal inertia owner, which bypasses ``body_I_s``; refresh them
-    under the same mask so a masked inertial update reaches every mass consumer.
+    under the same mask so a masked inertial update reaches every mass consumer. A global refresh step
+    (``global_refresh[0]`` set) already materialized every inertia during forward kinematics and skips this.
     """
+    if global_refresh[0] != 0:
+        return
     joint = wp.tid()
     articulation = joint_articulation[joint]
     if articulation < 0 or joint >= articulation_joint_end[articulation] or mass_update_mask[articulation] == 0:
@@ -2519,11 +2633,20 @@ def compute_composite_inertia(
     joint_child: wp.array[int],
     joint_order: wp.array[int],
     body_I_s: wp.array[wp.spatial_matrix],
+    global_refresh: wp.array[int],
+    skip_global_refresh: int,
     # outputs
     body_I_c: wp.array[wp.spatial_matrix],
 ):
+    """Sum the link inertias of each masked articulation into composite inertias, child to parent.
+
+    With ``skip_global_refresh`` set, a global refresh step (``global_refresh[0]`` set) leaves the
+    reduction to the warp kernel, or to nothing when no articulation reads composite inertias.
+    """
     art_idx = wp.tid()
 
+    if skip_global_refresh != 0 and global_refresh[0] != 0:
+        return
     if mass_update_mask[art_idx] == 0:
         return
 
@@ -3734,7 +3857,7 @@ def eval_rigid_tau_and_augmented_drives(
 
 @wp.kernel
 def build_mass_update_mask(
-    global_flag: int,
+    global_flag: wp.array[int],
     dt: float,
     mass_update_requested: wp.array[int],
     articulation_active: wp.array[int],
@@ -3743,7 +3866,7 @@ def build_mass_update_mask(
 ):
     """Refresh active factors whose timestep differs, including during graph replay."""
     tid = wp.tid()
-    flag = 1 if global_flag != 0 else 0
+    flag = 1 if global_flag[0] != 0 else 0
     # Ignore float-rounding jitter, but retain relative sensitivity for tiny timesteps.
     factor_dt = mass_factor_dt[tid]
     dt_changed = wp.abs(factor_dt - dt) > 1.0e-6 * wp.max(wp.abs(factor_dt), wp.abs(dt))
@@ -3754,6 +3877,39 @@ def build_mass_update_mask(
     mass_update_mask[tid] = flag
     if flag != 0:
         mass_factor_dt[tid] = dt
+
+
+@wp.kernel(enable_backward=False)
+def advance_mass_refresh_step(
+    interval: int,
+    # outputs
+    refresh_step: wp.array[int],
+    global_refresh: wp.array[int],
+):
+    """Flag this step's global mass refresh from the device step counter, then advance the counter.
+
+    The counter runs modulo ``interval`` on the device, so a step captured in a CUDA graph keeps the
+    cadence on every replay, whatever the step it was captured at.
+    """
+    step = refresh_step[0]
+    global_refresh[0] = wp.where(step == 0, 1, 0)
+    refresh_step[0] = (step + 1) % interval
+
+
+@wp.kernel(enable_backward=False)
+def zero_on_global_mass_refresh(
+    global_refresh: wp.array[int],
+    stride: int,
+    # outputs
+    values: wp.array[float],
+):
+    """Zero ``values`` on a global mass refresh step; ``stride`` is the launch dimension."""
+    if global_refresh[0] == 0:
+        return
+    i = wp.tid()
+    while i < values.shape[0]:
+        values[i] = 0.0
+        i += stride
 
 
 # =============================================================================
@@ -4114,11 +4270,41 @@ def _walk_has_free_dof(
     return False
 
 
+@wp.func
+def _closure_anchor_parts(
+    art: int,
+    body: int,
+    in_articulation: bool,
+    anchor: wp.vec3,
+    body_q: wp.array[wp.transform],
+    body_rel_t: wp.array[wp.vec3],
+    articulation_ref_t: wp.array[wp.vec3],
+):
+    """Split a closure anchor's world position [m] into a reference point and a small offset.
+
+    A body of articulation ``art`` (``in_articulation``) takes the articulation's reference and
+    its root-relative position (:func:`eval_body_relative_poses`); the world (``body < 0``) takes
+    the anchor itself; any other body takes its ``body_q`` position. The offset is the rest.
+    """
+    if body < 0:
+        return anchor, wp.vec3(0.0, 0.0, 0.0)
+    X = body_q[body]
+    offset = wp.quat_rotate(wp.transform_get_rotation(X), anchor)
+    if in_articulation:
+        return articulation_ref_t[art], body_rel_t[body] + offset
+    return wp.transform_get_translation(X), offset
+
+
+CONNECT_MAX_ROWS = 6
+"""Rows of the largest closure (FIXED); the connect kernel runs this many threads per closure."""
+
+
 @wp.kernel
 def populate_connect_J_for_size(
     articulation_dof_start: wp.array[int],
     art_to_world: wp.array[int],
     group_to_art: wp.array[int],
+    art_group_idx: wp.array[int],
     n_dofs: int,
     connect_slot: wp.array[int],
     connect_art: wp.array[int],
@@ -4138,7 +4324,10 @@ def populate_connect_J_for_size(
     joint_ancestor: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_S_s: wp.array[wp.spatial_vector],
-    articulation_origin: wp.array[wp.vec3],
+    body_rel_t: wp.array[wp.vec3],
+    articulation_ref_t: wp.array[wp.vec3],
+    articulation_start: wp.array[int],
+    joint_child: wp.array[int],
     # outputs
     J_group: wp.array3d[float],
     world_row_type: wp.array2d[int],
@@ -4151,8 +4340,9 @@ def populate_connect_J_for_size(
 ):
     """Fill the Jacobian and metadata of the connect rows of one size group.
 
-    One thread per articulation of the group scans the closure table and writes three
-    rows per owned closure: for world axis ``e``, ``phi = e . (p_A - p_B)`` and
+    One thread per closure row (``CONNECT_MAX_ROWS`` threads per closure) writes the rows of
+    the closures owned by an articulation of this group; ``art_group_idx`` maps an
+    articulation to its index within its size group. A closure has three point rows: for world axis ``e``, ``phi = e . (p_A - p_B)`` and
     ``J = e . (J_point(parent, p_M) - J_point(child, p_M))``, built with the ancestor
     walk of the contact rows. ``p_M`` is the midpoint of the two anchors, so each impulse
     pair acts at one world point and adds no couple while the closure is open. Once the
@@ -4180,150 +4370,172 @@ def populate_connect_J_for_size(
     error against a near-zero diagonal. Degenerate rows are left inert (zero ``J``,
     ``phi`` and target). ``connect_row_inv_norm`` keeps each row's factor (zero when
     inert) so a solved impulse maps back to a force.
+
+    The gap and lever arms are measured from the articulation's reference point
+    ``articulation_ref_t`` (see :func:`eval_body_relative_poses`), not from world positions.
+    Each anchor is a reference plus a small offset: a body of the closure's articulation takes
+    the articulation reference and its root-relative position ``body_rel_t``; the world anchor
+    of a world-parent closure is its own reference; a body outside the articulation takes its
+    ``body_q`` position. The large parts are subtracted first, which is exact for nearby points,
+    and only then the offsets are added. The world poses of an articulation far from the origin
+    carry the float32 rounding of its position, which the gap of two nearby anchors would
+    inherit and the normalization above would amplify.
     """
-    group_idx = wp.tid()
-    art = group_to_art[group_idx]
+    tid = wp.tid()
+    k = tid // CONNECT_MAX_ROWS
+    r = tid - k * CONNECT_MAX_ROWS
+    if r >= connect_rows[k]:
+        return
+    art = connect_art[k]
+    group_idx = art_group_idx[art]
+    if group_idx < 0 or group_idx >= group_to_art.shape[0]:
+        return
+    if group_to_art[group_idx] != art:
+        return
+    base_slot = connect_slot[k]
+    if base_slot < 0:
+        return
     world = art_to_world[art]
     dof_start = articulation_dof_start[art]
 
-    n_connect = connect_art.shape[0]
-    for k in range(n_connect):
-        if connect_art[k] != art:
-            continue
-        base_slot = connect_slot[k]
-        if base_slot < 0:
-            continue
-
-        body_p = connect_body_p[k]
-        body_c = connect_body_c[k]
-        prescribed = connect_parent_prescribed[k] != 0
-        joint = connect_joint[k]
-        anchor_p = wp.transform_get_translation(joint_X_p[joint])
-        p_a = anchor_p
-        v_a = wp.vec3(0.0, 0.0, 0.0)
-        if body_p >= 0:
-            p_a = wp.transform_point(body_q[body_p], anchor_p)
-            if prescribed:
-                # The anchor velocity of a prescribed parent comes from its body twist.
-                twist = body_qd[body_p]
-                x_com = wp.transform_point(body_q[body_p], body_com[body_p])
-                v_a = wp.spatial_top(twist) + wp.cross(wp.spatial_bottom(twist), p_a - x_com)
-        p_b = wp.transform_point(body_q[body_c], wp.transform_get_translation(joint_X_c[joint]))
-        origin = articulation_origin[art]
-        rel_a = p_a - origin
-        rel_b = p_b - origin
-        delta = p_a - p_b
-        at_midpoint = (
-            not prescribed
-            and _walk_has_free_dof(body_p, body_to_joint, joint_ancestor, joint_qd_start, kinematic_dof_mask)
-            and _walk_has_free_dof(body_c, body_to_joint, joint_ancestor, joint_qd_start, kinematic_dof_mask)
-        )
+    body_p = connect_body_p[k]
+    body_c = connect_body_c[k]
+    prescribed = connect_parent_prescribed[k] != 0
+    joint = connect_joint[k]
+    anchor_p = wp.transform_get_translation(joint_X_p[joint])
+    v_a = wp.vec3(0.0, 0.0, 0.0)
+    if body_p >= 0 and prescribed:
+        # The anchor velocity of a prescribed parent comes from its body twist.
+        twist = body_qd[body_p]
+        lever = wp.quat_rotate(wp.transform_get_rotation(body_q[body_p]), anchor_p - body_com[body_p])
+        v_a = wp.spatial_top(twist) + wp.cross(wp.spatial_bottom(twist), lever)
+    # Each anchor as a large reference part plus a small offset, measured in the frame of the
+    # articulation's reference point. The child is always in the articulation, the parent
+    # unless it is prescribed (see ``SolverSteel._build_connect_plan``).
+    frame_t = articulation_ref_t[art]
+    root = joint_child[articulation_start[art]]
+    origin = body_rel_t[root] + wp.quat_rotate(wp.transform_get_rotation(body_q[root]), body_com[root])
+    big_a, small_a = _closure_anchor_parts(
+        art, body_p, not prescribed, anchor_p, body_q, body_rel_t, articulation_ref_t
+    )
+    big_b, small_b = _closure_anchor_parts(
+        art, body_c, True, wp.transform_get_translation(joint_X_c[joint]), body_q, body_rel_t, articulation_ref_t
+    )
+    rel_a = (big_a - frame_t) + small_a - origin
+    rel_b = (big_b - frame_t) + small_b - origin
+    delta = (big_a - big_b) + (small_a - small_b)
+    at_midpoint = (
+        not prescribed
+        and _walk_has_free_dof(body_p, body_to_joint, joint_ancestor, joint_qd_start, kinematic_dof_mask)
+        and _walk_has_free_dof(body_c, body_to_joint, joint_ancestor, joint_qd_start, kinematic_dof_mask)
+    )
+    if r == 0:
         connect_at_midpoint[k] = int(at_midpoint)
-        if at_midpoint:
-            # Both walks take their lever arm from the anchors' midpoint, so the impulse pair
-            # is not a couple across an open closure.
-            rel_a = (p_a - 0.5 * delta) - origin
-            rel_b = rel_a
+    if at_midpoint:
+        # Both walks take their lever arm from the anchors' midpoint, so the impulse pair
+        # is not a couple across an open closure.
+        rel_a = rel_a - 0.5 * delta
+        rel_b = rel_a
 
-        for axis in range(3):
-            slot = base_slot + axis
-            e = wp.vec3(0.0, 0.0, 0.0)
-            e[axis] = 1.0
-            target = float(0.0)
+    if r < 3:
+        axis = r
+        slot = base_slot + axis
+        e = wp.vec3(0.0, 0.0, 0.0)
+        e[axis] = 1.0
+        target = float(0.0)
 
-            # Both walks accumulate into the row, which the caller zeroed this step.
-            if prescribed:
-                target = -wp.dot(e, v_a)
-            else:
-                curr = body_to_joint[body_p]
-                while curr != -1:
-                    for d in range(joint_qd_start[curr], joint_qd_start[curr + 1]):
-                        S = joint_S_s[d]
-                        lin = wp.vec3(S[0], S[1], S[2])
-                        ang = wp.vec3(S[3], S[4], S[5])
-                        J_group[group_idx, slot, d - dof_start] += wp.dot(e, lin + wp.cross(ang, rel_a))
-                    curr = joint_ancestor[curr]
-            curr = body_to_joint[body_c]
+        # Both walks accumulate into the row, which the caller zeroed this step.
+        if prescribed:
+            target = -wp.dot(e, v_a)
+        else:
+            curr = body_to_joint[body_p]
             while curr != -1:
                 for d in range(joint_qd_start[curr], joint_qd_start[curr + 1]):
                     S = joint_S_s[d]
                     lin = wp.vec3(S[0], S[1], S[2])
                     ang = wp.vec3(S[3], S[4], S[5])
-                    J_group[group_idx, slot, d - dof_start] -= wp.dot(e, lin + wp.cross(ang, rel_b))
+                    J_group[group_idx, slot, d - dof_start] += wp.dot(e, lin + wp.cross(ang, rel_a))
                 curr = joint_ancestor[curr]
+        curr = body_to_joint[body_c]
+        while curr != -1:
+            for d in range(joint_qd_start[curr], joint_qd_start[curr + 1]):
+                S = joint_S_s[d]
+                lin = wp.vec3(S[0], S[1], S[2])
+                ang = wp.vec3(S[3], S[4], S[5])
+                J_group[group_idx, slot, d - dof_start] -= wp.dot(e, lin + wp.cross(ang, rel_b))
+            curr = joint_ancestor[curr]
 
-            connect_row_inv_norm[k, axis] = _finish_connect_row(
-                group_idx,
-                slot,
-                n_dofs,
-                world,
-                delta[axis],
-                target,
-                J_group,
-                world_row_type,
-                world_row_parent,
-                world_row_mu,
-                world_phi,
-                world_target_velocity,
-            )
-
-        rows = connect_rows[k]
-        if rows < 5:
-            continue
-        dirs, phis = _connect_rotation_rows(
-            rows, body_p, body_c, joint, joint_axis, joint_qd_start, joint_X_p, joint_X_c, body_q
+        connect_row_inv_norm[k, axis] = _finish_connect_row(
+            group_idx,
+            slot,
+            n_dofs,
+            world,
+            delta[axis],
+            target,
+            J_group,
+            world_row_type,
+            world_row_parent,
+            world_row_mu,
+            world_phi,
+            world_target_velocity,
         )
-        omega_a = wp.vec3(0.0, 0.0, 0.0)
-        if prescribed and body_p >= 0:
-            omega_a = wp.spatial_bottom(body_qd[body_p])
-        # Rotation rows: two hinge-alignment rows for REVOLUTE, three weld rows for FIXED.
-        for i in range(rows - 3):
-            slot = base_slot + 3 + i
-            e = dirs[i]
-            target = float(0.0)
-            if prescribed:
-                target = -wp.dot(e, omega_a)
-            else:
-                _accumulate_angular_jacobian_row(
-                    body_p,
-                    1.0,
-                    e,
-                    body_to_joint,
-                    joint_ancestor,
-                    joint_qd_start,
-                    joint_S_s,
-                    dof_start,
-                    group_idx,
-                    slot,
-                    J_group,
-                )
-            _accumulate_angular_jacobian_row(
-                body_c,
-                -1.0,
-                e,
-                body_to_joint,
-                joint_ancestor,
-                joint_qd_start,
-                joint_S_s,
-                dof_start,
-                group_idx,
-                slot,
-                J_group,
-            )
-            connect_row_inv_norm[k, 3 + i] = _finish_connect_row(
-                group_idx,
-                slot,
-                n_dofs,
-                world,
-                phis[i],
-                target,
-                J_group,
-                world_row_type,
-                world_row_parent,
-                world_row_mu,
-                world_phi,
-                world_target_velocity,
-            )
+        return
+
+    rows = connect_rows[k]
+    dirs, phis = _connect_rotation_rows(
+        rows, body_p, body_c, joint, joint_axis, joint_qd_start, joint_X_p, joint_X_c, body_q
+    )
+    omega_a = wp.vec3(0.0, 0.0, 0.0)
+    if prescribed and body_p >= 0:
+        omega_a = wp.spatial_bottom(body_qd[body_p])
+    # Rotation rows: two hinge-alignment rows for REVOLUTE, three weld rows for FIXED.
+    i = r - 3
+    slot = base_slot + 3 + i
+    e = dirs[i]
+    target = float(0.0)
+    if prescribed:
+        target = -wp.dot(e, omega_a)
+    else:
+        _accumulate_angular_jacobian_row(
+            body_p,
+            1.0,
+            e,
+            body_to_joint,
+            joint_ancestor,
+            joint_qd_start,
+            joint_S_s,
+            dof_start,
+            group_idx,
+            slot,
+            J_group,
+        )
+    _accumulate_angular_jacobian_row(
+        body_c,
+        -1.0,
+        e,
+        body_to_joint,
+        joint_ancestor,
+        joint_qd_start,
+        joint_S_s,
+        dof_start,
+        group_idx,
+        slot,
+        J_group,
+    )
+    connect_row_inv_norm[k, 3 + i] = _finish_connect_row(
+        group_idx,
+        slot,
+        n_dofs,
+        world,
+        phis[i],
+        target,
+        J_group,
+        world_row_type,
+        world_row_parent,
+        world_row_mu,
+        world_phi,
+        world_target_velocity,
+    )
 
 
 # =============================================================================
