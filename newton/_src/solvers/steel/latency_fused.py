@@ -745,12 +745,9 @@ def get_fused_iteration_kernel(
         for i in range(iterations):
             g = iteration_offset + i
             if wp.static(split_momentum):
-                # With rod trees only the first step runs here (it records the warm start); the later ones run after
-                # the previous sweep, where the propagation that follows installs their move with the sweep's.
-                if not wp.static(split_rods) or i == 0:
-                    momentum_age = wp.static(advance_momentum)(
-                        world, t, i, momentum_age, g == friction_start_iteration, extra[0].split[0]
-                    )
+                momentum_age = wp.static(advance_momentum)(
+                    world, t, i, momentum_age, g == friction_start_iteration, extra[0].split[0]
+                )
             # propagation_interval: the rod trees propagate every ``every``-th sweep and after the last, and the
             # momentum steps with them (the sweeps' body estimates carry the impulses in between).
             last = i == iterations - 1
@@ -814,13 +811,6 @@ def get_fused_iteration_kernel(
                 friction_start_iteration, g, propagation_impulses, body_qd, body_impulses,
             )  # fmt: skip
             _block_sync()
-            if wp.static(split_momentum and split_rods):
-                # The next sweep's step: its rod rows' moves join this sweep's pending impulses.
-                if not last:
-                    momentum_age = wp.static(advance_momentum)(
-                        world, t, i + 1, momentum_age, g + 1 == friction_start_iteration, extra[0].split[0]
-                    )
-                    _block_sync()
             if wp.static(momentum):
                 if propagates and not last:
                     # The momentum's move joins the sweep's pending impulses, so the propagation installs both.
