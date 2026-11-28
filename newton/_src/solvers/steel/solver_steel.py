@@ -42,6 +42,7 @@ from .contact_adhesion import (
 )
 from .contact_angular_friction import (
     accumulate_free_rigid_angular_wrenches,
+    articulated_rolling_shapes,
     configure_free_rigid_angular_friction,
     free_rigid_angular_friction_gs_sources,
     free_rigid_route_bodies,
@@ -3251,19 +3252,13 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._friction_combine_id = _MATERIAL_COMBINE_MODES[friction_combine]
         self._restitution_combine_id = _MATERIAL_COMBINE_MODES[restitution_combine]
         configure_free_rigid_angular_friction(self, model, free_rigid_torsional_friction, free_rigid_rolling_friction)
-        if self._free_rigid_angular_rows and articulated_contact_response == "immediate" and model._has_rod_joints:
-            condim = self._namespaced_attribute("condim")
-            rolling = model.shape_material_mu_rolling.numpy() if model.shape_count else np.zeros(0)
-            joint_art = model.joint_articulation.numpy()
-            rod_arts = np.unique(joint_art[model.joint_type.numpy() == int(JointType.ROD)])
-            rod_bodies = model.joint_child.numpy()[np.isin(joint_art, rod_arts[rod_arts >= 0])]
-            on_rods = np.isin(model.shape_body.numpy(), rod_bodies)
-            if condim is not None and bool(np.any(on_rods & (condim.numpy() >= 6) & (rolling > 0.0))):
-                warnings.warn(
-                    "SolverSteel: cable rolling friction (steel:condim 6) is solved only under "
-                    "articulated_contact_response='propagation'; the immediate response ignores it on cable links.",
-                    NewtonWarning,
-                    stacklevel=2,
+        self._articulated_rolling = articulated_rolling_shapes(self, model)
+        if self._articulated_rolling:
+            # The dense sweep packs each row's type beside its parent; a rolling row's type needs a fourth bit.
+            max_parent = ((2**31 - 1) >> _dense_meta_type_bits(True)) - 1
+            if self._requested_dense_max_constraints - 1 > max_parent:
+                raise ValueError(
+                    f"articulation_constraint_max must be at most {max_parent + 1} with articulated rolling friction"
                 )
         if not model.device.is_cuda:
             if model._has_rod_joints:
@@ -3456,6 +3451,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             plan = self._model_plan
             worlds = plan.articulation_world[plan.response_dof_count > 0]
             self._color_immediate = bool(np.any(np.bincount(worlds, minlength=plan.world_count) > 1))
+            # The colored dense sweep solves no rolling rows; articulated rolling keeps the serial dense sweep.
+            if self._articulated_rolling:
+                self._color_immediate = False
             # A world's single rod articulation takes part in nearly every contact of that world (its own
             # collisions and whatever it touches), so the immediate colors are singletons in serial order as
             # well, and the per-world fused sweep is both exact Gauss-Seidel and faster than the colored
@@ -3624,6 +3622,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             and not self._contact_compliance
             and not self._adhesion_enabled
             and not self._contact_torsion_enabled
+            and not self._articulated_rolling
             and self._friction_mode == "fixed_normal"
             and bool(np.all(np.isin(model.joint_type.numpy(), (int(JointType.FREE), int(JointType.ROD)))))
             # The packed kernels hold six DOFs per joint; an inextensible rod joint has three.
@@ -4966,6 +4965,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._classify_free_rigid_bodies(model)
         self._compact_contact_jacobian = bool(
             model.device.is_cuda
+            # The compact builder writes no rolling rows.
+            and not self._articulated_rolling
             and self._body_response_dof_mask is not None
             and self._size_groups
             and max(self._size_groups) <= _CONTACT_JACOBIAN_MAX_DOF
@@ -6356,6 +6357,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         supported = bool(
             model.joint_dof_count > 0
             and self._enable_joint_limits
+            and not self._articulated_rolling
             and not self._color_immediate
             and self._articulated_contact_response == "immediate"
             and self._row_schedule == "interleaved"
@@ -6755,6 +6757,8 @@ class SolverSteel(SolverBase, CouplingInterface):
         if not self._kernel_overrides.get("sparse_mass_matrix", True) or self._sparse_diagonal_contact_solve:
             return
         if self._rod_material is not None or _model_has_bilateral_constraints(model) or self._distance_limit_count:
+            return
+        if self._articulated_rolling:  # the sparse sweep solves no rolling rows
             return
         # The sparse rows and sweep exist only in the interleaved CUDA solve, without drive rows.
         if not model.device.is_cuda or self._has_drive_rows or self._row_schedule != "interleaved":
@@ -7774,6 +7778,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 contact_compliance=self._contact_compliance,
                 pair_cache=self._mfgs_pair_cache,
                 free_rigid_angular_friction=self._free_rigid_angular_rows,
+                articulated_rolling=self._articulated_rolling,
                 stream_mf_lambda=self._mfgs_stream_mf_lambda,
                 torsion_links=self._mfgs_torsion_links,
                 nesterov_momentum=self._nesterov_momentum,
@@ -12100,6 +12105,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._restitution_combine_id,
                     recovery_phi,
                     self._rigid_body_max_depenetration_velocity,
+                    self._articulated_mu_rolling,
                 ],
                 outputs=[
                     self._row_type,
@@ -19089,6 +19095,7 @@ def _get_pgs_solve_mf_gs_kernel(
     joint_friction: bool = False,
     contact_compliance: bool = False,
     free_rigid_angular_friction: bool = False,
+    articulated_rolling: bool = False,
     row_phase: int | None = None,
     pair_cache: bool = False,
     stream_mf_lambda: bool = False,
@@ -19200,7 +19207,8 @@ def _get_pgs_solve_mf_gs_kernel(
     M_MF = free_body_constraint_max
     D = max_world_dofs
     ELEMS_PER_LANE = (D + 31) // 32
-    type_bits = _dense_meta_type_bits(joint_friction)
+    # A rolling row's type (articulated rolling pairs on dense rows) needs the fourth type bit too.
+    type_bits = _dense_meta_type_bits(joint_friction or articulated_rolling)
     type_mask = (1 << type_bits) - 1
 
     def lanes(template: str) -> str:
@@ -19545,6 +19553,7 @@ def _get_pgs_solve_mf_gs_kernel(
                         residual, sibling_residual, old_impulse, s_lam_dense[sib], radius, omega);
 """
     )
+    dense_pair_candidate = dense_pair_solve
     if pair_cache:
         # The launch prologue set up the pair's operator; only its sibling residual changes between sweeps.
         dense_pair_solve = (
@@ -19592,6 +19601,20 @@ def _get_pgs_solve_mf_gs_kernel(
                         for (int d = lane; d < {D}; d += 32) s_v[d] += Y_world.data[sib_row_base + d] * sib_delta;
                     }}
                 }}"""
+    # A dense rolling pair (an articulated contact's rows parent + 3 and parent + 4) is solved on a disk of
+    # radius mu_r times the pooled normal load at its first row, as the sliding pair is at parent + 1. The
+    # launch's pair cache holds only sliding pairs, so the rolling pair takes the uncached pair solve.
+    dense_rolling_update = ""
+    if articulated_rolling:
+        sliding_update = dense_friction_update
+        if pair_cache:
+            sliding_update = sliding_update.replace(dense_pair_solve, dense_pair_candidate)
+        dense_rolling_update = (
+            sliding_update.replace("i != parent_idx + 1", "i != parent_idx + 3")
+            .replace("int sib = parent_idx + 2;", "int sib = parent_idx + 4;")
+            .replace("The first tangent row solves both tangents", "The first rolling row solves both rolling rows")
+        )
+        assert dense_rolling_update.count("parent_idx + 4") == 1 and "parent_idx + 3" in dense_rolling_update
     if friction_mode == "fixed_normal":
         mf_friction_update = """                int sib = mf_par + 2;
                 int sib_mf6 = mf6_base + sib * 6;
@@ -19667,6 +19690,17 @@ def _get_pgs_solve_mf_gs_kernel(
         if friction_mode not in ("bisection", "bisection_desaxce")
         else ""
     )
+
+    dense_second_rolling_skip = ""
+    dense_rolling_branch = ""
+    if articulated_rolling:
+        rolling = int(PGS_CONSTRAINT_TYPE_CONTACT_ROLLING)
+        dense_second_rolling_skip = (
+            f"\n            if (row_type == {rolling} && i != ((s_meta_dense[i] >> {type_bits}) - 1) + 3) continue;"
+        )
+        dense_rolling_branch = f""" else if (row_type == {rolling}) {{
+{dense_rolling_update}
+            }}"""
 
     mf_angular_skip, mf_angular_radius, mf_angular_update, mf_angular_load_decl = "", "", "", ""
     if free_rigid_angular_friction:
@@ -19868,12 +19902,12 @@ def _get_pgs_solve_mf_gs_kernel(
             if (row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)}) continue;
             if (freeze_drive_rows != 0 && row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)}) continue;
 {dense_phase_filter}
-            if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)} && global_iter < friction_start_iteration) {{
+            if ((row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)} || row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT_ROLLING)}) && global_iter < friction_start_iteration) {{
                 s_lam_dense[i] = 0.0f;
                 __syncwarp();
                 continue;
             }}
-{dense_second_friction_skip}
+{dense_second_friction_skip}{dense_second_rolling_skip}
             float denom = s_diag_dense[i];
             if (denom <= 0.0f{dense_friction_denominator_guard}) continue;
 
@@ -19891,7 +19925,7 @@ def _get_pgs_solve_mf_gs_kernel(
 {drive_update}
             if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
 {dense_friction_update}
-            }} else if (new_impulse < 0.0f && (row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)} ||
+            }}{dense_rolling_branch} else if (new_impulse < 0.0f && (row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)} ||
                                                row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)})) {{
                 // Contact and joint-limit rows are unilateral; mimic and connect rows are bilateral.
                 new_impulse = 0.0f;
@@ -20154,6 +20188,7 @@ def _get_pgs_solve_mf_gs_kernel(
         joint_friction,
         contact_compliance,
         free_rigid_angular_friction,
+        articulated_rolling,
         row_phase,
         pair_cache,
         torsion_links,
@@ -20327,6 +20362,7 @@ def _mf_gs_kernel_name(
     joint_friction: bool,
     contact_compliance: bool,
     free_rigid_angular_friction: bool = False,
+    articulated_rolling: bool = False,
     row_phase: int | None = None,
     pair_cache: bool = False,
     torsion_links: bool = False,
@@ -20346,6 +20382,7 @@ def _mf_gs_kernel_name(
         f"{'_jfric' if joint_friction else ''}"
         f"{'_compliance' if contact_compliance else ''}"
         f"{'_free_rigid_angular' if free_rigid_angular_friction else ''}"
+        f"{'_articulated_rolling' if articulated_rolling else ''}"
         f"{'_momentum' if nesterov_momentum else ''}"
     )
 

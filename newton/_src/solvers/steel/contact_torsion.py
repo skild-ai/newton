@@ -190,7 +190,8 @@ def _contact_groups(solver, state, contacts):
             continue
         # Point friction gives every admitted normal its tangent pair. Patches give
         # tangent rows only to the selected anchors; other normals occupy one slot.
-        anchor = int(slots_needed[c]) == 3
+        # An articulated rolling pair (slots 3 and 4) follows the tangent pair without changing it.
+        anchor = int(slots_needed[c]) >= 3
         if (
             world < 0
             or world >= len(row_counts)

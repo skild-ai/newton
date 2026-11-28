@@ -1405,38 +1405,42 @@ def test_cable_torsion_stops_a_spin_with_warm_start(test, device):
 
 
 def test_cable_rolling_friction(test, device):
-    """Rolling friction (steel:condim 6) stops a cable rolling sideways under propagation, at about the rate of a
-    rolling cylinder, alone and with contact torsion; the free-body override does not reach cable links, and the
-    immediate response warns that it ignores cable rolling."""
+    """Rolling friction (steel:condim 6) stops a cable rolling sideways under both responses, at about the rate of
+    a rolling cylinder, alone and with contact torsion; the free-body override does not reach cable links."""
     dt, speed, radius, rolling = 1.0 / 240.0, 0.5, 0.02, 0.002
     roll = {"linear": (0.0, speed, 0.0), "angular": (-speed / radius, 0.0, 0.0)}
     # A rolling capsule decelerates at mu_r g / (r (1 + I / (m r^2))), with I / (m r^2) between 0.4 and 0.5.
     slowest = speed / (rolling * 9.81 / (radius * 1.5))
     fastest = speed / (rolling * 9.81 / (radius * 1.4))
-    options = _CABLE_RESPONSES["propagation"]
-    for torsion in (0.0, 0.01):
-        with test.subTest(torsion=torsion):
-            model = _ground_cable(device, rolling=rolling, torsion_radius=torsion)
-            opts = {**options, "friction_anchor_beta": 0.0}
-            if torsion:
-                opts.update(contact_torsion_device=True, contact_warmstart=True)
-            _, state, twists = _run_ground_cable(model, opts, 240, dt=dt, **roll)
-            test.assertTrue(np.all(np.isfinite(state.body_q.numpy())))
-            stopped = np.flatnonzero(np.abs(twists[:, :, 1]).mean(axis=1) < 0.01)
-            test.assertGreater(stopped.size, 0)
-            test.assertGreater(stopped[0] * dt, 0.8 * fastest)
-            test.assertLess(stopped[0] * dt, 1.2 * slowest)
-    # Without condim the cable keeps rolling, even with the free-body override set.
-    model = _ground_cable(device)
-    _, _, twists = _run_ground_cable(model, {**options, "free_rigid_rolling_friction": rolling}, 240, dt=dt, **roll)
-    test.assertGreater(twists[-1, :, 1].mean(), 0.9 * speed)
-    # Contact torsion still stops an upright spinning cable whose contact also has a rolling pair.
-    model = _ground_cable(device, links=3, length=0.12, radius=0.03, upright=True, torsion_radius=0.01, rolling=rolling)
-    opts = {**options, "contact_torsion_device": True, "contact_warmstart": True, "friction_anchor_beta": 0.0}
-    _, _, twists = _run_ground_cable(model, opts, 120, angular=(0.0, 0.0, 4.0))
-    test.assertLess(np.abs(twists[-1, :, 5]).mean(), 1.0e-3)
-    with test.assertWarnsRegex(newton.NewtonWarning, "rolling"):
-        newton.solvers.SolverSteel(_ground_cable(device, rolling=rolling), **_CABLE_RESPONSES["immediate"])
+    for response, options in _CABLE_RESPONSES.items():
+        for torsion in (0.0, 0.01):
+            with test.subTest(response=response, torsion=torsion):
+                model = _ground_cable(device, rolling=rolling, torsion_radius=torsion)
+                opts = {**options, "friction_anchor_beta": 0.0}
+                if torsion:
+                    opts.update(contact_torsion_device=True, contact_warmstart=True)
+                solver, state, twists = _run_ground_cable(model, opts, 240, dt=dt, **roll)
+                test.assertTrue(solver._articulated_rolling)
+                test.assertTrue(np.all(np.isfinite(state.body_q.numpy())))
+                stopped = np.flatnonzero(np.abs(twists[:, :, 1]).mean(axis=1) < 0.01)
+                test.assertGreater(stopped.size, 0)
+                test.assertGreater(stopped[0] * dt, 0.8 * fastest)
+                test.assertLess(stopped[0] * dt, 1.2 * slowest)
+        with test.subTest(response=response, override_only=True):
+            # Without condim the cable keeps rolling, even with the free-body override set.
+            model = _ground_cable(device)
+            opts = {**options, "free_rigid_rolling_friction": rolling}
+            solver, _, twists = _run_ground_cable(model, opts, 240, dt=dt, **roll)
+            test.assertFalse(solver._articulated_rolling)
+            test.assertGreater(twists[-1, :, 1].mean(), 0.9 * speed)
+        with test.subTest(response=response, upright=True):
+            # Contact torsion still stops an upright spinning cable whose contact also has a rolling pair.
+            model = _ground_cable(
+                device, links=3, length=0.12, radius=0.03, upright=True, torsion_radius=0.01, rolling=rolling
+            )
+            opts = {**options, "contact_torsion_device": True, "contact_warmstart": True, "friction_anchor_beta": 0.0}
+            _, _, twists = _run_ground_cable(model, opts, 120, angular=(0.0, 0.0, 4.0))
+            test.assertLess(np.abs(twists[-1, :, 5]).mean(), 1.0e-3)
 
 
 def test_cable_sleeps_and_wakes_with_warm_start(test, device):

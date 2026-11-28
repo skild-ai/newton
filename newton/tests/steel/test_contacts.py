@@ -517,6 +517,7 @@ def _launch_dense_contact_builders(
             0,  # restitution_combine
             None,
             wp.full((3,), wp.inf, dtype=wp.float32, device=device),
+            wp.zeros((2,), dtype=wp.float32, device=device),  # articulated_mu_rolling
         ],
         outputs=list(metadata.values()),
         device=device,

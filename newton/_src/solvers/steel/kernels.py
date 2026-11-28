@@ -5600,12 +5600,13 @@ def _allocate_world_contact_slot(
             slots_needed = free_rigid_angular_slots(torsional, rolling)
         elif (
             free_rigid_angular != 0
-            and is_propagation
+            and not free_body_pair
             and (friction_patches.enabled == 0 or _first_patch_anchor(friction_patches, c))
         ):
-            # An articulated propagation contact (a cable link's) takes the rolling pair of its shapes' condim and
-            # material, never the free-body override; its spin is contact torsion's, whose spare follows the pair
-            # (see articulated_contact_torsion_spare).
+            # An articulated contact (a cable link's), dense or propagation, takes the rolling pair of its shapes'
+            # condim and material, never the free-body override (articulated_mu_rolling stays zero unless the
+            # solver enabled articulated rolling); its spin is contact torsion's, whose propagation spare follows
+            # the pair (see articulated_contact_torsion_spare).
             torsional, rolling = free_rigid_angular_friction_coefficients(
                 contact_shape0[c], contact_shape1[c], free_rigid_mu_torsional, articulated_mu_rolling
             )
@@ -5886,6 +5887,37 @@ def accumulate_jacobian_row_world_lane(
 
 
 @wp.func
+def accumulate_angular_jacobian_row_world_lane(
+    body_index: int,
+    sign: float,
+    axis: wp.vec3,
+    body_to_joint: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    art_dof_start: int,
+    n_dofs: int,
+    group_idx: int,
+    row: int,
+    lane: int,
+    lanes: int,
+    J_group: wp.array3d[float],
+):
+    """Add ``sign * axis . omega(body)`` to DOFs ``lane, lane + lanes, ...`` of every joint above a body."""
+    if body_index < 0:
+        return
+    curr_joint = body_to_joint[body_index]
+    while curr_joint >= 0:
+        dof_end = joint_qd_start[curr_joint + 1]
+        for global_dof in range(joint_qd_start[curr_joint] + lane, dof_end, lanes):
+            S = joint_S_s[global_dof]
+            local_dof = global_dof - art_dof_start
+            if local_dof >= 0 and local_dof < n_dofs:
+                J_group[group_idx, row, local_dof] += sign * wp.dot(axis, wp.vec3(S[3], S[4], S[5]))
+        curr_joint = joint_ancestor[curr_joint]
+
+
+@wp.func
 def prescribed_contact_velocity(
     body: int,
     art: int,
@@ -6162,6 +6194,7 @@ def prepare_world_contact_rows(
     restitution_combine: int,
     recovery_phi: wp.array[float],
     rigid_body_max_depenetration_velocity: wp.array[float],
+    articulated_mu_rolling: wp.array[float],
     # outputs
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
@@ -6277,6 +6310,28 @@ def prepare_world_contact_rows(
                 articulation_origin,
                 body_v_s,
             ) + surface_contact_target(contact_surface_velocity, c, tangent)
+        # An articulated contact's rolling pair (slots 3 and 4): pure angular rows about the tangents, bounded by
+        # the rolling coefficient times the pooled normal load; a prescribed side's angular rate enters the target.
+        if contact_slots_needed[c] == 5:
+            _unused, rolling = free_rigid_angular_friction_coefficients(
+                shape_a, shape_b, articulated_mu_rolling, articulated_mu_rolling
+            )
+            for k in range(2):
+                axis = tangent0
+                if k == 1:
+                    axis = tangent1
+                row = slot + 3 + k
+                world_row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT_ROLLING
+                world_row_parent[world, row] = slot
+                world_row_mu[world, row] = rolling
+                world_phi[world, row] = 0.0
+                world_row_rebound_velocity[world, row] = 0.0
+                known = float(0.0)
+                if body_a >= 0 and art_a >= 0 and prescribed_articulation[art_a] != 0:
+                    known += wp.dot(axis, wp.spatial_bottom(body_v_s[body_a]))
+                if body_b >= 0 and art_b >= 0 and prescribed_articulation[art_b] != 0:
+                    known -= wp.dot(axis, wp.spatial_bottom(body_v_s[body_b]))
+                world_target_velocity[world, row] = -known
 
 
 @wp.kernel
@@ -6478,7 +6533,30 @@ def _populate_world_J_for_size_contact(
         dof_start = art_dof_start[art]
         origin = articulation_origin[art]
         for row in range(row_count):
-            if row_only >= 0 and row != row_only:
+            # A split thread of row r also writes the rolling row r + 3, so the split keeps three rows of lanes.
+            if row_only >= 0 and row != row_only and row != row_only + 3:
+                continue
+            if row >= 3:
+                # The rolling pair (an articulated contact's slots 3 and 4): J = [0, axis] on the body.
+                axis = t0
+                if row == 4:
+                    axis = t1
+                accumulate_angular_jacobian_row_world_lane(
+                    body,
+                    sign,
+                    axis,
+                    body_to_joint,
+                    joint_ancestor,
+                    joint_qd_start,
+                    joint_S_s,
+                    dof_start,
+                    target_size,
+                    group_idx,
+                    slot + row,
+                    lane,
+                    wp.max(lanes, 1),
+                    J_group,
+                )
                 continue
             direction = normal
             row_point = point
@@ -8153,16 +8231,20 @@ def accumulate_free_rigid_angular_wrenches_from_impulses(
     propagation_constraint_count: wp.array[wp.int32],
     propagation_row_type: wp.array2d[int],
     propagation_impulses: wp.array2d[wp.float32],
+    dense_constraint_count: wp.array[wp.int32],
+    dense_row_type: wp.array2d[int],
+    dense_impulses: wp.array2d[wp.float32],
     inv_dt: float,
     # outputs
     body_contact_wrench: wp.array[wp.spatial_vector],
 ):
-    """Add the rolling and spin rows of each free-body contact to its two bodies as world-frame torques."""
+    """Add the rolling and spin rows of each contact (a free body's, or an articulated contact's rolling pair on
+    dense or propagation rows) to its two bodies as world-frame torques."""
     c = wp.tid()
     if c >= wp.min(contact_count[0], rigid_contact_max):
         return
     path = contact_path[c]
-    if path != 1 and path != 2:
+    if path != 0 and path != 1 and path != 2:
         return
     slot = contact_slot[c]
     if slot < 0:
@@ -8175,6 +8257,8 @@ def accumulate_free_rigid_angular_wrenches_from_impulses(
     row_count = mf_constraint_count[world]
     if path == 2:
         row_count = propagation_constraint_count[world]
+    elif path == 0:
+        row_count = dense_constraint_count[world]
     for row in range(slot + 3, wp.min(slot + contact_slots_needed[c], row_count)):
         # The two row families have independent capacities, so index only the contact's own.
         row_type = int(0)
@@ -8182,6 +8266,9 @@ def accumulate_free_rigid_angular_wrenches_from_impulses(
         if path == 2:
             row_type = propagation_row_type[world, row]
             impulse = propagation_impulses[world, row]
+        elif path == 0:
+            row_type = dense_row_type[world, row]
+            impulse = dense_impulses[world, row]
         else:
             row_type = mf_row_type[world, row]
             impulse = mf_impulses[world, row]

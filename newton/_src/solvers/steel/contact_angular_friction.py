@@ -6,15 +6,16 @@ A shape opts in through the ``steel:condim`` custom attribute, borrowing MuJoCo'
 convention: at 4 it contributes :attr:`~newton.Model.shape_material_mu_torsional` [m]
 to a spin row about the contact normal, at 6 also :attr:`~newton.Model.shape_material_mu_rolling`
 [m] to a rolling pair about the contact tangents. A contact takes the larger coefficient of its
-two shapes. The rows follow the contact's sliding pair, ``[normal, t1, t2, roll1, roll2, spin]``,
+two shapes. Articulated contacts (cable or robot links) take the rolling pair only, from the shapes' condim and
+material and never from the free-body override; their spin is contact torsion's. The rows follow the contact's sliding pair, ``[normal, t1, t2, roll1, roll2, spin]``,
 and are bounded by their coefficient times the pooled normal load of the contact's patch: the
-rolling pair on a disk, the spin row on a box. Only contacts on the free-body route (free bodies
-against free bodies or static and kinematic geometry) receive them.
+rolling pair on a disk, the spin row on a box.
 """
 
 import numpy as np
 import warp as wp
 
+from ...sim.enums import JointType
 from .kernels import (
     MF_META_ROW_TYPE_BITS,
     PGS_CONSTRAINT_TYPE_CONTACT_ROLLING,
@@ -63,6 +64,35 @@ def configure_free_rigid_angular_friction(solver, model, torsional: float | None
         raise NotImplementedError(f"{source} does not support {', '.join(unsupported)}")
 
 
+def articulated_rolling_shapes(solver, model) -> bool:
+    """Decide at construction whether articulated contacts (cable links, robot links) take rolling rows.
+
+    They do when a shape on a body of an articulation that is not a single free body has ``steel:condim`` 6
+    and a positive :attr:`~newton.Model.shape_material_mu_rolling`. The decision fixes the dense sweep's row
+    metadata width; later edits change the coefficients but cannot enable the rows.
+    """
+    if not solver._free_rigid_angular_rows or not model.shape_count or not model.articulation_count:
+        return False
+    condim = solver._namespaced_attribute("condim")
+    if condim is None:
+        return False
+    rolling = (condim.numpy() >= 6) & (model.shape_material_mu_rolling.numpy() > 0.0)
+    if not np.any(rolling):
+        return False
+    starts = model.articulation_start.numpy()
+    joint_types = model.joint_type.numpy()
+    joint_child = model.joint_child.numpy()
+    articulated = np.zeros(max(model.body_count, 1), dtype=bool)
+    for art in range(model.articulation_count):
+        joints = np.arange(starts[art], starts[art + 1])
+        free_body = joints.size == 1 and joint_types[joints[0]] == int(JointType.FREE)
+        if not free_body:
+            articulated[joint_child[joints]] = True
+    bodies = model.shape_body.numpy()
+    attached = bodies >= 0
+    return bool(np.any(rolling & attached & articulated[np.maximum(bodies, 0)]))
+
+
 def refresh_free_rigid_angular_friction(solver) -> None:
     """Write each shape's gated torsional and rolling coefficients [m] on the device; capturable."""
     if not solver._free_rigid_angular_rows:
@@ -84,6 +114,8 @@ def refresh_free_rigid_angular_friction(solver) -> None:
         outputs=[solver._free_rigid_mu_torsional, solver._free_rigid_mu_rolling],
         device=model.device,
     )
+    if not getattr(solver, "_articulated_rolling", False):
+        return
     wp.launch(
         gate_free_rigid_angular_coefficients,
         dim=model.shape_count,
@@ -233,6 +265,9 @@ def accumulate_free_rigid_angular_wrenches(solver, contacts, rigid_contact_max: 
             # Contacts take path 2 only under an active propagation response, which allocates its row types.
             solver._propagation_row_type if solver._propagation_active else solver._mf_row_type,
             solver._propagation_impulses,
+            solver._constraint_count,
+            solver._row_type,
+            solver._impulses,
             inv_dt,
         ],
         outputs=[wrench],
