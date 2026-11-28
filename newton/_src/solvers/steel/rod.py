@@ -459,14 +459,49 @@ def _carry_twists(
 
 
 @wp.kernel
+def _validate_carried(
+    articulations: wp.array[int],
+    articulation_start: wp.array[int],
+    joint_end: wp.array[int],
+    q_start: wp.array[int],
+    qd_start: wp.array[int],
+    q: wp.array[float],
+    carried_q: wp.array[float],
+    qd: wp.array[float],
+    carried_qd: wp.array[float],
+    valid: wp.array[int],
+):
+    """Mark the carried articulations whose every joint coordinate and velocity is the state the last step left."""
+    art = articulations[wp.tid()]
+    ok = int(1)
+    for j in range(articulation_start[art], joint_end[art]):
+        for k in range(q_start[j], q_start[j + 1]):
+            if q[k] != carried_q[k]:
+                ok = 0
+        for k in range(qd_start[j], qd_start[j + 1]):
+            if qd[k] != carried_qd[k]:
+                ok = 0
+    valid[art] = ok
+
+
+@wp.kernel
+def _invalidate_carried(
+    worlds: wp.array[int], mask: wp.array[bool], count: int, q_start: wp.array[int], carried_q: wp.array[float]
+):
+    """Drop the carried state of the reset worlds' joints (NaN compares unequal to every coordinate)."""
+    j = wp.tid()
+    world = worlds[j]
+    if not mask or mask[wp.where(world >= 0, world, count)]:
+        for k in range(q_start[j], q_start[j + 1]):
+            carried_q[k] = wp.nan
+
+
+@wp.kernel
 def _momentum_correction(
-    carried: wp.array[bool],
+    carried_valid: wp.array[int],
     children: wp.array[int],
     owners: wp.array[int],
     flags: wp.array[int],
-    q_start: wp.array[int],
-    q: wp.array[float],
-    carried_q: wp.array[float],
     mass: wp.array[float],
     inertia: wp.array[wp.mat33],
     com: wp.array[wp.vec3],
@@ -485,15 +520,13 @@ def _momentum_correction(
     """
     j = wp.tid()
     art = owners[j]
-    if art < 0 or not carried[art]:
+    # Only a state this solver produced carries its twists (_validate_carried): an edit to any joint's coordinates
+    # or velocities, or a reset, drops the whole articulation's.
+    if art < 0 or carried_valid[art] == 0:
         return
     b = children[j]
     if (flags[b] & BodyFlags.KINEMATIC) != 0:
         return
-    # Only a state this solver produced carries its twists: any edit to the joint's coordinates drops them.
-    for k in range(q_start[j], q_start[j + 1]):
-        if q[k] != carried_q[k]:
-            return
     cx = wp.transform_point(pose[b], com[b])
     arm = cx - origin[art]
     v = body_v[b]
@@ -758,6 +791,13 @@ class RodMaterial:
         if np.any(model.joint_dof_dim.numpy()[loops, 0] == 0):
             raise NotImplementedError("Steel does not yet support a loop-closing inextensible rod joint.")
         if loops_as_rows:
+            if self.has_history and len(loops):
+                # The closure rows (build_propagation_rod_loop_rows) carry no Dahl history: the seam would answer
+                # elastically while the tree joints hysteretically.
+                raise NotImplementedError(
+                    "Steel does not yet apply Dahl hysteresis to a closed rod's closing joint under the propagation "
+                    "response; use articulated_contact_response='immediate' for a closed rod with Dahl friction."
+                )
             # The solver enforces loop-closing rods as rows; the mass matrix keeps only the tree rods.
             loops = loops[:0]
         # In a full-spatial rod tree the six generalized velocities per link
@@ -784,6 +824,8 @@ class RodMaterial:
             self.carried_twist = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
             self.carried_accumulated = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
             self.carried_q = wp.full(model.joint_coord_count, float("nan"), dtype=float, device=model.device)
+            self.carried_qd = wp.full(model.joint_dof_count, float("nan"), dtype=float, device=model.device)
+            self.carried_valid = wp.zeros(max(model.articulation_count, 1), dtype=int, device=model.device)
         self.all_spatial = bool(np.all(spatial))
         self.spatial_mask = spatial
         # Rod trees the propagation response can step without a dense mass matrix: full-spatial ones (their
@@ -987,16 +1029,30 @@ class RodMaterial:
             device=m.device,
         )
         wp.launch(
+            _validate_carried,
+            dim=len(self.carried_articulations),
+            inputs=[
+                self.carried_articulations,
+                m.articulation_start,
+                solver._articulation_joint_end,
+                m.joint_q_start,
+                m.joint_qd_start,
+                state.joint_q,
+                self.carried_q,
+                state.joint_qd,
+                self.carried_qd,
+            ],
+            outputs=[self.carried_valid],
+            device=m.device,
+        )
+        wp.launch(
             _momentum_correction,
             dim=m.joint_count,
             inputs=[
-                self.carried_mask,
+                self.carried_valid,
                 m.joint_child,
                 m.joint_articulation,
                 m.body_flags,
-                m.joint_q_start,
-                state.joint_q,
-                self.carried_q,
                 m.body_mass,
                 m.body_inertia,
                 m.body_com,
@@ -1043,6 +1099,7 @@ class RodMaterial:
         if not all_chains:
             self._carry_walk(solver, state, augmented, result, chain)
         wp.copy(self.carried_q, result.joint_q)
+        wp.copy(self.carried_qd, result.joint_qd)
 
     def _carry_walk(self, solver, state, augmented, result, chain):
         """The serial walk of :meth:`carry` for the carried trees that are not chains."""
@@ -1174,8 +1231,13 @@ class RodMaterial:
             )
 
     def reserve_history_snapshot(self):
-        if self.has_history and not self.history_snapshot:
-            live = (self.history.strain, self.history.stress, self.history.initialized)
+        if (self.has_history or getattr(self, "carried", False)) and not self.history_snapshot:
+            live = ()
+            if self.has_history:
+                live += (self.history.strain, self.history.stress, self.history.initialized)
+            if getattr(self, "carried", False):
+                # A coupled solver's restarted iteration starts from the carried momenta of the step's start.
+                live += (self.carried_q, self.carried_qd, self.carried_twist)
             self.history_snapshot = tuple((field, wp.clone(field)) for field in live)
 
     def transfer_history(self, *, restore):
@@ -1186,6 +1248,14 @@ class RodMaterial:
                 wp.copy(saved, live)
 
     def reset(self, model, world_mask):
+        if getattr(self, "carried", False):
+            # A reset state carries no momenta from the previous episode.
+            wp.launch(
+                _invalidate_carried,
+                dim=model.joint_count,
+                inputs=[model.joint_world, world_mask, model.world_count, model.joint_q_start, self.carried_q],
+                device=model.device,
+            )
         if self.has_history:
             wp.launch(
                 _reset_history,

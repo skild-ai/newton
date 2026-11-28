@@ -209,6 +209,7 @@ from .kernels import (
     hinv_jt_par_row,
     hinv_jt_par_row_contact_fallback,
     integrate_generalized_joints,
+    invalidate_propagation_connect_anchors,
     invert_lower_factor_grouped,
     local_solve_launch_gate,
     map_propagation_contact_units,
@@ -4589,6 +4590,14 @@ class SolverSteel(SolverBase, CouplingInterface):
         world_mask = self._normalize_reset_world_mask(world_mask)
         if self._rod_material is not None:
             self._rod_material.reset(self.model, world_mask)
+        if self._connect_count and self._articulated_contact_response != "immediate":
+            # The propagation closures' warm starts belong to the previous episode.
+            wp.launch(
+                invalidate_propagation_connect_anchors,
+                dim=self._connect_count,
+                inputs=[self._connect_world, world_mask, self.model.world_count, self._propagation_connect_anchor],
+                device=self.model.device,
+            )
         if self._sleeping is not None:
             if world_mask is None:
                 self._sleeping.wake()
@@ -15317,6 +15326,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._propagation_J_b,
                 self._propagation_phi,
                 self._propagation_row_type,
+                self._propagation_row_mu,
                 self._propagation_target_velocity,
                 self._propagation_restitution_bias,
                 self._propagation_body_qd,
@@ -15573,6 +15583,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                     self._propagation_J_b,
                     self._propagation_MiJt_a,
                     self._propagation_MiJt_b,
+                    self._propagation_row_type,
+                    self._propagation_row_parent,
+                    self._propagation_row_mu,
                     self._propagation_row_contact,
                     self._contact_units,
                     self._contact_unit_response,
@@ -15626,7 +15639,14 @@ class SolverSteel(SolverBase, CouplingInterface):
         wp.launch(
             propagation_momentum_rows,
             dim=rows,
-            inputs=[self._propagation_constraint_count, self._propagation_max_constraints, self._momentum_beta],
+            inputs=[
+                self._propagation_constraint_count,
+                self._propagation_max_constraints,
+                self._momentum_beta,
+                self._propagation_row_type,
+                self._propagation_row_parent,
+                self._propagation_row_mu,
+            ],
             outputs=[self._propagation_impulses, self._momentum_prev, self._momentum_delta],
             device=device,
         )

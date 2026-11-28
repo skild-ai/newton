@@ -10289,16 +10289,77 @@ def propagation_momentum_step(
 
 
 @wp.func
-def propagation_momentum_apply_row(
+def _project_contact_impulse(n: float, t1: float, t2: float, mu: float) -> wp.vec3:
+    """A contact's normal and two friction impulses projected onto its cone: n >= 0, |t| <= mu n."""
+    n = wp.max(n, 0.0)
+    r = wp.sqrt(t1 * t1 + t2 * t2)
+    limit = mu * n
+    if r > limit and r > 0.0:
+        scale = limit / r
+        t1 = t1 * scale
+        t2 = t2 * scale
+    return wp.vec3(n, t1, t2)
+
+
+@wp.func
+def _contact_friction_rows(
+    world: int, i: int, count: int, row_type: wp.array2d[int], row_parent: wp.array2d[int]
+) -> int:
+    """How many friction rows follow contact row ``i`` (0 or 2): a contact's rows are contiguous."""
+    if row_type.shape[1] <= 1 or i + 2 >= count:
+        return 0
+    if (
+        row_type[world, i + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+        and row_type[world, i + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+        and row_parent[world, i + 1] == i
+        and row_parent[world, i + 2] == i
+    ):
+        return 2
+    return 0
+
+
+@wp.func
+def _momentum_row_add(
     world: int,
-    i: int,
-    beta: float,
+    r: int,
+    delta: float,
     propagation_body_a: wp.array2d[int],
     propagation_body_b: wp.array2d[int],
     propagation_J_a: wp.array3d[float],
     propagation_J_b: wp.array3d[float],
     propagation_MiJt_a: wp.array3d[float],
     propagation_MiJt_b: wp.array3d[float],
+    propagation_body_qd: wp.array2d[float],
+    propagation_body_impulses: wp.array2d[float],
+):
+    if delta == 0.0:
+        return
+    ba = propagation_body_a[world, r]
+    bb = propagation_body_b[world, r]
+    for k in range(6):
+        if ba >= 0:
+            wp.atomic_add(propagation_body_qd, ba, k, propagation_MiJt_a[world, r, k] * delta)
+            wp.atomic_add(propagation_body_impulses, ba, k, propagation_J_a[world, r, k] * delta)
+        if bb >= 0:
+            wp.atomic_add(propagation_body_qd, bb, k, propagation_MiJt_b[world, r, k] * delta)
+            wp.atomic_add(propagation_body_impulses, bb, k, propagation_J_b[world, r, k] * delta)
+
+
+@wp.func
+def propagation_momentum_apply_row(
+    world: int,
+    i: int,
+    beta: float,
+    count: int,
+    propagation_body_a: wp.array2d[int],
+    propagation_body_b: wp.array2d[int],
+    propagation_J_a: wp.array3d[float],
+    propagation_J_b: wp.array3d[float],
+    propagation_MiJt_a: wp.array3d[float],
+    propagation_MiJt_b: wp.array3d[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_row_parent: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
     propagation_row_contact: wp.array2d[int],
     contact_units: wp.array[float],
     contact_unit_response: wp.array[int],
@@ -10312,9 +10373,10 @@ def propagation_momentum_apply_row(
 ):
     """Move each row's impulse on by its world's momentum and add the move to its bodies' twists and impulses.
 
-    A contact unit's three rows move together on its first row's thread: each body gets the summed row impulse and
-    the summed response (stored, or its split response to the summed impulse), instead of a twist and an impulse
-    per row.
+    A contact's extrapolated normal and friction impulses are projected onto its friction cone (n >= 0,
+    |t| <= mu n) before the move is installed, so the step never carries an adhesive or out-of-cone impulse into
+    the trees. A contact's rows move together on its normal row's thread: a contact unit's three rows sum into
+    one impulse and response per body; separate rows add their own.
     """
     rc = propagation_row_unit(propagation_row_contact, world, i)
     if rc >= 0:
@@ -10323,18 +10385,24 @@ def propagation_momentum_apply_row(
         p = rc >> 2
         slot = contact_unit_response[p]
         stored = slot >= 0
+        lam = wp.vec3(
+            propagation_impulses[world, i], propagation_impulses[world, i + 1], propagation_impulses[world, i + 2]
+        )
+        prev = wp.vec3(momentum_prev[world, i], momentum_prev[world, i + 1], momentum_prev[world, i + 2])
+        mu = contact_unit_block(contact_units, 1, p)[3]
+        y = lam + beta * (lam - prev)
+        y = _project_contact_impulse(y[0], y[1], y[2], mu)
         pa = wp.spatial_vector()
         pb = wp.spatial_vector()
         va = wp.spatial_vector()
         vb = wp.spatial_vector()
         moved = bool(False)
         for r in range(3):
-            lam_r = propagation_impulses[world, i + r]
-            delta_r = beta * (lam_r - momentum_prev[world, i + r])
-            momentum_prev[world, i + r] = lam_r
+            momentum_prev[world, i + r] = lam[r]
+            delta_r = y[r] - lam[r]
             if delta_r != 0.0:
                 moved = True
-                propagation_impulses[world, i + r] = lam_r + delta_r
+                propagation_impulses[world, i + r] = y[r]
                 pa += contact_unit_row(contact_units, p, r, 0) * delta_r
                 pb += contact_unit_row(contact_units, p, r, 1) * delta_r
                 if stored:
@@ -10357,21 +10425,49 @@ def propagation_momentum_apply_row(
                 wp.atomic_add(propagation_body_qd, bb_c, k, vb[k])
                 wp.atomic_add(propagation_body_impulses, bb_c, k, pb[k])
         return
+    kind = int(-1)
+    if propagation_row_type.shape[1] > 1:
+        kind = propagation_row_type[world, i]
+    if kind == PGS_CONSTRAINT_TYPE_FRICTION:
+        parent = propagation_row_parent[world, i]
+        if (
+            parent >= 0
+            and _contact_friction_rows(world, parent, count, propagation_row_type, propagation_row_parent) == 2
+        ):
+            return  # moved with its contact row
+    if kind == PGS_CONSTRAINT_TYPE_CONTACT:
+        friction = _contact_friction_rows(world, i, count, propagation_row_type, propagation_row_parent)
+        n0 = propagation_impulses[world, i]
+        y = wp.vec3(n0 + beta * (n0 - momentum_prev[world, i]), 0.0, 0.0)
+        lam = wp.vec3(n0, 0.0, 0.0)
+        if friction == 2:
+            for r in range(1, 3):
+                lam[r] = propagation_impulses[world, i + r]
+                y[r] = lam[r] + beta * (lam[r] - momentum_prev[world, i + r])
+            mu = float(0.0)
+            if propagation_row_mu.shape[1] > 1:
+                mu = propagation_row_mu[world, i]
+            y = _project_contact_impulse(y[0], y[1], y[2], mu)
+        else:
+            y[0] = wp.max(y[0], 0.0)
+        for r in range(1 + friction):
+            momentum_prev[world, i + r] = lam[r]
+            propagation_impulses[world, i + r] = y[r]
+            _momentum_row_add(
+                world, i + r, y[r] - lam[r], propagation_body_a, propagation_body_b, propagation_J_a, propagation_J_b,
+                propagation_MiJt_a, propagation_MiJt_b, propagation_body_qd, propagation_body_impulses,
+            )  # fmt: skip
+        return
     lam = propagation_impulses[world, i]
     delta = beta * (lam - momentum_prev[world, i])
     momentum_prev[world, i] = lam
     if delta == 0.0:
         return
     propagation_impulses[world, i] = lam + delta
-    ba = propagation_body_a[world, i]
-    bb = propagation_body_b[world, i]
-    for k in range(6):
-        if ba >= 0:
-            wp.atomic_add(propagation_body_qd, ba, k, propagation_MiJt_a[world, i, k] * delta)
-            wp.atomic_add(propagation_body_impulses, ba, k, propagation_J_a[world, i, k] * delta)
-        if bb >= 0:
-            wp.atomic_add(propagation_body_qd, bb, k, propagation_MiJt_b[world, i, k] * delta)
-            wp.atomic_add(propagation_body_impulses, bb, k, propagation_J_b[world, i, k] * delta)
+    _momentum_row_add(
+        world, i, delta, propagation_body_a, propagation_body_b, propagation_J_a, propagation_J_b,
+        propagation_MiJt_a, propagation_MiJt_b, propagation_body_qd, propagation_body_impulses,
+    )  # fmt: skip
 
 
 @wp.kernel
@@ -10385,6 +10481,9 @@ def propagation_momentum_apply(
     propagation_J_b: wp.array3d[float],
     propagation_MiJt_a: wp.array3d[float],
     propagation_MiJt_b: wp.array3d[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_row_parent: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
     propagation_row_contact: wp.array2d[int],
     contact_units: wp.array[float],
     contact_unit_response: wp.array[int],
@@ -10400,18 +10499,23 @@ def propagation_momentum_apply(
     tid = wp.tid()
     world = tid // propagation_max_constraints
     i = tid - world * propagation_max_constraints
-    if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
+    count = wp.min(propagation_constraint_count[world], propagation_max_constraints)
+    if i >= count:
         return
     propagation_momentum_apply_row(
         world,
         i,
         momentum_beta[world],
+        count,
         propagation_body_a,
         propagation_body_b,
         propagation_J_a,
         propagation_J_b,
         propagation_MiJt_a,
         propagation_MiJt_b,
+        propagation_row_type,
+        propagation_row_parent,
+        propagation_row_mu,
         propagation_row_contact,
         contact_units,
         contact_unit_response,
@@ -10429,20 +10533,58 @@ def propagation_momentum_rows(
     propagation_constraint_count: wp.array[int],
     propagation_max_constraints: int,
     momentum_beta: wp.array[float],
+    propagation_row_type: wp.array2d[int],
+    propagation_row_parent: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
     # in/out
     propagation_impulses: wp.array2d[float],
     momentum_prev: wp.array2d[float],
     # outputs
     momentum_delta: wp.array2d[float],
 ):
-    """Extrapolate each row's impulse by its world's momentum; ``momentum_delta`` is the change to install."""
+    """Extrapolate each row's impulse by its world's momentum; ``momentum_delta`` is the change to install.
+
+    A contact's normal and friction rows move together, projected onto its friction cone (see
+    :func:`propagation_momentum_apply_row`).
+    """
     tid = wp.tid()
     world = tid // propagation_max_constraints
     i = tid - world * propagation_max_constraints
-    if i >= wp.min(propagation_constraint_count[world], propagation_max_constraints):
+    count = wp.min(propagation_constraint_count[world], propagation_max_constraints)
+    if i >= count:
+        return
+    beta = momentum_beta[world]
+    kind = int(-1)
+    if propagation_row_type.shape[1] > 1:
+        kind = propagation_row_type[world, i]
+    if kind == PGS_CONSTRAINT_TYPE_FRICTION:
+        parent = propagation_row_parent[world, i]
+        if (
+            parent >= 0
+            and _contact_friction_rows(world, parent, count, propagation_row_type, propagation_row_parent) == 2
+        ):
+            return  # moved with its contact row
+    if kind == PGS_CONSTRAINT_TYPE_CONTACT:
+        friction = _contact_friction_rows(world, i, count, propagation_row_type, propagation_row_parent)
+        lam = wp.vec3(propagation_impulses[world, i], 0.0, 0.0)
+        y = wp.vec3(lam[0] + beta * (lam[0] - momentum_prev[world, i]), 0.0, 0.0)
+        if friction == 2:
+            for r in range(1, 3):
+                lam[r] = propagation_impulses[world, i + r]
+                y[r] = lam[r] + beta * (lam[r] - momentum_prev[world, i + r])
+            mu = float(0.0)
+            if propagation_row_mu.shape[1] > 1:
+                mu = propagation_row_mu[world, i]
+            y = _project_contact_impulse(y[0], y[1], y[2], mu)
+        else:
+            y[0] = wp.max(y[0], 0.0)
+        for r in range(1 + friction):
+            momentum_prev[world, i + r] = lam[r]
+            propagation_impulses[world, i + r] = y[r]
+            momentum_delta[world, i + r] = y[r] - lam[r]
         return
     lam = propagation_impulses[world, i]
-    delta = momentum_beta[world] * (lam - momentum_prev[world, i])
+    delta = beta * (lam - momentum_prev[world, i])
     momentum_prev[world, i] = lam
     propagation_impulses[world, i] = lam + delta
     momentum_delta[world, i] = delta
@@ -10580,6 +10722,18 @@ def _write_connect_row(
     propagation_target_velocity[world, slot] = target
     propagation_row_rebound_velocity[world, slot] = 0.0
     propagation_impulses[world, slot] = seed
+
+
+@wp.kernel
+def invalidate_propagation_connect_anchors(
+    connect_world: wp.array[int], mask: wp.array[bool], count: int, connect_anchor: wp.array[wp.transform]
+):
+    """Drop the warm-start anchors of the reset worlds' closures (a NaN anchor never matches ``joint_X_p``)."""
+    k = wp.tid()
+    world = connect_world[k]
+    if not mask or mask[wp.where(world >= 0, world, count)]:
+        nan = float(wp.nan)
+        connect_anchor[k] = wp.transform(wp.vec3(nan, nan, nan), wp.quat(nan, nan, nan, nan))
 
 
 @wp.kernel
@@ -10957,6 +11111,7 @@ def compute_propagation_velocity_rhs(
     propagation_J_b: wp.array3d[float],
     propagation_phi: wp.array2d[float],
     propagation_row_type: wp.array2d[int],
+    propagation_row_mu: wp.array2d[float],
     propagation_target_velocity: wp.array2d[float],
     propagation_restitution_bias: wp.array2d[float],
     position_body_qd: wp.array2d[float],
@@ -10998,6 +11153,10 @@ def compute_propagation_velocity_rhs(
             end_gap = phi + dt * (jv_position - target_velocity)
             if end_gap > _CONTACT_END_GAP_SLOP:
                 bias = phi / dt
+    elif propagation_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONNECT:
+        # A rod closure's material bias (compliance gamma in the row's mu) is its elastic force, not drift.
+        if propagation_row_mu.shape[1] > 1 and propagation_row_mu[world, i] > 0.0:
+            bias = propagation_phi[world, i]
     propagation_rhs[world, i] = bias - target_velocity
 
 

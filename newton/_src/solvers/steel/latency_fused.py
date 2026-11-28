@@ -572,6 +572,9 @@ def get_split_momentum(
         if wp.static(propagation):
             _update_rows(world, lane, stride, h.prop, prop_offset, beta, False, h)
             if wp.static(rods):
+                # The injection reads other threads' history rows (a contact unit's three rows; every row in the
+                # ordered walk), so every row's move must be recorded first. beta is uniform over the block.
+                _block_sync()
                 if beta != 0.0:
                     if wp.static(ordered):
                         # One thread in row order keeps run-to-run runs bitwise identical.
@@ -825,8 +828,9 @@ def get_fused_iteration_kernel(
                     beta = extra[0].momentum_beta[world]
                     for r in range(t, rows_n, wp.static(block_threads)):
                         propagation_momentum_apply_row(
-                            world, r, beta, colored.body_a, colored.body_b, colored.J_a, colored.J_b,
-                            colored.MiJt_a, colored.MiJt_b, extra[0].row_contact, colored.contact_units,
+                            world, r, beta, rows_n, colored.body_a, colored.body_b, colored.J_a, colored.J_b,
+                            colored.MiJt_a, colored.MiJt_b, colored.row_type, colored.row_parent, colored.row_mu,
+                            extra[0].row_contact, colored.contact_units,
                             extra[0].unit_response, colored.contact_responses, colored.body_response_split,
                             propagation_impulses, extra[0].momentum_prev, body_qd, body_impulses,
                         )  # fmt: skip
