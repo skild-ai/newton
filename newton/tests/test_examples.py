@@ -2041,7 +2041,7 @@ for scene, frames in (
             use_viewer=True,
             test_suffix=f"native_steel_{mode}",
         )
-# The propagation response, the default from cable_solver.ARM_PROPAGATION_WORLDS worlds, at one world.
+# The propagation response, the example's default from 1,024 worlds, at one world.
 add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_franka_cable_ik_pick_place",
