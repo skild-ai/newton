@@ -1225,3 +1225,85 @@ add_function_test(
     test_inextensible_long_chain_whip,
     devices=get_cuda_test_devices(),
 )
+
+
+def test_carried_rod_state_follows_resets_and_velocity_edits(test, device):
+    """An inextensible rod's carried momenta survive only an unedited state of the last step.
+
+    A reset replays a fresh solver's trajectory exactly, and a velocity edit at an unchanged pose drops the carried
+    momenta of its articulation for that step instead of being pulled back toward them.
+    """
+
+    def run(solver, model, steps):
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        contacts = pipeline.contacts()
+        a, b, control = model.state(), model.state(), model.control()
+        for _ in range(steps):
+            pipeline.collide(a, contacts)
+            solver.step(a, b, control, contacts, 1.0 / 240.0)
+            a, b = b, a
+        return a
+
+    def make(model):
+        return newton.solvers.SolverSteel(
+            model,
+            articulated_contact_response="propagation",
+            articulation_constraint_max=256,
+            iterations=16,
+            deterministic=wp.DeterministicMode.RUN_TO_RUN,
+        )
+
+    model, _bodies = _hanging_rod(device, inextensible=True)
+    reused = make(model)
+    test.assertTrue(reused._rod_material.carried)
+    run(reused, model, 12)
+    reused.reset(model.state())
+    replay = run(reused, model, 12).body_q.numpy()
+    fresh = run(make(model), model, 12).body_q.numpy()
+    test.assertTrue(np.all(np.isfinite(replay)))
+    np.testing.assert_array_equal(replay, fresh)
+
+    # The rod's articulation keeps its carried momenta while the state is the step's own ...
+    solver = make(model)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    a, b, control = model.state(), model.state(), model.control()
+    art = int(model.joint_articulation.numpy()[int(model.articulation_start.numpy()[0])])
+    for _ in range(6):
+        pipeline.collide(a, contacts)
+        solver.step(a, b, control, contacts, 1.0 / 240.0)
+        a, b = b, a
+    test.assertEqual(int(solver._rod_material.carried_valid.numpy()[art]), 1)
+    # ... and drops them for a step whose joint velocities were edited at the same pose.
+    a.joint_qd.zero_()
+    pipeline.collide(a, contacts)
+    solver.step(a, b, control, contacts, 1.0 / 240.0)
+    test.assertEqual(int(solver._rod_material.carried_valid.numpy()[art]), 0)
+
+
+def test_closed_rod_dahl_under_propagation_raises(test, device):
+    """A closed rod with Dahl friction under the propagation response is refused: its closing joint has no history."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    newton.solvers.SolverSteel.register_custom_attributes(builder)
+    angles = np.linspace(0.0, 2.0 * np.pi, 13)
+    points = [wp.vec3(0.2 * np.cos(t), 0.2 * np.sin(t), 0.3) for t in angles]
+    points[-1] = points[0]
+    builder.add_rod(rod=newton.Rod(points, radius=0.01, closed=True), stretch_stiffness=1.0e5, bend_stiffness=2.0)
+    model = builder.finalize(device=device)
+    # Registered but inactive Dahl attributes (both zero) do not refuse the ring.
+    newton.solvers.SolverSteel(model, **_PROPAGATION)
+    model.steel.dahl_eps_max.fill_(0.05)
+    model.steel.dahl_tau.fill_(0.1)
+    with test.assertRaisesRegex(NotImplementedError, "Dahl hysteresis"):
+        newton.solvers.SolverSteel(model, **_PROPAGATION)
+    newton.solvers.SolverSteel(model)  # the immediate response carries the closing joint's history
+
+
+for _name, _fn in (
+    (
+        "test_carried_rod_state_follows_resets_and_velocity_edits",
+        test_carried_rod_state_follows_resets_and_velocity_edits,
+    ),
+    ("test_closed_rod_dahl_under_propagation_raises", test_closed_rod_dahl_under_propagation_raises),
+):
+    add_function_test(TestSteelRod, _name, _fn, devices=get_cuda_test_devices())

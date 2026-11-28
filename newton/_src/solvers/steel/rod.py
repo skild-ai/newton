@@ -791,7 +791,9 @@ class RodMaterial:
         if np.any(model.joint_dof_dim.numpy()[loops, 0] == 0):
             raise NotImplementedError("Steel does not yet support a loop-closing inextensible rod joint.")
         if loops_as_rows:
-            if self.has_history and len(loops):
+            if self.has_history and len(loops) and bool(
+                np.any((attrs.dahl_eps_max.numpy()[loops] > 0.0) & (attrs.dahl_tau.numpy()[loops] > 0.0))
+            ):
                 # The closure rows (build_propagation_rod_loop_rows) carry no Dahl history: the seam would answer
                 # elastically while the tree joints hysteretically.
                 raise NotImplementedError(
