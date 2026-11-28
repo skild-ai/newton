@@ -334,16 +334,16 @@ class Example:
         self.sim_time = 0.0
         self.world_count = max(1, int(args.world_count))
         # Under the immediate response eight substeps of six iterations hold both grasps; the propagation response's
-        # split sweep needs 24 iterations and runs faster from cable_solver.ARM_PROPAGATION_WORLDS worlds. The knot keeps
-        # the immediate response at any world count: it holds every grip (100 of 100 runs, about 21 ms per frame at one
-        # world), while under the propagation response (8 substeps of 20 iterations, the tree propagating every sweep,
-        # about 16 ms) a jaw still loses the cable in about 1 run of 300.
+        # split sweep needs 32 iterations for add_rod's light segments (24 lost arm A's grasp in 445 of 1,024 wrap
+        # worlds; 32 holds every world, 2% slower) and runs faster from cable_solver.ARM_PROPAGATION_WORLDS worlds.
+        # The knot keeps the immediate response by default at any world count; both responses hold every grip (300 of
+        # 300 runs each, about 22 ms per frame immediate and 16 ms propagation at one world).
         if args.contact_response is None and args.task == "knot" and self.native:
             args.contact_response = "immediate"
         if self.native and args.task == "knot" and args.contact_response == "propagation":
             native_substeps, native_iterations = 8, 20
         elif self.native and cable_solver.arm_contact_response(args, self.world_count) == "propagation":
-            native_substeps, native_iterations = 8, 24
+            native_substeps, native_iterations = 8, 32
         else:
             native_substeps, native_iterations = 8, 6
         self.sim_substeps = (
