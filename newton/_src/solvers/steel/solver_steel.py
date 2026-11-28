@@ -26,8 +26,8 @@ from ...utils.deprecation import warn_deprecation
 from ..coupled.interface import CouplingInterface
 from ..coupled.model_view import ModelView
 from ..solver import SolverBase
+from . import closure_direct_sparse, latency_fused
 from . import contact_compliance as _contact_compliance
-from . import latency_fused
 from ._testing import current_kernel_overrides
 from .contact_adhesion import (
     allocate_contact_adhesion,
@@ -1286,6 +1286,14 @@ def _estimate_cholesky_shared_memory(n_dofs: int) -> int:
     matrix_bytes = _align_shared_memory(4 * n_dofs * n_dofs)
     vector_bytes = _align_shared_memory(4 * n_dofs)
     return 3 * matrix_bytes + vector_bytes
+
+
+def _estimate_trisolve_shared_memory(n_dofs: int, *, tile_threads: int) -> int:
+    """Estimate the complete tiled triangular-solve shared-memory footprint [B].
+
+    The factor and three vectors, plus the kernel's static reservation of four bytes per thread.
+    """
+    return _align_shared_memory(4 * n_dofs * n_dofs) + 3 * _align_shared_memory(4 * n_dofs) + 4 * tile_threads
 
 
 def _estimate_hinv_jt_shared_memory(n_dofs: int, constraint_count: int, *, tile_threads: int) -> int:
@@ -3091,6 +3099,25 @@ class SolverSteel(SolverBase, CouplingInterface):
         if self._serial_kernel_block_dim != "auto" and self._serial_kernel_block_dim not in _SERIAL_KERNEL_BLOCK_DIMS:
             raise ValueError(f"serial_kernel_block_dim must be 'auto' or one of {_SERIAL_KERNEL_BLOCK_DIMS}")
         self._sm_count = int(getattr(model.device, "sm_count", 0) or 0)
+        # Experimental sparse direct closure solve (closure_direct_sparse.py): one regularized factorization of
+        # K = H + J^T W J per substep in place of the serial sweep over the loop-closure rows.
+        self._closure_direct_factor = self._kernel_overrides.get("closure_direct_factor", None)
+        if self._closure_direct_factor not in (None, "sparse"):
+            raise ValueError("closure_direct_factor must be None or 'sparse'")
+        self._closure_ds_active = self._closure_direct_factor == "sparse"
+        self._closure_direct_eps = float(self._kernel_overrides.get("closure_direct_eps", 1.0e-3))
+        self._closure_direct_pivot_floor = float(self._kernel_overrides.get("closure_direct_pivot_floor", 1.0e-4))
+        self._closure_direct_pivot_shift = float(self._kernel_overrides.get("closure_direct_pivot_shift", 1.0e-3))
+        if not 0.0 <= self._closure_direct_pivot_floor < self._closure_direct_pivot_shift:
+            raise ValueError("closure_direct_pivot_floor and closure_direct_pivot_shift need 0 <= floor < shift")
+        self._closure_direct_bias = self._kernel_overrides.get("closure_direct_bias", "baumgarte")
+        if self._closure_direct_bias not in ("baumgarte", "implicit"):
+            raise ValueError("closure_direct_bias must be one of ['baumgarte', 'implicit']")
+        self._closure_direct_timeconst = float(self._kernel_overrides.get("closure_direct_timeconst", 0.004))
+        self._closure_direct_dampratio = float(self._kernel_overrides.get("closure_direct_dampratio", 1.0))
+        self._closure_direct_sparse = None
+        self._closure_direct_qd0 = None
+        self._closure_direct_dt = 0.0
         if not model.device.is_cuda:
             # The tiled and native kernels are CUDA-only; CPU runs the scalar Warp kernels.
             self._cholesky_kernel = "loop"
@@ -3211,12 +3238,34 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._setup_paired_response(model)
         self._keep_dense_factor_groups_on_cholesky()
         self._hinv_jt_diag_sizes -= self._articulated_body_sizes
+        self._check_tiled_trisolve_fits(model)
 
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
         self._allocate_articulated_body_buffers(model)
         self._allocate_paired_response_buffers(model)
         self._allocate_world_buffers(model)
+        if self._closure_ds_active:
+            if not model.device.is_cuda:
+                raise NotImplementedError("closure_direct_factor='sparse' requires a CUDA device")
+            if (
+                self._has_free_rigid_bodies
+                or self._velocity_iterations > 0
+                or self._sparse_mass_matrix_size is not None
+                or self._preelim_active
+                or self._paired_response_primary_size is not None
+                or self._sparse_diagonal_contact_solve
+                or self._propagation_active
+                or self._contact_warmstart
+                or self._has_drive_rows
+                or self._distance_limit_count
+            ):
+                raise NotImplementedError(
+                    "closure_direct_factor='sparse' supports only articulations with loop-closure rows: no free "
+                    "rigid bodies, velocity_iterations=0, the dense mass solve, no bilateral pre-elimination, "
+                    "immediate contact response, no contact warm start, no PGS drive rows and no distance limits"
+                )
+            self._closure_direct_sparse = closure_direct_sparse.DirectSparseBuffers(self)
         self._allocate_mf_buffers(model)
         self._allocate_sparse_diagonal_buffers(model)
         # Contact rows keep row_parent for their friction/patch load linkage; torsion keeps
@@ -5000,6 +5049,10 @@ class SolverSteel(SolverBase, CouplingInterface):
 
             self._reserve_rows(self._connect_world_index, self._slot_counter, launch_connect, ordered=True)
             self._launch_body_relative_poses(state_in)
+            if self._closure_ds_active:
+                # The sparse direct solve builds its rows on their static supports; no dense J exists.
+                closure_direct_sparse.launch_connect_rows(self, state_in, state_aug)
+                return
             for size in self._connect_sizes:
                 wp.launch(
                     populate_connect_J_for_size,
@@ -6535,8 +6588,21 @@ class SolverSteel(SolverBase, CouplingInterface):
             else:
                 self._H_by_size[size] = wp.zeros((n_arts, size, size), dtype=wp.float32, device=device)
                 self._L_by_size[size] = wp.zeros((n_arts, size, size), dtype=wp.float32, device=device)
-            self._J_by_size[size] = wp.zeros((n_arts, max_constraints, size), dtype=wp.float32, device=device)
-            self._Y_by_size[size] = wp.zeros((n_arts, max_constraints, size), dtype=wp.float32, device=device)
+            if self._closure_ds_active:
+                # The sparse direct solve builds its rows on their supports and forms no response: a zero-stride
+                # view reads as an all-zero J of the full shape for the launches that take it as an argument.
+                self._ds_J_base = wp.zeros(1, dtype=wp.float32, device=device)
+                self._J_by_size[size] = wp.array(
+                    ptr=self._ds_J_base.ptr,
+                    dtype=wp.float32,
+                    shape=(n_arts, max_constraints, size),
+                    strides=(0, 0, 0),
+                    device=device,
+                )
+                self._Y_by_size[size] = wp.zeros((1, 1, 1), dtype=wp.float32, device=device)
+            else:
+                self._J_by_size[size] = wp.zeros((n_arts, max_constraints, size), dtype=wp.float32, device=device)
+                self._Y_by_size[size] = wp.zeros((n_arts, max_constraints, size), dtype=wp.float32, device=device)
             self._diag_by_size[size] = (
                 wp.zeros((n_arts, max_constraints), dtype=wp.float32, device=device)
                 if size in self._hinv_jt_diag_sizes
@@ -6549,7 +6615,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._qdd_by_size[size] = wp.zeros((n_arts, size, 1), dtype=wp.float32, device=device)
         # Double buffering ping-pongs H and J; sparse factors keep their own storage.
         self._double_buffered = bool(
-            self._double_buffer and device.is_cuda and self._size_groups and self._sparse_mass_matrix_size is None
+            self._double_buffer
+            and device.is_cuda
+            and self._size_groups
+            and self._sparse_mass_matrix_size is None
+            and not self._closure_ds_active
         )
         self._H_bufs = None
         self._J_bufs = None
@@ -7216,6 +7286,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         gate = {"friction_start_iteration": friction_start_iteration, "iteration_offset": iteration_offset}
         if self._sparse_diagonal_contact_solve:
             self._launch_sparse_diagonal_solve(rhs, iterations, **gate)
+            return
+        if self._closure_ds_active:
+            closure_direct_sparse.launch_solve(self, rhs, iterations, self._closure_direct_dt)
             return
         if iterations <= 0 or self._pgs_solve_mf_gs_kernel is None:
             return
@@ -8581,7 +8654,13 @@ class SolverSteel(SolverBase, CouplingInterface):
     def _solve_matrix_free(self, state_in: State, state_aug: State, contacts: Contacts | None, dt: float) -> None:
         """Build the matrix-free responses and right-hand sides and run the fused solve into ``v_out``."""
         model = self.model
-        if self._paired_response_primary_size is not None:
+        self._closure_direct_dt = dt
+        self._closure_direct_qd0 = state_in.joint_qd
+        if self._closure_ds_active:
+            # The sparse direct solve forms its own system from the rows on their supports and scales the rows by
+            # its own diagonal: no response H^-1 J^T and no J H^-1 J^T diagonal.
+            self._diag.zero_()
+        elif self._paired_response_primary_size is not None:
             # One kernel writes both components' world rows and the diagonal.
             self._stage4_hinv_jt_paired()
         elif self._sparse_mass_matrix_size is None:
@@ -8772,7 +8851,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[self._rhs],
                 device=model.device,
             )
-        else:
+        elif not self._closure_ds_active:
+            # Only contact rows carry a rebound; the sparse direct solve's worlds have none.
             wp.launch(
                 apply_world_contact_restitution,
                 dim=self._world_count * self._articulation_constraint_max,
@@ -8830,7 +8910,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             if self._propagation_active:
                 self._propagation_setup(state_in, state_aug, dt)
             _contact_compliance.prepare_rows(self, contacts, dt)
-        self._pack_mf_meta(self._mf_rhs)
+        if not self._closure_ds_active:
+            # The sparse direct solve has no free-body rows and never reads the packed metadata.
+            self._pack_mf_meta(self._mf_rhs)
         friction_start = self._friction_start_iteration(self._iterations)
         if self._propagation_active:
 
@@ -9524,6 +9606,32 @@ class SolverSteel(SolverBase, CouplingInterface):
                     f"{int(joint_ancestor[unordered[0]])}"
                 )
 
+    def _check_tiled_trisolve_fits(self, model: Model) -> None:
+        """Reject a Cholesky group whose tiled triangular solve cannot fit the device's shared memory.
+
+        The tiled Cholesky factor and ``H^-1 J^T`` fall back to their per-thread kernels past the limit, but the
+        tiled triangular solve has no fallback and would fail at its first launch, so raise at construction.
+        """
+        if not model.device.is_cuda or self._trisolve_kernel == "loop":
+            return
+        available = int(getattr(model.device, "max_shared_memory_per_block", 0))
+        for size in self._size_groups:
+            if (
+                size in (self._sparse_mass_matrix_size, self._sparse_diagonal_response_size)
+                or self._execution_plan.use_diagonal_mass(size)
+                or size in self._articulated_body_sizes
+            ):
+                continue
+            if self._trisolve_kernel == "auto" and size <= self._small_dof_threshold:
+                continue
+            required = _estimate_trisolve_shared_memory(size, tile_threads=self._tile_threads)
+            if required > available:
+                raise ValueError(
+                    f"SolverSteel: the Cholesky mass solve of a {size}-DOF articulation needs {required} bytes of "
+                    f"shared memory for its tiled triangular solve, but {model.device} exposes {available} bytes "
+                    "per block; use mass_solve='articulated_body' (kernel_overrides) for articulations this large."
+                )
+
     def _keep_dense_factor_groups_on_cholesky(self) -> None:
         """Leave the groups whose dense Cholesky factor the paired response or the local solves read on Cholesky.
 
@@ -9592,8 +9700,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._ab_Dinv_by_size[size] = wp.zeros((n_arts, size, 6), dtype=wp.float32, device=device)
             self._ab_diag_by_size[size] = wp.zeros((n_arts, size), dtype=wp.float32, device=device)
             self._ab_rhs_by_size[size] = wp.zeros((n_arts, 1, size), dtype=wp.float32, device=device)
+            # The sparse direct solve forms no row responses; the tau solve uses column 0 only.
+            scratch_cols = 1 if self._closure_ds_active else max_constraints
             self._ab_scratch_by_size[size] = wp.zeros(
-                (n_arts, max_slots, max_constraints), dtype=wp.spatial_vector, device=device
+                (n_arts, max_slots, scratch_cols), dtype=wp.spatial_vector, device=device
             )
             # Threads per articulation of the row solve: enough to fill the GPU (about 512
             # resident per SM), each looping over the world's rows, at most one per row.
@@ -9821,6 +9931,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 outputs=[self._H_by_size[size]],
                 device=model.device,
             )
+        if self._closure_direct_sparse is not None:
+            closure_direct_sparse.refresh_mass(self, state_aug)
         self._mass_update_requested.zero_()
         self._force_mass_update = False
 
@@ -10659,9 +10771,11 @@ class SolverSteel(SolverBase, CouplingInterface):
             frozen_bodies = sleeping.patch_frozen_bodies
         # Rows are rebuilt every step; clear the grouped Jacobians once before any family writes.
         # Double-buffered Jacobians were cleared on the memset stream after their last use.
-        if sparse_size is None and not self._double_buffered:
+        if sparse_size is None and not self._double_buffered and not self._closure_ds_active:
             for size in self._size_groups:
                 self._J_by_size[size].zero_()
+        if self._closure_ds_active and contacts is not None and contacts.rigid_contact_max > 0:
+            raise NotImplementedError("closure_direct_factor='sparse' does not build contact rows")
 
         if self._has_drive_rows:
             for size in self._size_groups:
@@ -10710,6 +10824,8 @@ class SolverSteel(SolverBase, CouplingInterface):
 
         # Disabled joint limits create no rows (and use no capacity), as in the reference solver.
         limit_sizes = self._joint_limit_sizes if self._enable_joint_limits else frozenset()
+        if self._closure_ds_active and limit_sizes:
+            raise NotImplementedError("closure_direct_factor='sparse' does not build joint-limit rows")
         if self._sparse_diagonal_contact_solve:
             # The diagonal articulation's limits are projected per DOF inside the sparse-diagonal solve.
             limit_sizes = limit_sizes - self._fused_diagonal_joint_limit_sizes
