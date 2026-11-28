@@ -7,6 +7,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.steel._testing import kernel_overrides
 from newton._src.solvers.steel.rod import _angular_measure
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
 
@@ -991,6 +992,123 @@ add_function_test(
     TestSteelRod,
     "test_propagation_tree_dynamics_frees_dense_buffers",
     test_propagation_tree_dynamics_frees_dense_buffers,
+    devices=get_cuda_test_devices(),
+)
+
+
+def _slide_with_cable(device):
+    """Two stacked prismatic slides (as in the cross-slide table) carrying a table, and a cable lying across it.
+
+    The slides' limits are dense rows; the cable's contacts with the table and the ground are propagation rows, so the
+    slides' articulation is a propagation tree whose DOFs the limit rows' responses also reach.
+    """
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    limits = {"limit_ke": 1.0e4, "limit_kd": 1.0e-4, "friction": 0.0}
+    slide = builder.add_link(xform=wp.transform((0.0, 0.0, 0.05), wp.quat_identity()), mass=1.0)
+    table = builder.add_link(xform=wp.transform((0.0, 0.0, 0.05), wp.quat_identity()), mass=2.0)
+    builder.add_shape_box(table, hx=0.2, hy=0.2, hz=0.05)
+    x = builder.add_joint_prismatic(
+        -1,
+        slide,
+        axis=wp.vec3(1.0, 0.0, 0.0),
+        parent_xform=wp.transform((0.0, 0.0, 0.05), wp.quat_identity()),
+        limit_lower=-0.02,
+        limit_upper=0.02,
+        target_q=0.05,
+        target_ke=500.0,
+        target_kd=50.0,
+        **limits,
+    )
+    y = builder.add_joint_prismatic(
+        slide, table, axis=wp.vec3(0.0, 1.0, 0.0), limit_lower=-0.02, limit_upper=0.02, **limits
+    )
+    builder.add_articulation([x, y])
+    # The table starts toward both limits.
+    builder.joint_qd[builder.joint_qd_start[x]] = 0.3
+    builder.joint_qd[builder.joint_qd_start[y]] = 0.3
+    rod = newton.Rod.create_straight(
+        start=(-0.1, 0.0, 0.112), direction=(1.0, 0.0, 0.0), length=0.5, segment_count=10, radius=0.01
+    )
+    bodies, _joints = builder.add_rod(rod=rod, bend_stiffness=0.05, twist_stiffness=0.05)
+    return builder.finalize(device=device), [int(b) for b in bodies]
+
+
+def _settle_slide(model, solver, steps):
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    a, b, control, contacts = model.state(), model.state(), model.control(), pipeline.contacts()
+    for _ in range(steps):
+        pipeline.collide(a, contacts)
+        solver.step(a, b, control, contacts, 1.0 / 240.0)
+        a, b = b, a
+    return a
+
+
+def test_partitioned_momentum_installs_only_its_rows(test, device):
+    """With Nesterov and propagation_momentum together, each moves velocities only through its own rows.
+
+    Nesterov steps the dense rows and installs ``Y e`` (their moves through their world response), so the slide's DOF
+    takes exactly that and the cable's DOFs, which only propagation_momentum moves, take nothing; the cable rests
+    where it rests with Nesterov off.
+    """
+    # The slide's drive solved as a dense row (``drive_mode="rows"``), the row Nesterov steps.
+    options = {
+        **_PROPAGATION,
+        "iterations": 8,
+        "articulation_constraint_max": 64,
+        "propagation_momentum": True,
+        "drive_mode": "rows",
+    }
+    model, cable = _slide_with_cable(device)
+    plain = _settle_slide(model, newton.solvers.SolverSteel(model, nesterov_momentum=False, **options), 240)
+    model, cable = _slide_with_cable(device)
+    solver = newton.solvers.SolverSteel(model, nesterov_momentum=True, **options)
+    test.assertTrue(solver._split_momentum_exact)
+    state = _settle_slide(model, solver, 240)
+    q, q_plain = state.body_q.numpy(), plain.body_q.numpy()
+    test.assertTrue(np.all(np.isfinite(q)))
+    np.testing.assert_allclose(q[cable, :3], q_plain[cable, :3], atol=2.0e-3)
+
+    # Inside the solve (the per-pass launches, where each advance is its own launch): every advance changes the
+    # velocity by exactly the dense rows' Y e, and nowhere else.
+    with kernel_overrides({"propagation_latency_fused": False}):
+        model, cable = _slide_with_cable(device)
+        solver = newton.solvers.SolverSteel(model, nesterov_momentum=True, **options)
+    test.assertTrue(solver._split_momentum_exact)
+    h = solver._split_momentum_state
+    dofs = solver._world_dof_indices.numpy()
+    checked = {"calls": 0, "moved": 0}
+    advance = solver._advance_split_momentum
+
+    def checked_advance(iteration, friction_transition):
+        v0 = solver._v_out.numpy().copy()
+        advance(iteration, friction_transition)
+        dv = solver._v_out.numpy() - v0
+        e = h.history.numpy()[..., 1]
+        Y = solver._Y_world.numpy()
+        count = solver._constraint_count.numpy()
+        expected = np.zeros_like(v0)
+        for w in range(dofs.shape[0]):
+            n = min(int(count[w]), Y.shape[1])
+            for d, dof in enumerate(dofs[w]):
+                if dof >= 0:
+                    expected[dof] += float(Y[w, :n, d] @ e[w, :n])
+        np.testing.assert_allclose(dv, expected, atol=1.0e-6)
+        checked["calls"] += 1
+        checked["moved"] += int(np.any(np.abs(expected) > 0.0))
+
+    solver._advance_split_momentum = checked_advance
+    _settle_slide(model, solver, 60)
+    test.assertGreater(checked["calls"], 0)
+    test.assertGreater(
+        checked["moved"], 0, f"no advance moved a dense row ({checked}, rows {solver._constraint_count.numpy()})"
+    )
+
+
+add_function_test(
+    TestSteelRod,
+    "test_partitioned_momentum_installs_only_its_rows",
+    test_partitioned_momentum_installs_only_its_rows,
     devices=get_cuda_test_devices(),
 )
 

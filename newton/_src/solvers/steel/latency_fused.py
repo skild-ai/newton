@@ -290,6 +290,16 @@ class SplitSweep:
     contact_responses: wp.array[float]
     response_split: wp.array3d[float]
     body_impulses: wp.array2d[float]
+    # Partitioned with propagation_momentum (``exact``): the step installs the velocity of its own rows' moves through
+    # their responses (dense rows' world response, free-body rows' M^-1 J^T) instead of extrapolating velocities,
+    # since propagation_momentum moves the same velocities through the propagation rows.
+    Y_world: wp.array3d[float]
+    mf_body_count: wp.array[int]
+    mf_body_dof_start: wp.array2d[int]
+    mf_local_body_a: wp.array2d[int]
+    mf_local_body_b: wp.array2d[int]
+    mf_MiJt_a: wp.array3d[float]
+    mf_MiJt_b: wp.array3d[float]
 
 
 @wp.struct
@@ -470,9 +480,54 @@ def _rod_inject_row(world: int, i: int, offset: int, h: SplitSweep):
     _rod_inject_add(h, bb, pb, vb)
 
 
+@wp.func
+def _install_row_moves(world: int, lane: int, stride: int, free_offset: int, beta: float, h: SplitSweep):
+    """Add the velocity of the dense and free-body rows' moves (their history's second entry) to the world velocity.
+
+    The velocity is affine in the impulses, so ``v += Y e`` for the dense rows and ``v += M^-1 J^T e`` for the
+    free-body rows is the step's velocity for exactly those rows. The rows' moves were written by every lane, so the
+    block syncs first; ``prev_velocity`` keeps the velocity before the move for the restart test.
+    """
+    _block_sync()
+    for d in range(lane, h.dofs.shape[1], stride):
+        dof = h.dofs[world, d]
+        if dof >= 0:
+            v = h.velocity[dof]
+            h.prev_velocity[dof] = v
+            if beta != 0.0:
+                dv = float(0.0)
+                for i in range(wp.min(h.dense.count[world], h.Y_world.shape[1])):
+                    e = h.history[world, i][1]
+                    if e != 0.0:
+                        dv += h.Y_world[world, i, d] * e
+                h.velocity[dof] = v + dv
+    if beta != 0.0:
+        n_free = wp.min(h.free.count[world], h.free.impulses.shape[1])
+        for k in range(lane, 6 * h.mf_body_count[world], stride):
+            local = k // 6
+            c = k - 6 * local
+            dv = float(0.0)
+            for i in range(n_free):
+                e = h.history[world, free_offset + i][1]
+                if e != 0.0:
+                    if h.mf_local_body_a[world, i] == local:
+                        dv += h.mf_MiJt_a[world, i, c] * e
+                    if h.mf_local_body_b[world, i] == local:
+                        dv += h.mf_MiJt_b[world, i, c] * e
+            if dv != 0.0:
+                dof = h.mf_body_dof_start[world, local] + c
+                h.velocity[dof] = h.velocity[dof] + dv
+
+
 @cache
 def get_split_momentum(
-    warps: int, propagation: bool, torsion: bool, ordered: bool, patch_anchors: bool, rods: bool = False
+    warps: int,
+    propagation: bool,
+    torsion: bool,
+    ordered: bool,
+    patch_anchors: bool,
+    rods: bool = False,
+    exact: bool = False,
 ):
     """Use the owner block to advance the iterate before its first row phase."""
     stride = 32 * warps
@@ -581,13 +636,16 @@ def get_split_momentum(
                     else:
                         for i in range(lane, wp.min(h.prop.count[world], h.prop.impulses.shape[1]), stride):
                             _rod_inject_row(world, i, prop_offset, h)
-        for i in range(lane, h.dofs.shape[1], stride):
-            dof = h.dofs[world, i]
-            if dof >= 0:
-                v = h.velocity[dof]
-                if beta != 0.0:
-                    h.velocity[dof] = v + beta * (v - h.prev_velocity[dof])
-                h.prev_velocity[dof] = v
+        if wp.static(exact):
+            _install_row_moves(world, lane, stride, free_offset, beta, h)
+        else:
+            for i in range(lane, h.dofs.shape[1], stride):
+                dof = h.dofs[world, i]
+                if dof >= 0:
+                    v = h.velocity[dof]
+                    if beta != 0.0:
+                        h.velocity[dof] = v + beta * (v - h.prev_velocity[dof])
+                    h.prev_velocity[dof] = v
         if wp.static(propagation):
             start = h.body_start[world]
             for i in range(lane, 6 * (h.body_start[world + 1] - start), stride):
@@ -611,9 +669,9 @@ def get_split_momentum(
 
 @cache
 def get_advance_split_sweep(
-    propagation: bool, torsion: bool, ordered: bool, patch_anchors: bool, rods: bool = False
+    propagation: bool, torsion: bool, ordered: bool, patch_anchors: bool, rods: bool = False, exact: bool = False
 ) -> wp.Kernel:
-    advance = get_split_momentum(1, propagation, torsion, ordered, patch_anchors, rods)
+    advance = get_split_momentum(1, propagation, torsion, ordered, patch_anchors, rods, exact)
 
     @wp.kernel(enable_backward=False, module="unique", module_options=WARP_DETERMINISM_OFF)
     def advance_split_sweep(histories: wp.array[SplitSweep], iteration: int, friction_transition: bool):
@@ -642,6 +700,7 @@ def get_fused_iteration_kernel(
     split_momentum: bool = False,
     split_propagation: bool = True,
     split_rods: bool = False,
+    split_exact: bool = False,
     torsion: bool = False,
     ordered: bool = False,
     patch_anchors: bool = False,
@@ -666,7 +725,7 @@ def get_fused_iteration_kernel(
     momentum_step = momentum_step_native(block_threads) if momentum else None
     # SolverSteel(nesterov_momentum=True): the split sweep's own Nesterov, for solves without rod-tree momentum.
     advance_momentum = (
-        get_split_momentum(warps, split_propagation, torsion, ordered, patch_anchors, split_rods)
+        get_split_momentum(warps, split_propagation, torsion, ordered, patch_anchors, split_rods, split_exact)
         if split_momentum
         else None
     )

@@ -7838,6 +7838,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         # the trees' pending impulses), so Nesterov's split sweep keeps to the generalized and free-body rows.
         propagation = self._propagation_active and not self._propagation_momentum
         self._split_momentum_propagation = propagation
+        # Partitioned, the step installs its own rows' velocity through their responses: extrapolating whole
+        # velocities would move the propagation trees' DOFs a second time, on top of propagation_momentum's step.
+        exact = self._propagation_active and self._propagation_momentum
+        self._split_momentum_exact = exact
 
         patch_anchors = self._momentum_patch_anchors
 
@@ -7854,6 +7858,26 @@ class SolverSteel(SolverBase, CouplingInterface):
         h.dofs, h.velocity = self._world_dof_indices, self._v_out
         h.prev_velocity = wp.empty_like(h.velocity)
         worlds, device = self._world_count, model.device
+        if exact:
+            if self._sparse_mass_matrix_size is not None or self._packed_rod_size is not None:
+                raise ValueError(
+                    "nesterov_momentum with propagation_momentum needs the dense rows' world response; this model's "
+                    "sparse or packed rod factorization stores factor-coordinate responses. Disable one of the two."
+                )
+            if self._has_free_rigid_bodies and getattr(self, "_mf_body_count", None) is None:
+                raise ValueError(
+                    "nesterov_momentum with propagation_momentum needs the free-body row maps, which contact "
+                    "warm-starting builds. Enable contact warm-starting or disable one of the two."
+                )
+            h.Y_world = self._Y_world
+            if self._has_free_rigid_bodies:
+                h.mf_body_count, h.mf_body_dof_start = self._mf_body_count, self._mf_body_dof_start
+                h.mf_local_body_a, h.mf_local_body_b = self._mf_local_body_a, self._mf_local_body_b
+            else:
+                h.mf_body_count = wp.zeros(worlds, dtype=wp.int32, device=device)
+                h.mf_body_dof_start = wp.zeros((1, 1), dtype=wp.int32, device=device)
+                h.mf_local_body_a = h.mf_local_body_b = wp.zeros((1, 1), dtype=wp.int32, device=device)
+            h.mf_MiJt_a, h.mf_MiJt_b = self._mf_MiJt_a, self._mf_MiJt_b
         width = self._impulses.shape[1] + self._mf_impulses.shape[1]
         if propagation:
             h.prop = rows(
@@ -7891,7 +7915,7 @@ class SolverSteel(SolverBase, CouplingInterface):
         if patch_anchors:
             h.anchor_sq = wp.empty(worlds, device=device)
         self._advance_split_sweep = latency_fused.get_advance_split_sweep(
-            propagation, self._contact_torsion_enabled, ordered, patch_anchors, rods
+            propagation, self._contact_torsion_enabled, ordered, patch_anchors, rods, exact
         )
         self._split_momentum_state = h
         self._split_momentum = wp.array([h], dtype=latency_fused.SplitSweep, device=device)
@@ -15922,6 +15946,7 @@ class SolverSteel(SolverBase, CouplingInterface):
             split_momentum=self._nesterov_momentum and self._split_momentum is not None,
             split_propagation=getattr(self, "_split_momentum_propagation", True),
             split_rods=self._split_momentum_rods,
+            split_exact=getattr(self, "_split_momentum_exact", False),
             torsion=self._contact_torsion_enabled,
             ordered=self._ordered_rows,
             has_phase3=interleaved and has_internal_rows,
