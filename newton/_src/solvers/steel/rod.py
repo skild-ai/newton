@@ -15,32 +15,46 @@ wp.set_module_options(WARP_DETERMINISM_OFF)
 
 @wp.func
 def _angular_measure(q: wp.quat):
-    """Return material curvature, transported twist and their left-rotation Jacobian."""
+    """Return material curvature, transported twist and their left-rotation Jacobian.
+
+    The curvature is ``2 (z x t) / (1 + t_z)`` (``2 tan`` of half the bend angle along the bend direction), capped at
+    magnitude 20 from about 168.6 degrees on. In the capped regime it is ``20 u`` with ``u`` the unit bend direction
+    and its Jacobian is evaluated from ``z x t`` directly, so the bend plane stays continuous up to the fold and the
+    in-plane stiffness stays positive there (its ``1 / |z x t|`` gain is floored); only an exactly antiparallel
+    tangent falls back to the parent material X as the half-turn axis, as in the authored rod model.
+    """
     z = wp.vec3(0.0, 0.0, 1.0)
     t = wp.quat_rotate(q, z)
     # 1 + t.z = 2 (w² + z²). This form retains precision near a fold.
     denom = 2.0 * (q[3] * q[3] + q[2] * q[2])
-    if denom <= 1.0e-12:
-        # At antiparallel tangents parallel transport is undefined. Choose the
-        # parent material X as the half-turn axis, as in the authored rod model.
-        normal = wp.quat_rotate(q, wp.vec3(1.0, 0.0, 0.0))
-        angle = wp.atan2(-normal[1], normal[0])
-        return wp.vec3(20.0, 0.0, angle), wp.matrix_from_rows(wp.vec3(), wp.vec3(), t)
-
     cross = wp.cross(z, t)
-    bend = 2.0 * cross / denom
-    d_bend = (2.0 / denom) * (t[2] * wp.identity(3, float) - wp.outer(t, z))
-    d_bend += wp.outer(bend, cross) / denom
-    magnitude = wp.length(bend)
-    if magnitude > 20.0:
-        unit = bend / magnitude
-        d_bend = (20.0 / magnitude) * (wp.identity(3, float) - wp.outer(unit, unit)) * d_bend
+    c = wp.length(cross)
+    # d(z x t) for a left rotation of t.
+    d_cross = t[2] * wp.identity(3, float) - wp.outer(t, z)
+    bend = wp.vec3()
+    d_bend = wp.mat33()
+    if denom > 1.0e-12 and 2.0 * c <= 20.0 * denom:
+        bend = 2.0 * cross / denom
+        d_bend = (2.0 / denom) * d_cross + wp.outer(bend, cross) / denom
+    else:
+        unit = wp.vec3(1.0, 0.0, 0.0)
+        if c > 1.0e-12:
+            unit = cross / c
         bend = 20.0 * unit
+        d_bend = (20.0 / wp.max(c, 1.0e-3)) * (wp.identity(3, float) - wp.outer(unit, unit)) * d_cross
 
     # The twist left after minimal tangent transport is the Z part of the
     # swing-twist decomposition. Both atan2 operands are invariant to q -> -q.
-    twist = wp.atan2(2.0 * q[2] * q[3], q[3] * q[3] - q[2] * q[2])
-    twist_row = wp.vec3(t[0] / denom, t[1] / denom, 1.0)
+    twist = float(0.0)
+    twist_row = wp.vec3()
+    if denom > 1.0e-12:
+        twist = wp.atan2(2.0 * q[2] * q[3], q[3] * q[3] - q[2] * q[2])
+        twist_row = wp.vec3(t[0] / denom, t[1] / denom, 1.0)
+    else:
+        # At antiparallel tangents parallel transport is undefined: the twist is taken about the parent material X.
+        normal = wp.quat_rotate(q, wp.vec3(1.0, 0.0, 0.0))
+        twist = wp.atan2(-normal[1], normal[0])
+        twist_row = t
     return wp.vec3(bend[0], bend[1], twist), wp.matrix_from_rows(d_bend[0], d_bend[1], twist_row)
 
 
