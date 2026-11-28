@@ -1,0 +1,1 @@
+Add an opt-in articulated-body mass solve behind the private ``mass_solve`` kernel override; the default solve is unchanged.

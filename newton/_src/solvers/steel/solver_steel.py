@@ -171,6 +171,7 @@ from .kernels import (
     eval_rigid_fk_kinematics,
     eval_rigid_tau,
     eval_rigid_tau_and_augmented_drives,
+    factor_articulated_body,
     factor_diagonal_mass,
     factor_propagation_tree_for_size,
     fill_contact_family_sort_keys,
@@ -189,6 +190,7 @@ from .kernels import (
     gather_JY_to_world,
     gather_propagation_unit_meta,
     gather_tau_to_groups,
+    hinv_jt_articulated_body,
     hinv_jt_diagonal,
     hinv_jt_par_row,
     hinv_jt_par_row_contact_fallback,
@@ -235,6 +237,7 @@ from .kernels import (
     snapshot_propagation_cache_qd_base,
     snapshot_row_warmstart,
     snapshot_step_warmstart,
+    solve_articulated_body_tau,
     solve_compact_diagonal_mass,
     solve_diagonal_mass,
     subtract_arrays,
@@ -3222,6 +3225,9 @@ class SolverSteel(SolverBase, CouplingInterface):
             raise ValueError("trisolve_kernel must be one of ['auto', 'loop', 'tiled']")
         if self._hinv_jt_kernel not in ("tiled", "par_row", "auto"):
             raise ValueError("hinv_jt_kernel must be one of ['auto', 'par_row', 'tiled']")
+        self._mass_solve = self._kernel_overrides.get("mass_solve", "cholesky")
+        if self._mass_solve not in ("cholesky", "articulated_body"):
+            raise ValueError("mass_solve must be one of ['articulated_body', 'cholesky']")
         self._tile_threads = int(self._kernel_overrides.get("tile_threads", _TILE_THREADS))
         if self._tile_threads not in (32, 64, 128, 256):
             raise ValueError("tile_threads must be one of (32, 64, 128, 256)")
@@ -3350,12 +3356,16 @@ class SolverSteel(SolverBase, CouplingInterface):
         )
         if not self._hinv_jt_writes_world or self._preelim_active or self._sparse_mass_matrix_size is not None:
             self._hinv_jt_diag_sizes = frozenset()
+        self._setup_articulated_body_sizes()
         self._setup_local_solves(model)
         self._setup_paired_response(model)
+        self._keep_dense_factor_groups_on_cholesky()
+        self._hinv_jt_diag_sizes -= self._articulated_body_sizes
 
         self._check_index_range(model)
         self._allocate_common_buffers(model)
         self._allocate_buffers(model)
+        self._allocate_articulated_body_buffers(model)
         self._allocate_paired_response_buffers(model)
         self._allocate_world_buffers(model)
         self._allocate_mf_buffers(model)
@@ -6215,7 +6225,11 @@ class SolverSteel(SolverBase, CouplingInterface):
         """
         self._sparse_mass_matrix_size = None
         self._sparse_mass_matrix_plan = None
-        if not self._kernel_overrides.get("sparse_mass_matrix", True) or self._sparse_diagonal_contact_solve:
+        if (
+            not self._kernel_overrides.get("sparse_mass_matrix", True)
+            or self._mass_solve == "articulated_body"
+            or self._sparse_diagonal_contact_solve
+        ):
             return
         if _model_has_bilateral_constraints(model) or self._distance_limit_count:
             return
@@ -6702,8 +6716,12 @@ class SolverSteel(SolverBase, CouplingInterface):
                 self._J_by_size[size] = self._Y_by_size[size] = stand_in
                 self._diag_by_size[size] = self._dummy_hinv_diag
                 continue
-            self._H_by_size[size] = wp.zeros((n_arts, size, size), dtype=wp.float32, device=device)
-            self._L_by_size[size] = wp.zeros((n_arts, size, size), dtype=wp.float32, device=device)
+            if size in self._articulated_body_sizes:
+                # The articulated-body factors replace the dense matrix and its Cholesky factor.
+                self._H_by_size[size] = self._L_by_size[size] = wp.zeros((1, 1, 1), dtype=wp.float32, device=device)
+            else:
+                self._H_by_size[size] = wp.zeros((n_arts, size, size), dtype=wp.float32, device=device)
+                self._L_by_size[size] = wp.zeros((n_arts, size, size), dtype=wp.float32, device=device)
             self._J_by_size[size] = wp.zeros((n_arts, max_constraints, size), dtype=wp.float32, device=device)
             self._Y_by_size[size] = wp.zeros((n_arts, max_constraints, size), dtype=wp.float32, device=device)
             self._diag_by_size[size] = (
@@ -8008,6 +8026,9 @@ class SolverSteel(SolverBase, CouplingInterface):
         for size in self._for_sizes():
             if size in (self._sparse_mass_matrix_size, self._sparse_diagonal_response_size):
                 continue
+            if size in self._articulated_body_sizes:
+                self._stage2_factor_articulated_body(size, state_aug)
+                continue
             # Fused groups were assembled and factored in stage 1.
             if self._crba_cholesky_kernels_by_size[size] or self._crba_cholesky_warp_kernels_by_size[size]:
                 pass
@@ -8068,6 +8089,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 continue
             if self._execution_plan.use_diagonal_mass(size):
                 self._stage3_solve_diagonal(size, state_aug)
+                continue
+            if size in self._articulated_body_sizes:
+                self._stage3_solve_articulated_body(size, state_aug)
                 continue
             use_tiled = self._trisolve_kernel == "tiled" or (
                 self._trisolve_kernel == "auto" and size > self._small_dof_threshold
@@ -8753,6 +8777,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                     continue
                 if self._execution_plan.use_diagonal_mass(size):
                     self._stage4_hinv_jt_diagonal(size)
+                elif size in self._articulated_body_sizes:
+                    self._stage4_hinv_jt_articulated_body(size)
                 elif self._execution_plan.use_tiled_hinv_jt(size):
                     self._stage4_hinv_jt_tiled(size)
                 else:
@@ -9657,6 +9683,216 @@ class SolverSteel(SolverBase, CouplingInterface):
             return self._serial_kernel_block_dim
         return _serial_launch_block_dim(thread_count, self._sm_count)
 
+    def _setup_articulated_body_sizes(self) -> None:
+        """Select the dense groups whose mass matrix is factored and solved by articulated-body passes."""
+        self._articulated_body_sizes = frozenset()
+        if self._mass_solve != "articulated_body":
+            return
+        # Free rigid bodies read their group's dense Cholesky factor in the free-root velocity
+        # correction, so a group holding any of them (for example free boxes next to a six-DOF
+        # arm) keeps the Cholesky path, not only groups made of free bodies alone.
+        is_free_rigid = self._model_plan.is_free_rigid
+        self._articulated_body_sizes = frozenset(
+            size
+            for size in self._size_groups
+            if size not in (self._sparse_mass_matrix_size, self._sparse_diagonal_response_size)
+            and not self._execution_plan.use_diagonal_mass(size)
+            and not np.any(is_free_rigid[self._group_to_art[size].numpy()] != 0)
+        )
+        if not self._articulated_body_sizes:
+            return
+        # The passes walk joints in index order: a tree joint that precedes its parent would
+        # silently drop its subtree's inertia and bias forces.
+        model = self.model
+        joint_ancestor = model.joint_ancestor.numpy()
+        articulation_start = model.articulation_start.numpy()
+        response_dofs = self._model_plan.response_dof_count
+        for art in range(model.articulation_count):
+            if int(response_dofs[art]) not in self._articulated_body_sizes:
+                continue
+            joints = np.arange(articulation_start[art], self._model_plan.articulation_joint_end[art])
+            unordered = joints[joint_ancestor[joints] >= joints]
+            if unordered.size:
+                raise NotImplementedError(
+                    "mass_solve='articulated_body' requires every tree joint to follow its parent joint; "
+                    f"joint {int(unordered[0])} of articulation {art} precedes its parent joint "
+                    f"{int(joint_ancestor[unordered[0]])}"
+                )
+
+    def _keep_dense_factor_groups_on_cholesky(self) -> None:
+        """Leave the groups whose dense Cholesky factor the paired response or the local solves read on Cholesky.
+
+        Both are selected automatically for small groups (at most 26 DOFs), where the Cholesky path is also the
+        faster one, so the articulated-body solve keeps only the remaining groups.
+        """
+        if not self._articulated_body_sizes:
+            return
+        dense = {self._paired_response_primary_size, self._paired_response_secondary_size}
+        if self._local_internal_fast_path:
+            for counts in (
+                self._local_internal_art_counts,
+                self._local_pair_art_counts,
+                self._local_residual_art_counts,
+            ):
+                dense.update(size for size, count in counts.items() if count)
+        self._articulated_body_sizes -= dense
+
+    def _allocate_articulated_body_buffers(self, model: Model) -> None:
+        """Allocate the articulated-body factors and the per-row scratch of the selected groups."""
+        device = model.device
+        self._ab_S_by_size = {}
+        self._ab_U_by_size = {}
+        self._ab_Dinv_by_size = {}
+        self._ab_diag_by_size = {}
+        self._ab_rhs_by_size = {}
+        self._ab_scratch_by_size = {}
+        self._ab_rows_launch_by_size = {}
+        self._ab_body_I_A = None
+        self._ab_branch_slot = None
+        if not self._articulated_body_sizes:
+            return
+        self._ab_body_I_A = wp.zeros(max(model.body_count, 1), dtype=wp.spatial_matrix, device=device)
+        articulation_start = model.articulation_start.numpy()
+        joint_end = self._model_plan.articulation_joint_end
+        # A joint gets a scratch slot when a child other than the next joint hangs off it; the
+        # next joint hands its result over in registers.
+        joint_ancestor = model.joint_ancestor.numpy()
+        joint_count = model.joint_count
+        joint_art = np.full(joint_count, -1, dtype=np.int64)
+        for art in range(model.articulation_count):
+            joint_art[articulation_start[art] : joint_end[art]] = art
+        children = np.arange(joint_count)
+        in_art = (joint_art >= 0) & (joint_ancestor >= 0)
+        in_art[in_art] &= joint_ancestor[in_art] >= articulation_start[joint_art[in_art]]
+        is_branch = np.zeros(joint_count, dtype=bool)
+        is_branch[joint_ancestor[in_art & (joint_ancestor != children - 1)]] = True
+        # Number the branch joints within their articulation in joint order.
+        running = np.cumsum(is_branch) - is_branch
+        art_base = np.zeros(model.articulation_count, dtype=np.int64)
+        if joint_count:
+            art_base = running[np.minimum(articulation_start[: model.articulation_count], joint_count - 1)]
+        branch_slot = np.full(max(joint_count, 1), -1, dtype=np.int32)
+        member = is_branch & (joint_art >= 0)
+        branch_slot[:joint_count][member] = (running[member] - art_base[joint_art[member]]).astype(np.int32)
+        slots_per_art = np.zeros(model.articulation_count, dtype=np.int64)
+        np.add.at(slots_per_art, joint_art[member], 1)
+        self._ab_branch_slot = wp.array(branch_slot, dtype=wp.int32, device=device)
+        max_constraints = max(self._articulation_constraint_max, 1)
+        for size in self._articulated_body_sizes:
+            n_arts = self._n_arts_by_size[size]
+            arts = self._group_to_art[size].numpy()
+            max_slots = max(int(np.max(slots_per_art[arts])), 1)
+            self._ab_S_by_size[size] = wp.zeros((n_arts, size), dtype=wp.spatial_vector, device=device)
+            self._ab_U_by_size[size] = wp.zeros((n_arts, size), dtype=wp.spatial_vector, device=device)
+            self._ab_Dinv_by_size[size] = wp.zeros((n_arts, size, 6), dtype=wp.float32, device=device)
+            self._ab_diag_by_size[size] = wp.zeros((n_arts, size), dtype=wp.float32, device=device)
+            self._ab_rhs_by_size[size] = wp.zeros((n_arts, 1, size), dtype=wp.float32, device=device)
+            self._ab_scratch_by_size[size] = wp.zeros(
+                (n_arts, max_slots, max_constraints), dtype=wp.spatial_vector, device=device
+            )
+            # Threads per articulation of the row solve: enough to fill the GPU (about 512
+            # resident per SM), each looping over the world's rows, at most one per row.
+            rows_launch = 32
+            while rows_launch < max_constraints and n_arts * rows_launch < 512 * max(self._sm_count, 1):
+                rows_launch *= 2
+            self._ab_rows_launch_by_size[size] = min(rows_launch, max_constraints)
+
+    def _stage2_factor_articulated_body(self, size: int, state_aug: State) -> None:
+        """Factor the augmented mass matrices of an articulated-body group."""
+        model = self.model
+        wp.launch(
+            factor_articulated_body,
+            dim=self._n_arts_by_size[size],
+            inputs=[
+                self._group_to_art[size],
+                model.articulation_start,
+                self._articulation_joint_end,
+                self._articulation_dof_start,
+                self._mass_update_mask,
+                model.joint_ancestor,
+                model.joint_child,
+                model.joint_qd_start,
+                self._ab_branch_slot,
+                state_aug._joint_S_s,
+                state_aug._body_I_s,
+                self._R_by_size[size],
+                size,
+                self._articulation_max_dofs,
+                self._aug_row_counts,
+                self._aug_row_dof_index,
+                self._aug_row_K,
+            ],
+            outputs=[
+                self._ab_body_I_A,
+                self._ab_diag_by_size[size],
+                self._ab_S_by_size[size],
+                self._ab_U_by_size[size],
+                self._ab_Dinv_by_size[size],
+            ],
+            device=model.device,
+            block_dim=self._serial_block_dim(self._n_arts_by_size[size]),
+        )
+
+    def _stage3_solve_articulated_body(self, size: int, state_aug: State) -> None:
+        """Solve the unconstrained accelerations of an articulated-body group."""
+        model = self.model
+        wp.launch(
+            solve_articulated_body_tau,
+            dim=self._n_arts_by_size[size],
+            inputs=[
+                self._group_to_art[size],
+                model.articulation_start,
+                self._articulation_joint_end,
+                self._articulation_dof_start,
+                self._dynamics_art_active,
+                model.joint_ancestor,
+                model.joint_qd_start,
+                self._ab_branch_slot,
+                self._ab_S_by_size[size],
+                self._ab_U_by_size[size],
+                self._ab_Dinv_by_size[size],
+                size,
+                state_aug._joint_tau,
+            ],
+            outputs=[self._ab_rhs_by_size[size], self._ab_scratch_by_size[size], state_aug._joint_qdd],
+            device=model.device,
+            block_dim=self._serial_block_dim(self._n_arts_by_size[size]),
+        )
+
+    def _stage4_hinv_jt_articulated_body(self, size: int) -> None:
+        """Compute the row responses of an articulated-body group."""
+        model = self.model
+        max_constraints = self._articulation_constraint_max
+        rows_launch = self._ab_rows_launch_by_size[size]
+        wp.launch(
+            hinv_jt_articulated_body,
+            dim=self._n_arts_by_size[size] * rows_launch,
+            inputs=[
+                self._group_to_art[size],
+                self._art_to_world,
+                model.articulation_start,
+                self._articulation_joint_end,
+                self._articulation_dof_start,
+                model.joint_ancestor,
+                model.joint_qd_start,
+                self._ab_branch_slot,
+                self._ab_S_by_size[size],
+                self._ab_U_by_size[size],
+                self._ab_Dinv_by_size[size],
+                self._J_by_size[size],
+                self._articulation_world_dof_offset,
+                self._constraint_count,
+                size,
+                max_constraints,
+                rows_launch,
+                int(self._hinv_jt_writes_world),
+            ],
+            outputs=[self._ab_scratch_by_size[size], self._Y_by_size[size], self._J_world, self._Y_world],
+            device=model.device,
+            # Neighbouring threads solve rows of one articulation and share its factor reads.
+            block_dim=32,
+        )
+
     def _stage1_crba(self, state_aug: State, dt: float):
         """Build the joint-space mass matrix of articulations due for a refresh and add drive terms."""
         model = self.model
@@ -9746,6 +9982,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 continue
             if size == self._sparse_diagonal_response_size:
                 self._stage1_compact_diagonal_inverse_mass(state_aug, size)
+                continue
+            if size in self._articulated_body_sizes:
+                # The articulated-body factor reads the body inertias directly.
                 continue
             if self._launch_fused_crba_cholesky(state_aug, size):
                 continue

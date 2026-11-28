@@ -2627,6 +2627,449 @@ def cholesky_loop(
             L_group[group_idx, i, j] = s * inv_s
 
 
+# =============================================================================
+# Articulated-Body Mass Solve
+# =============================================================================
+# The articulated-body factorization of the same augmented mass matrix the Cholesky path
+# factors, H + diag(armature + drive K), and the O(n) solves H^-1 x it supports. Spatial
+# quantities share the frame of ``joint_S_s`` and ``body_I_s`` (world orientation about the
+# articulation origin). Joint ``j`` stores per DOF its motion column ``S``, ``U = I^A S`` and
+# a row of ``D^-1`` (``D = S^T I^A S`` plus the diagonal terms, at most 6 x 6). Tree joints
+# must follow their parent within the articulation.
+#
+# Both passes walk the joints in index order, so a joint whose parent is the previous joint
+# hands its result over in registers. Only a joint with a child elsewhere (a branch point)
+# keeps a slot, ``branch_slot[j] >= 0``, that its other children accumulate into; a chain has
+# none. Joints with one or three DOFs (revolute, prismatic, ball) keep ``S``, ``U`` and ``D^-1``
+# in registers; other joints use the general block code.
+
+
+# Relative size below which an eliminated pivot of a joint block counts as a dependent
+# (massless or redundant) direction; such directions get a zero response, as the Cholesky
+# solves give an exactly zero pivot.
+_AB_PIVOT_RTOL = wp.constant(1.0e-6)
+
+
+@wp.func
+def _invert_spd_block(D: wp.spatial_matrix, k: int) -> wp.spatial_matrix:
+    """Return the inverse of the leading ``k x k`` block of a symmetric positive-semidefinite matrix.
+
+    A pivot that is not positive, or below ``_AB_PIVOT_RTOL`` of its original diagonal, leaves its
+    row and column zero, so a massless or redundant direction responds with zero instead of NaN.
+    """
+    A = wp.spatial_matrix(D)
+    inv = wp.identity(n=6, dtype=wp.float32)
+    for c in range(k):
+        if A[c, c] <= _AB_PIVOT_RTOL * D[c, c] or A[c, c] <= 0.0:
+            for j in range(k):
+                A[c, j] = 0.0
+                inv[c, j] = 0.0
+            continue
+        pivot = 1.0 / A[c, c]
+        for j in range(k):
+            A[c, j] = A[c, j] * pivot
+            inv[c, j] = inv[c, j] * pivot
+        for r in range(k):
+            if r != c:
+                f = A[r, c]
+                for j in range(k):
+                    A[r, j] = A[r, j] - f * A[c, j]
+                    inv[r, j] = inv[r, j] - f * inv[c, j]
+    return inv
+
+
+@wp.func
+def _invert_psd3(D: wp.mat33) -> wp.mat33:
+    """Return the inverse of a symmetric positive-semidefinite 3 x 3 block, as :func:`_invert_spd_block`.
+
+    Unlike ``wp.inverse`` it does not form the determinant, which underflows float32 for
+    well-conditioned blocks below about 1e-13 and then zeroes the whole block.
+    """
+    A = wp.mat33(D)
+    inv = wp.identity(n=3, dtype=wp.float32)
+    for c in range(3):
+        if A[c, c] <= _AB_PIVOT_RTOL * D[c, c] or A[c, c] <= 0.0:
+            for j in range(3):
+                A[c, j] = 0.0
+                inv[c, j] = 0.0
+            continue
+        pivot = 1.0 / A[c, c]
+        for j in range(3):
+            A[c, j] = A[c, j] * pivot
+            inv[c, j] = inv[c, j] * pivot
+        for r in range(3):
+            if r != c:
+                f = A[r, c]
+                for j in range(3):
+                    A[r, j] = A[r, j] - f * A[c, j]
+                    inv[r, j] = inv[r, j] - f * inv[c, j]
+    return inv
+
+
+@wp.kernel
+def factor_articulated_body(
+    group_to_art: wp.array[int],
+    articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    mass_update_mask: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_child: wp.array[int],
+    joint_qd_start: wp.array[int],
+    branch_slot: wp.array[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_I_s: wp.array[wp.spatial_matrix],
+    R_group: wp.array2d[float],  # [n_arts, n_dofs] armature
+    n_dofs: int,
+    max_dofs: int,
+    drive_row_counts: wp.array[int],
+    drive_row_dof_index: wp.array[int],
+    drive_row_K: wp.array[float],
+    # outputs
+    body_I_A: wp.array[wp.spatial_matrix],  # body-indexed articulated inertia of branch points
+    diag_group: wp.array2d[float],  # [n_arts, n_dofs] diagonal terms scratch
+    S_group: wp.array2d[wp.spatial_vector],  # [n_arts, n_dofs]
+    U_group: wp.array2d[wp.spatial_vector],  # [n_arts, n_dofs]
+    Dinv_group: wp.array3d[float],  # [n_arts, n_dofs, 6]
+):
+    """Factor one articulation's augmented mass matrix with the articulated-body recursion.
+
+    One thread per articulation of the group; articulations without a mass update keep
+    their factor, motion columns included, so later solves stay consistent with it.
+    """
+    idx = wp.tid()
+    art = group_to_art[idx]
+    if mass_update_mask[art] == 0:
+        return
+    start = articulation_start[art]
+    end = articulation_joint_end[art]
+    dof0 = articulation_dof_start[art]
+
+    for d in range(n_dofs):
+        diag_group[idx, d] = R_group[idx, d]
+    # Implicit drive and passive-damping terms, as the Cholesky path adds them to the diagonal.
+    for i in range(drive_row_counts[art]):
+        row = art * max_dofs + i
+        local = drive_row_dof_index[row] - dof0
+        K = drive_row_K[row]
+        if local >= 0 and local < n_dofs and K > 0.0:
+            diag_group[idx, local] += K
+
+    zero = wp.spatial_matrix()
+    for j in range(start, end):
+        if branch_slot[j] >= 0:
+            body_I_A[joint_child[j]] = zero
+    carry = wp.spatial_matrix()
+    for j in range(end - 1, start - 1, -1):
+        IA = body_I_s[joint_child[j]] + carry
+        carry = zero
+        if branch_slot[j] >= 0:
+            IA = IA + body_I_A[joint_child[j]]
+        d0 = joint_qd_start[j] - dof0
+        k = joint_qd_start[j + 1] - joint_qd_start[j]
+        parent = joint_ancestor[j]
+        if k == 1:
+            S = joint_S_s[dof0 + d0]
+            U = IA * S
+            D1 = wp.dot(S, U) + diag_group[idx, d0]
+            # A massless DOF without armature responds with zero, like a zero Cholesky pivot.
+            dinv = float(0.0)
+            if D1 > 0.0:
+                dinv = 1.0 / D1
+            S_group[idx, d0] = S
+            U_group[idx, d0] = U
+            Dinv_group[idx, d0, 0] = dinv
+            for b in range(1, 6):
+                Dinv_group[idx, d0, b] = 0.0
+            IA = IA - wp.outer(U, dinv * U)
+        elif k == 3:
+            S0 = joint_S_s[dof0 + d0]
+            S1 = joint_S_s[dof0 + d0 + 1]
+            S2 = joint_S_s[dof0 + d0 + 2]
+            U0 = IA * S0
+            U1 = IA * S1
+            U2 = IA * S2
+            # Build D symmetric: rounding leaves I^A slightly asymmetric, and an asymmetric D^-1 feeds
+            # an antisymmetric part back into the parent's I^A that grows at every multi-DOF joint.
+            d01 = 0.5 * (wp.dot(S0, U1) + wp.dot(S1, U0))
+            d02 = 0.5 * (wp.dot(S0, U2) + wp.dot(S2, U0))
+            d12 = 0.5 * (wp.dot(S1, U2) + wp.dot(S2, U1))
+            D = wp.mat33(
+                wp.dot(S0, U0) + diag_group[idx, d0],
+                d01,
+                d02,
+                d01,
+                wp.dot(S1, U1) + diag_group[idx, d0 + 1],
+                d12,
+                d02,
+                d12,
+                wp.dot(S2, U2) + diag_group[idx, d0 + 2],
+            )
+            Di = _invert_psd3(D)
+            S_group[idx, d0] = S0
+            S_group[idx, d0 + 1] = S1
+            S_group[idx, d0 + 2] = S2
+            U_group[idx, d0] = U0
+            U_group[idx, d0 + 1] = U1
+            U_group[idx, d0 + 2] = U2
+            for a in range(3):
+                for b in range(3):
+                    Dinv_group[idx, d0 + a, b] = Di[a, b]
+                for b in range(3, 6):
+                    Dinv_group[idx, d0 + a, b] = 0.0
+            W0 = Di[0, 0] * U0 + Di[0, 1] * U1 + Di[0, 2] * U2
+            W1 = Di[1, 0] * U0 + Di[1, 1] * U1 + Di[1, 2] * U2
+            W2 = Di[2, 0] * U0 + Di[2, 1] * U1 + Di[2, 2] * U2
+            IA = IA - wp.outer(U0, W0) - wp.outer(U1, W1) - wp.outer(U2, W2)
+        else:
+            for a in range(k):
+                S = joint_S_s[dof0 + d0 + a]
+                S_group[idx, d0 + a] = S
+                U_group[idx, d0 + a] = IA * S
+            Dg = wp.spatial_matrix()
+            for a in range(k):
+                for b in range(k):
+                    # Symmetric by construction, as in the 3-DOF branch.
+                    Dg[a, b] = 0.5 * (
+                        wp.dot(S_group[idx, d0 + a], U_group[idx, d0 + b])
+                        + wp.dot(S_group[idx, d0 + b], U_group[idx, d0 + a])
+                    )
+                Dg[a, a] = Dg[a, a] + diag_group[idx, d0 + a]
+            Dinv = _invert_spd_block(Dg, k)
+            for a in range(k):
+                for b in range(6):
+                    Dinv_group[idx, d0 + a, b] = Dinv[a, b]
+            for a in range(k):
+                Ua = U_group[idx, d0 + a]
+                for b in range(k):
+                    IA = IA - Dinv[a, b] * wp.outer(Ua, U_group[idx, d0 + b])
+        if parent >= start:
+            if parent == j - 1:
+                carry = IA
+            else:
+                body_I_A[joint_child[parent]] = body_I_A[joint_child[parent]] + IA
+
+
+@wp.func
+def _articulated_body_solve(
+    idx: int,
+    row: int,
+    start: int,
+    end: int,
+    dof0: int,
+    joint_ancestor: wp.array[int],
+    joint_qd_start: wp.array[int],
+    branch_slot: wp.array[int],
+    S_group: wp.array2d[wp.spatial_vector],
+    U_group: wp.array2d[wp.spatial_vector],
+    Dinv_group: wp.array3d[float],
+    x: wp.array3d[float],
+    y: wp.array3d[float],
+    scratch: wp.array3d[wp.spatial_vector],
+):
+    """Write ``y[idx, row] = H^-1 x[idx, row]`` for one articulation; ``x`` and ``y`` may alias.
+
+    ``scratch[idx, branch_slot[j], row]`` holds a branch point's articulated bias force on the
+    way up and its spatial acceleration on the way down.
+    """
+    zero = wp.spatial_vector()
+    for j in range(start, end):
+        slot = branch_slot[j]
+        if slot >= 0:
+            scratch[idx, slot, row] = zero
+    carry = wp.spatial_vector()
+    for j in range(end - 1, start - 1, -1):
+        p = carry
+        carry = zero
+        slot = branch_slot[j]
+        if slot >= 0:
+            p = p + scratch[idx, slot, row]
+        d0 = joint_qd_start[j] - dof0
+        k = joint_qd_start[j + 1] - joint_qd_start[j]
+        if k == 1:
+            u = x[idx, row, d0] - wp.dot(S_group[idx, d0], p)
+            y[idx, row, d0] = u
+            p = p + (Dinv_group[idx, d0, 0] * u) * U_group[idx, d0]
+        elif k == 3:
+            u0 = x[idx, row, d0] - wp.dot(S_group[idx, d0], p)
+            u1 = x[idx, row, d0 + 1] - wp.dot(S_group[idx, d0 + 1], p)
+            u2 = x[idx, row, d0 + 2] - wp.dot(S_group[idx, d0 + 2], p)
+            y[idx, row, d0] = u0
+            y[idx, row, d0 + 1] = u1
+            y[idx, row, d0 + 2] = u2
+            w0 = Dinv_group[idx, d0, 0] * u0 + Dinv_group[idx, d0, 1] * u1 + Dinv_group[idx, d0, 2] * u2
+            w1 = Dinv_group[idx, d0 + 1, 0] * u0 + Dinv_group[idx, d0 + 1, 1] * u1 + Dinv_group[idx, d0 + 1, 2] * u2
+            w2 = Dinv_group[idx, d0 + 2, 0] * u0 + Dinv_group[idx, d0 + 2, 1] * u1 + Dinv_group[idx, d0 + 2, 2] * u2
+            p = p + w0 * U_group[idx, d0] + w1 * U_group[idx, d0 + 1] + w2 * U_group[idx, d0 + 2]
+        else:
+            for a in range(k):
+                y[idx, row, d0 + a] = x[idx, row, d0 + a] - wp.dot(S_group[idx, d0 + a], p)
+            for a in range(k):
+                w = float(0.0)
+                for b in range(k):
+                    w += Dinv_group[idx, d0 + a, b] * y[idx, row, d0 + b]
+                p = p + w * U_group[idx, d0 + a]
+        parent = joint_ancestor[j]
+        if parent >= start:
+            if parent == j - 1:
+                carry = p
+            else:
+                pslot = branch_slot[parent]
+                scratch[idx, pslot, row] = scratch[idx, pslot, row] + p
+    acc_prev = wp.spatial_vector()
+    for j in range(start, end):
+        parent = joint_ancestor[j]
+        acc = wp.spatial_vector()
+        if parent >= start:
+            if parent == j - 1:
+                acc = acc_prev
+            else:
+                acc = scratch[idx, branch_slot[parent], row]
+        d0 = joint_qd_start[j] - dof0
+        k = joint_qd_start[j + 1] - joint_qd_start[j]
+        if k == 1:
+            q = Dinv_group[idx, d0, 0] * (y[idx, row, d0] - wp.dot(U_group[idx, d0], acc))
+            y[idx, row, d0] = q
+            acc = acc + q * S_group[idx, d0]
+        elif k == 3:
+            t0 = y[idx, row, d0] - wp.dot(U_group[idx, d0], acc)
+            t1 = y[idx, row, d0 + 1] - wp.dot(U_group[idx, d0 + 1], acc)
+            t2 = y[idx, row, d0 + 2] - wp.dot(U_group[idx, d0 + 2], acc)
+            q0 = Dinv_group[idx, d0, 0] * t0 + Dinv_group[idx, d0, 1] * t1 + Dinv_group[idx, d0, 2] * t2
+            q1 = Dinv_group[idx, d0 + 1, 0] * t0 + Dinv_group[idx, d0 + 1, 1] * t1 + Dinv_group[idx, d0 + 1, 2] * t2
+            q2 = Dinv_group[idx, d0 + 2, 0] * t0 + Dinv_group[idx, d0 + 2, 1] * t1 + Dinv_group[idx, d0 + 2, 2] * t2
+            y[idx, row, d0] = q0
+            y[idx, row, d0 + 1] = q1
+            y[idx, row, d0 + 2] = q2
+            acc = acc + q0 * S_group[idx, d0] + q1 * S_group[idx, d0 + 1] + q2 * S_group[idx, d0 + 2]
+        else:
+            t = wp.spatial_vector()
+            for a in range(k):
+                t[a] = y[idx, row, d0 + a] - wp.dot(U_group[idx, d0 + a], acc)
+            for a in range(k):
+                q = float(0.0)
+                for b in range(k):
+                    q += Dinv_group[idx, d0 + a, b] * t[b]
+                y[idx, row, d0 + a] = q
+                acc = acc + q * S_group[idx, d0 + a]
+        acc_prev = acc
+        slot = branch_slot[j]
+        if slot >= 0:
+            scratch[idx, slot, row] = acc
+
+
+@wp.kernel
+def solve_articulated_body_tau(
+    group_to_art: wp.array[int],
+    articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    articulation_active: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_qd_start: wp.array[int],
+    branch_slot: wp.array[int],
+    S_group: wp.array2d[wp.spatial_vector],
+    U_group: wp.array2d[wp.spatial_vector],
+    Dinv_group: wp.array3d[float],
+    n_dofs: int,
+    joint_tau: wp.array[float],
+    # outputs
+    rhs_group: wp.array3d[float],  # [n_arts, 1, n_dofs]
+    scratch: wp.array3d[wp.spatial_vector],
+    joint_qdd: wp.array[float],
+):
+    """Solve the unconstrained accelerations ``qdd = H^-1 tau``, one thread per articulation."""
+    idx = wp.tid()
+    art = group_to_art[idx]
+    if articulation_active[art] == 0:
+        return
+    dof0 = articulation_dof_start[art]
+    for d in range(n_dofs):
+        rhs_group[idx, 0, d] = joint_tau[dof0 + d]
+    _articulated_body_solve(
+        idx,
+        0,
+        articulation_start[art],
+        articulation_joint_end[art],
+        dof0,
+        joint_ancestor,
+        joint_qd_start,
+        branch_slot,
+        S_group,
+        U_group,
+        Dinv_group,
+        rhs_group,
+        rhs_group,
+        scratch,
+    )
+    for d in range(n_dofs):
+        joint_qdd[dof0 + d] = rhs_group[idx, 0, d]
+
+
+@wp.kernel
+def hinv_jt_articulated_body(
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_qd_start: wp.array[int],
+    branch_slot: wp.array[int],
+    S_group: wp.array2d[wp.spatial_vector],
+    U_group: wp.array2d[wp.spatial_vector],
+    Dinv_group: wp.array3d[float],
+    J_group: wp.array3d[float],  # [n_arts, max_constraints, n_dofs]
+    articulation_world_dof_offset: wp.array[int],
+    world_constraint_count: wp.array[int],
+    n_dofs: int,
+    max_constraints: int,
+    rows_launch: int,
+    write_world: int,
+    # outputs
+    scratch: wp.array3d[wp.spatial_vector],
+    Y_group: wp.array3d[float],
+    J_world: wp.array3d[float],
+    Y_world: wp.array3d[float],
+):
+    """Compute the row responses ``Y = H^-1 J^T``.
+
+    ``rows_launch`` threads per articulation each solve the rows ``lane, lane + rows_launch, ...``
+    below the world's row count, so the launch is sized by the GPU rather than by the row capacity.
+    """
+    tid = wp.tid()
+    idx = tid // rows_launch
+    lane = tid - idx * rows_launch
+    art = group_to_art[idx]
+    world = art_to_world[art]
+    count = wp.min(world_constraint_count[world], max_constraints)
+    start = articulation_start[art]
+    end = articulation_joint_end[art]
+    dof0 = articulation_dof_start[art]
+    offset = articulation_world_dof_offset[art]
+    for row in range(lane, count, rows_launch):
+        _articulated_body_solve(
+            idx,
+            row,
+            start,
+            end,
+            dof0,
+            joint_ancestor,
+            joint_qd_start,
+            branch_slot,
+            S_group,
+            U_group,
+            Dinv_group,
+            J_group,
+            Y_group,
+            scratch,
+        )
+        if write_world != 0:
+            for d in range(n_dofs):
+                J_world[world, row, offset + d] = J_group[idx, row, d]
+                Y_world[world, row, offset + d] = Y_group[idx, row, d]
+
+
 @wp.func
 def _is_identity_rotation(q: wp.quat):
     return q[0] == 0.0 and q[1] == 0.0 and q[2] == 0.0

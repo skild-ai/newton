@@ -111,6 +111,7 @@ def test_kernel_overrides_validate_their_values(test, device):
         ({"serial_kernel_block_dim": 0}, "serial_kernel_block_dim"),
         ({"serial_kernel_block_dim": 48}, "serial_kernel_block_dim"),
         ({"serial_kernel_block_dim": 2048}, "serial_kernel_block_dim"),
+        ({"mass_solve": "lu"}, "mass_solve"),
     ):
         with test.subTest(overrides=overrides), test.assertRaisesRegex(ValueError, pattern):
             with kernel_overrides(overrides):

@@ -19,8 +19,9 @@ def kernel_overrides(overrides: Mapping[str, object]) -> Iterator[None]:
     A solver reads the overrides once at construction and keeps them. Tasks and threads that
     inherit this context see the overrides; others do not. Keys: ``cholesky_kernel``, ``trisolve_kernel``,
     ``hinv_jt_kernel``, ``tile_threads``, ``serial_kernel_block_dim``,
-    ``sparse_mass_matrix``, ``diagonal_mass``, ``propagation_tree_kernel`` and the
-    ``colored_*`` sweep variants.
+    ``sparse_mass_matrix``, ``diagonal_mass``, ``propagation_tree_kernel``, ``mass_solve`` and the
+    ``colored_*`` sweep variants. ``mass_solve="articulated_body"`` replaces the dense Cholesky
+    factor, solve and ``H^-1 J^T`` of the dense articulation groups with articulated-body passes.
     """
     token = _KERNEL_OVERRIDES.set(dict(overrides))
     try:
