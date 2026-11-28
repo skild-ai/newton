@@ -3069,7 +3069,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 )
         self._articulated_contact_response = articulated_contact_response
         if nesterov_momentum is None:
-            nesterov_momentum = model.device.is_cuda
+            # Rods under the immediate response converge on their dense rows without it, and their contact-unit
+            # sweep (one warp reduction per contact) has no momentum path.
+            rods_immediate = getattr(model, "_has_rod_joints", False) and articulated_contact_response == "immediate"
+            nesterov_momentum = model.device.is_cuda and not rods_immediate
         self._nesterov_momentum = bool(nesterov_momentum)
         if self._nesterov_momentum and propagation_momentum:
             raise ValueError("nesterov_momentum and propagation_momentum both extrapolate the sweep; enable one")
@@ -15092,12 +15095,16 @@ class SolverSteel(SolverBase, CouplingInterface):
         wpb = _PROPAGATION_WORLDS_PER_BLOCK
         # Contracted chains keep v_out until the iterations end, so nothing else may read it in between.
         momentum = self._propagation_momentum
-        contracted = self._rod_contracted and not refresh_forced and not momentum
+        # With rod trees the Nesterov step's later moves run after each sweep (see the fused loop): its rod rows'
+        # moves join that sweep's pending impulses, so the contracted chains' deferred install cannot be used.
+        split_rods = self._split_momentum is not None and self._split_momentum_rods
+        contracted = self._rod_contracted and not refresh_forced and not momentum and not split_rods
         if momentum:
             self._momentum_t.fill_(1.0)
             wp.copy(self._momentum_prev, self._propagation_impulses)
         for iteration in range(iteration_offset, iteration_offset + iterations):
-            self._advance_split_momentum(iteration - iteration_offset, iteration == friction_start_iteration)
+            if not split_rods or iteration == iteration_offset:
+                self._advance_split_momentum(iteration - iteration_offset, iteration == friction_start_iteration)
             if has_internal_rows and not contact_then_internal:
                 phase(3, iteration_offset=iteration)
             phase(4, iteration_offset=iteration)
@@ -15226,6 +15233,10 @@ class SolverSteel(SolverBase, CouplingInterface):
             # between, the sweep's own body estimates carry the impulses it keeps summing.
             last = iteration == iteration_offset + iterations - 1
             propagates = every == 1 or last or (iteration - iteration_offset) % every == every - 1
+            if split_rods and not last:
+                self._advance_split_momentum(
+                    iteration + 1 - iteration_offset, iteration + 1 == friction_start_iteration
+                )
             if momentum and propagates and not last:
                 # The momentum's move joins the sweep's pending impulses, so one propagation installs both.
                 self._apply_propagation_momentum()
