@@ -1299,11 +1299,193 @@ def test_closed_rod_dahl_under_propagation_raises(test, device):
     newton.solvers.SolverSteel(model)  # the immediate response carries the closing joint's history
 
 
+_CABLE_RESPONSES = {
+    "immediate": {"articulated_contact_response": "immediate", "articulation_constraint_max": 512},
+    "propagation": {
+        "articulated_contact_response": "propagation",
+        "solve_mode": "colored",
+        "propagation_same_articulation_rows": True,
+        "propagation_constraint_max": 512,
+    },
+}
+
+
+def _ground_cable(device, *, mu=0.6, links=12, length=0.6, radius=0.02, upright=False, torsion_radius=0.0, rolling=0.0):
+    """A cable lying on (or, ``upright``, standing on its end on) the ground plane."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    newton.solvers.SolverSteel.register_custom_attributes(builder)
+    builder.rigid_gap = 0.01
+    if upright:
+        start, direction = (0.0, 0.0, radius + 0.001), (0.0, 0.0, 1.0)
+    else:
+        start, direction = (-0.5 * length, 0.0, radius), (1.0, 0.0, 0.0)
+    rod = newton.Rod.create_straight(
+        start=start, direction=direction, length=length, segment_count=links, radius=radius
+    )
+    cfg = newton.ModelBuilder.ShapeConfig(density=1200.0, mu=mu)
+    builder.add_rod(rod=rod, cfg=cfg, bend_stiffness=5.0e1, bend_damping=1.0, stretch_stiffness=1.0e5)
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=mu))
+    model = builder.finalize(device=device)
+    if torsion_radius:
+        model.steel.min_torsional_patch_radius.fill_(torsion_radius)
+    if rolling:
+        model.steel.condim.fill_(6)
+        model.shape_material_mu_rolling.fill_(rolling)
+    model.rigid_contact_max = max(model.rigid_contact_max or 0, 1024)
+    return model
+
+
+def _run_ground_cable(
+    model, options, steps, *, linear=(0.0, 0.0, 0.0), angular=(0.0, 0.0, 0.0), settle=30, dt=1.0 / 240.0, on_step=None
+):
+    """Settle, set the root joint's velocity, and step; return the solver, final state and per-step body twists."""
+    solver = newton.solvers.SolverSteel(model, iterations=24, **options)
+    pipeline = newton.CollisionPipeline(model, deterministic=True, contact_matching="latest")
+    contacts = pipeline.contacts()
+    a, b, control = model.state(), model.state(), model.control()
+    for _ in range(settle):
+        pipeline.collide(a, contacts)
+        solver.step(a, b, control, contacts, dt)
+        a, b = b, a
+    if any(linear) or any(angular):
+        root = int(np.flatnonzero(model.joint_parent.numpy() == -1)[0])
+        dof = int(model.joint_qd_start.numpy()[root])
+        qd = np.zeros_like(a.joint_qd.numpy())
+        qd[dof : dof + 3] = linear
+        qd[dof + 3 : dof + 6] = angular
+        a.joint_qd.assign(qd)
+        newton.eval_fk(model, a.joint_q, a.joint_qd, a)
+    twists = []
+    for step in range(steps):
+        if on_step is not None:
+            on_step(step, a, solver)
+        pipeline.collide(a, contacts)
+        solver.step(a, b, control, contacts, dt)
+        a, b = b, a
+        twists.append(a.body_qd.numpy().copy())
+    solver.check_constraint_capacity()
+    return solver, a, np.array(twists)
+
+
+def test_cable_friction_modes_stop_a_slide(test, device):
+    """Every friction model stops a cable sliding along its axis at the Coulomb rate, under both responses."""
+    dt, speed, mu = 1.0 / 240.0, 1.0, 0.5
+    expected = speed / (mu * 9.81)
+    for mode in ("fixed_normal", "bisection", "bisection_desaxce", "coulomb_newton"):
+        for response, options in _CABLE_RESPONSES.items():
+            with test.subTest(mode=mode, response=response):
+                model = _ground_cable(device, mu=mu)
+                opts = {**options, "friction_mode": mode, "friction_anchor_beta": 0.0}
+                _, state, twists = _run_ground_cable(model, opts, 120, linear=(speed, 0.0, 0.0), dt=dt)
+                test.assertTrue(np.all(np.isfinite(state.body_q.numpy())))
+                stopped = np.flatnonzero(np.abs(twists[:, :, 0]).mean(axis=1) < 0.02)
+                test.assertGreater(stopped.size, 0)
+                test.assertAlmostEqual(stopped[0] * dt, expected, delta=0.03)
+                test.assertLess(np.abs(twists[-1, :, 0]).max(), 0.01)
+
+
+def test_cable_torsion_stops_a_spin_with_warm_start(test, device):
+    """Contact torsion stops a cable spinning on its end, with the cable presets' warm start, under both responses."""
+    for response, options in _CABLE_RESPONSES.items():
+        for radius in (0.0, 0.01):
+            with test.subTest(response=response, radius=radius):
+                model = _ground_cable(device, links=3, length=0.12, radius=0.03, upright=True, torsion_radius=radius)
+                opts = {
+                    **options,
+                    "contact_torsion_device": True,
+                    "contact_warmstart": True,
+                    "friction_anchor_beta": 0.0,
+                }
+                _, _, twists = _run_ground_cable(model, opts, 120, angular=(0.0, 0.0, 4.0))
+                spin = np.abs(twists[-1, :, 5]).mean()
+                if radius:
+                    test.assertLess(spin, 1.0e-3)
+                else:
+                    test.assertGreater(spin, 3.9)
+
+
+def test_cable_rolling_friction(test, device):
+    """Rolling friction (steel:condim 6) stops a cable rolling sideways under propagation, at about the rate of a
+    rolling cylinder, alone and with contact torsion; the free-body override does not reach cable links, and the
+    immediate response warns that it ignores cable rolling."""
+    dt, speed, radius, rolling = 1.0 / 240.0, 0.5, 0.02, 0.002
+    roll = {"linear": (0.0, speed, 0.0), "angular": (-speed / radius, 0.0, 0.0)}
+    # A rolling capsule decelerates at mu_r g / (r (1 + I / (m r^2))), with I / (m r^2) between 0.4 and 0.5.
+    slowest = speed / (rolling * 9.81 / (radius * 1.5))
+    fastest = speed / (rolling * 9.81 / (radius * 1.4))
+    options = _CABLE_RESPONSES["propagation"]
+    for torsion in (0.0, 0.01):
+        with test.subTest(torsion=torsion):
+            model = _ground_cable(device, rolling=rolling, torsion_radius=torsion)
+            opts = {**options, "friction_anchor_beta": 0.0}
+            if torsion:
+                opts.update(contact_torsion_device=True, contact_warmstart=True)
+            _, state, twists = _run_ground_cable(model, opts, 240, dt=dt, **roll)
+            test.assertTrue(np.all(np.isfinite(state.body_q.numpy())))
+            stopped = np.flatnonzero(np.abs(twists[:, :, 1]).mean(axis=1) < 0.01)
+            test.assertGreater(stopped.size, 0)
+            test.assertGreater(stopped[0] * dt, 0.8 * fastest)
+            test.assertLess(stopped[0] * dt, 1.2 * slowest)
+    # Without condim the cable keeps rolling, even with the free-body override set.
+    model = _ground_cable(device)
+    _, _, twists = _run_ground_cable(model, {**options, "free_rigid_rolling_friction": rolling}, 240, dt=dt, **roll)
+    test.assertGreater(twists[-1, :, 1].mean(), 0.9 * speed)
+    # Contact torsion still stops an upright spinning cable whose contact also has a rolling pair.
+    model = _ground_cable(device, links=3, length=0.12, radius=0.03, upright=True, torsion_radius=0.01, rolling=rolling)
+    opts = {**options, "contact_torsion_device": True, "contact_warmstart": True, "friction_anchor_beta": 0.0}
+    _, _, twists = _run_ground_cable(model, opts, 120, angular=(0.0, 0.0, 4.0))
+    test.assertLess(np.abs(twists[-1, :, 5]).mean(), 1.0e-3)
+    with test.assertWarnsRegex(newton.NewtonWarning, "rolling"):
+        newton.solvers.SolverSteel(_ground_cable(device, rolling=rolling), **_CABLE_RESPONSES["immediate"])
+
+
+def test_cable_sleeps_and_wakes_with_warm_start(test, device):
+    """A resting cable falls asleep (its rod gains are material, not a drive) and a force wakes it, warm-started or not."""
+    for response, options in _CABLE_RESPONSES.items():
+        for warm in (False, True):
+            with test.subTest(response=response, warm=warm):
+                model = _ground_cable(device)
+                opts = {
+                    **options,
+                    "enable_sleeping": True,
+                    "sleep_quiet_time": 0.25,
+                    "contact_warmstart": warm,
+                    "friction_anchor_beta": 0.0,
+                }
+                seen = {}
+
+                def on_step(step, state, solver, seen=seen):
+                    asleep = bool(np.any(solver._sleeping.asleep_steps.numpy() > 0))
+                    if asleep and "slept" not in seen:
+                        seen["slept"] = step
+                        seen["pose"] = state.body_q.numpy().copy()
+                    if step == 200:
+                        force = state.body_f.numpy()
+                        force[0, 2] = 5.0
+                        state.body_f.assign(force)
+                    if step == 202:
+                        seen["woken"] = not asleep
+                        state.body_f.zero_()
+
+                solver, state, _ = _run_ground_cable(model, opts, 400, settle=0, on_step=on_step)
+                test.assertIn("slept", seen)
+                test.assertLess(seen["slept"], 150)
+                test.assertTrue(seen["woken"])
+                test.assertTrue(bool(np.any(solver._sleeping.asleep_steps.numpy() > 0)))
+                test.assertTrue(np.all(np.isfinite(state.body_q.numpy())))
+                # It settles back where it slept: the poke lifts one end briefly.
+                test.assertLess(np.abs(state.body_q.numpy()[:, :3] - seen["pose"][:, :3]).max(), 0.02)
+
+
 for _name, _fn in (
     (
         "test_carried_rod_state_follows_resets_and_velocity_edits",
         test_carried_rod_state_follows_resets_and_velocity_edits,
     ),
     ("test_closed_rod_dahl_under_propagation_raises", test_closed_rod_dahl_under_propagation_raises),
+    ("test_cable_friction_modes_stop_a_slide", test_cable_friction_modes_stop_a_slide),
+    ("test_cable_torsion_stops_a_spin_with_warm_start", test_cable_torsion_stops_a_spin_with_warm_start),
+    ("test_cable_sleeps_and_wakes_with_warm_start", test_cable_sleeps_and_wakes_with_warm_start),
+    ("test_cable_rolling_friction", test_cable_rolling_friction),
 ):
     add_function_test(TestSteelRod, _name, _fn, devices=get_cuda_test_devices())

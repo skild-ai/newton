@@ -2755,8 +2755,8 @@ class SolverSteel(SolverBase, CouplingInterface):
                 a disk of radius ``R`` it is ``2 * R / 3``. Rows are rebuilt every step and
                 carry no spin history; free-body contacts get none. Supported geometry is
                 sphere, box, capsule, cylinder, cone, ellipsoid, plane and convex mesh.
-                Requires ``contact_warmstart=False``; contacts with hydroelastic stiffness are
-                rejected. Dense torsion rows count against ``articulation_constraint_max`` after
+                A warm-started solve starts each torsion row cold (only contact and friction rows
+                carry history); contacts with hydroelastic stiffness are rejected. Dense torsion rows count against ``articulation_constraint_max`` after
                 the world's other dense rows. A world whose groups do not all fit keeps the rows
                 that fit, and a world that dropped dense rows gets no dense torsion rows; both set
                 the world's :attr:`constraint_overflow` entry and warn when
@@ -2833,10 +2833,11 @@ class SolverSteel(SolverBase, CouplingInterface):
                 shapes (other notifications and changes to static or kinematic owners wake
                 every island). Driven articulations (nonzero drive gains) and articulations with
                 passive springs (nonzero :attr:`~newton.Model.joint_stiffness` on a PRISMATIC,
-                REVOLUTE or D6 tree joint) stay awake. For resting stacks that stay awake with the
+                REVOLUTE or D6 tree joint) stay awake. A ROD joint's gains are its bend, twist and
+                stretch material, not a drive, so cables can sleep. For resting stacks that stay awake with the
                 default contact order, see :ref:`Tuning Solver Reference`.
-                Sleeping is configured at construction; rebuild captured graphs to change it. Construction raises :class:`ValueError` with ``contact_warmstart``
-                or ``velocity_iterations``, or for a model without articulations, and
+                Sleeping is configured at construction; rebuild captured graphs to change it. Construction raises :class:`ValueError` with
+                ``velocity_iterations``, or for a model without articulations, and
                 :class:`NotImplementedError` with ``articulated_contact_response="propagation"`` and
                 ``solve_mode="serial"``, and with ``solve_mode="colored"`` on CPU, where the colored
                 mode runs the serial propagation sweep; with ``solve_mode="colored"`` on CUDA
@@ -3250,6 +3251,20 @@ class SolverSteel(SolverBase, CouplingInterface):
         self._friction_combine_id = _MATERIAL_COMBINE_MODES[friction_combine]
         self._restitution_combine_id = _MATERIAL_COMBINE_MODES[restitution_combine]
         configure_free_rigid_angular_friction(self, model, free_rigid_torsional_friction, free_rigid_rolling_friction)
+        if self._free_rigid_angular_rows and articulated_contact_response == "immediate" and model._has_rod_joints:
+            condim = self._namespaced_attribute("condim")
+            rolling = model.shape_material_mu_rolling.numpy() if model.shape_count else np.zeros(0)
+            joint_art = model.joint_articulation.numpy()
+            rod_arts = np.unique(joint_art[model.joint_type.numpy() == int(JointType.ROD)])
+            rod_bodies = model.joint_child.numpy()[np.isin(joint_art, rod_arts[rod_arts >= 0])]
+            on_rods = np.isin(model.shape_body.numpy(), rod_bodies)
+            if condim is not None and bool(np.any(on_rods & (condim.numpy() >= 6) & (rolling > 0.0))):
+                warnings.warn(
+                    "SolverSteel: cable rolling friction (steel:condim 6) is solved only under "
+                    "articulated_contact_response='propagation'; the immediate response ignores it on cable links.",
+                    NewtonWarning,
+                    stacklevel=2,
+                )
         if not model.device.is_cuda:
             if model._has_rod_joints:
                 raise ValueError("Native Steel cables require a CUDA device.")
@@ -3927,6 +3942,10 @@ class SolverSteel(SolverBase, CouplingInterface):
         # Free-rigid angular coefficients after the condim gate; the kernels read them only when the rows are enabled.
         self._free_rigid_mu_torsional = wp.zeros(max(model.shape_count, 1), dtype=wp.float32, device=model.device)
         self._free_rigid_mu_rolling = wp.zeros(max(model.shape_count, 1), dtype=wp.float32, device=model.device)
+        # Articulated contacts (cable links) take the rolling coefficient behind condim only, never the free-body
+        # override; the spin output is a scratch (their spin is contact torsion's).
+        self._articulated_mu_rolling = wp.zeros(max(model.shape_count, 1), dtype=wp.float32, device=model.device)
+        self._articulated_mu_spin_scratch = wp.zeros(max(model.shape_count, 1), dtype=wp.float32, device=model.device)
         self._refresh_shape_materials()
         self._free_rigid_route_body = free_rigid_route_bodies(self)
 
@@ -12026,6 +12045,7 @@ class SolverSteel(SolverBase, CouplingInterface):
                     int(self._free_rigid_angular_rows),
                     self._free_rigid_mu_torsional,
                     self._free_rigid_mu_rolling,
+                    self._articulated_mu_rolling,
                     int(self._ordered_rows),
                     self._contact_torsion_shape_radius if self._propagation_torsion_rows else self._no_torsion_radius,
                     int(self._propagation_torsion_rows),
@@ -21860,10 +21880,15 @@ def _colored_unit_torsion_row(first: str, *, shared: bool, end: str = "") -> str
                         propagation_row_type.data[world_base + n + 2] == {friction_type} &&
                         propagation_row_parent.data[world_base + n + 2] == n"""
     end_check = f"if ({end}) break;" if end else ""
+    rolling_type = int(PGS_CONSTRAINT_TYPE_CONTACT_ROLLING)
+    spin_type = int(PGS_CONSTRAINT_TYPE_CONTACT_SPIN)
     return f"""
             do {{
                 {end_check}
-                const int slot = start_slot + ({first});
+                int slot = start_slot + ({first});
+                // An articulated contact's rolling pair sits between its sliding pair and its torsion row.
+                while (slot < m && (propagation_row_type.data[world_base + slot] == {rolling_type} ||
+                                    propagation_row_type.data[world_base + slot] == {spin_type})) ++slot;
                 if (slot >= m) break;
                 const int off = world_base + slot;
                 if (propagation_row_type.data[off] != {torsion_type}) break;

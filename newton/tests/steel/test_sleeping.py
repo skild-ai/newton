@@ -147,7 +147,6 @@ def test_invalid_options(test, device):
         ({"sleep_linear_threshold": float("nan")}, "finite and positive"),
         ({"sleep_angular_threshold": -1.0}, "finite and positive"),
         ({"velocity_iterations": 1}, "sleeping requires"),
-        ({"contact_warmstart": True}, "sleeping requires"),
     ):
         with test.subTest(kwargs=kwargs), test.assertRaisesRegex(ValueError, message):
             SolverSteel(model, enable_sleeping=True, friction_anchor_beta=0.0, **kwargs)

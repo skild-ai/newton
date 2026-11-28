@@ -88,8 +88,10 @@ def configure_contact_torsion(solver):
 
 def _validate_torsion_mode(solver):
     """Reject unsupported construction and runtime mode combinations."""
-    if not solver.model.device.is_cuda or solver.model.requires_grad or solver._contact_warmstart:
-        raise ValueError("Contact torsion requires a non-differentiable CUDA model and contact_warmstart=False")
+    # Torsion rows carry no history: every step clears its rows before the warm-start gather, which seeds only
+    # contact and friction rows, so a warm-started solve starts each torsion row cold.
+    if not solver.model.device.is_cuda or solver.model.requires_grad:
+        raise ValueError("Contact torsion requires a non-differentiable CUDA model")
     if solver._friction_mode != "fixed_normal":
         raise ValueError(f"Contact torsion requires friction_mode='fixed_normal', got {solver._friction_mode!r}")
 

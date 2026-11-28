@@ -84,6 +84,20 @@ def refresh_free_rigid_angular_friction(solver) -> None:
         outputs=[solver._free_rigid_mu_torsional, solver._free_rigid_mu_rolling],
         device=model.device,
     )
+    wp.launch(
+        gate_free_rigid_angular_coefficients,
+        dim=model.shape_count,
+        inputs=[
+            condim if condim is not None else solver._free_rigid_condim_placeholder,
+            int(condim is not None),
+            model.shape_material_mu_torsional,
+            model.shape_material_mu_rolling,
+            -1.0,
+            -1.0,
+        ],
+        outputs=[solver._articulated_mu_spin_scratch, solver._articulated_mu_rolling],
+        device=model.device,
+    )
 
 
 def validate_free_rigid_angular_friction(solver) -> None:
@@ -178,6 +192,7 @@ def launch_propagation_free_rigid_angular_friction_rows(solver, state_aug, conta
             solver._prescribed_articulation,
             solver._free_rigid_mu_torsional,
             solver._free_rigid_mu_rolling,
+            solver._articulated_mu_rolling,
         ],
         outputs=[
             solver._propagation_body_a,

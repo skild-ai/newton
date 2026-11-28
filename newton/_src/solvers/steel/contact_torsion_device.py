@@ -24,6 +24,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_TORSION,
     WARP_DETERMINISM_OFF,
     _has_torsion_radius,
+    articulated_contact_torsion_spare,
     contact_base_rows,
     free_body_contact,
 )
@@ -187,7 +188,7 @@ def _gather(
         family = _DENSE
     elif (
         paths[c] == 2
-        and rows > base_rows
+        and articulated_contact_torsion_spare(rows) >= 0
         # A free-body contact's extra rows are its angular rows, not a torsion spare.
         and not free_body_contact(contact_art_a[c], contact_art_b[c], articulation_response_dof_count, is_free_rigid)
     ):
@@ -264,7 +265,7 @@ def _gather(
         work.row_contact[world, slot] = c
     else:
         work.propagation_row_contact[world, slot] = c
-        work.spare[c] = slot + base_rows
+        work.spare[c] = slot + articulated_contact_torsion_spare(rows)
 
 
 @wp.kernel(enable_backward=False)
