@@ -476,10 +476,6 @@ def get_split_momentum(
 ):
     """Use the owner block to advance the iterate before its first row phase."""
     stride = 32 * warps
-    import os as _os  # noqa: PLC0415  (experiment switches, removed before landing)
-
-    prop_only = _os.environ.get("UM_PROP_ONLY") == "1"
-    inject = _os.environ.get("UM_NO_INJECT") != "1"
 
     @wp.func(module="unique")
     def progress(
@@ -571,14 +567,11 @@ def get_split_momentum(
                     anchor_sq = h.anchor_sq[world]
                 age = next_momentum_age(previous_age, sums[0], friction_transition or sums[3] == 0.0)
                 beta = momentum_beta(age, sums[0], sums[1], sums[2], sums[4], sums[5], anchor_sq)
-        beta_rows = beta
-        if wp.static(prop_only):
-            beta_rows = 0.0
-        _update_rows(world, lane, stride, h.dense, 0, beta_rows, True, h)
-        _update_rows(world, lane, stride, h.free, free_offset, beta_rows, True, h)
+        _update_rows(world, lane, stride, h.dense, 0, beta, True, h)
+        _update_rows(world, lane, stride, h.free, free_offset, beta, True, h)
         if wp.static(propagation):
             _update_rows(world, lane, stride, h.prop, prop_offset, beta, False, h)
-            if wp.static(rods and inject):
+            if wp.static(rods):
                 if beta != 0.0:
                     if wp.static(ordered):
                         # One thread in row order keeps run-to-run runs bitwise identical.
@@ -592,15 +585,15 @@ def get_split_momentum(
             dof = h.dofs[world, i]
             if dof >= 0:
                 v = h.velocity[dof]
-                if beta_rows != 0.0:
-                    h.velocity[dof] = v + beta_rows * (v - h.prev_velocity[dof])
+                if beta != 0.0:
+                    h.velocity[dof] = v + beta * (v - h.prev_velocity[dof])
                 h.prev_velocity[dof] = v
         if wp.static(propagation):
             start = h.body_start[world]
             for i in range(lane, 6 * (h.body_start[world + 1] - start), stride):
                 body = h.bodies[start + i // 6]
                 skip = False
-                if wp.static(rods and inject):
+                if wp.static(rods):
                     # A rod body's move arrives through its pending impulses (above).
                     skip = h.rod_body[body] != 0
                 if not skip:

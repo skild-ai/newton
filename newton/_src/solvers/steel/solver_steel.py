@@ -2768,8 +2768,10 @@ class SolverSteel(SolverBase, CouplingInterface):
                 long trees that carry rows on most links (a cable lying on a surface, pushed or held); momentum
                 recovers much of that convergence without loosening the split. It keeps rod chains off their
                 contracted iterations.
-                ``None`` (default) turns it on when the model has rod material and ``nesterov_momentum`` is off;
-                the two extrapolate the same sweep, so enabling both raises.
+                ``None`` (default) turns it on when the model has rod material. With ``nesterov_momentum`` as well,
+                the two take disjoint rows: this one the propagation rows, Nesterov the generalized and free-body
+                rows. Nesterov alone on a rod tree's propagation rows carries the move through the tree's pending
+                impulses instead, but does not hold a tied cable's grips as this one does.
             propagation_weighted_split: With ``articulated_contact_response="propagation"``, share each joint's
                 mobility among the row-bearing bodies below it in proportion to the normal impulse their rows carry
                 at the start of the step (with contact warm starting, the last step's), instead of evenly; every
@@ -2840,8 +2842,9 @@ class SolverSteel(SolverBase, CouplingInterface):
                 Can converge in fewer iterations on stacks, mass ratios and long chains; gains appear above a
                 few iterations. The position and velocity passes each start fresh history. On CUDA this
                 preserves the selected mass factorization, row ownership, scheduling and propagation fusion.
-                Defaults to enabled on CUDA, except for models with rod joints, whose trees take
-                ``propagation_momentum`` instead. CPU uses plain sweeps, so at a fixed iteration count the
+                Defaults to enabled on CUDA, except for rod models under the immediate response (whose dense rows
+                converge without it and whose contact-unit sweep has no momentum path). With
+                ``propagation_momentum`` the propagation rows take that step instead (see there). CPU uses plain sweeps, so at a fixed iteration count the
                 device defaults can produce different trajectories. Pass ``False`` for plain Gauss-Seidel
                 sweeps on CUDA. Construction-only.
         """
