@@ -15,6 +15,7 @@ import warp as wp
 import newton
 from newton._src.core.types import MAXVAL
 from newton._src.solvers.steel import kernels as steel_kernels
+from newton._src.solvers.steel._testing import kernel_overrides
 from newton._src.solvers.steel.kernels import (
     PGS_CONSTRAINT_TYPE_CONNECT,
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -1241,8 +1242,9 @@ class TestPreeliminationKernels(unittest.TestCase):
         # A world anchor and one rotational child DOF with a 2 mm lever arm.
         wp.launch(
             steel_kernels.populate_connect_J_for_size,
-            dim=1,
+            dim=steel_kernels.CONNECT_MAX_ROWS,
             inputs=[
+                arr([0]),
                 arr([0]),
                 arr([0]),
                 arr([0]),
@@ -4310,6 +4312,24 @@ def _build_closure_ladder(device, offsets, units=4, world_closure=False):
     pins the last unit's right tip to the world with a BALL closure, at an anchor that ``offsets`` move exactly.
     """
     template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    tips = _add_closure_ladder(template, units)
+    if world_closure:
+        # The right tip of the last unit rests at (-0.2, 0, 1.9 - 0.3 * (units - 1)); its anchor 0.2 m along x sits on
+        # the spine axis, at a point float32 holds exactly after any of the test offsets.
+        tip_z = 1.9 - 0.3 * (units - 1)
+        template.add_joint_ball(
+            -1,
+            tips[-1][1],
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, round(tip_z * 64.0) / 64.0), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+        )
+    builder = newton.ModelBuilder()
+    builder.replicate(template, len(offsets), xforms=[wp.transform(wp.vec3(*o), wp.quat_identity()) for o in offsets])
+    return builder.finalize(device=device)
+
+
+def _add_closure_ladder(template, units):
+    """Add one closure ladder (see :func:`_build_closure_ladder`) to ``template``; return each unit's two tip bodies."""
     joints, tips, parent = [], [], -1
     for u in range(units):
         spine = template.add_link(mass=1.0 + 0.1 * u, inertia=wp.mat33(np.eye(3) * 0.01))
@@ -4357,19 +4377,7 @@ def _build_closure_ladder(device, offsets, units=4, world_closure=False):
             template.add_joint_revolute(left, right, axis=wp.vec3(1.0, 0.0, 0.0), parent_xform=xa, child_xform=xb)
         if u + 1 < units:
             template.add_joint_ball(left, tips[u + 1][0], parent_xform=xa, child_xform=xn)
-    if world_closure:
-        # The right tip of the last unit rests at (-0.2, 0, 1.9 - 0.3 * (units - 1)); its anchor 0.2 m along x sits on
-        # the spine axis, at a point float32 holds exactly after any of the test offsets.
-        tip_z = 1.9 - 0.3 * (units - 1)
-        template.add_joint_ball(
-            -1,
-            tips[-1][1],
-            parent_xform=wp.transform(wp.vec3(0.0, 0.0, round(tip_z * 64.0) / 64.0), wp.quat_identity()),
-            child_xform=xb,
-        )
-    builder = newton.ModelBuilder()
-    builder.replicate(template, len(offsets), xforms=[wp.transform(wp.vec3(*o), wp.quat_identity()) for o in offsets])
-    return builder.finalize(device=device)
+    return tips
 
 
 def _float64_closure_gaps(model, joint_q):
@@ -4587,6 +4595,57 @@ def test_second_root_closure_rows_are_translation_invariant(test, device):
     test.assertGreater(largest_gap, 1.0e-6)  # the closure opened, so the rows compared real gaps
 
 
+def test_closure_rows_do_not_depend_on_the_launch_shape(test, device):
+    """Two closure ladders of different sizes step bitwise alike with every serial launch block size.
+
+    The connect rows are built by one thread per row, and the serial kernels (forward kinematics, loop Cholesky and
+    triangular solves, row builders) size their blocks from the thread and SM counts. A thread's arithmetic does not
+    depend on either, so BALL, REVOLUTE and FIXED closures in two articulation size groups give the same trajectory for
+    every block size.
+    """
+    template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    _add_closure_ladder(template, units=3)
+    tips = _add_closure_ladder(template, units=2)
+    # A weld between the small ladder's two unit tips, whose anchors coincide in the rest pose.
+    template.add_joint_fixed(
+        tips[0][1],
+        tips[1][1],
+        parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.3), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+    )
+    builder = newton.ModelBuilder()
+    builder.replicate(template, 3, spacing=(1.0, 0.0, 0.0))
+    model = builder.finalize(device=device)
+
+    def run(block_dim):
+        with kernel_overrides({} if block_dim is None else {"serial_kernel_block_dim": block_dim}):
+            solver = SolverSteel(
+                model,
+                iterations=8,
+                update_mass_matrix_interval=1,
+                articulation_constraint_max=64,
+                deterministic=wp.DeterministicMode.RUN_TO_RUN,
+            )
+        test.assertEqual(sorted(solver._connect_rows.numpy().tolist()).count(6), 3)
+        test.assertEqual(len(solver._connect_sizes), 2)
+        state, out = model.state(), model.state()
+        state.joint_qd.assign(np.random.default_rng(5).uniform(-0.5, 0.5, model.joint_dof_count).astype(np.float32))
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        control = model.control()
+        for _ in range(6):
+            solver.step(state, out, control, None, 1.0 / 120.0)
+            state, out = out, state
+        return state.joint_q.numpy(), state.joint_qd.numpy()
+
+    reference = run(None)
+    test.assertTrue(np.all(np.isfinite(reference[1])))
+    for block_dim in (8, 64, 256):
+        with test.subTest(block_dim=block_dim):
+            q, qd = run(block_dim)
+            np.testing.assert_array_equal(q, reference[0])
+            np.testing.assert_array_equal(qd, reference[1])
+
+
 class TestSteelRevoluteLoop(unittest.TestCase):
     pass
 
@@ -4607,6 +4666,7 @@ for _name in (
     "test_closure_rows_are_translation_invariant",
     "test_world_parent_closure_rows_are_translation_invariant",
     "test_second_root_closure_rows_are_translation_invariant",
+    "test_closure_rows_do_not_depend_on_the_launch_shape",
 ):
     add_function_test(TestSteelRevoluteLoop, _name, globals()[_name], devices=get_cuda_test_devices())
 
