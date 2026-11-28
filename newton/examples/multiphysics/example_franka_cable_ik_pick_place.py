@@ -60,6 +60,8 @@ FRANKA_Q = [
 # Cable: 19 capsule segments spaced 0.02 m (20 nodes), radius 0.005 m, per IsaacLab.
 CABLE_CENTER = wp.vec3(0.5, 0.0, 0.256)
 CABLE_LENGTH = 0.38
+# The world count from which the propagation response is the default (see Example.__init__).
+_PROPAGATION_WORLDS = 1024
 CABLE_CONTACT_KE = 1.0e3
 CABLE_CONTACT_KD = 1.0e-1
 
@@ -116,10 +118,16 @@ class Example:
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         # The native sweep revisits the jaw contacts in every iteration (coupled_contact_passes). Under the
-        # immediate response six substeps of four iterations hold the thin cable through the carry in every world;
-        # the propagation response's split sweep needs eight of sixteen.
-        if self.native_cable and cable_solver.arm_contact_response(args, int(args.world_count)) == "propagation":
-            native_substeps, native_iterations = 8, 16
+        # immediate response six substeps of four iterations hold the thin cable through the carry in every world
+        # (0 of 1,024 worlds lost, each world's cable placed 1 um apart, either narrow phase); the propagation
+        # response's split sweep needs eight of forty (eight of sixteen lost 752 of 1,024; forty none). At forty it
+        # is faster only from 1,024 worlds (43 ms per frame against 54 ms; at 512 worlds 39 ms against 30 ms).
+        world_count = int(args.world_count)
+        if (
+            self.native_cable
+            and cable_solver.arm_contact_response(args, world_count, threshold=_PROPAGATION_WORLDS) == "propagation"
+        ):
+            native_substeps, native_iterations = 8, 40
         else:
             native_substeps, native_iterations = 6, 4
         # A Steel arm coupled to the VBD cable places it within the 1 cm check at 4 substeps of 12 iterations, at
@@ -627,7 +635,7 @@ class Example:
         parser = cable_solver.create_parser(baseline="coupled")
         # The jaws pinch a light cable between two articulations: the immediate response's exact Gauss-Seidel holds
         # it at a small budget, the propagation response's split sweep at a larger one that runs faster from
-        # cable_solver.ARM_PROPAGATION_WORLDS worlds, so the default follows the world count.
+        # _PROPAGATION_WORLDS worlds, so the default follows the world count.
         parser.set_defaults(contact_response=None)
         newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
