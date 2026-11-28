@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import itertools
 import math
-import os
 import warnings
 
 import numpy as np
@@ -325,6 +324,7 @@ class Example:
         self.task = args.task
         self.twist_roll = float(args.twist_roll)
         self.knot_handoff = not args.knot_control
+        self.knot_dahl = bool(getattr(args, "knot_dahl", False))
         self.clamps = cable_solver.CableClamps(args)
         self.native = getattr(args, "solver", "coupled") == "steel"
         # Levenberg-Marquardt iterations per frame, warm-started from the previous frame's solution.
@@ -1139,7 +1139,7 @@ class Example:
             builder.color()
         self.model = builder.finalize()
         self.device = self.model.device
-        if self.task == "knot" and os.environ.get("KNOT_DAHL") == "1":
+        if self.task == "knot" and self.knot_dahl:
             # A plastic cable: Dahl friction in its bending keeps the shape it is bent into.
             material = self.model.steel if self.native else self.model.vbd
             for name, value in (("dahl_eps_max", DAHL_EPS_MAX), ("dahl_tau", DAHL_TAU)):
@@ -1454,6 +1454,11 @@ class Example:
         parser.add_argument("--task", choices=("twist", "wrap", "knot"), default="twist", help="Bimanual task.")
         parser.add_argument(
             "--knot-control", action="store_true", help="Knot: skip the handoff (a negative control; no knot forms)."
+        )
+        parser.add_argument(
+            "--knot-dahl",
+            action="store_true",
+            help="Knot: Dahl friction in the cable's bending, so it keeps the shape it is bent into (a plastic cable).",
         )
         parser.add_argument(
             "--rigid-solver", choices=("mujoco", "steel"), default="mujoco", help="Solver that owns the arms."
