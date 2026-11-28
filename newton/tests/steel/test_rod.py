@@ -500,7 +500,8 @@ def test_propagation_rows_fit_32_bit_indices(test, device):
     world = newton.ModelBuilder()
     world.replicate(builder, copy_count=4)
     model = world.finalize(device=device)
-    with test.assertRaisesRegex(ValueError, "32-bit row indices"):
+    # The solver's index-range check (_check_index_range) bounds the 6-wide propagation rows over all worlds.
+    with test.assertRaisesRegex(ValueError, "propagation row Jacobians.*propagation_constraint_max"):
         newton.solvers.SolverSteel(
             model, articulated_contact_response="propagation", propagation_constraint_max=(2**31) // 24 + 1
         )

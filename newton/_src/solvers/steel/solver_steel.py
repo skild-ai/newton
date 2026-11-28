@@ -3326,15 +3326,6 @@ class SolverSteel(SolverBase, CouplingInterface):
             self._propagation_max_constraints = self._free_body_constraint_max + self._requested_dense_max_constraints
         else:
             self._propagation_max_constraints = self._requested_dense_max_constraints
-        if articulated_contact_response != "immediate":
-            # The propagation kernels index a row's Jacobian floats with 32-bit offsets (world * rows + row) * 6.
-            limit = (2**31 - 1) // (6 * max(int(model.world_count), 1))
-            if self._propagation_max_constraints > limit:
-                raise ValueError(
-                    f"{self._propagation_max_constraints} propagation rows per world over {model.world_count} worlds "
-                    f"exceed the {limit} rows per world that 32-bit row indices address; lower "
-                    "propagation_constraint_max"
-                )
         if propagation_color_order == "rotating" and self._propagation_max_constraints >= _ROTATING_WALK_PRIMES[0]:
             raise ValueError(
                 f"propagation_color_order='rotating' supports fewer than {_ROTATING_WALK_PRIMES[0]} propagation "
